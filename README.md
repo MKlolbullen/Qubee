@@ -7,7 +7,7 @@
 
 ## Table of Contents
 1. [Why Qubee?](#why-qubee)
-2. [Security Show-down](#Security Show-down)
+2. [Security Show-down](#SecurityShow-down)
 3. [Features](#features)
 4. [Quick Start](#quick-start)
 5. [Architecture](#architecture)

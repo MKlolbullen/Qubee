@@ -45,7 +45,7 @@ Qubee flips the table:
 
 ## Security Show-down: Qubee vs Signal (July 2025 snapshot)
 
-```markdown
+
 | Axis | Qubee | Signal |
 |------|-------|--------|
 | **Cryptography** | Custom hybrid: X25519 + Kyber-768 (KEM) inside Double Ratchet; Dilithium-2 for identity/packet sigs. | Standard X3DH / PQXDH handshake and Double Ratchet; Ed25519 for identity keys. |
@@ -59,7 +59,7 @@ Qubee flips the table:
 | **Risk summary** | Cutting-edge but unvetted; excellent lab demo, dangerous production bet. | Battle-tested; good enough for journalists and dissidents today. |
 
 > **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
-```
+
 ---
 
 ## Quick Start

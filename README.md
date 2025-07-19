@@ -7,15 +7,16 @@
 
 ## Table of Contents
 1. [Why Qubee?](#why-qubee)
-2. [Features](#features)
-3. [Quick Start](#quick-start)
-4. [Architecture](#architecture)
-5. [Security Model](#security-model)
+2. [Security showdown](#security-showdown)
+3. [Features](#features)
+4. [Quick Start](#quick-start)
+5. [Architecture](#architecture)
+6. [Security Model](#security-model)
 6. [Configuration](#configuration)
-7. [Roadmap](#roadmap)
-8. [Benchmarks](#benchmarks)
-9. [Contributing](#contributing)
-10. [License](#license)
+8. [Roadmap](#roadmap)
+9. [Benchmarks](#benchmarks)
+10. [Contributing](#contributing)
+11. [License](#license)
 
 ---
 
@@ -47,3 +48,25 @@ git clone https://github.com/MKlolbullen/Qubee.git
 cd Qubee
 cargo build --release
 ./target/release/qubee --help
+
+---
+
+### Security Show-down: Qubee vs Signal (July 2025 snapshot)
+
+| Axis | Qubee | Signal |
+|------|-------|--------|
+| **Cryptography** | Custom hybrid: X25519 + Kyber-768 (KEM) inside Double Ratchet; Dilithium-2 for identity/packet sigs. | Standard X3DH / PQXDH handshake and Double Ratchet; Ed25519 for identity keys. |
+| **Post-quantum scope** | End-to-end (initial handshake **and** every ratchet step). | Handshake only (PQXDH); message ratchet still classical. 6 |
+| **Metadata exposure** | None by design—no servers. NAT traversal leaks only to peers. | Relay servers log IP/timing (claimed to drop metadata but still single point). 7 |
+| **Deniability** | Weak: Dilithium signatures provably bind messages to sender. | Strong cryptographic deniability; no long-term sigs. 8 |
+| **Traffic analysis** | Dummy cover traffic on all channels. | None (relies on TLS). |
+| **Implementation rigor** | Two commits, zero test coverage, no audit—**high risk**. 9 | Mature open-source, multiple formal/security reviews. 10 |
+| **Usability** | CLI only; requires port-forwarding/hole-punch. | Polished mobile/desktop apps, push notifications. |
+| **Dependency risk** | Pure Rust, no TLS, minimal deps. | Relies on Firebase/APNs for push (mobile). |
+| **Risk summary** | Cutting-edge but unvetted; excellent lab demo, dangerous production bet. | Battle-tested; good enough for journalists and dissidents today. |
+
+> **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
+
+---
+
+Enjoy, and feel free to fork the README further.11

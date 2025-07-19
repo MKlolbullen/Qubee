@@ -7,7 +7,7 @@
 
 ## Table of Contents
 1. [Why Qubee?](#why-qubee)
-2. [Security showdown](#security-showdown)
+2. [Security Show-down](#Security Show-down)
 3. [Features](#features)
 4. [Quick Start](#quick-start)
 5. [Architecture](#architecture)
@@ -41,18 +41,11 @@ Qubee flips the table:
 | Zero servers | NAT traversal via UDP hole-punching; no fallback relay. |
 | Extensible | Pluggable ZK-proof layer (SNARKs/Bulletproofs stubs). |
 
-## Quick Start
-
-```bash
-git clone https://github.com/MKlolbullen/Qubee.git
-cd Qubee
-cargo build --release
-./target/release/qubee --help
-
 ---
 
-### Security Show-down: Qubee vs Signal (July 2025 snapshot)
+## Security Show-down: Qubee vs Signal (July 2025 snapshot)
 
+```markdown
 | Axis | Qubee | Signal |
 |------|-------|--------|
 | **Cryptography** | Custom hybrid: X25519 + Kyber-768 (KEM) inside Double Ratchet; Dilithium-2 for identity/packet sigs. | Standard X3DH / PQXDH handshake and Double Ratchet; Ed25519 for identity keys. |
@@ -66,7 +59,21 @@ cargo build --release
 | **Risk summary** | Cutting-edge but unvetted; excellent lab demo, dangerous production bet. | Battle-tested; good enough for journalists and dissidents today. |
 
 > **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
+```
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/MKlolbullen/Qubee.git
+cd Qubee
+cargo build --release
+./target/release/qubee --help
 
 ---
 
-Enjoy, and feel free to fork the README further.11
+## Security Show-down: Qubee vs Signal (July 2025 snapshot)
+
+
+
+Enjoy, and feel free to fork the README further.

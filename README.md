@@ -1,164 +1,49 @@
-# 🚀 Qubee is a cutting-edge, post-quantum secure, peer-to-peer messaging and file transfer application designed for maximum privacy and security — with no centralized servers.
+# Qubee  <!-- Logo/branding here later -->
+> **Post-quantum, peer-to-peer messaging & file-sharing—no servers, no excuses.**
 
-File structure
-```markdown
-Qubee/
-├── src/
-│   ├── main.rs
-│   ├── lib.rs
-│   ├── hybrid_ratchet.rs
-│   ├── secure_message.rs      
-│   ├── file_transfer.rs       
-│   ├── audio.rs               
-│   ├── identity.rs
-│   ├── error.rs
-│   ├── logging.rs
-│   ├── config.rs
-│   ├── ephemeral_keys.rs
-│   ├── sas.rs
-│   └── oob_secret.rs
-│
-├── Cargo.toml
-└── README.md
-```
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange)
+![Status](https://img.shields.io/badge/status-experimental-red)
+
+## Table of Contents
+1. [Why Qubee?](#why-qubee)
+2. [Features](#features)
+3. [Quick Start](#quick-start)
+4. [Architecture](#architecture)
+5. [Security Model](#security-model)
+6. [Configuration](#configuration)
+7. [Roadmap](#roadmap)
+8. [Benchmarks](#benchmarks)
+9. [Contributing](#contributing)
+10. [License](#license)
 
 ---
 
-🔒 Features
+## Why Qubee?
+Current “secure” messengers still hinge on **centralised infrastructure** or **pre-quantum key exchange**.  
+Qubee flips the table:
 
-✅ Post-Quantum Security:
+* **100 % peer-to-peer**—metadata never touches a server.  
+* **Hybrid Kyber-768 + Dilithium-2 Double Ratchet**—post-quantum confidentiality _and_ authentication.  
+* **Rust first**—memory-safety without a garbage collector.
 
-Hybrid Double Ratchet with Kyber-768 and Dilithium-2 ensures robust protection against future quantum attacks.
+> **Reality check:** Qubee is *research-grade*. Expect sharp edges and zero backwards-compat guarantees.
 
+## Features
+| Category | Qubee |
+|----------|-------|
+| Post-quantum | Kyber-768 KEM + Dilithium-2 sigs inside a classical Double Ratchet. |
+| Sealed Sender | Ephemeral Dilithium sig per packet—sender unlinkability. |
+| Cover Traffic | Configurable dummy packets for audio, text & files. |
+| File integrity | BLAKE3 chunk hashing; pass/fail before file release. |
+| Trust model | TOFU _or_ pre-pinned keys; change alerts. |
+| Zero servers | NAT traversal via UDP hole-punching; no fallback relay. |
+| Extensible | Pluggable ZK-proof layer (SNARKs/Bulletproofs stubs). |
 
-✅ Sealed Sender:
+## Quick Start
 
-Ephemeral signatures on every packet, protecting sender metadata.
-
-
-✅ Ephemeral Key Pinning:
-
-Trust-on-first-use (TOFU) detection of ephemeral key changes to detect potential MITM attempts.
-
-
-✅ Cover Traffic:
-
-Dummy packets injected into audio, text, and file streams, preventing traffic analysis and metadata leakage.
-
-
-✅ File Integrity Verification:
-
-Per-file hash checking ensures every transferred file is complete and untampered.
-
-
-✅ Zero-Knowledge Proof Interface (Pluggable):
-
-Hooks for integrating zk-SNARKs/Bulletproofs in the future.
-
-
-✅ No Backend Servers:
-
-100% peer-to-peer, no cloud dependencies.
-
-
-✅ Configurable Trust Model:
-
-Choose between TOFU or pre-pinned keys.
-
-
-✅ Modular Architecture:
-
-Written in Rust for performance and safety.
-
-
-
----
-
-📚 Installation
-```sh
-git clone https://github.com/yourusername/pq_messenger.git
-cd pq_messenger
+```bash
+git clone https://github.com/MKlolbullen/Qubee.git
+cd Qubee
 cargo build --release
-```
-
----
-
-🛠️ Usage
-
-Run the application:
-```sh
-cargo run --release
-```
-
----
-
-⚙️ Configuration
-
-Adjust runtime settings in src/config.rs:
-
-pub struct AppConfig {
-    pub enable_cover_traffic: bool,
-    pub dummy_packet_frequency_secs: u64,
-    pub trust_model: String, // \"TOFU\" or \"pinned\"
-}
-
-
----
-
-🧩 Modules
-
-secure_message.rs: Text messaging with Sealed Sender.
-
-file_transfer.rs: Chunked file transfer with ephemeral key pinning.
-
-audio.rs: Real-time encrypted audio with dummy packet support.
-
-hybrid_ratchet.rs: Combines classical Double Ratchet with PQ Kyber KEM.
-
-identity.rs: Handles Dilithium-based identity key management.
-
-ephemeral_keys.rs: TOFU ephemeral key store.
-
-config.rs: App configuration.
-
-logging.rs: Tracing integration.
-
-error.rs: Structured error handling.
-
-sas.rs: Short Authentication Strings (SAS) generator.
-
-oob_secret.rs: Out-of-Band secret generator.
-
-
-
----
-
-🧪 Benchmarking
-
-Run with:
-```
-cargo run --release
-```
-Logs CPU times and encryption/decryption performance automatically.
-
-
----
-
-🤝 Contributing
-
-Contributions welcome! Please submit pull requests with detailed descriptions.
-
-
----
-
-🛡️ License
-
-MIT — see LICENSE file for details.
-
-
----
-
-📞 Contact
-
-Victor — 0daybullen@protonmail.com 
-
+./target/release/qubee --help

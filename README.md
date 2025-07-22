@@ -37,6 +37,13 @@ QubeeSecureApp/
 
 
 ```
+Build the .so for *JNI*
+in qubee-crypto. 
+```markdown
+cargo install cargo-ndk
+cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+```
+
 ## Table of Contents
 1. [Why Qubee?](#why-qubee)
 2. [Security Show-down](#SecurityShow-down)

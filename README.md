@@ -5,7 +5,35 @@
 ![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange)
 ![Status](https://img.shields.io/badge/status-experimental-red)
 ```markdown
-QubeeSecureApp/ ├── app/ │   ├── build.gradle │   ├── proguard-rules.pro │   ├── src/ │   │   └── main/ │   │       ├── AndroidManifest.xml │   │       ├── java/ │   │       │   └── com/ │   │       │       └── qubee/ │   │       │           └── secure/ │   │       │               ├── MainActivity.kt │   │       │               ├── NativeLib.kt │   │       │               └── KeyStoreHelper.kt │   │       ├── cpp/ │   │       │   ├── Android.mk │   │       │   └── Application.mk │   │       └── jniLibs/ │   │           └── arm64-v8a/ │   │               └── libqubee.so  <-- built via cargo-ndk or ndk-build ├── qubee-crypto/ │   ├── Cargo.toml │   └── src/ │       ├── lib.rs               <-- JNI entry point │       ├── crypto/ │       │   └── identity.rs      <-- SecureSession, IdentityManager ├── build.gradle ├── settings.gradle └── gradle.properties
+QubeeSecureApp/
+├── app/
+│   ├── build.gradle
+│   ├── proguard-rules.pro
+│   ├── src/
+│   │   └── main/
+│   │       ├── AndroidManifest.xml
+│   │       ├── java/
+│   │       │   └── com/
+│   │       │       └── qubee/
+│   │       │           └── secure/
+│   │       │               ├── MainActivity.kt
+│   │       │               ├── NativeLib.kt
+│   │       │               └── KeyStoreHelper.kt
+│   │       ├── cpp/
+│   │       │   ├── Android.mk
+│   │       │   └── Application.mk
+│   │       └── jniLibs/
+│   │           └── arm64-v8a/
+│   │               └── libqubee.so  <-- built via cargo-ndk or ndk-build
+├── qubee-crypto/
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs               <-- JNI entry point
+│       ├── crypto/
+│       │   └── identity.rs      <-- SecureSession, IdentityManager
+├── build.gradle
+├── settings.gradle
+└── gradle.properties
 
 
 ```

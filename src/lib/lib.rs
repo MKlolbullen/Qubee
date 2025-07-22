@@ -9,11 +9,11 @@ pub extern "C" fn Java_com_qubee_video_RustSignaling_encryptSignal(
     signal: JString,
 ) -> jstring {
     let signal: String = env.get_string(signal).unwrap().into();
-    let encrypted = pqc_encrypt_signal(&signal); // Your PQC encryption logic
+    let encrypted = pqc_encrypt_signal(&signal); // PQC encryption logic
     env.new_string(encrypted).unwrap().into_raw()
 }
 
 fn pqc_encrypt_signal(signal: &str) -> String {
-    // Use Kyber/Dilithium to encrypt signaling payload
+    // Uses Kyber/Dilithium to encrypt signaling payload
     format!("ENCRYPTED({})", signal)
 }

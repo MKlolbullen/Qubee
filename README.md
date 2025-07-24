@@ -51,7 +51,7 @@ cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
 3. [Features](#features)
 4. [Quick Start](#quick-start)
 5. [Architecture](#architecture)
-6. [Security Model](#security-model)
+6. [Security Updates](#security-updates)
 6. [Configuration](#configuration)
 8. [Roadmap](#roadmap)
 9. [Benchmarks](#benchmarks)
@@ -100,6 +100,20 @@ Qubee flips the table:
 
 > **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
 
+---
+## Security-Updates
+
+**MAJOR SECURITY IMPROVEMENTS**: This enhanced version addresses critical security vulnerabilities found in the original Qubee implementation:
+
+- ✅ **Secure Random Number Generation**: Enhanced entropy collection from multiple sources
+- ✅ **Memory Protection**: Secure memory allocation with zeroization and memory locking
+- ✅ **Key Storage Security**: Encrypted key storage with platform integration
+- ✅ **Input Validation**: Comprehensive input sanitization and bounds checking
+- ✅ **Replay Protection**: Message sequence numbers and timestamp validation
+- ✅ **Side-Channel Protection**: Constant-time operations and secure implementations
+- ✅ **Comprehensive Auditing**: Built-in security audit framework
+
+**Recommendation**: While significantly more secure than the original, this implementation should still undergo professional security audit before production deployment.
 ---
 ## Roadmap
 

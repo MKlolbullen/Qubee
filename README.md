@@ -100,6 +100,26 @@ Qubee flips the table:
 > **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
 
 ---
+## 🛣️ [Roadmap](#roadmap)
+Roadmap
+
+### Version 0.3.0 
+- [ ] Complete network security implementation
+- [ ] Hardware security module integration
+- [ ] Mobile platform support (Android/iOS)
+- [ ] Performance optimizations
+
+### Version 0.4.0 
+- [ ] Formal verification completion
+- [ ] Zero-knowledge proof integration
+- [ ] Advanced traffic analysis resistance
+- [ ] Multi-device synchronization
+
+### Version 1.0.0 
+- [ ] Production security audit completion
+- [ ] FIPS 140-2 Level 3 certification
+- [ ] Enterprise deployment tools
+- [ ] Long-term support commitment
 
 ## Quick Start
 

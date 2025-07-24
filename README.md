@@ -4,6 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange)
 ![Status](https://img.shields.io/badge/status-experimental-red)
+### Project skeleton for android testing.
 ```markdown
 QubeeSecureApp/
 ├── app/
@@ -100,8 +101,7 @@ Qubee flips the table:
 > **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
 
 ---
-## 🛣️ [Roadmap](#roadmap)
-Roadmap
+## Roadmap
 
 ### Version 0.3.0 
 - [ ] Complete network security implementation

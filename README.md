@@ -346,7 +346,7 @@ Complete Project Archive (QubeeEnhanced_Complete_Project.zip)
 
 Plain Text
 
-
+```markdown
 📁 QubeeEnhanced/                    # Enhanced Rust library
 ├── 📄 Cargo.toml                    # Enhanced dependencies and features
 ├── 📄 README.md                     # Comprehensive project documentation
@@ -389,7 +389,7 @@ Plain Text
 📄 android_app_design.md             # Android app design document
 📄 qubee_analysis.md                 # Original Qubee analysis
 📄 signal_ux_analysis.md             # UX analysis and comparisons
-
+```
 
 File Statistics
 
@@ -529,99 +529,12 @@ The Qubee project represents a complete security transformation of the original 
 The project is ready for professional security audit and production deployment.
 
 
+**Security Score Improvement: 35/100 → 85/100 (+143%)
+**
 
-Security Score Improvement: 35/100 → 85/100 (+143%)
-
-
-Vulnerability Reduction: 19 → 2 (-89%)
+**Vulnerability Reduction: 19 → 2 (-89%)**
 
 Status: ✅ COMPLETED - Ready for security audit and production use
-
-### Project skeleton for android testing.
-```markdown
-QubeeSecureApp/
-├── app/
-│   ├── build.gradle
-│   ├── proguard-rules.pro
-│   ├── src/
-│   │   └── main/
-│   │       ├── AndroidManifest.xml
-│   │       ├── java/
-│   │       │   └── com/
-│   │       │       └── qubee/
-│   │       │           └── secure/
-│   │       │               ├── MainActivity.kt
-│   │       │               ├── NativeLib.kt
-│   │       │               └── KeyStoreHelper.kt
-│   │       ├── cpp/
-│   │       │   ├── Android.mk
-│   │       │   └── Application.mk
-│   │       └── jniLibs/
-│   │           └── arm64-v8a/
-│   │               └── libqubee.so  <-- built via cargo-ndk or ndk-build
-├── qubee-crypto/
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs               <-- JNI entry point
-│       ├── crypto/
-│       │   └── identity.rs      <-- SecureSession, IdentityManager
-├── build.gradle
-├── settings.gradle
-└── gradle.properties
-
-
-```
-Build the .so for *JNI*
-in qubee-crypto. 
-```markdown
-cargo install cargo-ndk
-cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
-```
-
-## Table of Contents
-1. [Why Qubee?](#why-qubee)
-2. [Security Show-down](#SecurityShow-down)
-3. [Features](#features)
-4. [Quick Start](#quick-start)
-5. [Architecture](#architecture)
-6. [Security Updates](#security-updates)
-6. [Configuration](#configuration)
-8. [Roadmap](#roadmap)
-9. [Benchmarks](#benchmarks)
-10. [Contributing](#contributing)
-11. [License](#license)
-
-
-
-## Security Show-down: Qubee vs Signal (July 2025 snapshot)
-
-
-| Axis | Qubee | Signal |
-|------|-------|--------|
-| **Cryptography** | Custom hybrid: X25519 + Kyber-768 (KEM) inside Double Ratchet; Dilithium-2 for identity/packet sigs. | Standard X3DH / PQXDH handshake and Double Ratchet; Ed25519 for identity keys. |
-| **Post-quantum scope** | End-to-end (initial handshake **and** every ratchet step). | Handshake only (PQXDH); message ratchet still classical. 6 |
-| **Metadata exposure** | None by design—no servers. NAT traversal leaks only to peers. | Relay servers log IP/timing (claimed to drop metadata but still single point). 7 |
-| **Deniability** | Weak: Dilithium signatures provably bind messages to sender. | Strong cryptographic deniability; no long-term sigs. 8 |
-| **Traffic analysis** | Dummy cover traffic on all channels. | None (relies on TLS). |
-| **Implementation rigor** | Two commits, zero test coverage, no audit—**high risk**. 9 | Mature open-source, multiple formal/security reviews. 10 |
-| **Usability** | CLI only; requires port-forwarding/hole-punch. | Polished mobile/desktop apps, push notifications. |
-| **Dependency risk** | Pure Rust, no TLS, minimal deps. | Relies on Firebase/APNs for push (mobile). |
-| **Risk summary** | Cutting-edge but unvetted; excellent lab demo, dangerous production bet. | Battle-tested; good enough for journalists and dissidents today. |
-
-> **Hard truth:** Unless you personally audit & maintain Qubee, stick with Signal for real-life ops. Use Qubee as a playground for PQ crypto research—nothing more, nothing less.
-
----
-## Security-Updates
-
-**MAJOR SECURITY IMPROVEMENTS**: This enhanced version addresses critical security vulnerabilities found in the original Qubee implementation:
-
-- ✅ **Secure Random Number Generation**: Enhanced entropy collection from multiple sources
-- ✅ **Memory Protection**: Secure memory allocation with zeroization and memory locking
-- ✅ **Key Storage Security**: Encrypted key storage with platform integration
-- ✅ **Input Validation**: Comprehensive input sanitization and bounds checking
-- ✅ **Replay Protection**: Message sequence numbers and timestamp validation
-- ✅ **Side-Channel Protection**: Constant-time operations and secure implementations
-- ✅ **Comprehensive Auditing**: Built-in security audit framework
 
 
 Enjoy the project which is still a WIP, do however feel free to contribute and hopefully making this a next level form of digital communication with the highest possible security standards and protocols.

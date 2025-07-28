@@ -1,8 +1,8 @@
 [package]
-name = "qubee-enhanced"
+name = "Qubee"
 version = "0.2.0"
 edition = "2021"
-authors = ["Victor Åhgren", "Security Enhancement Team"]
+authors = ["Victor Åhgren", "Qubee security team"]
 description = "Peer-to-peer Post-Quantum Secure Messenger with Enhanced Security Features"
 license = "MIT"
 repository = "https://github.com/MKlolbullen/Qubee"
@@ -101,7 +101,7 @@ security-framework = "2.9"
 
 # Development dependencies
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports"], optional = true }
 proptest = "1.4"
 quickcheck = "1.0"
 tokio-test = "0.4"
@@ -152,7 +152,7 @@ parallel-crypto = ["rayon"]
 
 # Development features
 testing = []
-benchmarking = ["criterion"]
+benchmarking = ["dep:criterion"]
 fuzzing = ["arbitrary", "honggfuzz"]
 
 # Platform features

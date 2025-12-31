@@ -1,36 +1,36 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Qubee" type="ComposePreviewRunConfiguration">
-    <module name="Qubee" />
+  <configuration default="false" name="Qubee" type="AndroidRunConfigurationType" factoryName="Android App" editBeforeRun="true" singleton="true">
     <option name="ANDROID_RUN_CONFIGURATION_SCHEMA_VERSION" value="1" />
     <option name="DEPLOY" value="true" />
     <option name="DEPLOY_APK_FROM_BUNDLE" value="true" />
     <option name="DEPLOY_AS_INSTANT" value="false" />
     <option name="ARTIFACT_NAME" value="" />
     <option name="PM_INSTALL_OPTIONS" value="" />
-    <option name="ALL_USERS" value="false" />
-    <option name="ALWAYS_INSTALL_WITH_PM" value="false" />
-    <option name="ALLOW_ASSUME_VERIFIED" value="false" />
+    <option name="ALL_USERS" value="true" />
+    <option name="ALWAYS_INSTALL_WITH_PM" value="true" />
+    <option name="ALLOW_ASSUME_VERIFIED" value="true" />
     <option name="CLEAR_APP_STORAGE" value="false" />
     <option name="DYNAMIC_FEATURES_DISABLED_LIST" value="" />
-    <option name="ACTIVITY_EXTRA_FLAGS" value="--es composable " />
-    <option name="MODE" value="specific_activity" />
+    <option name="ACTIVITY_EXTRA_FLAGS" value="android:exported=true, android:grantUriPermission=true, android:launchMode=singleTask, android:allowTaskReparenting=true, " />
+    <option name="MODE" value="default_activity" />
     <option name="RESTORE_ENABLED" value="false" />
     <option name="RESTORE_FILE" value="" />
     <option name="RESTORE_FRESH_INSTALL_ONLY" value="false" />
     <option name="CLEAR_LOGCAT" value="false" />
-    <option name="SHOW_LOGCAT_AUTOMATICALLY" value="false" />
+    <option name="SHOW_LOGCAT_AUTOMATICALLY" value="true" />
     <option name="TARGET_SELECTION_MODE" value="DEVICE_AND_SNAPSHOT_COMBO_BOX" />
     <option name="SELECTED_CLOUD_MATRIX_CONFIGURATION_ID" value="-1" />
     <option name="SELECTED_CLOUD_MATRIX_PROJECT_ID" value="" />
-    <option name="DEBUGGER_TYPE" value="Auto" />
+    <option name="DEBUGGER_TYPE" value="Native" />
     <Auto>
       <option name="USE_JAVA_AWARE_DEBUGGER" value="false" />
       <option name="SHOW_STATIC_VARS" value="true" />
       <option name="WORKING_DIR" value="" />
       <option name="TARGET_LOGGING_CHANNELS" value="lldb process:gdb-remote packets" />
       <option name="SHOW_OPTIMIZED_WARNING" value="true" />
-      <option name="ATTACH_ON_WAIT_FOR_DEBUGGER" value="false" />
+      <option name="ATTACH_ON_WAIT_FOR_DEBUGGER" value="true" />
       <option name="DEBUG_SANDBOX_SDK" value="false" />
+      <symbol_dirs symbol_path="C:\Users\mahgr\StudioProjects\Qubee\app\src\main\jniLibs\arm64-v8a" />
       <symbol_dirs symbol_path="C:\Users\mahgr\StudioProjects\Qubee\target\release\build" />
     </Auto>
     <Hybrid>
@@ -54,6 +54,7 @@
       <option name="SHOW_OPTIMIZED_WARNING" value="true" />
       <option name="ATTACH_ON_WAIT_FOR_DEBUGGER" value="false" />
       <option name="DEBUG_SANDBOX_SDK" value="false" />
+      <symbol_dirs symbol_path="C:\Users\mahgr\StudioProjects\Qubee" />
     </Native>
     <Profilers>
       <option name="ADVANCED_PROFILING_ENABLED" value="false" />
@@ -65,10 +66,12 @@
     </Profilers>
     <option name="DEEP_LINK" value="" />
     <option name="ACTIVITY" value="" />
-    <option name="ACTIVITY_CLASS" value="androidx.compose.ui.tooling.PreviewActivity" />
-    <option name="SEARCH_ACTIVITY_IN_GLOBAL_SCOPE" value="true" />
+    <option name="ACTIVITY_CLASS" value="" />
+    <option name="SEARCH_ACTIVITY_IN_GLOBAL_SCOPE" value="false" />
     <option name="SKIP_ACTIVITY_VALIDATION" value="false" />
-    <compose-preview-run-configuration composable-fqn="" />
-    <method v="2" />
+    <method v="2">
+      <option name="MakeProject" enabled="true" />
+      <option name="Gradle.BeforeRunTask" enabled="true" tasks="267ef58b6a16a0651f7c1505ac69ad00a90f2fdd56c2374ea78859da95a2f765f1a49d300607d4838cd3c7a20fbd05314c584cc897f9e1531d357b35b7b0d602" externalProjectPath="$PROJECT_DIR$" vmOptions="" scriptParameters="" />
+    </method>
   </configuration>
 </component>

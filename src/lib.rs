@@ -9,3 +9,4 @@ pub mod config;
 pub mod ephemeral_keys;
 pub mod sas;
 pub mod oob_secret;
+pub mod jni_api;

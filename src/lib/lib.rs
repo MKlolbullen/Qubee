@@ -378,4 +378,3 @@ mod tests {
         assert_eq!(VERSION_PATCH, 0);
     }
 }
-pub mod jni_api;

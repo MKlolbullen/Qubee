@@ -9,7 +9,12 @@ plugins {
 android {
     namespace 'com.qubee.messenger'
     compileSdk 34
-
+    sourceSets {
+    main {
+        // Berätta för Android Studio att native libs finns i denna mapp
+        jniLibs.srcDirs = ['src/main/jniLibs']
+    }
+}
     defaultConfig {
         applicationId "com.qubee.messenger"
         minSdk 24

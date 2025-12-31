@@ -2,6 +2,7 @@
 <project version="4">
   <component name="Kotlin2JsCompilerArguments">
     <option name="moduleKind" value="plain" />
+    <option name="sourceMap" value="true" />
   </component>
   <component name="Kotlin2JvmCompilerArguments">
     <option name="jvmTarget" value="1.8" />

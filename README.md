@@ -17,14 +17,14 @@ The core logic and cryptography are implemented in **Rust** for memory safety an
 
 ## ✨ Features
 
-| Category | Qubee |
-|----------|-------|
-| **Post-quantum** | Kyber-768 KEM + Dilithium-2 signatures inside a Double Ratchet. |
-| **P2P** | 100% peer-to-peer; metadata never touches a server. |
+| Category          | Qubee                                                               |
+|-------------------|---------------------------------------------------------------------|
+| **Post-quantum**  | Kyber-768 KEM + Dilithium-2 signatures inside a Double Ratchet.     |
+| **P2P**           | 100% peer-to-peer; metadata never touches a server.                 |
 | **Sealed Sender** | Ephemeral Dilithium signatures per packet for sender unlinkability. |
-| **Architecture** | Hybrid: Android (UI/Service) + Rust (Crypto/Protocol). |
-| **Zero Servers** | NAT traversal via UDP hole-punching. |
-| **Security** | Encrypted local storage (Room + SQLCipher), secure memory handling. |
+| **Architecture**  | Hybrid: Android (UI/Service) + Rust (Crypto/Protocol).              |
+| **Zero Servers**  | NAT traversal via UDP hole-punching.                                |
+| **Security**      | Encrypted local storage (Room + SQLCipher), secure memory handling. |
 
 ## 🛠 Tech Stack
 

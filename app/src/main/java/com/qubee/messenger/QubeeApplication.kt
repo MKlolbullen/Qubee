@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import androidx.core.content.ContextCompat
+import com.qubee.messenger.crypto.QubeeManager
 import dagger.hilt.android.HiltAndroidApp
 import timber.log.Timber
 
@@ -15,11 +16,6 @@ class QubeeApplication : Application() {
         const val NOTIFICATION_CHANNEL_MESSAGES = "messages"
         const val NOTIFICATION_CHANNEL_CALLS = "calls"
         const val NOTIFICATION_CHANNEL_SERVICE = "service"
-        
-        // Load native library
-        init {
-            System.loadLibrary("qubee_native")
-        }
     }
 
     override fun onCreate() {
@@ -34,7 +30,7 @@ class QubeeApplication : Application() {
         createNotificationChannels()
         
         // Initialize Qubee native library
-        initializeQubeeLibrary()
+        QubeeManager.initialize()
         
         Timber.d("QubeeApplication initialized")
     }
@@ -84,22 +80,4 @@ class QubeeApplication : Application() {
             )
         }
     }
-
-    private fun initializeQubeeLibrary() {
-        try {
-            // Initialize the native Qubee library
-            val result = nativeInitialize()
-            if (result) {
-                Timber.d("Qubee native library initialized successfully")
-            } else {
-                Timber.e("Failed to initialize Qubee native library")
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error initializing Qubee native library")
-        }
-    }
-
-    // Native method declarations
-    private external fun nativeInitialize(): Boolean
 }
-

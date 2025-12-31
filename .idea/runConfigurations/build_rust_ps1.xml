@@ -1,0 +1,21 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="build_rust.ps1" type="ShConfigurationType">
+    <option name="SCRIPT_TEXT" value="" />
+    <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
+    <option name="SCRIPT_PATH" value="" />
+    <option name="SCRIPT_OPTIONS" value="" />
+    <option name="INDEPENDENT_SCRIPT_WORKING_DIRECTORY" value="true" />
+    <option name="SCRIPT_WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="INDEPENDENT_INTERPRETER_PATH" value="false" />
+    <option name="INTERPRETER_PATH" value="$USER_HOME$/.cargo/bin/cargo.exe" />
+    <option name="INTERPRETER_OPTIONS" value="Set-ExecutionPolicy RemoteSigned -Scope Process" />
+    <option name="EXECUTE_IN_TERMINAL" value="true" />
+    <option name="EXECUTE_SCRIPT_FILE" value="true" />
+    <envs>
+      <env name="ANDROID_NDK_HOME" value="&quot;C:\Users\mahgr\AppData\Local\Android\Sdk\ndk\29.0.14206865\&quot;" />
+    </envs>
+    <method v="2">
+      <option name="Gradle.BeforeRunTask" enabled="true" tasks="" />
+    </method>
+  </configuration>
+</component>

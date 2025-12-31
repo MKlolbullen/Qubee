@@ -1,9 +1,10 @@
 [package]
-name = "Qubee"
+name = "qubee_crypto" # VIKTIGT: Måste matcha System.loadLibrary("qubee_crypto") i Kotlin
 version = "0.2.0"
 edition = "2021"
-authors = ["Victor Åhgren"]
-description = "Peer-to-peer Post-Quantum Secure Messenger with Sealed Sender and Cover Traffic"
+
+[lib]
+crate-type = ["cdylib"] # VIKTIGT: För att skapa .so filer till Android
 
 [dependencies]
 anyhow = "1.0.98"
@@ -19,3 +20,13 @@ tracing-subscriber = "0.3"
 secrecy = "0.8"
 thiserror = "1.0"
 blake3 = "1.4"
+hkdf = "0.12"
+sha2 = "0.10"
+subtle = "2.4"
+zeroize = { version = "1.6", features = ["derive"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
+dirs = "5.0" # Behövs för SecureMessenger::new()
+
+# NYA BEROENDEN FÖR JNI:
+jni = "0.21.1"
+lazy_static = "1.4.0"

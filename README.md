@@ -54,7 +54,7 @@ The core logic and cryptography are implemented in **Rust** for memory safety an
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/Qubee.git
+git clone https://github.com/MKlolbullen/Qubee.git
 cd Qubee
 ```
 

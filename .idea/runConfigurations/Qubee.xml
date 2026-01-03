@@ -2,7 +2,7 @@
   <configuration default="false" name="Qubee" type="AndroidRunConfigurationType" factoryName="Android App" editBeforeRun="true" singleton="true">
     <option name="ANDROID_RUN_CONFIGURATION_SCHEMA_VERSION" value="1" />
     <option name="DEPLOY" value="true" />
-    <option name="DEPLOY_APK_FROM_BUNDLE" value="true" />
+    <option name="DEPLOY_APK_FROM_BUNDLE" value="false" />
     <option name="DEPLOY_AS_INSTANT" value="false" />
     <option name="ARTIFACT_NAME" value="" />
     <option name="PM_INSTALL_OPTIONS" value="" />
@@ -21,7 +21,7 @@
     <option name="TARGET_SELECTION_MODE" value="DEVICE_AND_SNAPSHOT_COMBO_BOX" />
     <option name="SELECTED_CLOUD_MATRIX_CONFIGURATION_ID" value="-1" />
     <option name="SELECTED_CLOUD_MATRIX_PROJECT_ID" value="" />
-    <option name="DEBUGGER_TYPE" value="Native" />
+    <option name="DEBUGGER_TYPE" value="Hybrid" />
     <Auto>
       <option name="USE_JAVA_AWARE_DEBUGGER" value="false" />
       <option name="SHOW_STATIC_VARS" value="true" />
@@ -71,7 +71,6 @@
     <option name="SKIP_ACTIVITY_VALIDATION" value="false" />
     <method v="2">
       <option name="MakeProject" enabled="true" />
-      <option name="Gradle.BeforeRunTask" enabled="true" tasks="267ef58b6a16a0651f7c1505ac69ad00a90f2fdd56c2374ea78859da95a2f765f1a49d300607d4838cd3c7a20fbd05314c584cc897f9e1531d357b35b7b0d602" externalProjectPath="$PROJECT_DIR$" vmOptions="" scriptParameters="" />
     </method>
   </configuration>
 </component>

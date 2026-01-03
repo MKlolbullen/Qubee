@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PromptTemplates">
+    <option name="prompts">
+      <list>
+        <PromptTemplate>
+          <option name="enabled" value="true" />
+          <option name="name" value="APK creation" />
+          <option name="text" value="Build the project, create an APK and install it on the virtual device selected." />
+        </PromptTemplate>
+      </list>
+    </option>
+  </component>
+</project>

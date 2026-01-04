@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<navigation xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/nav_graph"
+    app:startDestination="@id/navigation_conversations">
+
+    <fragment
+        android:id="@+id/navigation_conversations"
+        android:name="com.qubee.messenger.ui.main.ConversationsFragment"
+        android:label="Chats"
+        tools:layout="@layout/fragment_conversations">
+        <action
+            android:id="@+id/action_to_chat"
+            app:destination="@id/chatFragment" />
+        <action
+            android:id="@+id/action_to_contact_selection"
+            app:destination="@id/contactSelectionFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/navigation_contacts"
+        android:name="com.qubee.messenger.ui.contacts.ContactsFragment"
+        android:label="Contacts"
+        tools:layout="@layout/fragment_contacts">
+        <action
+            android:id="@+id/action_contact_to_chat"
+            app:destination="@id/chatFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/navigation_settings"
+        android:name="com.qubee.messenger.ui.settings.SettingsFragment"
+        android:label="Settings" />
+
+    <fragment
+        android:id="@+id/chatFragment"
+        android:name="com.qubee.messenger.ui.chat.ChatFragment"
+        android:label="Chat">
+        <argument
+            android:name="contactId"
+            app:argType="string" />
+    </fragment>
+    
+    <fragment
+        android:id="@+id/contactSelectionFragment"
+        android:name="com.qubee.messenger.ui.contacts.ContactSelectionFragment"
+        android:label="Choose contact" />
+
+</navigation>

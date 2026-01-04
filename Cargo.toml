@@ -26,6 +26,7 @@ subtle = "2.4"
 zeroize = { version = "1.6", features = ["derive"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
 dirs = "5.0" # Behövs för SecureMessenger::new()
+libp2p = { version = "0.53", features = ["tcp", "dns", "websocket", "noise", "yamux", "kad", "mdns", "gossipsub"] }
 
 # NYA BEROENDEN FÖR JNI:
 jni = "0.21.1"

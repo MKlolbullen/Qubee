@@ -6,6 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::groups::group_manager::GroupId;
 use crate::security::secure_rng;
 
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use secrecy::ExposeSecret;
+use anyhow::Context;
+
 /// Symmetric key used for encrypting group messages. It stores the raw
 /// 256‑bit secret along with the creation timestamp. In a complete
 /// implementation the key material would be encrypted at rest and
@@ -94,5 +98,48 @@ impl GroupCrypto {
     /// Retrieve the current key for a group, if any.
     pub fn get_group_key(&self, group_id: &GroupId) -> Option<&GroupKey> {
         self.keys.get(group_id)
+    }
+
+    /// Encrypt a plaintext message for the given group using the
+    /// current group key. A fresh nonce is generated for each
+    /// encryption and is prefixed to the returned ciphertext. The
+    /// resulting vector has the format `[nonce | ciphertext]`.
+    pub fn encrypt_message(&self, group_id: &GroupId, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let key = self
+            .get_group_key(group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group key not found"))?;
+        // Derive a cipher from the 256‑bit group key
+        let cipher = ChaCha20Poly1305::new(key.key.expose_secret().into());
+        // Generate a random 96‑bit nonce
+        let nonce_bytes = secure_rng::random::array::<12>()?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        // Encrypt the plaintext
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .context("Group message encryption failed")?;
+        // Prepend nonce to ciphertext
+        let mut output = Vec::with_capacity(12 + ciphertext.len());
+        output.extend_from_slice(&nonce_bytes);
+        output.extend_from_slice(&ciphertext);
+        Ok(output)
+    }
+
+    /// Decrypt a group message. Expects the input to have the nonce
+    /// prepended as returned by `encrypt_message`. Returns the
+    /// plaintext on success.
+    pub fn decrypt_message(&self, group_id: &GroupId, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 12 {
+            return Err(anyhow::anyhow!("Ciphertext too short"));
+        }
+        let key = self
+            .get_group_key(group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group key not found"))?;
+        let cipher = ChaCha20Poly1305::new(key.key.expose_secret().into());
+        let (nonce_bytes, ciphertext) = data.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .context("Group message decryption failed")?;
+        Ok(plaintext)
     }
 }

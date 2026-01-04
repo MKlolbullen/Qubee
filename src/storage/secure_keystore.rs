@@ -22,6 +22,12 @@ pub struct SecureKeyStore {
     keys: HashMap<String, EncryptedKeyEntry>,
 }
 
+/// Alias maintained for backwards compatibility with existing code. Some
+/// parts of the codebase refer to `SecureKeystore` instead of
+/// `SecureKeyStore`. This type alias prevents compilation errors
+/// without changing all call sites.
+pub type SecureKeystore = SecureKeyStore;
+
 #[derive(Serialize, Deserialize, Clone)]
 struct EncryptedKeyEntry {
     encrypted_data: Vec<u8>,

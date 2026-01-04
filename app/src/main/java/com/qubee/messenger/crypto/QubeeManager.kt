@@ -1,5 +1,3 @@
-// app/src/main/java/com/qubee/messenger/crypto/QubeeManager.kt
-
 package com.qubee.messenger.crypto
 
 import com.qubee.messenger.network.NetworkCallback
@@ -31,9 +29,6 @@ class QubeeManager @Inject constructor() {
         }
     }
 
-    /**
-     * Registers the callback interface for network events (P2P).
-     */
     fun setNetworkCallback(callback: NetworkCallback) {
         if (!isInitialized) {
             Timber.e("Cannot register callback: Qubee not initialized")
@@ -45,6 +40,19 @@ class QubeeManager @Inject constructor() {
     suspend fun startNetworkNode(bootstrapNodes: String = ""): Boolean = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext false
         nativeStartNetwork(bootstrapNodes)
+    }
+    
+    /**
+     * Sends a payload to a specific peer (or broadcasts it) via the P2P network.
+     * @param peerId The ID of the recipient (or topic/group ID).
+     * @param data The encrypted byte array.
+     */
+    suspend fun sendP2PMessage(peerId: String, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) {
+            Timber.e("Cannot send P2P message: Qubee not initialized")
+            return@withContext false
+        }
+        nativeSendP2PMessage(peerId, data)
     }
 
     // --- Wrapper Methods ---
@@ -73,16 +81,35 @@ class QubeeManager @Inject constructor() {
         if (bytes != null) String(bytes) else null
     }
 
+    // We can add wrapper for encryptSignaling if needed by ViewModel, 
+    // but typically signaling is internal or handled by CallManager.
+    suspend fun encryptSignaling(
+        sessionId: String,
+        callId: String,
+        sdpJson: String
+    ): EncryptedMessage? = withContext(Dispatchers.IO) {
+        val bytes = nativeEncryptSignaling(sessionId, callId, sdpJson)
+        if (bytes != null) EncryptedMessage.fromBytes(bytes) else null
+    }
+    
     // --- Native Definitions ---
     private external fun nativeInitialize(): Boolean
-    private external fun nativeRegisterCallback(callback: NetworkCallback) // NEW
+    private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
-    
+    private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean // NEW
+
     private external fun nativeGenerateIdentityKeyPair(): ByteArray?
     private external fun nativeCreateRatchetSession(cid: String, key: ByteArray, init: Boolean): ByteArray?
     private external fun nativeEncryptMessage(sid: String, data: ByteArray): ByteArray?
     private external fun nativeDecryptMessage(sid: String, data: ByteArray): ByteArray?
+    private external fun nativeEncryptSignaling(sid: String, callId: String, sdp: String): ByteArray?
     
-    // Cleanup
+    // Legacy / Utils
+    private external fun nativeGenerateEphemeralKeys(): ByteArray?
+    private external fun nativeVerifyIdentityKey(cid: String, key: ByteArray, sig: ByteArray): Boolean
+    private external fun nativeGenerateSAS(k1: ByteArray, k2: ByteArray): String?
+    private external fun nativeEncryptFile(sid: String, data: ByteArray): ByteArray?
+    private external fun nativeDecryptFile(sid: String, data: ByteArray): ByteArray?
+    
     external fun nativeCleanup()
 }

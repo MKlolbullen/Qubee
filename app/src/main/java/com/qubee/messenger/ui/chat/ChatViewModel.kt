@@ -1,98 +1,98 @@
 package com.qubee.messenger.ui.chat
 
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.MessageRepository
-import com.qubee.messenger.network.P2PNetworkManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
 
 @HiltViewModel
 class ChatViewModel @Inject constructor(
-    private val qubeeManager: QubeeManager,
+    savedStateHandle: SavedStateHandle,
     private val messageRepository: MessageRepository,
-    private val p2pNetwork: P2PNetworkManager // Vår "serverless" transport
+    private val contactRepository: ContactRepository,
+    private val qubeeManager: QubeeManager
 ) : ViewModel() {
 
-    private val _messages = MutableStateFlow<List<UiMessage>>(emptyList())
-    val messages = _messages.asStateFlow()
-
-    // Laddar meddelanden för en specifik session (kontakt)
-    fun loadMessages(sessionId: String) {
-        viewModelScope.launch {
-            messageRepository.getMessagesForSession(sessionId).collect { dbMessages ->
-                // Här skulle vi normalt mappa om DB-objekt till UI-objekt
-                // _messages.value = dbMessages.map { ... }
+    // Hämta contactId från navigation argumenten
+    private val contactId: String = checkNotNull(savedStateHandle["contactId"])
+    
+    // UI State som kombinerar kontaktinfo och meddelanden
+    val uiState: StateFlow<ChatUiState> = combine(
+        contactRepository.getContactFlow(contactId),
+        messageRepository.getMessagesForSession("session_$contactId") // Förenklad session-mappning
+    ) { contact, messages ->
+        ChatUiState(
+            contactName = contact?.name ?: "Okänd",
+            messages = messages.map { msg ->
+                UiMessage(
+                    id = msg.id,
+                    text = msg.content, // Antar att DB sparar klartext efter dekryptering
+                    isFromMe = msg.isFromMe,
+                    timestamp = msg.timestamp,
+                    type = UiMessageType.TEXT // Utöka DB för att stödja bild/fil
+                )
             }
-        }
-    }
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = ChatUiState(contactName = "Laddar...", messages = emptyList())
+    )
 
-    fun sendMessage(sessionId: String, contactNetworkAddress: String, plaintext: String) {
+    fun sendMessage(text: String) {
+        if (text.isBlank()) return
+        
         viewModelScope.launch {
             try {
-                // 1. Kryptera meddelandet lokalt med Rust (Hybrid Ratchet)
-                val encryptedMessage = qubeeManager.encryptMessage(sessionId, plaintext)
+                val sessionId = "session_$contactId"
 
-                if (encryptedMessage != null) {
-                    // 2. Spara det krypterade meddelandet i lokal DB (Outbox)
-                    messageRepository.saveMessage(sessionId, plaintext, isFromMe = true)
+                // 1. Kryptera meddelandet med Rust (Kyber/Dilithium)
+                val encrypted = qubeeManager.encryptMessage(sessionId, text)
+                
+                if (encrypted != null) {
+                    // 2. Spara i lokal DB (först som 'Sending' om vi hade status)
+                    messageRepository.saveMessage(sessionId, text, isFromMe = true)
 
-                    // 3. Skicka direkt till mottagaren (P2P)
-                    // Vi skickar inte via en server, utan direkt till deras IP/Address
-                    val success = p2pNetwork.sendDirect(
-                        address = contactNetworkAddress, 
-                        payload = encryptedMessage.toBytes()
-                    )
-
-                    if (!success) {
-                        Timber.e("Mottagaren är offline eller onåbar (P2P-fail)")
-                        // Uppdatera UI att meddelandet väntar (köas)
-                    }
+                    // 3. Skicka via P2P (Här behöver vi en ny metod i QubeeManager!)
+                    // qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+                    Timber.d("Message encrypted & saved. Ready for P2P transport.")
+                } else {
+                    Timber.e("Encryption failed")
                 }
             } catch (e: Exception) {
-                Timber.e(e, "Kunde inte skicka meddelande")
+                Timber.e(e, "Failed to send message")
             }
         }
     }
 
-    // Lyssnar på inkommande P2P-trafik
-    init {
-        viewModelScope.launch {
-            p2pNetwork.incomingMessages.collect { (senderAddress, payload) ->
-                // När vi tar emot data direkt från en peer:
-                // 1. Identifiera session baserat på senderAddress eller payload metadata
-                val sessionId = resolveSession(senderAddress)
-                
-                // 2. Dekryptera med Rust
-                // OBS: EncryptedMessage.fromBytes måste implementeras i Kotlin-sidan
-                val encryptedObj = com.qubee.messenger.crypto.EncryptedMessage.fromBytes(payload)
-                
-                if (encryptedObj != null) {
-                    val decryptedText = qubeeManager.decryptMessage(sessionId, encryptedObj)
-                    
-                    if (decryptedText != null) {
-                        messageRepository.saveMessage(sessionId, decryptedText, isFromMe = false)
-                    }
-                }
-            }
-        }
-    }
-    
-    private fun resolveSession(address: String): String {
-        // Logik för att mappa IP/Address till ett SessionID i databasen
-        return "session_xyz" 
-    }
+    // Media handlers (Placeholder logic)
+    fun onAttachFile() { Timber.d("Attach file clicked") }
+    fun onTakePhoto() { Timber.d("Take photo clicked") }
+    fun onRecordAudio() { Timber.d("Record audio clicked") }
 }
 
-// En enkel datamodell för UI
+data class ChatUiState(
+    val contactName: String,
+    val messages: List<UiMessage>
+)
+
 data class UiMessage(
     val id: String,
     val text: String,
     val isFromMe: Boolean,
-    val timestamp: Long
+    val timestamp: Long,
+    val type: UiMessageType
 )
+
+enum class UiMessageType { TEXT, IMAGE, FILE, AUDIO }

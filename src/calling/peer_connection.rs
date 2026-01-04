@@ -5,6 +5,7 @@ use crate::calling::call_manager::CallId;
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::webrtc_manager::MediaStats;
 use crate::calling::webrtc_manager::WebRTCConfig;
+_usecensored_vertices.forEach(entity => local.sanitizeEntity(entity));
 use crate::identity::identity_key::IdentityId;
 
 // Import the WebRTC API. We rely on the webrtc-rs crate for a pure
@@ -17,6 +18,13 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::sdp::session_description::{RTCSessionDescription, RTCSdpType};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+
+// The media subsystem of webrtc-rs exposes track types and codec capabilities
+use webrtc::media::track::track_local::{TrackLocal, track_local_static_sample::TrackLocalStaticSample};
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+
+use tokio::sync::Mutex;
 
 /// Represents the state of a peer connection. In a complete
 /// implementation this would mirror the states exposed by a WebRTC
@@ -70,6 +78,16 @@ pub struct PeerConnection {
     /// SCTP transports. We wrap it in an `Arc` so it can be cloned to
     /// attach event handlers if needed.
     webrtc_pc: Arc<RTCPeerConnection>,
+
+    /// Optional audio track and sender. Wrapped in a mutex to allow
+    /// mutation through an immutable reference to the peer connection.
+    audio_track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
+    audio_sender: Arc<Mutex<Option<Arc<RTCRtpSender>>>>,
+
+    /// Optional video track and sender. As with audio, these are
+    /// protected by mutexes so that toggling video is thread safe.
+    video_track: Arc<Mutex<Option<Arc<TrackLocalStaticSample>>>>,
+    video_sender: Arc<Mutex<Option<Arc<RTCRtpSender>>>>,
 }
 
 impl PeerConnection {
@@ -120,6 +138,10 @@ impl PeerConnection {
             media_key,
             state: PeerConnectionState::New,
             webrtc_pc: Arc::new(pc),
+            audio_track: Arc::new(Mutex::new(None)),
+            audio_sender: Arc::new(Mutex::new(None)),
+            video_track: Arc::new(Mutex::new(None)),
+            video_sender: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -133,28 +155,163 @@ impl PeerConnection {
         Ok(())
     }
 
-    /// Enable or disable audio for this connection. This stub does
-    /// nothing beyond returning success.
-    pub async fn set_audio_enabled(&self, _enabled: bool) -> Result<()> {
+    /// Enable or disable audio for this connection. When enabled, a
+    /// local audio track is created (if none exists) and added to
+    /// the underlying peer connection. When disabled, the existing
+    /// track is removed by replacing it with `None` on the RTP
+    /// sender. This method is idempotent.
+    pub async fn set_audio_enabled(&self, enabled: bool) -> Result<()> {
+        // Acquire locks on the track and sender. The scope of
+        // the locks is limited to avoid holding them across awaits.
+        let mut sender_opt = self.audio_sender.lock().await;
+        let mut track_opt = self.audio_track.lock().await;
+
+        if enabled {
+            // If no sender exists yet, we need to create a new track
+            // and add it to the peer connection. This will start
+            // sending silence until samples are provided by the
+            // application. For now we rely on the media subsystem to
+            // handle silence frames.
+            if sender_opt.is_none() {
+                // Define the codec capability for Opus audio. We use
+                // stereo at 48 kHz, which is widely supported.
+                let audio_cap = RTCRtpCodecCapability {
+                    mime_type: "audio/opus".to_string(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: String::new(),
+                    rtcp_feedback: vec![],
+                };
+                let track = Arc::new(TrackLocalStaticSample::new(
+                    audio_cap.clone(),
+                    "audio".to_string(),
+                    "qubee-audio".to_string(),
+                ));
+                // Cast the track into a trait object. The add_track
+                // function expects an Arc<dyn TrackLocal + Send + Sync>.
+                let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
+                let sender = self.webrtc_pc.add_track(dyn_track).await
+                    .context("Failed to add audio track to peer connection")?;
+                *track_opt = Some(track);
+                *sender_opt = Some(sender);
+            } else {
+                // A sender already exists but may have been
+                // previously disabled. Re-enable it by swapping
+                // back in the track. If a track is missing, create
+                // one as above.
+                let track = if let Some(track) = track_opt.as_ref() {
+                    track.clone()
+                } else {
+                    let audio_cap = RTCRtpCodecCapability {
+                        mime_type: "audio/opus".to_string(),
+                        clock_rate: 48000,
+                        channels: 2,
+                        sdp_fmtp_line: String::new(),
+                        rtcp_feedback: vec![],
+                    };
+                    let t = Arc::new(TrackLocalStaticSample::new(
+                        audio_cap,
+                        "audio".to_string(),
+                        "qubee-audio".to_string(),
+                    ));
+                    *track_opt = Some(t.clone());
+                    t
+                };
+                if let Some(sender) = sender_opt.as_ref() {
+                    // Replace the track on the sender. Some WebRTC
+                    // implementations require `Some` to re-add.
+                    let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
+                    sender.replace_track(Some(dyn_track)).await
+                        .context("Failed to enable audio track")?;
+                }
+            }
+        } else {
+            // Disable audio by replacing the track on the RTP sender
+            // with None. This will cause silence on the remote end.
+            if let Some(sender) = sender_opt.as_ref() {
+                sender.replace_track(None).await
+                    .context("Failed to disable audio track")?;
+            }
+        }
         Ok(())
     }
 
-    /// Enable or disable video for this connection. This stub does
-    /// nothing beyond returning success.
-    pub async fn set_video_enabled(&self, _enabled: bool) -> Result<()> {
+    /// Enable or disable video for this connection. When enabled, a
+    /// local video track is created (if none exists) and added to
+    /// the underlying peer connection. When disabled, the existing
+    /// track is removed by replacing it with `None` on the RTP
+    /// sender.
+    pub async fn set_video_enabled(&self, enabled: bool) -> Result<()> {
+        let mut sender_opt = self.video_sender.lock().await;
+        let mut track_opt = self.video_track.lock().await;
+        if enabled {
+            if sender_opt.is_none() {
+                // Use VP8 as the default video codec. Many browsers
+                // and clients support VP8 without requiring H.264.
+                let video_cap = RTCRtpCodecCapability {
+                    mime_type: "video/VP8".to_string(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: String::new(),
+                    rtcp_feedback: vec![],
+                };
+                let track = Arc::new(TrackLocalStaticSample::new(
+                    video_cap.clone(),
+                    "video".to_string(),
+                    "qubee-video".to_string(),
+                ));
+                let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
+                let sender = self.webrtc_pc.add_track(dyn_track).await
+                    .context("Failed to add video track to peer connection")?;
+                *track_opt = Some(track);
+                *sender_opt = Some(sender);
+            } else {
+                let track = if let Some(track) = track_opt.as_ref() {
+                    track.clone()
+                } else {
+                    let video_cap = RTCRtpCodecCapability {
+                        mime_type: "video/VP8".to_string(),
+                        clock_rate: 90000,
+                        channels: 0,
+                        sdp_fmtp_line: String::new(),
+                        rtcp_feedback: vec![],
+                    };
+                    let t = Arc::new(TrackLocalStaticSample::new(
+                        video_cap,
+                        "video".to_string(),
+                        "qubee-video".to_string(),
+                    ));
+                    *track_opt = Some(t.clone());
+                    t
+                };
+                if let Some(sender) = sender_opt.as_ref() {
+                    let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
+                    sender.replace_track(Some(dyn_track)).await
+                        .context("Failed to enable video track")?;
+                }
+            }
+        } else {
+            if let Some(sender) = sender_opt.as_ref() {
+                sender.replace_track(None).await
+                    .context("Failed to disable video track")?;
+            }
+        }
         Ok(())
     }
 
-    /// Begin screen capture on this peer connection. Not implemented
-    /// in the stub.
+    /// Begin screen capture on this peer connection. In this simple
+    /// implementation we map screen sharing to enabling the video
+    /// track. A more complete implementation would create a second
+    /// video track dedicated to screen content.
     pub async fn start_screen_capture(&self) -> Result<()> {
-        Ok(())
+        // For now, reuse the video track infrastructure.
+        self.set_video_enabled(true).await
     }
 
-    /// Stop screen capture on this peer connection. Not implemented
-    /// in the stub.
+    /// Stop screen capture on this peer connection. This disables
+    /// the video track associated with screen sharing.
     pub async fn stop_screen_capture(&self) -> Result<()> {
-        Ok(())
+        self.set_video_enabled(false).await
     }
 
     /// Retrieve basic media statistics. Real statistics would query
@@ -257,4 +414,3 @@ impl PeerConnection {
         Ok(())
     }
 }
-

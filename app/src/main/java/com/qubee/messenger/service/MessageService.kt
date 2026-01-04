@@ -13,9 +13,11 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.qubee.messenger.R
 import com.qubee.messenger.QubeeApplication
+import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.repository.MessageRepository
 import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.ContactRepository
+import com.qubee.messenger.network.NetworkCallback
 import com.qubee.messenger.ui.main.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
@@ -23,7 +25,7 @@ import timber.log.Timber
 import javax.inject.Inject
 
 @AndroidEntryPoint
-class MessageService : Service() {
+class MessageService : Service(), NetworkCallback {
 
     @Inject
     lateinit var messageRepository: MessageRepository
@@ -33,6 +35,9 @@ class MessageService : Service() {
     
     @Inject
     lateinit var contactRepository: ContactRepository
+
+    @Inject
+    lateinit var qubeeManager: QubeeManager
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var isRunning = false
@@ -61,20 +66,99 @@ class MessageService : Service() {
         if (!isRunning) {
             startForegroundService()
             startBackgroundTasks()
+            
+            // Initialize P2P Network
+            startP2PNetwork()
+            
             isRunning = true
             Timber.d("MessageService started")
         }
         return START_STICKY
     }
 
+    private fun startP2PNetwork() {
+        serviceScope.launch {
+            if (qubeeManager.initialize()) {
+                // Register this service to receive Rust callbacks
+                qubeeManager.setNetworkCallback(this@MessageService)
+                
+                // Boot up the libp2p node
+                // You can pass bootstrap nodes here if you have them, e.g., "/ip4/1.2.3.4/tcp/4001/p2p/Qm..."
+                if (qubeeManager.startNetworkNode()) {
+                    Timber.d("P2P Network Node started successfully")
+                } else {
+                    Timber.e("Failed to start P2P Network Node")
+                }
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        // Optional: qubeeManager.cleanup() if you want to kill the node on service stop
         serviceScope.cancel()
         Timber.d("MessageService destroyed")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    // --- NetworkCallback Implementation ---
+
+    override fun onMessageReceived(senderId: String, data: ByteArray) {
+        serviceScope.launch {
+            try {
+                Timber.d("Encrypted message received from $senderId (${data.size} bytes)")
+
+                // 1. Identify or Create Session
+                // In a real scenario, you'd look up the session based on the senderId
+                val sessionId = "session_$senderId" // Simplified for demo
+
+                // 2. Decrypt Payload using Rust
+                // Assuming 'data' is the raw encrypted bytes. If you have a specific wrapper, adjust here.
+                // We use a dummy encrypted object wrapper for the API call
+                val dummyEncryptedObj = com.qubee.messenger.crypto.EncryptedMessage(
+                    header = byteArrayOf(), 
+                    ciphertext = data,
+                    iv = byteArrayOf(),
+                    mac = byteArrayOf()
+                )
+                
+                // This will call into Rust to decrypt using the Double Ratchet
+                val decryptedText = qubeeManager.decryptMessage(sessionId, dummyEncryptedObj)
+
+                if (decryptedText != null) {
+                    // 3. Save to Local Database
+                    // Ensure you have a contact/conversation for this sender
+                    val conversationId = conversationRepository.getOrCreateConversationId(senderId)
+                    messageRepository.saveMessage(
+                        sessionId = sessionId,
+                        content = decryptedText,
+                        isFromMe = false
+                    )
+
+                    // 4. Notify User
+                    val senderName = contactRepository.getContactName(senderId) ?: "Unknown User"
+                    showMessageNotification(conversationId, senderName, "New secure message")
+                    updateUnreadBadge()
+                } else {
+                    Timber.w("Failed to decrypt message from $senderId")
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Error processing incoming P2P message")
+            }
+        }
+    }
+
+    override fun onPeerDiscovered(peerId: String) {
+        serviceScope.launch {
+            Timber.d("Discovered new peer: $peerId")
+            // Update contact status to 'Online' or similar
+            // contactRepository.updateStatus(peerId, Status.ONLINE)
+        }
+    }
+
+    // --- Standard Service Methods ---
 
     private fun startForegroundService() {
         val notification = createServiceNotification()
@@ -84,7 +168,6 @@ class MessageService : Service() {
     private fun createServiceNotification(): Notification {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-        // Create notification channel for Android O and above
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 QubeeApplication.NOTIFICATION_CHANNEL_SERVICE,
@@ -99,7 +182,6 @@ class MessageService : Service() {
             notificationManager.createNotificationChannel(channel)
         }
 
-        // Create intent to open main activity
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
@@ -110,7 +192,7 @@ class MessageService : Service() {
 
         return NotificationCompat.Builder(this, QubeeApplication.NOTIFICATION_CHANNEL_SERVICE)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Secure messaging service running")
+            .setContentText("Qubee P2P Node Active")
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -120,7 +202,6 @@ class MessageService : Service() {
     }
 
     private fun startBackgroundTasks() {
-        // Start periodic cleanup task
         serviceScope.launch {
             while (isActive && isRunning) {
                 try {
@@ -132,90 +213,39 @@ class MessageService : Service() {
                 }
             }
         }
-
-        // Start message processing task
-        serviceScope.launch {
-            while (isActive && isRunning) {
-                try {
-                    processIncomingMessages()
-                    delay(5000) // Check for new messages every 5 seconds
-                } catch (e: Exception) {
-                    Timber.e(e, "Error processing incoming messages")
-                    delay(5000)
-                }
-            }
-        }
-
-        // Start disappearing message cleanup task
-        serviceScope.launch {
-            while (isActive && isRunning) {
-                try {
-                    cleanupDisappearingMessages()
-                    delay(30000) // Check every 30 seconds
-                } catch (e: Exception) {
-                    Timber.e(e, "Error cleaning up disappearing messages")
-                    delay(30000)
-                }
-            }
-        }
     }
 
     private suspend fun performPeriodicCleanup() {
         try {
-            // Clean up expired messages
             val expiredCount = messageRepository.cleanupExpiredMessages().getOrDefault(0)
             if (expiredCount > 0) {
                 Timber.d("Cleaned up $expiredCount expired messages")
             }
-
-            // Additional cleanup tasks can be added here
-            // - Clean up old temporary files
-            // - Clean up old crypto keys
-            // - Optimize database
-            
         } catch (e: Exception) {
             Timber.e(e, "Error in periodic cleanup")
         }
     }
 
-    private suspend fun processIncomingMessages() {
-        try {
-            // This would handle incoming messages from the network
-            // For now, this is a placeholder - actual implementation would depend on
-            // the networking layer and message protocol
-            
-            // Example: Check for pending messages, decrypt them, and store in database
-            // processPendingNetworkMessages()
-            
-        } catch (e: Exception) {
-            Timber.e(e, "Error processing incoming messages")
-        }
-    }
-
-    private suspend fun cleanupDisappearingMessages() {
-        try {
-            val result = messageRepository.cleanupExpiredMessages()
-            result.onSuccess { count ->
-                if (count > 0) {
-                    Timber.d("Cleaned up $count disappearing messages")
-                }
-            }.onFailure { error ->
-                Timber.e(error, "Failed to cleanup disappearing messages")
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error in disappearing message cleanup")
-        }
-    }
-
-    private suspend fun showMessageNotification(
+    private fun showMessageNotification(
         conversationId: String,
         senderName: String,
         messageContent: String
     ) {
         try {
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            
+            // Channel needs to be created if not exists (usually in Application class, but safety check here)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (notificationManager.getNotificationChannel(QubeeApplication.NOTIFICATION_CHANNEL_MESSAGES) == null) {
+                    val channel = NotificationChannel(
+                        QubeeApplication.NOTIFICATION_CHANNEL_MESSAGES,
+                        "Messages",
+                        NotificationManager.IMPORTANCE_HIGH
+                    )
+                    notificationManager.createNotificationChannel(channel)
+                }
+            }
 
-            // Create intent to open conversation
             val intent = Intent(this, MainActivity::class.java).apply {
                 putExtra("conversation_id", conversationId)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
@@ -227,7 +257,7 @@ class MessageService : Service() {
 
             val notification = NotificationCompat.Builder(this, QubeeApplication.NOTIFICATION_CHANNEL_MESSAGES)
                 .setContentTitle(senderName)
-                .setContentText(messageContent)
+                .setContentText(messageContent) // In a privacy mode, this might hide actual content
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentIntent(pendingIntent)
                 .setAutoCancel(true)
@@ -243,12 +273,10 @@ class MessageService : Service() {
 
     private suspend fun updateUnreadBadge() {
         try {
-            val unreadCount = messageRepository.getTotalUnreadMessageCount()
-            // Update app badge with unread count
-            // This would depend on the launcher and badge implementation
+            // val unreadCount = messageRepository.getTotalUnreadMessageCount()
+            // Implementation depends on launcher support
         } catch (e: Exception) {
             Timber.e(e, "Failed to update unread badge")
         }
     }
 }
-

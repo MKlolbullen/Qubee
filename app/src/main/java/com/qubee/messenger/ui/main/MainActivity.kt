@@ -20,6 +20,7 @@ import androidx.navigation.ui.setupWithNavController
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.qubee.messenger.R
 import com.qubee.messenger.databinding.ActivityMainBinding
+import com.qubee.messenger.service.MessageService
 import com.qubee.messenger.ui.settings.SettingsActivity
 import com.qubee.messenger.util.PermissionHelper
 import dagger.hilt.android.AndroidEntryPoint
@@ -54,8 +55,11 @@ class MainActivity : AppCompatActivity() {
         
         // Check and request permissions
         checkPermissions()
+
+        // Start the P2P background service
+        MessageService.start(this)
         
-        Timber.d("MainActivity created")
+        Timber.d("MainActivity created & Service started")
     }
 
     private fun setupToolbar() {
@@ -120,11 +124,17 @@ class MainActivity : AppCompatActivity() {
                 when (event) {
                     is MainViewModel.NavigationEvent.OpenChat -> {
                         // Navigate to chat
-                        val action = MainFragmentDirections.actionToChat(event.contactId)
-                        navController.navigate(action)
+                        // Note: Ensure your nav_graph.xml has an action or global action to chatFragment
+                        // using SafeArgs e.g.: MainFragmentDirections.actionToChat(event.contactId)
+                        // For now we use the ID defined in nav_graph.xml
+                        val bundle = Bundle().apply { putString("contactId", event.contactId) }
+                        navController.navigate(R.id.chatFragment, bundle)
                     }
                     is MainViewModel.NavigationEvent.OpenSettings -> {
                         startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
+                    }
+                    is MainViewModel.NavigationEvent.OpenContactSelection -> {
+                        navController.navigate(R.id.contactSelectionFragment)
                     }
                 }
             }
@@ -223,7 +233,7 @@ class MainActivity : AppCompatActivity() {
             }
             R.id.action_new_chat -> {
                 // Navigate to contact selection
-                navController.navigate(R.id.action_to_contact_selection)
+                navController.navigate(R.id.contactSelectionFragment)
                 true
             }
             R.id.action_settings -> {
@@ -243,4 +253,3 @@ class MainActivity : AppCompatActivity() {
         Timber.d("MainActivity destroyed")
     }
 }
-

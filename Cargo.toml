@@ -30,6 +30,13 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
 dirs = "5.0"
 hex = "0.4"
 
+# Add the webrtc crate for real-time media and data channel support.
+# This pulls in the pure-Rust WebRTC implementation from the webrtc-rs project.
+webrtc = { version = "0.14", default-features = false, features = ["api", "peer-connection", "data", "media", "dtls", "ice", "sctp", "rtp", "rtcp", "sdp"] }
+# Logging is used by the WebRTC crate for diagnostics. You may configure
+# a subscriber in your application to capture these logs.
+log = "0.4"
+
 # JNI Bridge for Android
 jni = "0.21.1"
 lazy_static = "1.4.0"

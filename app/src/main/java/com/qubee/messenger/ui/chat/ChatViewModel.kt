@@ -24,63 +24,88 @@ class ChatViewModel @Inject constructor(
     private val qubeeManager: QubeeManager
 ) : ViewModel() {
 
-    // Hämta contactId från navigation argumenten
+    // Retrieve the contactId from the navigation arguments
     private val contactId: String = checkNotNull(savedStateHandle["contactId"])
     
-    // UI State som kombinerar kontaktinfo och meddelanden
+    // UI State that combines contact information and the message list
     val uiState: StateFlow<ChatUiState> = combine(
         contactRepository.getContactFlow(contactId),
-        messageRepository.getMessagesForSession("session_$contactId") // Förenklad session-mappning
+        messageRepository.getMessagesForSession("session_$contactId") // Simplified session mapping
     ) { contact, messages ->
         ChatUiState(
-            contactName = contact?.name ?: "Okänd",
+            contactName = contact?.name ?: "Unknown",
             messages = messages.map { msg ->
                 UiMessage(
                     id = msg.id,
-                    text = msg.content, // Antar att DB sparar klartext efter dekryptering
+                    text = msg.content, // Assuming the DB stores plaintext after decryption
                     isFromMe = msg.isFromMe,
                     timestamp = msg.timestamp,
-                    type = UiMessageType.TEXT // Utöka DB för att stödja bild/fil
+                    type = UiMessageType.TEXT // Expand DB to support images/files in the future
                 )
             }
         )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
-        initialValue = ChatUiState(contactName = "Laddar...", messages = emptyList())
+        initialValue = ChatUiState(contactName = "Loading...", messages = emptyList())
     )
 
+    /**
+     * Encrypts and sends a text message to the current contact.
+     */
     fun sendMessage(text: String) {
         if (text.isBlank()) return
         
         viewModelScope.launch {
             try {
+                // In a real app, you would look up the correct Session ID for this contact
                 val sessionId = "session_$contactId"
 
-                // 1. Kryptera meddelandet med Rust (Kyber/Dilithium)
+                // 1. Encrypt the message using Rust (Kyber/Dilithium)
                 val encrypted = qubeeManager.encryptMessage(sessionId, text)
                 
                 if (encrypted != null) {
-                    // 2. Spara i lokal DB (först som 'Sending' om vi hade status)
+                    // 2. Save to local database (marked as 'Sending' if status tracking exists)
                     messageRepository.saveMessage(sessionId, text, isFromMe = true)
 
-                    // 3. Skicka via P2P (Här behöver vi en ny metod i QubeeManager!)
-                    // qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
-                    Timber.d("Message encrypted & saved. Ready for P2P transport.")
+                    // 3. Send via P2P Network
+                    // This sends the encrypted blob into the swarm
+                    val success = qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+                    
+                    if (success) {
+                        Timber.d("Message sent successfully via P2P to $contactId")
+                    } else {
+                        Timber.e("Failed to send message via P2P network")
+                        // TODO: Update message status to FAILED in database
+                    }
                 } else {
-                    Timber.e("Encryption failed")
+                    Timber.e("Encryption failed - Message not sent")
                 }
             } catch (e: Exception) {
-                Timber.e(e, "Failed to send message")
+                Timber.e(e, "Exception during sendMessage")
             }
         }
     }
 
-    // Media handlers (Placeholder logic)
-    fun onAttachFile() { Timber.d("Attach file clicked") }
-    fun onTakePhoto() { Timber.d("Take photo clicked") }
-    fun onRecordAudio() { Timber.d("Record audio clicked") }
+    // --- Media Handler Placeholders ---
+    
+    fun onAttachFile() { 
+        Timber.d("Attach file clicked") 
+        // TODO: Implement file picker logic
+    }
+    
+    fun onTakePhoto() { 
+        Timber.d("Take photo clicked") 
+        // TODO: Implement camera logic
+    }
+    
+    fun onRecordAudio() { 
+        Timber.d("Record audio clicked") 
+        // TODO: Implement voice recorder logic
+    }
 }
+
+// --- UI Data Models ---
 
 data class ChatUiState(
     val contactName: String,

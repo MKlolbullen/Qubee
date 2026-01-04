@@ -8,7 +8,10 @@ use crate::identity::identity_key::{IdentityId, IdentityKey, HybridSignature};
 use crate::groups::group_crypto::{GroupCrypto, GroupKey};
 use crate::groups::group_permissions::{GroupPermissions, Permission, Role};
 use crate::groups::group_events::{GroupEvent, GroupEventType, GroupEventLog};
-use crate::storage::secure_keystore::SecureKeystore;
+use crate::storage::secure_keystore::{SecureKeystore, KeyType, KeyMetadata, KeyUsage};
+use std::collections::HashMap as StdHashMap;
+use bincode;
+use hex;
 
 /// Comprehensive group management system
 pub struct GroupManager {
@@ -674,10 +677,21 @@ impl GroupManager {
                 .as_secs(),
         };
         
-        // Store event in keystore
+        // Store event in keystore. We classify group events as message keys
+        // since they represent logged messages rather than cryptographic
+        // material. The serialized event is stored under a key name that
+        // includes the group ID and timestamp. We include minimal metadata
+        // describing the format and size of the stored data.  
         let event_key = format!("group_event_{}_{}", group_id, event.timestamp);
         let serialized = bincode::serialize(&event)?;
-        self.keystore.store_key(&event_key, &serialized)?;
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Encryption],
+            expiry: None,
+            tags: StdHashMap::new(),
+        };
+        self.keystore.store_key(&event_key, &serialized, KeyType::MessageKey, metadata)?;
         
         Ok(())
     }
@@ -687,23 +701,73 @@ impl GroupManager {
         if let Some(group) = self.groups.get(group_id) {
             let serialized = bincode::serialize(group)?;
             let key_name = format!("group_{}", hex::encode(group_id.as_ref()));
-            self.keystore.store_key(&key_name, &serialized)?;
+            let metadata = KeyMetadata {
+                algorithm: "bincode".to_string(),
+                key_size: serialized.len(),
+                usage: vec![KeyUsage::Encryption],
+                expiry: None,
+                tags: StdHashMap::new(),
+            };
+            self.keystore.store_key(&key_name, &serialized, KeyType::EncryptionKey, metadata)?;
         }
         Ok(())
+    }
+
+    /// Retrieve all events logged for the given group. Events are
+    /// stored in the secure keystore with keys of the form
+    /// `group_event_{group_id_hex}_{timestamp}`. This method
+    /// iterates over all stored keys, deserializes the corresponding
+    /// events and returns them sorted by timestamp.
+    pub fn get_group_events(&mut self, group_id: &GroupId) -> Result<Vec<GroupEvent>> {
+        let prefix = format!("group_event_{}", hex::encode(group_id.as_ref()));
+        let key_ids = self.keystore.list_keys();
+        let mut events = Vec::new();
+        for key_id in key_ids {
+            if key_id.starts_with(&prefix) {
+                if let Some(secret_data) = self.keystore.retrieve_key(&key_id)? {
+                    let data = secret_data.expose_secret();
+                    if let Ok(event) = bincode::deserialize::<GroupEvent>(data) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events.sort_by_key(|e| e.timestamp);
+        Ok(events)
+    }
+
+    /// Encrypt a plaintext message for delivery to the specified group.
+    /// This method uses the `GroupCrypto` to derive a symmetric key
+    /// associated with the group and returns the ciphertext with the
+    /// nonce prepended. The caller is responsible for publishing the
+    /// encrypted message via the network layer (e.g. gossipsub).
+    pub fn encrypt_group_message(&self, group_id: &GroupId, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.group_crypto.encrypt_message(group_id, plaintext)
+    }
+
+    /// Decrypt an incoming group message. The provided `data` should
+    /// contain the nonce prefix as produced by `encrypt_group_message`.
+    /// If decryption succeeds the plaintext is returned; otherwise
+    /// an error is propagated.
+    pub fn decrypt_group_message(&self, group_id: &GroupId, data: &[u8]) -> Result<Vec<u8>> {
+        self.group_crypto.decrypt_message(group_id, data)
     }
     
     /// Load groups from storage
     pub fn load_groups_from_storage(&mut self) -> Result<()> {
-        let group_keys = self.keystore.list_keys()?
+        // List all keys and filter to those representing stored group objects
+        let group_keys = self
+            .keystore
+            .list_keys()
             .into_iter()
             .filter(|key| key.starts_with("group_"))
             .collect::<Vec<_>>();
-        
+
         for key_name in group_keys {
-            if let Ok(data) = self.keystore.retrieve_key(&key_name) {
-                if let Ok(group) = bincode::deserialize::<Group>(&data) {
+            if let Some(secret_data) = self.keystore.retrieve_key(&key_name)? {
+                let data = secret_data.expose_secret();
+                if let Ok(group) = bincode::deserialize::<Group>(data) {
                     let group_id = group.id;
-                    
                     // Update member groups mapping
                     for member_id in group.members.keys() {
                         self.member_groups
@@ -711,12 +775,10 @@ impl GroupManager {
                             .or_insert_with(HashSet::new)
                             .insert(group_id);
                     }
-                    
                     self.groups.insert(group_id, group);
                 }
             }
         }
-        
         Ok(())
     }
 }
@@ -784,10 +846,14 @@ impl Default for GroupMetadata {
 mod tests {
     use super::*;
     use crate::identity::identity_key::IdentityKeyPair;
+    use tempfile::TempDir;
     
     #[test]
     fn test_group_creation() {
-        let keystore = SecureKeystore::new().expect("Should create keystore");
+        // Create a temporary keystore for testing
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let keystore_path = temp_dir.path().join("group_keystore.db");
+        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
         
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -812,7 +878,10 @@ mod tests {
     
     #[test]
     fn test_member_management() {
-        let keystore = SecureKeystore::new().expect("Should create keystore");
+        // Create a temporary keystore for testing
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let keystore_path = temp_dir.path().join("group_keystore.db");
+        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
         
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -871,7 +940,10 @@ mod tests {
     
     #[test]
     fn test_group_invitations() {
-        let keystore = SecureKeystore::new().expect("Should create keystore");
+        // Create a temporary keystore for testing
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let keystore_path = temp_dir.path().join("group_keystore.db");
+        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
         
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");

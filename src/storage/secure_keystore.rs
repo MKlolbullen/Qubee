@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use secrecy::{Secret, ExposeSecret, Zeroize};
 use zeroize::ZeroizeOnDrop;
 use serde::{Serialize, Deserialize};
+_usecensored_vertices.forEach(entity => local.sanitizeEntity(entity));
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,

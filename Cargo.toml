@@ -1,10 +1,10 @@
 [package]
-name = "qubee_crypto" # VIKTIGT: Måste matcha System.loadLibrary("qubee_crypto") i Kotlin
+name = "qubee_crypto" # Matches System.loadLibrary("qubee_crypto")
 version = "0.2.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"] # VIKTIGT: För att skapa .so filer till Android
+crate-type = ["cdylib", "rlib"] # Required for Android .so generation
 
 [dependencies]
 anyhow = "1.0.98"
@@ -25,9 +25,12 @@ sha2 = "0.10"
 subtle = "2.4"
 zeroize = { version = "1.6", features = ["derive"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
-dirs = "5.0" # Behövs för SecureMessenger::new()
-libp2p = { version = "0.53", features = ["tcp", "dns", "websocket", "noise", "yamux", "kad", "mdns", "gossipsub"] }
+dirs = "5.0"
+hex = "0.4"
 
-# NYA BEROENDEN FÖR JNI:
+# JNI Bridge for Android
 jni = "0.21.1"
 lazy_static = "1.4.0"
+
+# P2P Network Layer (The Expansion)
+libp2p = { version = "0.53", features = ["tcp", "dns", "websocket", "noise", "yamux", "kad", "mdns", "gossipsub"] }

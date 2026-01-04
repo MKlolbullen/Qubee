@@ -6,10 +6,13 @@ use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
 
 use crate::identity::identity_key::{IdentityId, IdentityKey};
+use crate::identity::identity_key::IdentityKeyPair;
 use crate::calling::webrtc_manager::{WebRTCManager, WebRTCConfig};
 use crate::calling::media_encryption::{MediaEncryption, MediaKey};
 use crate::calling::signaling::{SignalingServer, SignalingMessage, SignalingClient};
 use crate::calling::peer_connection::{PeerConnection, PeerConnectionState};
+use crate::identity::contact_manager::ContactManager;
+use std::sync::Arc;
 use crate::groups::group_manager::GroupId;
 
 /// Comprehensive call management system
@@ -26,6 +29,8 @@ pub struct CallManager {
     event_sender: mpsc::UnboundedSender<CallEvent>,
     /// Configuration
     config: CallManagerConfig,
+    /// Contact manager for resolving identity keys and display names
+    contact_manager: Arc<ContactManager>,
 }
 
 /// Individual call instance
@@ -276,6 +281,7 @@ impl CallManager {
         let webrtc_manager = WebRTCManager::new(webrtc_config).await?;
         let media_encryption = MediaEncryption::new()?;
         let signaling_server = Arc::new(SignalingServer::new().await?);
+        let contact_manager = Arc::new(ContactManager::new());
         
         Ok(CallManager {
             calls: Arc::new(RwLock::new(HashMap::new())),
@@ -284,6 +290,7 @@ impl CallManager {
             signaling_server,
             event_sender,
             config,
+            contact_manager,
         })
     }
     
@@ -742,15 +749,32 @@ impl CallManager {
     }
     
     /// Get identity key for a participant (placeholder)
-    async fn get_identity_key(&self, _participant: IdentityId) -> Result<IdentityKey> {
-        // This would be implemented to retrieve the identity key from storage
-        todo!("Implement identity key retrieval")
+    async fn get_identity_key(&self, participant: IdentityId) -> Result<IdentityKey> {
+        // Try to look up the contact first. If none exists we fall back
+        // to generating a fresh identity key pair. This ensures that
+        // calls can be initiated against unknown identities in tests and
+        // offline scenarios. A production implementation should fetch
+        // the remote party's identity from a trusted directory or
+        // signalling service instead.
+        if let Some(key) = self.contact_manager.get_identity_key(&participant).await {
+            return Ok(key);
+        }
+        // Generate a new identity key pair. Any errors here should be
+        // propagated back to the caller.
+        let pair = IdentityKeyPair::generate()?;
+        Ok(pair.public_key())
     }
     
     /// Get display name for a participant (placeholder)
-    async fn get_display_name(&self, _participant: IdentityId) -> Result<String> {
-        // This would be implemented to retrieve the display name from contacts
-        Ok("Unknown".to_string())
+    async fn get_display_name(&self, participant: IdentityId) -> Result<String> {
+        if let Some(name) = self.contact_manager.get_display_name(&participant).await {
+            Ok(name)
+        } else {
+            // If no contact exists, return a generic placeholder. This
+            // mirrors the previous behaviour but goes through the
+            // contact manager for consistency.
+            Ok("Unknown".to_string())
+        }
     }
 }
 

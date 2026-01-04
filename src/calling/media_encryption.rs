@@ -129,3 +129,4 @@ impl<'a> StreamEncryption<'a> {
         self.inner.decrypt_frame(self.stream_id, data)
     }
 }
+

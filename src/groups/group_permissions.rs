@@ -612,4 +612,3 @@ mod tests {
         assert!(permissions.role_has_permission(&Role::Observer, &Permission::SendMessages));
     }
 }
-

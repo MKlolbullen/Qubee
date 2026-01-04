@@ -338,6 +338,46 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
+/// Send a P2P message (Publish/Direct)
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2PMessage(
+    env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+    data: JByteArray,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let peer_id_str: String = env.get_string(peer_id).expect("Invalid peer_id").into();
+        let data_vec = env.convert_byte_array(data).expect("Invalid data");
+
+        // Hämta låset till vår command-channel
+        let commander_lock = P2P_COMMANDER.lock().unwrap();
+        
+        if let Some(commander) = commander_lock.as_ref() {
+            // Skapa kommandot
+            let cmd = P2PCommand::SendMessage {
+                peer_id: peer_id_str,
+                data: data_vec
+            };
+
+            // Skicka kommandot till P2P-loopen.
+            // Vi använder try_send för att inte blockera JNI-tråden om kanalen är full.
+            match commander.try_send(cmd) {
+                Ok(_) => {
+                    // println!("Rust: Command sent to P2P node");
+                    1 // True
+                },
+                Err(e) => {
+                    eprintln!("Rust: Failed to send P2P command (Channel closed/full): {}", e);
+                    0 // False
+                }
+            }
+        } else {
+            eprintln!("Rust: P2P Commander not initialized (Node not started?)");
+            0 // False
+        }
+    })
+}
 // --- Cleanup ---
 
 #[no_mangle]

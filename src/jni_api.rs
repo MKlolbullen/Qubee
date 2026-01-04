@@ -4,20 +4,23 @@ use jni::sys::{jboolean, jstring, jbyteArray};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
+use tokio::runtime::Runtime;
 
-// Import core structures
-// Note: Adjust these paths if your SecureMessenger is in a different module
+// Import core modules
 use crate::SecureMessenger; 
 use crate::calling::signaling::CallSignal;
+use crate::network::p2p_node::{P2PNode, P2PCommand};
 
-// Global state to keep sessions alive across JNI calls
+// Global State
 lazy_static! {
     static ref SESSIONS: Mutex<HashMap<String, SecureMessenger>> = Mutex::new(HashMap::new());
     static ref INITIALIZED: Mutex<bool> = Mutex::new(false);
+    
+    // Command channel to talk to the background P2P node
+    static ref P2P_COMMANDER: Mutex<Option<tokio::sync::mpsc::Sender<P2PCommand>>> = Mutex::new(None);
 }
 
-// Helper struct for returning session info to Kotlin
 #[derive(Serialize)]
 struct RatchetSessionInfo {
     session_id: String,
@@ -25,7 +28,7 @@ struct RatchetSessionInfo {
     created_at: u64,
 }
 
-// Helper to catch panics and prevent crashing the JVM
+// Helper to safely execute Rust code and catch panics
 fn catch_unwind_result<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -34,7 +37,8 @@ where
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default()
 }
 
-/// Initialize the Qubee cryptographic system
+// --- Initialization & Network ---
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitialize(
     _env: JNIEnv,
@@ -45,7 +49,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
         return 1;
     }
 
-    // Android-specific: Set HOME for `dirs` crate to work
+    // Set Android specific environment for 'dirs' crate
     unsafe {
         std::env::set_var("HOME", "/data/user/0/com.qubee.messenger/files");
     }
@@ -54,21 +58,60 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     1
 }
 
-/// Generate a new identity key pair
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartNetwork(
+    env: JNIEnv,
+    _class: JClass,
+    bootstrap_nodes: JString,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let _bootstrap_str: String = env.get_string(bootstrap_nodes).expect("Invalid string").into();
+
+        // Spawn a new thread for the Toko Runtime and P2P Node
+        std::thread::spawn(|| {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async {
+                // 1. Generate or Load Identity (Ed25519 for libp2p)
+                let id_keys = libp2p::identity::Keypair::generate_ed25519();
+                println!("Rust: Starting P2P Node with PeerId: {}", libp2p::PeerId::from(id_keys.public()));
+
+                // 2. Initialize Node
+                match P2PNode::new(id_keys).await {
+                    Ok(mut node) => {
+                        // 3. Expose command channel
+                        {
+                            let mut cmd_lock = P2P_COMMANDER.lock().unwrap();
+                            *cmd_lock = Some(node.command_sender()); // Ensure P2PNode exposes this method
+                        }
+
+                        // 4. Run the node event loop (blocks this thread)
+                        node.run().await;
+                    },
+                    Err(e) => {
+                        eprintln!("Rust: Failed to start P2P node: {}", e);
+                    }
+                }
+            });
+        });
+
+        1 // True (started)
+    })
+}
+
+// --- Identity & Session Management ---
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateIdentityKeyPair(
     env: JNIEnv,
     _class: JClass,
 ) -> jbyteArray {
     catch_unwind_result(|| {
-        // In a real scenario, this delegates to SecureMessenger::generate_identity()
-        // For now, we generate random bytes as a placeholder
+        // Placeholder: Use SecureMessenger or KeyStore to generate/retrieve keys
         let key_data = crate::utils::generate_random_key(32).unwrap_or(vec![]);
         env.byte_array_from_slice(&key_data).unwrap()
     })
 }
 
-/// Create a new hybrid ratchet session with a contact
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateRatchetSession(
     env: JNIEnv,
@@ -79,19 +122,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
 ) -> jbyteArray {
     catch_unwind_result(|| {
         let contact_id: String = env.get_string(contact_id).expect("Invalid contact_id").into();
-        let _their_pub_key_vec = env.convert_byte_array(their_public_key).expect("Invalid pubkey");
-        
-        // Instantiate the SecureMessenger
+        // In reality, parse 'their_public_key' into DH and PQ keys
+        let _key_bytes = env.convert_byte_array(their_public_key).expect("Invalid key bytes");
+
         let mut messenger = match SecureMessenger::new() {
             Ok(m) => m,
             Err(_) => return std::ptr::null_mut(),
         };
 
-        // Placeholder for X3DH handshake logic
-        let shared_secret = b"shared_secret_placeholder"; 
+        // Placeholder Handshake Data
+        let shared_secret = b"shared_secret_placeholder";
         let dh_key = [0u8; 32];
-        let pq_key_len = if is_initiator != 0 { 1184 } else { 2400 }; 
-        let pq_key = vec![0u8; pq_key_len];
+        let pq_len = if is_initiator != 0 { 1184 } else { 2400 };
+        let pq_key = vec![0u8; pq_len];
 
         let init_result = if is_initiator != 0 {
             messenger.initialize_sender(shared_secret, &dh_key, &pq_key)
@@ -103,12 +146,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             return std::ptr::null_mut();
         }
 
-        // Store session globally
         let session_id = contact_id.clone();
         let mut sessions = SESSIONS.lock().unwrap();
         sessions.insert(session_id.clone(), messenger);
 
-        // Return session info
         let info = RatchetSessionInfo {
             session_id,
             state: "Active".to_string(),
@@ -120,7 +161,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
     })
 }
 
-/// Encrypt a standard chat message
+// --- Messaging & WebRTC Tunneling ---
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptMessage(
     env: JNIEnv,
@@ -146,40 +188,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
-/// Encrypt a WebRTC Signaling message (Tunneling)
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptSignaling(
-    env: JNIEnv,
-    _class: JClass,
-    session_id: JString,
-    call_id: JString,
-    sdp_json: JString,
-) -> jbyteArray {
-    catch_unwind_result(|| {
-        let session_id: String = env.get_string(session_id).expect("Invalid session_id").into();
-        let call_id: String = env.get_string(call_id).expect("Invalid call_id").into();
-        let sdp: String = env.get_string(sdp_json).expect("Invalid sdp").into();
-
-        // Wrap the SDP in a CallSignal structure
-        let signal = CallSignal::Offer { sdp, call_id };
-        let signal_bytes = signal.to_bytes().unwrap_or(vec![]);
-
-        let mut sessions = SESSIONS.lock().unwrap();
-        if let Some(messenger) = sessions.get_mut(&session_id) {
-            // Encrypt the signal just like a normal message
-            match messenger.encrypt_message(&signal_bytes) {
-                Ok(encrypted_bytes) => {
-                    env.byte_array_from_slice(&encrypted_bytes).unwrap()
-                },
-                Err(_) => std::ptr::null_mut()
-            }
-        } else {
-            std::ptr::null_mut()
-        }
-    })
-}
-
-/// Decrypt a message and check if it is a WebRTC signal
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptMessage(
     env: JNIEnv,
@@ -193,21 +201,21 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
 
         let mut sessions = SESSIONS.lock().unwrap();
         if let Some(messenger) = sessions.get_mut(&session_id) {
-            // Decrypt the blob
+            // 1. Decrypt raw bytes
             match messenger.decrypt_message(&cipher_vec) {
                 Ok(plaintext) => {
-                    // Check if this is a hidden WebRTC signal
+                    // 2. Intercept WebRTC Signals
                     if let Ok(signal) = CallSignal::from_bytes(&plaintext) {
-                        println!("Rust: Intercepted WebRTC Signal: {:?}", signal);
+                        println!("Rust: Intercepted hidden WebRTC Signal: {:?}", signal);
                         
-                        // TODO: Forward this signal to the Rust WebRTCManager here
-                        // webrtc_manager.handle_signal(signal);
-                        
-                        // Return null to indicate "This was consumed internally, do not show in chat"
-                        return std::ptr::null_mut(); 
+                        // TODO: Forward 'signal' to internal WebRTCManager using a channel or mutex
+                        // e.g. WEBRTC_MANAGER.handle_signal(signal);
+
+                        // Return null to tell Kotlin "This wasn't a chat message"
+                        return std::ptr::null_mut();
                     }
 
-                    // Not a signal? Return plain text to Kotlin
+                    // 3. Return normal chat text
                     env.byte_array_from_slice(&plaintext).unwrap()
                 },
                 Err(_) => std::ptr::null_mut()
@@ -218,23 +226,43 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
     })
 }
 
-/// Cleanup resources
 #[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanup(
-    _env: JNIEnv,
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptSignaling(
+    env: JNIEnv,
     _class: JClass,
-) {
-    let mut sessions = SESSIONS.lock().unwrap();
-    sessions.clear();
-    let mut init = INITIALIZED.lock().unwrap();
-    *init = false;
+    session_id: JString,
+    call_id: JString,
+    sdp_json: JString,
+) -> jbyteArray {
+    catch_unwind_result(|| {
+        let session_id: String = env.get_string(session_id).expect("Invalid session_id").into();
+        let call_id: String = env.get_string(call_id).expect("Invalid call_id").into();
+        let sdp: String = env.get_string(sdp_json).expect("Invalid sdp").into();
+
+        // Wrap in hidden CallSignal struct
+        let signal = CallSignal::Offer { sdp, call_id };
+        let signal_bytes = signal.to_bytes().unwrap_or(vec![]);
+
+        let mut sessions = SESSIONS.lock().unwrap();
+        if let Some(messenger) = sessions.get_mut(&session_id) {
+            match messenger.encrypt_message(&signal_bytes) {
+                Ok(encrypted_bytes) => {
+                    env.byte_array_from_slice(&encrypted_bytes).unwrap()
+                },
+                Err(_) => std::ptr::null_mut()
+            }
+        } else {
+            std::ptr::null_mut()
+        }
+    })
 }
 
-// Reuse existing functions for these implementations for now
+// --- Utils & Files ---
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateEphemeralKeys(
-    env: JNIEnv, _c: JClass) -> jbyteArray {
-    Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateIdentityKeyPair(env, _c)
+    env: JNIEnv, c: JClass) -> jbyteArray {
+    Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateIdentityKeyPair(env, c)
 }
 
 #[no_mangle]
@@ -259,4 +287,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptFile(
     env: JNIEnv, c: JClass, sid: JString, data: JByteArray) -> jbyteArray {
     Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptMessage(env, c, sid, data)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanup(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let mut sessions = SESSIONS.lock().unwrap();
+    sessions.clear();
+    let mut init = INITIALIZED.lock().unwrap();
+    *init = false;
+    // Note: We deliberately do not stop the P2P node here as it might be shared,
+    // but in a real app you might want a shutdown signal.
 }

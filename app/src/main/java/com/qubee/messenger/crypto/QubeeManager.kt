@@ -1,296 +1,88 @@
+// app/src/main/java/com/qubee/messenger/crypto/QubeeManager.kt
+
 package com.qubee.messenger.crypto
 
+import com.qubee.messenger.network.NetworkCallback
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/**
- * QubeeManager handles all cryptographic operations by interfacing with the Rust Qubee library
- * through JNI (Java Native Interface).
- */
 @Singleton
 class QubeeManager @Inject constructor() {
 
     private var isInitialized = false
 
-    /**
-     * Initialize the Qubee cryptographic system
-     */
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         try {
-            if (isInitialized) {
-                return@withContext true
-            }
-
-            // Load the native library
+            if (isInitialized) return@withContext true
             System.loadLibrary("qubee_crypto")
-
+            
             val result = nativeInitialize()
             if (result) {
                 isInitialized = true
-                Timber.d("Qubee cryptographic system initialized successfully")
-            } else {
-                Timber.e("Failed to initialize Qubee cryptographic system")
+                Timber.d("Qubee initialized")
             }
             result
         } catch (e: Exception) {
-            Timber.e(e, "Error initializing Qubee cryptographic system")
+            Timber.e(e, "Init failed")
             false
         }
     }
 
     /**
-     * Start the P2P Network Node (Libp2p).
-     * This connects the app to the decentralized swarm.
-     *
-     * @param bootstrapNodes Comma-separated list of multiaddrs to bootstrap from (optional).
+     * Registers the callback interface for network events (P2P).
      */
+    fun setNetworkCallback(callback: NetworkCallback) {
+        if (!isInitialized) {
+            Timber.e("Cannot register callback: Qubee not initialized")
+            return
+        }
+        nativeRegisterCallback(callback)
+    }
+
     suspend fun startNetworkNode(bootstrapNodes: String = ""): Boolean = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) {
-                Timber.e("Qubee not initialized")
-                return@withContext false
-            }
-            nativeStartNetwork(bootstrapNodes)
-        } catch (e: Exception) {
-            Timber.e(e, "Error starting P2P network")
-            false
-        }
+        if (!isInitialized) return@withContext false
+        nativeStartNetwork(bootstrapNodes)
     }
 
-    /**
-     * Generate a new identity key pair
-     */
+    // --- Wrapper Methods ---
+
     suspend fun generateIdentityKeyPair(): IdentityKeyPair? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) {
-                Timber.e("Qubee not initialized")
-                return@withContext null
-            }
-
-            val keyPairBytes = nativeGenerateIdentityKeyPair()
-            if (keyPairBytes != null) {
-                IdentityKeyPair.fromBytes(keyPairBytes)
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error generating identity key pair")
-            null
-        }
+        val bytes = nativeGenerateIdentityKeyPair()
+        if (bytes != null) IdentityKeyPair.fromBytes(bytes) else null
     }
 
-    /**
-     * Create a new hybrid ratchet session with a contact
-     */
     suspend fun createRatchetSession(
         contactId: String,
         theirPublicKey: ByteArray,
         isInitiator: Boolean
     ): RatchetSession? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) {
-                Timber.e("Qubee not initialized")
-                return@withContext null
-            }
-
-            val sessionBytes = nativeCreateRatchetSession(contactId, theirPublicKey, isInitiator)
-            if (sessionBytes != null) {
-                RatchetSession.fromBytes(sessionBytes)
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error creating ratchet session")
-            null
-        }
+        val bytes = nativeCreateRatchetSession(contactId, theirPublicKey, isInitiator)
+        if (bytes != null) RatchetSession.fromBytes(bytes) else null
     }
 
-    /**
-     * Encrypt a message using the hybrid ratchet
-     */
-    suspend fun encryptMessage(
-        sessionId: String,
-        plaintext: String
-    ): EncryptedMessage? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) {
-                Timber.e("Qubee not initialized")
-                return@withContext null
-            }
-
-            val encryptedBytes = nativeEncryptMessage(sessionId, plaintext.toByteArray())
-            if (encryptedBytes != null) {
-                EncryptedMessage.fromBytes(encryptedBytes)
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error encrypting message")
-            null
-        }
+    suspend fun encryptMessage(sessionId: String, plaintext: String): EncryptedMessage? = withContext(Dispatchers.IO) {
+        val bytes = nativeEncryptMessage(sessionId, plaintext.toByteArray())
+        if (bytes != null) EncryptedMessage.fromBytes(bytes) else null
     }
 
-    /**
-     * Decrypt a message using the hybrid ratchet
-     */
-    suspend fun decryptMessage(
-        sessionId: String,
-        encryptedMessage: EncryptedMessage
-    ): String? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) {
-                Timber.e("Qubee not initialized")
-                return@withContext null
-            }
-
-            val decryptedBytes = nativeDecryptMessage(sessionId, encryptedMessage.toBytes())
-            if (decryptedBytes != null) {
-                String(decryptedBytes)
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error decrypting message")
-            null
-        }
+    suspend fun decryptMessage(sessionId: String, encryptedMessage: EncryptedMessage): String? = withContext(Dispatchers.IO) {
+        val bytes = nativeDecryptMessage(sessionId, encryptedMessage.toBytes())
+        if (bytes != null) String(bytes) else null
     }
 
-    /**
-     * Encrypt a WebRTC Signaling message (SDP/ICE) to be sent over the secure channel.
-     */
-    suspend fun encryptSignaling(
-        sessionId: String,
-        callId: String,
-        sdpJson: String
-    ): EncryptedMessage? = withContext(Dispatchers.IO) {
-        try {
-             if (!isInitialized) return@withContext null
-             val bytes = nativeEncryptSignaling(sessionId, callId, sdpJson)
-             if (bytes != null) EncryptedMessage.fromBytes(bytes) else null
-        } catch (e: Exception) {
-            Timber.e(e, "Error encrypting signaling")
-            null
-        }
-    }
-
-    /**
-     * Generate ephemeral keys for key exchange
-     */
-    suspend fun generateEphemeralKeys(): EphemeralKeyPair? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) return@withContext null
-            val keyPairBytes = nativeGenerateEphemeralKeys()
-            if (keyPairBytes != null) EphemeralKeyPair.fromBytes(keyPairBytes) else null
-        } catch (e: Exception) {
-            Timber.e(e, "Error generating ephemeral keys")
-            null
-        }
-    }
-
-    /**
-     * Verify a contact's identity key
-     */
-    suspend fun verifyIdentityKey(
-        contactId: String,
-        identityKey: ByteArray,
-        signature: ByteArray
-    ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) return@withContext false
-            nativeVerifyIdentityKey(contactId, identityKey, signature)
-        } catch (e: Exception) {
-            Timber.e(e, "Error verifying identity key")
-            false
-        }
-    }
-
-    /**
-     * Generate a Short Authentication String (SAS) for key verification
-     */
-    suspend fun generateSAS(
-        ourKey: ByteArray,
-        theirKey: ByteArray
-    ): String? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) return@withContext null
-            nativeGenerateSAS(ourKey, theirKey)
-        } catch (e: Exception) {
-            Timber.e(e, "Error generating SAS")
-            null
-        }
-    }
-
-    /**
-     * Encrypt file data
-     */
-    suspend fun encryptFile(
-        sessionId: String,
-        fileData: ByteArray
-    ): EncryptedFile? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) return@withContext null
-            val encryptedBytes = nativeEncryptFile(sessionId, fileData)
-            if (encryptedBytes != null) EncryptedFile.fromBytes(encryptedBytes) else null
-        } catch (e: Exception) {
-            Timber.e(e, "Error encrypting file")
-            null
-        }
-    }
-
-    /**
-     * Decrypt file data
-     */
-    suspend fun decryptFile(
-        sessionId: String,
-        encryptedFile: EncryptedFile
-    ): ByteArray? = withContext(Dispatchers.IO) {
-        try {
-            if (!isInitialized) return@withContext null
-            nativeDecryptFile(sessionId, encryptedFile.toBytes())
-        } catch (e: Exception) {
-            Timber.e(e, "Error decrypting file")
-            null
-        }
-    }
-
-    /**
-     * Clean up resources
-     */
-    fun cleanup() {
-        try {
-            if (isInitialized) {
-                nativeCleanup()
-                isInitialized = false
-                Timber.d("Qubee cryptographic system cleaned up")
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "Error cleaning up Qubee")
-        }
-    }
-
-    // Native method declarations
+    // --- Native Definitions ---
     private external fun nativeInitialize(): Boolean
+    private external fun nativeRegisterCallback(callback: NetworkCallback) // NEW
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
+    
     private external fun nativeGenerateIdentityKeyPair(): ByteArray?
-    private external fun nativeCreateRatchetSession(
-        contactId: String,
-        theirPublicKey: ByteArray,
-        isInitiator: Boolean
-    ): ByteArray?
-    private external fun nativeEncryptMessage(sessionId: String, plaintext: ByteArray): ByteArray?
-    private external fun nativeDecryptMessage(sessionId: String, ciphertext: ByteArray): ByteArray?
-    private external fun nativeEncryptSignaling(sessionId: String, callId: String, sdpJson: String): ByteArray?
-    private external fun nativeGenerateEphemeralKeys(): ByteArray?
-    private external fun nativeVerifyIdentityKey(
-        contactId: String,
-        identityKey: ByteArray,
-        signature: ByteArray
-    ): Boolean
-    private external fun nativeGenerateSAS(ourKey: ByteArray, theirKey: ByteArray): String?
-    private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
-    private external fun nativeDecryptFile(sessionId: String, encryptedData: ByteArray): ByteArray?
-    private external fun nativeCleanup()
+    private external fun nativeCreateRatchetSession(cid: String, key: ByteArray, init: Boolean): ByteArray?
+    private external fun nativeEncryptMessage(sid: String, data: ByteArray): ByteArray?
+    private external fun nativeDecryptMessage(sid: String, data: ByteArray): ByteArray?
+    
+    // Cleanup
+    external fun nativeCleanup()
 }

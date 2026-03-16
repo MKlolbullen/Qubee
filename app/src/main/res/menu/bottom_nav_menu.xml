@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@+id/navigation_conversations"
+        android:icon="@android:drawable/ic_menu_edit" 
+        android:title="Chattar" />
+        
+    <item
+        android:id="@+id/navigation_contacts"
+        android:icon="@android:drawable/ic_menu_my_places"
+        android:title="Kontakter" />
+
+    <item
+        android:id="@+id/navigation_settings"
+        android:icon="@android:drawable/ic_menu_preferences"
+        android:title="Inställningar" />
+</menu>
+

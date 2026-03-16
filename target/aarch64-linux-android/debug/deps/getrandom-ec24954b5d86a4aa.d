@@ -1,0 +1,12 @@
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/debug/deps/getrandom-ec24954b5d86a4aa.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/util.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/error_impls.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/util_libc.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/use_file.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/lazy.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/linux_android_with_fallback.rs
+
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/debug/deps/libgetrandom-ec24954b5d86a4aa.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/util.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/error_impls.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/util_libc.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/use_file.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/lazy.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/linux_android_with_fallback.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/error.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/util.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/error_impls.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/util_libc.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/use_file.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/lazy.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/getrandom-0.2.16/src/linux_android_with_fallback.rs:

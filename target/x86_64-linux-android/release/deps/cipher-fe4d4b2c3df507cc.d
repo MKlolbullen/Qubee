@@ -1,0 +1,12 @@
+/home/kali/Qubee_v1/Qubee/target/x86_64-linux-android/release/deps/cipher-fe4d4b2c3df507cc.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs
+
+/home/kali/Qubee_v1/Qubee/target/x86_64-linux-android/release/deps/libcipher-fe4d4b2c3df507cc.rlib: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs
+
+/home/kali/Qubee_v1/Qubee/target/x86_64-linux-android/release/deps/libcipher-fe4d4b2c3df507cc.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/block.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/errors.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_core.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cipher-0.4.4/src/stream_wrapper.rs:

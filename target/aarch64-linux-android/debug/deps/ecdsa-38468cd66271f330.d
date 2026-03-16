@@ -1,0 +1,12 @@
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/debug/deps/ecdsa-38468cd66271f330.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/normalized.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/recovery.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/der.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/hazmat.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/signing.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/verifying.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/../README.md
+
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/debug/deps/libecdsa-38468cd66271f330.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/normalized.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/recovery.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/der.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/hazmat.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/signing.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/verifying.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/../README.md
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/normalized.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/recovery.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/der.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/hazmat.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/signing.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/verifying.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecdsa-0.16.9/src/../README.md:

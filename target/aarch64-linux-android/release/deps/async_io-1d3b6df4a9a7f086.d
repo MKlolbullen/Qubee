@@ -1,0 +1,12 @@
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/release/deps/async_io-1d3b6df4a9a7f086.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/driver.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os/unix.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor/unix.rs
+
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/release/deps/libasync_io-1d3b6df4a9a7f086.rlib: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/driver.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os/unix.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor/unix.rs
+
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/release/deps/libasync_io-1d3b6df4a9a7f086.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/driver.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os/unix.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor/unix.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/driver.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/os/unix.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/async-io-2.6.0/src/reactor/unix.rs:

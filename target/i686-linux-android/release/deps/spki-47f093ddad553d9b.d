@@ -1,0 +1,12 @@
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/spki-47f093ddad553d9b.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/algorithm.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/spki.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/traits.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/../README.md
+
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/libspki-47f093ddad553d9b.rlib: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/algorithm.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/spki.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/traits.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/../README.md
+
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/libspki-47f093ddad553d9b.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/algorithm.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/spki.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/traits.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/../README.md
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/algorithm.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/error.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/spki.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/traits.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spki-0.7.3/src/../README.md:

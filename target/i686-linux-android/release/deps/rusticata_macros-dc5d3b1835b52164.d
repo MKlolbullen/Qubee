@@ -1,0 +1,11 @@
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/rusticata_macros-dc5d3b1835b52164.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/combinator.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/debug.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/macros.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/traits.rs
+
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/librusticata_macros-dc5d3b1835b52164.rlib: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/combinator.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/debug.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/macros.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/traits.rs
+
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/librusticata_macros-dc5d3b1835b52164.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/combinator.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/debug.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/macros.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/traits.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/combinator.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/debug.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/macros.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusticata-macros-4.1.0/src/traits.rs:

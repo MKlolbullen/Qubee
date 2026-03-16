@@ -1,0 +1,101 @@
+plugins {
+    id 'com.android.application'
+    id 'com.google.devtools.ksp'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+android {
+    namespace 'com.qubee.messenger'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.qubee.messenger"
+        minSdk 26
+        targetSdk 34
+        versionCode 8
+        versionName "0.9.0-bootstrap-turn"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary true
+        }
+        buildConfigField "String", "DEFAULT_RELAY_URL", '"ws://10.0.2.2:8787/ws"'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        compose true
+        buildConfig true
+        viewBinding true
+    }
+
+
+    packaging {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'src/main/appshell/AndroidManifest.xml'
+            java.srcDirs = ['src/main/appshell/java']
+            res.srcDirs = ['src/main/appshell/res']
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+    dependenciesInfo {
+        includeInApk true
+        includeInBundle true
+    }
+    ndkVersion '29.0.14206865'
+    buildToolsVersion '34.0.0'
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.18.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.10.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.10.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
+
+    implementation platform('androidx.compose:compose-bom:2026.03.00')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.navigation:navigation-compose:2.9.7'
+
+    implementation 'androidx.room:room-runtime:2.10.3'
+    implementation 'net.zetetic:android-database-sqlcipher:4.5.4'
+    implementation 'androidx.room:room-ktx:2.8.4'
+    ksp 'androidx.room:room-compiler:2.8.4'
+
+    implementation 'com.squareup.okhttp3:okhttp:5.3.2'
+    implementation 'androidx.work:work-runtime-ktx:2.11.1'
+    implementation 'androidx.biometric:biometric:1.1.0'
+    implementation 'org.webrtc:google-webrtc:1.0.32006'
+    implementation 'com.google.zxing:core:3.5.4'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2'
+}

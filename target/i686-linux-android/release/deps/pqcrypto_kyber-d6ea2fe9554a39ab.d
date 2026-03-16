@@ -1,0 +1,11 @@
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/pqcrypto_kyber-d6ea2fe9554a39ab.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/ffi.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber1024.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber512.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber768.rs
+
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/libpqcrypto_kyber-d6ea2fe9554a39ab.rlib: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/ffi.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber1024.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber512.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber768.rs
+
+/home/kali/Qubee_v1/Qubee/target/i686-linux-android/release/deps/libpqcrypto_kyber-d6ea2fe9554a39ab.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/ffi.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber1024.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber512.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber768.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/ffi.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber1024.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber512.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pqcrypto-kyber-0.8.1/src/kyber768.rs:

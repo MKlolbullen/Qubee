@@ -1,0 +1,12 @@
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/debug/deps/tinystr-9ebc21b1a1e392a9.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/macros.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/ascii.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/asciibyte.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/int_ops.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/unvalidated.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/ule.rs
+
+/home/kali/Qubee_v1/Qubee/target/aarch64-linux-android/debug/deps/libtinystr-9ebc21b1a1e392a9.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/macros.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/ascii.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/asciibyte.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/error.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/int_ops.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/unvalidated.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/ule.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/macros.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/ascii.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/asciibyte.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/error.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/int_ops.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/unvalidated.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tinystr-0.8.2/src/ule.rs:

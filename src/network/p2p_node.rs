@@ -18,10 +18,24 @@ use tokio::sync::mpsc;
 /// Commands sent from Android (Kotlin) -> Rust
 #[derive(Debug)]
 pub enum P2PCommand {
-    /// Send a message to a specific peer or broadcast
+    /// Send a message to a specific peer or broadcast on the global topic.
     SendMessage { peer_id: String, data: Vec<u8> },
     /// Try to find a peer by their ID in the DHT
     FindPeer { peer_id: String },
+    /// Subscribe to a named gossipsub topic. Idempotent.
+    Subscribe { topic: String },
+    /// Stop receiving traffic on a named gossipsub topic.
+    Unsubscribe { topic: String },
+    /// Publish bytes on a named gossipsub topic. The local node must be
+    /// subscribed for the publish to actually go out — gossipsub
+    /// silently drops publishes on topics with no local subscription.
+    PublishToTopic { topic: String, data: Vec<u8> },
+}
+
+/// Public helper so callers (JNI, tests) build the per-group topic
+/// name in exactly one place.
+pub fn group_topic(group_id_hex: &str) -> String {
+    format!("qubee-group-{}", group_id_hex)
 }
 
 /// Events sent from Rust -> Android (Kotlin)
@@ -140,6 +154,29 @@ impl P2PNode {
                         match PeerId::from_str(&peer_id) {
                             Ok(pid) => { let _ = self.swarm.behaviour_mut().kademlia.get_closest_peers(pid); }
                             Err(e) => eprintln!("Invalid peer id {peer_id}: {e}"),
+                        }
+                    }
+                    Some(P2PCommand::Subscribe { topic }) => {
+                        let topic = gossipsub::IdentTopic::new(topic);
+                        if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                            eprintln!("Subscribe error for {topic}: {e:?}");
+                        }
+                    }
+                    Some(P2PCommand::Unsubscribe { topic }) => {
+                        let topic = gossipsub::IdentTopic::new(topic);
+                        if let Err(e) = self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                            eprintln!("Unsubscribe error for {topic}: {e:?}");
+                        }
+                    }
+                    Some(P2PCommand::PublishToTopic { topic, data }) => {
+                        let topic = gossipsub::IdentTopic::new(topic);
+                        if let Err(e) = self
+                            .swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(topic.clone(), data)
+                        {
+                            eprintln!("PublishToTopic {topic} error: {e:?}");
                         }
                     }
                     None => return,

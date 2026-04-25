@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio::runtime::Runtime;
 
 // Core modules
-use crate::network::p2p_node::{P2PNode, P2PCommand, NodeEvent};
+use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
@@ -220,6 +220,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                     Ok(node) => {
                         *P2P_COMMANDER.lock().unwrap() = Some(tx_cmd);
 
+                        // Re-subscribe to every group the local
+                        // identity already belongs to so a process
+                        // restart doesn't drop us off the topic mesh.
+                        resubscribe_known_groups();
+
                         tokio::spawn(async move {
                             while let Some(event) = rx_event.recv().await {
                                 // Intercept group-handshake traffic before
@@ -368,6 +373,16 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // create_group already mints a key inside group_crypto, but
             // be explicit so future refactors can't accidentally regress.
             gm.ensure_group_key(group_id)?;
+            // Drop the GM lock before talking to the network commander
+            // so we don't hold two mutexes across an await-equivalent.
+            drop(gm_guard);
+
+            // Subscribe to this group's gossipsub topic so we receive
+            // RequestJoin frames from peers who scan an invite.
+            // Best-effort: if the network thread isn't up yet, we'll
+            // re-subscribe on next bootstrap (TODO once we persist a
+            // group→subscribed mapping).
+            let _ = subscribe_topic(group_topic(&hex::encode(group_id.as_ref())));
 
             Ok(json!({
                 "group_id_hex": hex::encode(group_id.as_ref()),
@@ -535,7 +550,14 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
     };
     let signed = sign_request_join(identity.as_ref(), body)?;
     let wire = signed.to_wire()?;
-    Ok(send_p2p_broadcast(wire))
+
+    // Subscribe to the per-group topic so we receive the inviter's
+    // JoinAccepted reply. Then publish the RequestJoin on the same
+    // topic — every other peer not in the group is unsubscribed and
+    // never sees the handshake.
+    let topic = group_topic(&hex::encode(payload.group_id.as_ref()));
+    let _ = subscribe_topic(topic.clone());
+    Ok(publish_to_topic(topic, wire))
 }
 
 /// Pop the cached Kyber secret for an invitation, returning ownership
@@ -544,19 +566,55 @@ fn take_pending_kyber_secret(invitation_code: &str) -> Option<Vec<u8>> {
     PENDING_JOIN_KEMS.lock().unwrap().remove(invitation_code)
 }
 
-/// Try to publish bytes on the gossipsub global topic. Returns true on
-/// successful enqueue, false if the commander isn't initialised yet.
-fn send_p2p_broadcast(data: Vec<u8>) -> bool {
+/// Re-subscribe the network layer to every group topic the local user
+/// is in. Called once after the network thread comes up, plus any time
+/// we need to re-establish (e.g. a network reset). Best-effort: a
+/// failure to subscribe is logged but doesn't take the node down.
+fn resubscribe_known_groups() {
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = match gm_guard.as_mut() {
+        Some(g) => g,
+        None => return,
+    };
+    let active = match active_identity() {
+        Ok(Some(id)) => id,
+        _ => return,
+    };
+    let groups: Vec<_> = gm
+        .get_member_groups(&active.identity_id())
+        .iter()
+        .map(|g| hex::encode(g.id.as_ref()))
+        .collect();
+    drop(gm_guard);
+    for hex_id in groups {
+        let _ = subscribe_topic(group_topic(&hex_id));
+    }
+}
+
+/// Subscribe to a named gossipsub topic. No-op (returns false) if the
+/// network thread hasn't started yet.
+fn subscribe_topic(topic: String) -> bool {
     let commander_lock = P2P_COMMANDER.lock().unwrap();
     let commander = match commander_lock.as_ref() {
         Some(c) => c,
         None => return false,
     };
-    let cmd = P2PCommand::SendMessage {
-        peer_id: String::new(),
-        data,
+    matches!(commander.try_send(P2PCommand::Subscribe { topic }), Ok(()))
+}
+
+/// Publish bytes on a named gossipsub topic. The local node must be
+/// subscribed to the topic for the publish to actually go out — see
+/// `p2p_node.rs::P2PCommand::PublishToTopic`.
+fn publish_to_topic(topic: String, data: Vec<u8>) -> bool {
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return false,
     };
-    matches!(commander.try_send(cmd), Ok(()))
+    matches!(
+        commander.try_send(P2PCommand::PublishToTopic { topic, data }),
+        Ok(())
+    )
 }
 
 /// Snapshot the active identity Arc without holding the mutex across
@@ -720,7 +778,8 @@ fn on_request_join(body: RequestJoinBody) -> anyhow::Result<()> {
     };
     let signed = sign_join_accepted(identity.as_ref(), accepted_body)?;
     let wire = signed.to_wire()?;
-    let _ = send_p2p_broadcast(wire);
+    let topic = group_topic(&hex::encode(body.group_id.as_ref()));
+    let _ = publish_to_topic(topic, wire);
     Ok(())
 }
 
@@ -737,7 +796,8 @@ fn send_join_rejected(
     };
     let signed = sign_join_rejected(identity.as_ref(), body)?;
     let wire = signed.to_wire()?;
-    let _ = send_p2p_broadcast(wire);
+    let topic = group_topic(&hex::encode(body.group_id.as_ref()));
+    let _ = publish_to_topic(topic, wire);
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 // src/jni_api.rs
 
 use jni::{JNIEnv, JavaVM};
-use jni::objects::{JClass, JString, JByteArray, JObject, GlobalRef, JValue};
-use jni::sys::{jboolean, jstring, jbyteArray};
+use jni::objects::{JByteArray, JClass, JObject, JString, JValue, GlobalRef};
+use jni::sys::{jboolean, jstring};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use lazy_static::lazy_static;
@@ -285,195 +285,14 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
     }
 }
 
-// --- Encryption & Messaging ---
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptMessage(
-    env: JNIEnv,
-    _class: JClass,
-    session_id: JString,
-    plaintext: JByteArray,
-) -> jbyteArray {
-    catch_unwind_result(|| {
-        let session_id: String = env.get_string(session_id).expect("Invalid session_id").into();
-        let plaintext_vec = env.convert_byte_array(plaintext).expect("Invalid plaintext");
-
-        let mut sessions = SESSIONS.lock().unwrap();
-        if let Some(messenger) = sessions.get_mut(&session_id) {
-            match messenger.encrypt_message(&plaintext_vec) {
-                Ok(encrypted_bytes) => {
-                    env.byte_array_from_slice(&encrypted_bytes).unwrap()
-                },
-                Err(_) => std::ptr::null_mut()
-            }
-        } else {
-            std::ptr::null_mut()
-        }
-    })
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptMessage(
-    env: JNIEnv,
-    _class: JClass,
-    session_id: JString,
-    ciphertext: JByteArray,
-) -> jbyteArray {
-    catch_unwind_result(|| {
-        let session_id: String = env.get_string(session_id).expect("Invalid session_id").into();
-        let cipher_vec = env.convert_byte_array(ciphertext).expect("Invalid ciphertext");
-
-        let mut sessions = SESSIONS.lock().unwrap();
-        if let Some(messenger) = sessions.get_mut(&session_id) {
-            match messenger.decrypt_message(&cipher_vec) {
-                Ok(plaintext) => {
-                    if let Ok(signal) = CallSignal::from_bytes(&plaintext) {
-                        println!("Rust: Intercepted WebRTC Signal: {:?}", signal);
-                        return std::ptr::null_mut();
-                    }
-                    env.byte_array_from_slice(&plaintext).unwrap()
-                },
-                Err(_) => std::ptr::null_mut()
-            }
-        } else {
-            std::ptr::null_mut()
-        }
-    })
-}
-
-// --- Identity & Sessions (Standard) ---
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateIdentityKeyPair(
-    env: JNIEnv,
-    _class: JClass,
-) -> jbyteArray {
-    catch_unwind_result(|| {
-        let key_data = crate::utils::generate_random_key(32).unwrap_or(vec![]);
-        env.byte_array_from_slice(&key_data).unwrap()
-    })
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateRatchetSession(
-    env: JNIEnv,
-    _class: JClass,
-    contact_id: JString,
-    their_public_key: JByteArray,
-    is_initiator: jboolean,
-) -> jbyteArray {
-    catch_unwind_result(|| {
-        let contact_id: String = env.get_string(contact_id).expect("Invalid contact_id").into();
-        let _key_bytes = env.convert_byte_array(their_public_key).expect("Invalid key bytes");
-
-        let mut messenger = match SecureMessenger::new() {
-            Ok(m) => m,
-            Err(_) => return std::ptr::null_mut(),
-        };
-
-        let shared_secret = b"shared_secret_placeholder";
-        let dh_key = [0u8; 32];
-        let pq_len = if is_initiator != 0 { 1184 } else { 2400 };
-        let pq_key = vec![0u8; pq_len];
-
-        let init_result = if is_initiator != 0 {
-            messenger.initialize_sender(shared_secret, &dh_key, &pq_key)
-        } else {
-            messenger.initialize_receiver(shared_secret, &dh_key, &pq_key)
-        };
-
-        if init_result.is_err() {
-            return std::ptr::null_mut();
-        }
-
-        let session_id = contact_id.clone();
-        let mut sessions = SESSIONS.lock().unwrap();
-        sessions.insert(session_id.clone(), messenger);
-
-        let info = RatchetSessionInfo {
-            session_id,
-            state: "Active".to_string(),
-            created_at: 1234567890,
-        };
-        
-        let info_bytes = bincode::serialize(&info).unwrap();
-        env.byte_array_from_slice(&info_bytes).unwrap()
-    })
-}
-
-// --- WebRTC Tunneling ---
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptSignaling(
-    env: JNIEnv,
-    _class: JClass,
-    session_id: JString,
-    call_id: JString,
-    sdp_json: JString,
-) -> jbyteArray {
-    catch_unwind_result(|| {
-        let session_id: String = env.get_string(session_id).expect("Invalid session_id").into();
-        let call_id: String = env.get_string(call_id).expect("Invalid call_id").into();
-        let sdp: String = env.get_string(sdp_json).expect("Invalid sdp").into();
-
-        let signal = CallSignal::Offer { sdp, call_id };
-        let signal_bytes = signal.to_bytes().unwrap_or(vec![]);
-
-        let mut sessions = SESSIONS.lock().unwrap();
-        if let Some(messenger) = sessions.get_mut(&session_id) {
-            match messenger.encrypt_message(&signal_bytes) {
-                Ok(encrypted_bytes) => {
-                    env.byte_array_from_slice(&encrypted_bytes).unwrap()
-                },
-                Err(_) => std::ptr::null_mut()
-            }
-        } else {
-            std::ptr::null_mut()
-        }
-    })
-}
-
-// --- Utils & Cleanup ---
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateEphemeralKeys(
-    env: JNIEnv, c: JClass) -> jbyteArray {
-    Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateIdentityKeyPair(env, c)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerifyIdentityKey(
-    _e: JNIEnv, _c: JClass, _contact: JString, _key: JByteArray, _sig: JByteArray) -> jboolean {
-    1 
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateSAS(
-    env: JNIEnv, _c: JClass, _k1: JByteArray, _k2: JByteArray) -> jstring {
-    env.new_string("123-456").unwrap().into()
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptFile(
-    env: JNIEnv, c: JClass, sid: JString, data: JByteArray) -> jbyteArray {
-    Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptMessage(env, c, sid, data)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptFile(
-    env: JNIEnv, c: JClass, sid: JString, data: JByteArray) -> jbyteArray {
-    Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptMessage(env, c, sid, data)
-}
-
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanup(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    let mut sessions = SESSIONS.lock().unwrap();
-    sessions.clear();
-    let mut init = INITIALIZED.lock().unwrap();
-    *init = false;
+    *ACTIVE_IDENTITY.lock().unwrap() = None;
+    *KEYSTORE.lock().unwrap() = None;
+    *INITIALIZED.lock().unwrap() = false;
 }
 
 // ---------------------------------------------------------------------------

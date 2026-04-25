@@ -16,6 +16,9 @@
         <action
             android:id="@+id/action_to_contact_selection"
             app:destination="@id/contactSelectionFragment" />
+        <action
+            android:id="@+id/action_to_group_invite"
+            app:destination="@id/groupInviteFragment" />
     </fragment>
 
     <fragment
@@ -26,6 +29,9 @@
         <action
             android:id="@+id/action_contact_to_chat"
             app:destination="@id/chatFragment" />
+        <action
+            android:id="@+id/action_contact_to_add_contact"
+            app:destination="@id/addContactFragment" />
     </fragment>
 
     <fragment
@@ -41,10 +47,38 @@
             android:name="contactId"
             app:argType="string" />
     </fragment>
-    
+
     <fragment
         android:id="@+id/contactSelectionFragment"
         android:name="com.qubee.messenger.ui.contacts.ContactSelectionFragment"
         android:label="Choose contact" />
+
+    <!-- Group invite / scan flow. Optionally pre-populated with a deep
+         link via the `inviteLink` argument (set by MainActivity when
+         the user opens a qubee://invite/... URI). -->
+    <fragment
+        android:id="@+id/groupInviteFragment"
+        android:name="com.qubee.messenger.ui.groups.GroupInviteFragment"
+        android:label="Group invite">
+        <argument
+            android:name="inviteLink"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
+        <deepLink app:uri="qubee://invite/{token}" />
+    </fragment>
+
+    <!-- Adding a contact from a scanned/pasted qubee://identity/... link. -->
+    <fragment
+        android:id="@+id/addContactFragment"
+        android:name="com.qubee.messenger.ui.contacts.AddContactFragment"
+        android:label="Add contact">
+        <argument
+            android:name="identityLink"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
+        <deepLink app:uri="qubee://identity/{token}" />
+    </fragment>
 
 </navigation>

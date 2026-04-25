@@ -4,47 +4,62 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.repository.PreferenceRepository
+import com.qubee.messenger.identity.IdentityBundle
 import dagger.hilt.android.lifecycle.HiltViewModel
+import java.util.UUID
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.util.UUID
-import javax.inject.Inject
+import timber.log.Timber
 
+/**
+ * Drives the first-run flow. Generates a hybrid identity inside the Rust
+ * core, captures the resulting [IdentityBundle] (public key + ZK proof
+ * of ownership + share link), persists the public bits to encrypted
+ * prefs, and surfaces the share link so the UI can render it as a QR
+ * code for peer-to-peer key exchange.
+ */
 @HiltViewModel
 class OnboardingViewModel @Inject constructor(
     private val qubeeManager: QubeeManager,
-    private val preferences: PreferenceRepository // Antagen repository för SharedPreferences
+    private val preferences: PreferenceRepository,
 ) : ViewModel() {
 
-    private val _state = MutableStateFlow<OnboardingState>(OnboardingState.Idle)
+    private val _state = MutableStateFlow<OnboardingState>(
+        if (preferences.isOnboarded()) OnboardingState.Complete else OnboardingState.Idle
+    )
     val state = _state.asStateFlow()
 
     fun createIdentity(nickname: String) {
+        if (nickname.isBlank()) return
         viewModelScope.launch {
             _state.value = OnboardingState.Loading
 
-            // 1. Generera ett helt slumpmässigt ID (P2P-vänligt, kräver ingen server för att kolla unika namn)
-            val randomId = UUID.randomUUID().toString()
-
-            // 2. Generera kryptografiska nycklar via Rust (Kyber/Dilithium)
-            val identityKeyPair = qubeeManager.generateIdentityKeyPair()
-
-            if (identityKeyPair != null) {
-                // 3. Spara allt lokalt
-                preferences.saveUserIdentity(
-                    userId = randomId,
-                    nickname = nickname,
-                    publicKey = identityKeyPair.publicKey
-                )
-                
-                // Initiera P2P-nätverket med vår nya identitet
-                // p2pManager.startNode(randomId) 
-
-                _state.value = OnboardingState.Success
-            } else {
-                _state.value = OnboardingState.Error("Kunde inte generera kryptonycklar")
+            // Make sure the Rust core is up before we cross the JNI boundary.
+            val ready = qubeeManager.initialize()
+            if (!ready) {
+                _state.value = OnboardingState.Error("Could not initialise Qubee core")
+                return@launch
             }
+
+            val userId = preferences.userId() ?: UUID.randomUUID().toString()
+            val json = qubeeManager.createOnboardingBundle(nickname.trim(), userId)
+            val bundle = IdentityBundle.fromJson(json)
+            if (bundle == null) {
+                _state.value = OnboardingState.Error("Could not generate identity / ZK proof")
+                return@launch
+            }
+
+            preferences.saveBundle(bundle)
+            Timber.d("Onboarding complete for ${bundle.identityIdHex.take(8)}…")
+            _state.value = OnboardingState.Success(bundle)
+        }
+    }
+
+    fun acknowledge() {
+        if (_state.value is OnboardingState.Success) {
+            _state.value = OnboardingState.Complete
         }
     }
 }
@@ -52,6 +67,9 @@ class OnboardingViewModel @Inject constructor(
 sealed class OnboardingState {
     object Idle : OnboardingState()
     object Loading : OnboardingState()
-    object Success : OnboardingState()
+    /** Identity was just created — UI should show the QR for sharing. */
+    data class Success(val bundle: IdentityBundle) : OnboardingState()
+    /** Stable post-onboarding state; main UI should take over. */
+    object Complete : OnboardingState()
     data class Error(val message: String) : OnboardingState()
 }

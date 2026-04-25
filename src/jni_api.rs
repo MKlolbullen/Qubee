@@ -7,12 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use lazy_static::lazy_static;
 use serde::Serialize;
+use serde_json::json;
 use tokio::runtime::Runtime;
 
 // Core modules
-use crate::SecureMessenger; 
+use crate::SecureMessenger;
 use crate::calling::signaling::CallSignal;
 use crate::network::p2p_node::{P2PNode, P2PCommand, NodeEvent};
+use crate::identity::identity_key::IdentityKeyPair;
+use crate::onboarding::OnboardingBundle;
+use crate::groups::group_invite::InvitePayload;
+use crate::groups::group_manager::{GroupId, GroupInvitation, QUBEE_MAX_GROUP_MEMBERS};
+use crate::identity::identity_key::IdentityId;
 
 // --- Global State ---
 lazy_static! {
@@ -386,4 +392,188 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanu
     sessions.clear();
     let mut init = INITIALIZED.lock().unwrap();
     *init = false;
+}
+
+// ---------------------------------------------------------------------------
+// ZK Onboarding & invite-link surface (added for the identity/groups feature)
+// ---------------------------------------------------------------------------
+
+fn json_to_jstring(env: JNIEnv, value: serde_json::Value) -> jstring {
+    match env.new_string(value.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn ok_or_null(env: JNIEnv, result: anyhow::Result<serde_json::Value>) -> jstring {
+    match result {
+        Ok(v) => json_to_jstring(env, v),
+        Err(e) => {
+            eprintln!("Rust: JNI op failed: {:#}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Generate a fresh hybrid identity, build a ZK proof of key ownership, and
+/// return a JSON document describing the bundle plus a `qubee://identity/...`
+/// share link. The freshly minted keypair is cached in `ACTIVE_IDENTITY`
+/// for subsequent operations during this process lifetime.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateOnboardingBundle(
+    env: JNIEnv,
+    _class: JClass,
+    display_name: JString,
+    user_id: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let display_name: String = match env.get_string(display_name) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let user_id: String = match env.get_string(user_id) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let keypair = IdentityKeyPair::generate()?;
+            let bundle = OnboardingBundle::create(keypair, &display_name, &user_id)?;
+            let share_link = bundle.to_share_link()?;
+            Ok(json!({
+                "user_id": bundle.user_id,
+                "display_name": bundle.display_name,
+                "identity_id_hex": hex::encode(bundle.identity_id().as_ref()),
+                "fingerprint": bundle.public_key.fingerprint(),
+                "share_link": share_link,
+                "max_group_members": QUBEE_MAX_GROUP_MEMBERS,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Verify and decode a `qubee://identity/<token>` deep link. On success,
+/// returns a JSON object describing the remote identity. Returns NULL if
+/// the link is malformed or the embedded ZK proof fails verification.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerifyOnboardingLink(
+    env: JNIEnv,
+    _class: JClass,
+    link: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let link: String = match env.get_string(link) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let bundle = OnboardingBundle::from_share_link(&link)?;
+            Ok(json!({
+                "user_id": bundle.user_id,
+                "display_name": bundle.display_name,
+                "identity_id_hex": hex::encode(bundle.identity_id().as_ref()),
+                "fingerprint": bundle.public_key.fingerprint(),
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Build a `qubee://invite/<token>` link from a JSON invitation document
+/// `{group_id_hex, group_name, inviter_id_hex, inviter_name,
+///   invitation_code, expires_at?}`. The Qubee-wide member cap is baked
+/// into the encoded payload; senders cannot raise it.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildInviteLink(
+    env: JNIEnv,
+    _class: JClass,
+    invitation_json: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let raw: String = match env.get_string(invitation_json) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let v: serde_json::Value = serde_json::from_str(&raw)?;
+            let group_id = parse_hex32(v.get("group_id_hex").and_then(|s| s.as_str()))?;
+            let inviter_id = parse_hex32(v.get("inviter_id_hex").and_then(|s| s.as_str()))?;
+            let group_name = v.get("group_name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let inviter_name = v.get("inviter_name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let invitation_code = v.get("invitation_code").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let expires_at = v.get("expires_at").and_then(|s| s.as_u64());
+
+            let invitation = GroupInvitation {
+                group_id: GroupId::from_bytes(group_id),
+                group_name,
+                inviter_id: IdentityId::from(inviter_id),
+                inviter_name,
+                invitation_code,
+                expires_at,
+                max_uses: None,
+                current_uses: 0,
+                created_at: now_secs(),
+            };
+            let payload = InvitePayload::from_invitation(&invitation);
+            let link = payload.to_invite_link()?;
+            Ok(json!({ "link": link, "max_members": payload.max_members }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Parse a `qubee://invite/<token>` deep link and return its contents
+/// as JSON. Returns NULL if the link is malformed or its fingerprint
+/// fails verification.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeParseInviteLink(
+    env: JNIEnv,
+    _class: JClass,
+    link: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let link: String = match env.get_string(link) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let payload = InvitePayload::from_invite_link(&link)?;
+            Ok(json!({
+                "group_id_hex": hex::encode(payload.group_id.as_ref()),
+                "group_name": payload.group_name,
+                "inviter_id_hex": hex::encode(payload.inviter_id.as_ref()),
+                "inviter_name": payload.inviter_name,
+                "invitation_code": payload.invitation_code,
+                "expires_at": payload.expires_at,
+                "max_members": payload.max_members,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+fn parse_hex32(s: Option<&str>) -> anyhow::Result<[u8; 32]> {
+    let s = s.ok_or_else(|| anyhow::anyhow!("missing hex field"))?;
+    let bytes = hex::decode(s)?;
+    if bytes.len() != 32 {
+        anyhow::bail!("expected 32-byte hex, got {}", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

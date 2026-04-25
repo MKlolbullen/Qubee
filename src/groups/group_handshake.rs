@@ -183,6 +183,35 @@ pub struct JoinRejectedBody {
     pub reason: String,
 }
 
+/// One entry of a `KeyRotation` payload — the new group key wrapped
+/// to a single recipient's long-lived Kyber pubkey.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemberKeyDelivery {
+    pub recipient_id: IdentityId,
+    pub wrapped_key: WrappedGroupKey,
+}
+
+/// Body of a `KeyRotation` payload. Sent by the group owner (or any
+/// member with `Permission::RemoveMembers`) when a member is removed
+/// or leaves, so the remaining members converge on a fresh group key
+/// the departed member can no longer decrypt with.
+///
+/// `removed_member_id` is `None` for proactive rotations (e.g. on a
+/// timer or after a key compromise the owner suspects).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyRotationBody {
+    pub group_id: GroupId,
+    /// Monotonically increasing counter; receivers ignore rotations
+    /// older than the highest generation they've already seen.
+    pub generation: u64,
+    pub rotator_id: IdentityId,
+    pub removed_member_id: Option<IdentityId>,
+    pub deliveries: Vec<MemberKeyDelivery>,
+    /// Unix timestamp; receivers reject rotations older than
+    /// [`HANDSHAKE_MAX_AGE_SECS`] to bound replay window.
+    pub timestamp: u64,
+}
+
 /// Top-level handshake frame.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GroupHandshake {
@@ -196,6 +225,10 @@ pub enum GroupHandshake {
     },
     JoinRejected {
         body: JoinRejectedBody,
+        signature: HybridSignature,
+    },
+    KeyRotation {
+        body: KeyRotationBody,
         signature: HybridSignature,
     },
 }
@@ -238,6 +271,7 @@ impl GroupHandshake {
 const REQUEST_JOIN_TAG: &[u8] = b"qubee_handshake_request_join_v1";
 const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v1";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
+const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);
@@ -297,6 +331,37 @@ pub fn canonical_join_rejected(body: &JoinRejectedBody) -> Result<Vec<u8>> {
     out.extend_from_slice(body.joiner_id.as_ref());
     out.push(0u8);
     out.extend_from_slice(body.reason.as_bytes());
+    Ok(out)
+}
+
+pub fn canonical_key_rotation(body: &KeyRotationBody) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(2048);
+    out.extend_from_slice(KEY_ROTATION_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&body.generation.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(body.rotator_id.as_ref());
+    out.push(0u8);
+    if let Some(removed) = body.removed_member_id {
+        out.push(1u8);
+        out.extend_from_slice(removed.as_ref());
+    } else {
+        out.push(0u8);
+    }
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&(body.deliveries.len() as u32).to_le_bytes());
+    for d in &body.deliveries {
+        out.extend_from_slice(d.recipient_id.as_ref());
+        out.extend_from_slice(&(d.wrapped_key.kem_ciphertext.len() as u32).to_le_bytes());
+        out.extend_from_slice(&d.wrapped_key.kem_ciphertext);
+        out.extend_from_slice(&d.wrapped_key.nonce);
+        out.extend_from_slice(&(d.wrapped_key.wrapped_key.len() as u32).to_le_bytes());
+        out.extend_from_slice(&d.wrapped_key.wrapped_key);
+    }
     Ok(out)
 }
 
@@ -363,6 +428,29 @@ pub fn verify_join_rejected(
 ) -> Result<bool> {
     let payload = canonical_join_rejected(body)?;
     expected_inviter.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Sign a `KeyRotation` payload with the rotator's identity keypair.
+pub fn sign_key_rotation(
+    keypair: &IdentityKeyPair,
+    body: KeyRotationBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_key_rotation(&body)?;
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::KeyRotation { body, signature })
+}
+
+/// Verify a `KeyRotation` against the rotator's stated `IdentityKey`.
+/// The caller is responsible for pulling the rotator's pubkey out of
+/// the local group state — receivers should reject rotations from
+/// keys that aren't actually members with rotation permission.
+pub fn verify_key_rotation(
+    body: &KeyRotationBody,
+    signature: &HybridSignature,
+    expected_rotator: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_key_rotation(body)?;
+    expected_rotator.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
 }
 
 #[cfg(test)]

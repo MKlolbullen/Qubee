@@ -17,13 +17,14 @@ use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_request_join, GroupHandshake, RequestJoinBody,
+    generate_ephemeral_kyber, sign_request_join, GroupHandshake, KeyRotationBody, RequestJoinBody,
 };
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
 use crate::groups::handshake_handlers::{
-    process_join_accepted, process_request_join, HandshakeOutcome,
+    plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
+    HandshakeOutcome,
 };
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use std::collections::HashMap;
@@ -453,6 +454,73 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
     })
 }
 
+/// Remove a member from a group we own, rotate the group key, and
+/// broadcast a signed `KeyRotation` so remaining members converge on
+/// the fresh key. Returns JSON `{group_id_hex, removed_member_hex,
+/// generation, network_published}`.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemoveMember(
+    env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    member_id_hex: JString,
+    reason: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let group_id_hex: String = match env.get_string(group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let member_id_hex: String = match env.get_string(member_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let reason: String = match env.get_string(reason) {
+            Ok(s) => s.into(),
+            Err(_) => String::new(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+            let member_id = IdentityId::from(parse_hex32(Some(member_id_hex.as_str()))?);
+
+            let signed = {
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                plan_key_rotation(
+                    gm,
+                    identity.as_ref(),
+                    group_id,
+                    Some(member_id),
+                    &reason,
+                )?
+            };
+
+            let generation = match &signed {
+                GroupHandshake::KeyRotation { body, .. } => body.generation,
+                _ => 0,
+            };
+
+            let topic = group_topic(&hex::encode(group_id.as_ref()));
+            let wire = signed.to_wire()?;
+            let published = publish_to_topic(topic, wire);
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "removed_member_hex": hex::encode(member_id.as_ref()),
+                "generation": generation,
+                "network_published": published,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
 /// Record that the local user accepted a `qubee://invite/...` link
 /// and (best-effort) publish a signed `RequestJoin` over the
 /// gossipsub global topic so the inviter's device can enrol us.
@@ -668,8 +736,29 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
                 body.group_id, body.reason
             );
         }
+        GroupHandshake::KeyRotation { body, signature } => {
+            on_key_rotation(body, signature)?;
+        }
     }
     Ok(())
+}
+
+fn on_key_rotation(
+    body: KeyRotationBody,
+    signature: crate::identity::identity_key::HybridSignature,
+) -> anyhow::Result<()> {
+    let identity = active_identity()?
+        .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    // Don't process our own rotations as if we received them — we
+    // already installed the new key in plan_key_rotation.
+    if body.rotator_id == identity.identity_id() {
+        return Ok(());
+    }
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = gm_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+    process_key_rotation(gm, identity.identity_id(), &body, &signature)
 }
 
 fn on_request_join(

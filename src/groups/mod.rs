@@ -12,5 +12,6 @@ pub use group_permissions::{GroupPermissions, Permission, Role};
 pub use group_events::{GroupEvent, GroupEventLog, GroupEventType};
 pub use group_invite::{InvitePayload, QUBEE_INVITE_HOST, QUBEE_URI_SCHEME};
 pub use group_handshake::{
-    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, RequestJoinBody,
+    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, KeyRotationBody,
+    MemberKeyDelivery, RequestJoinBody,
 };

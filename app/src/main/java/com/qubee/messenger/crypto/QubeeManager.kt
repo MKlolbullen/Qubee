@@ -145,6 +145,21 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Remove a member from a group we own. Internally rotates the
+     * group's symmetric key and broadcasts a signed `KeyRotation` so
+     * the remaining members converge on the fresh key — the kicked
+     * member can no longer decrypt new traffic.
+     */
+    suspend fun removeMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        reason: String = "",
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeRemoveMember(groupIdHex, memberIdHex, reason)
+    }
+
+    /**
      * Parse a `qubee://invite/<token>` deep link and return its contents
      * as JSON. Returns null if the link is malformed.
      */
@@ -193,6 +208,11 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         expiresAtSeconds: Long,
         maxUses: Int,
+    ): String?
+    private external fun nativeRemoveMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        reason: String,
     ): String?
 
     external fun nativeCleanup()

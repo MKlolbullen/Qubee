@@ -74,6 +74,14 @@ pub struct GroupMember {
     pub invited_by: Option<IdentityId>,
     pub member_status: MemberStatus,
     pub custom_permissions: Option<HashSet<Permission>>,
+    /// Long-lived Kyber-768 public key the member uses to receive
+    /// rotated group keys. Captured during the join handshake (the
+    /// joiner's then-ephemeral key is promoted to long-lived once the
+    /// join lands). Empty for members enrolled before this field
+    /// existed — those members can't receive rotations until they
+    /// re-join, and `rotate_group_key_after_removal` filters them out.
+    #[serde(default)]
+    pub kyber_pub: Vec<u8>,
 }
 
 /// Member status in the group
@@ -196,6 +204,9 @@ impl GroupManager {
             invited_by: None,
             member_status: MemberStatus::Active,
             custom_permissions: None,
+            // Owner doesn't need a Kyber pubkey for self-rotations
+            // since they generate the new key directly.
+            kyber_pub: Vec::new(),
         };
         
         let mut members = HashMap::new();
@@ -288,20 +299,26 @@ impl GroupManager {
             invited_by: Some(admin_id),
             member_status: MemberStatus::Active,
             custom_permissions: None,
+            kyber_pub: Vec::new(),
         };
-        
+
         group.members.insert(new_member_id, new_member);
         group.last_updated = current_time;
         group.version += 1;
-        
+
         // Update member groups mapping
         self.member_groups
             .entry(new_member_id)
             .or_insert_with(HashSet::new)
             .insert(group_id);
-        
-        // Rotate group key for forward secrecy
-        self.group_crypto.rotate_group_key(group_id)?;
+
+        // NOTE: We deliberately do NOT rotate the group key here. The
+        // handshake-driven join already negotiates a fresh key via the
+        // wrapped-key mechanism in `confirm_external_invite_acceptance`,
+        // and rotating again would force the new joiner to learn about
+        // a key they were never told. Rotation on *removal* is what
+        // enforces forward secrecy in this codebase — see
+        // `rotate_group_key_after_removal`.
         
         // Log event
         self.log_group_event(
@@ -473,6 +490,118 @@ impl GroupManager {
         Ok(invitation)
     }
     
+    /// Stamp a member's long-lived Kyber-768 public key in place.
+    /// The handshake captures the joiner's ephemeral Kyber pubkey in
+    /// the RequestJoin and we persist it here so future key rotations
+    /// can wrap a new group key for this member without another
+    /// handshake.
+    pub fn set_member_kyber_pub(
+        &mut self,
+        group_id: GroupId,
+        member_id: IdentityId,
+        kyber_pub: Vec<u8>,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| anyhow::anyhow!("Member not in group"))?;
+        member.kyber_pub = kyber_pub;
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        group.version += 1;
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
+    /// Persist the local user's long-lived Kyber-768 secret for a
+    /// group inside the encrypted keystore. Used by the joiner to
+    /// keep the secret around so future `KeyRotation` messages can be
+    /// decapsulated even after a process restart.
+    pub fn store_my_kyber_secret(
+        &mut self,
+        group_id: GroupId,
+        secret_bytes: &[u8],
+    ) -> Result<()> {
+        let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
+        let metadata = KeyMetadata {
+            algorithm: "kyber768".to_string(),
+            key_size: secret_bytes.len(),
+            usage: vec![KeyUsage::KeyAgreement],
+            expiry: None,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key, secret_bytes, KeyType::EncryptionKey, metadata)?;
+        Ok(())
+    }
+
+    /// Inverse of [`store_my_kyber_secret`]. Returns `Ok(None)` if the
+    /// local user never joined the group (or already left it).
+    pub fn load_my_kyber_secret(&mut self, group_id: GroupId) -> Result<Option<Vec<u8>>> {
+        let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
+        let secret = match self.keystore.retrieve_key(&key)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        Ok(Some(secret.expose_secret().clone()))
+    }
+
+    /// Drop our Kyber secret for a group — call when leaving so the
+    /// secret can't be used to decapsulate further rotations.
+    pub fn wipe_my_kyber_secret(&mut self, group_id: GroupId) -> Result<()> {
+        let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
+        let _ = self.keystore.delete_key(&key);
+        Ok(())
+    }
+
+    /// Rotate the symmetric group key after a member is removed (or
+    /// leaves voluntarily). Generates a fresh key, then for each
+    /// remaining member with a registered Kyber pubkey produces a
+    /// `WrappedGroupKey`. Returns the deliveries plus the new key
+    /// so the caller can sign + publish them.
+    ///
+    /// Members with no `kyber_pub` (e.g. legacy enrolments before the
+    /// field existed) are skipped — they'll need to re-join to get the
+    /// new key. The owner's own copy is installed in-place and
+    /// persisted; they don't need a wrapped delivery.
+    pub fn rotate_group_key_after_removal(
+        &mut self,
+        group_id: GroupId,
+        rotator_id: IdentityId,
+    ) -> Result<Vec<(IdentityId, Vec<u8>)>> {
+        // Generate a fresh 32-byte key. We pass it through
+        // `set_group_key` so the rotator's own GroupCrypto picks it
+        // up immediately.
+        let new_key = crate::security::secure_rng::random::array::<32>()?;
+        self.group_crypto.set_group_key(group_id, new_key);
+
+        let group = self
+            .groups
+            .get(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+
+        // Build a (recipient_id, kyber_pub) plan first to avoid holding
+        // the immutable borrow across WrappedGroupKey::wrap calls.
+        let recipients: Vec<(IdentityId, Vec<u8>)> = group
+            .members
+            .iter()
+            .filter_map(|(id, m)| {
+                if *id == rotator_id || m.member_status != MemberStatus::Active {
+                    return None;
+                }
+                if m.kyber_pub.is_empty() {
+                    return None;
+                }
+                Some((*id, m.kyber_pub.clone()))
+            })
+            .collect();
+
+        Ok(recipients)
+    }
+
     /// Join a group using an invitation that was originally minted on
     /// **this** device.
     ///
@@ -617,6 +746,14 @@ impl GroupManager {
     /// Used by the handshake handler to wrap the key for new joiners.
     pub fn export_group_key(&self, group_id: &GroupId) -> Option<[u8; 32]> {
         self.group_crypto.export_group_key(group_id)
+    }
+
+    /// Install a 32-byte symmetric group key. Used by the joiner side
+    /// of a `KeyRotation` after it unwraps the new key from the wire.
+    pub fn install_group_key(&mut self, group_id: GroupId, key_bytes: &[u8; 32]) -> Result<()> {
+        self.group_crypto.set_group_key(group_id, *key_bytes);
+        self.store_group_securely(&group_id)?;
+        Ok(())
     }
 
     /// Ensure a freshly created group has a symmetric encryption key

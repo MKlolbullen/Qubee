@@ -19,7 +19,8 @@ use qubee_crypto::groups::group_handshake::{
 use qubee_crypto::groups::group_invite::InvitePayload;
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType};
 use qubee_crypto::groups::handshake_handlers::{
-    process_join_accepted, process_request_join, HandshakeOutcome,
+    plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
+    HandshakeOutcome,
 };
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
 use qubee_crypto::storage::secure_keystore::SecureKeyStore;
@@ -236,6 +237,156 @@ fn unknown_invitation_returns_silent_no_op() {
 
     let outcome = process_request_join(&mut alice_gm, &alice_kp, &req_body, &req_sig).unwrap();
     assert!(matches!(outcome, HandshakeOutcome::UnknownInvitation));
+}
+
+#[test]
+fn key_rotation_after_removal_converges_on_new_key() {
+    // Three devices: Alice (owner), Bob (member), Carol (member). Alice
+    // removes Bob; Carol (still in the group) should converge on the
+    // new group key, while Alice's own copy reflects the rotation too.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let (_bob_dir, bob_kp, mut bob_gm) = fresh_device("bob");
+    let (_carol_dir, carol_kp, mut carol_gm) = fresh_device("carol");
+
+    let alice_id = alice_kp.identity_id();
+
+    // Alice creates the group + an invitation that's reusable by
+    // both Bob and Carol.
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Three-Member".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invitation = alice_gm
+        .create_invitation(group_id, alice_id, None, Some(2))
+        .unwrap();
+    let payload = InvitePayload::from_invitation(&invitation);
+
+    // -------- Bob joins via the handshake --------
+    bob_gm
+        .record_external_invite_acceptance(
+            payload.group_id,
+            &payload.group_name,
+            payload.inviter_id,
+            &payload.inviter_name,
+            &payload.invitation_code,
+        )
+        .unwrap();
+    let (bob_kyber_pub, bob_kyber_secret) = generate_ephemeral_kyber();
+    let bob_request = match sign_request_join(
+        &bob_kp,
+        RequestJoinBody {
+            group_id,
+            invitation_code: payload.invitation_code.clone(),
+            joiner_public_key: bob_kp.public_key(),
+            joiner_display_name: "Bob".to_string(),
+            joiner_kyber_pub: bob_kyber_pub,
+        },
+    )
+    .unwrap()
+    {
+        GroupHandshake::RequestJoin { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    let bob_accepted = match process_request_join(&mut alice_gm, &alice_kp, &bob_request.0, &bob_request.1).unwrap() {
+        HandshakeOutcome::Accept { body, signature } => (body, signature),
+        _ => panic!("expected Accept for Bob"),
+    };
+    process_join_accepted(
+        &mut bob_gm,
+        payload.inviter_id,
+        &bob_accepted.0,
+        &bob_accepted.1,
+        &bob_kyber_secret,
+    )
+    .unwrap();
+
+    // -------- Carol joins via the handshake --------
+    carol_gm
+        .record_external_invite_acceptance(
+            payload.group_id,
+            &payload.group_name,
+            payload.inviter_id,
+            &payload.inviter_name,
+            &payload.invitation_code,
+        )
+        .unwrap();
+    let (carol_kyber_pub, carol_kyber_secret) = generate_ephemeral_kyber();
+    let carol_request = match sign_request_join(
+        &carol_kp,
+        RequestJoinBody {
+            group_id,
+            invitation_code: payload.invitation_code.clone(),
+            joiner_public_key: carol_kp.public_key(),
+            joiner_display_name: "Carol".to_string(),
+            joiner_kyber_pub: carol_kyber_pub,
+        },
+    )
+    .unwrap()
+    {
+        GroupHandshake::RequestJoin { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    let carol_accepted = match process_request_join(&mut alice_gm, &alice_kp, &carol_request.0, &carol_request.1).unwrap() {
+        HandshakeOutcome::Accept { body, signature } => (body, signature),
+        _ => panic!("expected Accept for Carol"),
+    };
+    process_join_accepted(
+        &mut carol_gm,
+        payload.inviter_id,
+        &carol_accepted.0,
+        &carol_accepted.1,
+        &carol_kyber_secret,
+    )
+    .unwrap();
+
+    let pre_rotation_key = alice_gm.export_group_key(&group_id).unwrap();
+    assert_eq!(pre_rotation_key, bob_gm.export_group_key(&group_id).unwrap());
+    assert_eq!(pre_rotation_key, carol_gm.export_group_key(&group_id).unwrap());
+
+    // -------- Alice kicks Bob --------
+    let rotation_signed = plan_key_rotation(
+        &mut alice_gm,
+        &alice_kp,
+        group_id,
+        Some(bob_kp.identity_id()),
+        "test removal",
+    )
+    .unwrap();
+    let (rotation_body, rotation_sig) = match rotation_signed {
+        GroupHandshake::KeyRotation { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Alice's own key has already moved.
+    let post_rotation_key_alice = alice_gm.export_group_key(&group_id).unwrap();
+    assert_ne!(post_rotation_key_alice, pre_rotation_key);
+
+    // Carol applies the rotation broadcast.
+    process_key_rotation(&mut carol_gm, carol_kp.identity_id(), &rotation_body, &rotation_sig)
+        .unwrap();
+    assert_eq!(
+        carol_gm.export_group_key(&group_id).unwrap(),
+        post_rotation_key_alice,
+        "Carol must converge on Alice's new group key",
+    );
+
+    // Bob applies the rotation broadcast — he's the removed member,
+    // so he should NOT pick up the new key. His local membership
+    // record drops the kyber secret.
+    process_key_rotation(&mut bob_gm, bob_kp.identity_id(), &rotation_body, &rotation_sig)
+        .unwrap();
+    assert_ne!(
+        bob_gm.export_group_key(&group_id).unwrap(),
+        post_rotation_key_alice,
+        "Bob (removed) must not converge on the new key",
+    );
 }
 
 #[test]

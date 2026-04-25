@@ -1,17 +1,17 @@
 // src/network/p2p_node.rs
+//
+// libp2p 0.53 swarm wired to gossipsub + Kademlia + mDNS.
 
+use anyhow::{anyhow, Result};
+use futures::StreamExt;
 use libp2p::{
-    swarm::{NetworkBehaviour, Swarm, SwarmBuilder, SwarmEvent},
-    PeerId,
-    kad::{Kademlia, KademliaConfig, KademliaEvent, store::MemoryStore},
-    gossipsub::{Gossipsub, GossipsubConfig, GossipsubEvent, MessageAuthenticity, IdentTopic},
-    mdns::{Mdns, MdnsConfig, Event as MdnsEvent},
-    identity::Keypair,
-    futures::StreamExt,
+    gossipsub, identity::Keypair, kad, mdns, noise,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, PeerId, Swarm,
 };
-use tokio::sync::mpsc;
-use std::error::Error;
+use std::str::FromStr;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 // --- Data Structures ---
 
@@ -28,47 +28,22 @@ pub enum P2PCommand {
 #[derive(Debug)]
 pub enum NodeEvent {
     /// Received a message from the network
-    MessageReceived { sender: String, topic: String, data: Vec<u8> },
+    MessageReceived {
+        sender: String,
+        topic: String,
+        data: Vec<u8>,
+    },
     /// Discovered a new peer (via mDNS or DHT)
     PeerDiscovered { peer_id: String },
 }
 
-/// The network behaviour defining what protocols we use
+/// Composed network behaviour. The derive expands a sibling
+/// `QubeeBehaviourEvent` enum that we match on inside the run loop.
 #[derive(NetworkBehaviour)]
-#[behaviour(out_event = "QubeeBehaviourEvent")]
 struct QubeeBehaviour {
-    /// Gossipsub for efficient message broadcasting (Group Chats)
-    gossipsub: Gossipsub,
-    /// Kademlia DHT for finding peers by ID (Identity Resolution)
-    kademlia: Kademlia<MemoryStore>,
-    /// mDNS for local network discovery (Wi-Fi)
-    mdns: Mdns,
-}
-
-/// Helper enum to wrap events from the different behaviours
-#[derive(Debug)]
-enum QubeeBehaviourEvent {
-    Gossipsub(GossipsubEvent),
-    Kademlia(KademliaEvent),
-    Mdns(MdnsEvent),
-}
-
-impl From<GossipsubEvent> for QubeeBehaviourEvent {
-    fn from(event: GossipsubEvent) -> Self {
-        QubeeBehaviourEvent::Gossipsub(event)
-    }
-}
-
-impl From<KademliaEvent> for QubeeBehaviourEvent {
-    fn from(event: KademliaEvent) -> Self {
-        QubeeBehaviourEvent::Kademlia(event)
-    }
-}
-
-impl From<MdnsEvent> for QubeeBehaviourEvent {
-    fn from(event: MdnsEvent) -> Self {
-        QubeeBehaviourEvent::Mdns(event)
-    }
+    gossipsub: gossipsub::Behaviour,
+    kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    mdns: mdns::tokio::Behaviour,
 }
 
 // --- The P2P Node ---
@@ -78,50 +53,56 @@ pub struct P2PNode {
     command_receiver: mpsc::Receiver<P2PCommand>,
 }
 
+const GLOBAL_TOPIC: &str = "qubee-global";
+
 impl P2PNode {
-    /// Create a new P2P Node instance
-    /// 
-    /// # Arguments
-    /// * `id_keys` - The cryptographic identity of this node
-    /// * `command_receiver` - Channel to receive commands from JNI
+    /// Create a new P2P node. Accepts the command channel so the JNI
+    /// layer can drive sends/lookups; the matching event channel is
+    /// passed to [`run`] so callers can fan events back into Kotlin.
     pub async fn new(
-        id_keys: Keypair, 
-        command_receiver: mpsc::Receiver<P2PCommand>
-    ) -> Result<Self, Box<dyn Error>> {
-        let peer_id = PeerId::from(id_keys.public());
-        
-        // 1. Configure Kademlia (DHT)
-        // We use an in-memory store for routing tables
-        let store = MemoryStore::new(peer_id);
-        let mut kad_config = KademliaConfig::default();
-        kad_config.set_query_timeout(Duration::from_secs(5 * 60));
-        let kademlia = Kademlia::with_config(peer_id, store, kad_config);
+        id_keys: Keypair,
+        command_receiver: mpsc::Receiver<P2PCommand>,
+    ) -> Result<Self> {
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .map_err(|e| anyhow!("tcp transport: {e}"))?
+            .with_behaviour(|key| {
+                let peer_id = PeerId::from(key.public());
 
-        // 2. Configure Gossipsub (PubSub)
-        // This handles the "chat room" logic efficiently
-        let gossipsub_config = GossipsubConfig::default();
-        let gossipsub = Gossipsub::new(
-            MessageAuthenticity::Signed(id_keys.clone()), 
-            gossipsub_config
-        )?;
+                let gossipsub_cfg = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(10))
+                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .build()
+                    .map_err(|s| std::io::Error::new(std::io::ErrorKind::Other, s))?;
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_cfg,
+                )
+                .map_err(|s| std::io::Error::new(std::io::ErrorKind::Other, s))?;
 
-        // 3. Configure mDNS (Local Discovery)
-        // Finds other Qubee users on the same Wi-Fi automatically
-        let mdns = Mdns::new(MdnsConfig::default()).await?;
+                let kad_store = kad::store::MemoryStore::new(peer_id);
+                let mut kademlia = kad::Behaviour::new(peer_id, kad_store);
+                kademlia.set_mode(Some(kad::Mode::Server));
 
-        let behaviour = QubeeBehaviour {
-            gossipsub,
-            kademlia,
-            mdns,
-        };
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
-        // 4. Build the Swarm
-        // Uses Tokio for async IO
-        let swarm = SwarmBuilder::with_tokio_executor(
-            libp2p::development_transport(id_keys).await?,
-            behaviour,
-            peer_id,
-        ).build();
+                Ok(QubeeBehaviour {
+                    gossipsub,
+                    kademlia,
+                    mdns,
+                })
+            })
+            .map_err(|e| anyhow!("behaviour: {e}"))?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+
+        // Bind to an OS-assigned TCP port on every interface.
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
         Ok(Self {
             swarm,
@@ -129,86 +110,72 @@ impl P2PNode {
         })
     }
 
-    /// The main Event Loop
-    /// 
-    /// This method blocks the thread it runs on, processing network events
-    /// and commands from the Android app.
+    /// Main event loop. Drives the swarm forward and translates
+    /// behaviour events into [`NodeEvent`] messages for Kotlin.
     pub async fn run(mut self, event_sender: mpsc::Sender<NodeEvent>) {
-        // Subscribe to a default global topic for testing/broadcasting
-        // In a real app, you would subscribe to specific group ID topics
-        let chat_topic = IdentTopic::new("qubee-global");
-        
-        if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&chat_topic) {
-             eprintln!("Failed to subscribe to topic: {:?}", e);
+        let chat_topic = gossipsub::IdentTopic::new(GLOBAL_TOPIC);
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&chat_topic)
+        {
+            eprintln!("Failed to subscribe to topic: {e:?}");
         }
 
         loop {
             tokio::select! {
-                // 1. Handle Commands from JNI (Kotlin)
                 command = self.command_receiver.recv() => match command {
                     Some(P2PCommand::SendMessage { peer_id: _, data }) => {
-                        // For this implementation, we broadcast everything to the global topic
-                        // EncryptedMessage handles the privacy (only the holder of the session key can read it)
-                        if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(chat_topic.clone(), data) {
-                            eprintln!("Publish error: {:?}", e);
+                        if let Err(e) = self
+                            .swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(chat_topic.clone(), data)
+                        {
+                            eprintln!("Publish error: {e:?}");
                         }
                     }
                     Some(P2PCommand::FindPeer { peer_id }) => {
-                        // Trigger a DHT lookup for a specific Peer ID
-                        if let Ok(pid) = text_peer_id_to_peer_id(&peer_id) {
-                            self.swarm.behaviour_mut().kademlia.get_closest_peers(pid);
+                        match PeerId::from_str(&peer_id) {
+                            Ok(pid) => { let _ = self.swarm.behaviour_mut().kademlia.get_closest_peers(pid); }
+                            Err(e) => eprintln!("Invalid peer id {peer_id}: {e}"),
                         }
                     }
-                    None => return, // Channel closed, shut down node
+                    None => return,
                 },
 
-                // 2. Handle Network Events (Swarm)
                 event = self.swarm.select_next_some() => match event {
-                    // mDNS Discovery (Local Network)
-                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Mdns(MdnsEvent::Discovered(list))) => {
+                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
-                            // Add discovered peer to our routing tables
                             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             self.swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr);
-                            
-                            // Notify Kotlin that we found someone
-                            let _ = event_sender.send(NodeEvent::PeerDiscovered { 
-                                peer_id: peer_id.to_string() 
-                            }).await;
+                            let _ = event_sender
+                                .send(NodeEvent::PeerDiscovered { peer_id: peer_id.to_string() })
+                                .await;
                         }
-                    },
-                    
-                    // Kademlia Discovery (DHT)
-                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Kademlia(KademliaEvent::RoutingUpdated { peer, .. })) => {
-                        // Notify Kotlin when DHT finds a new route
-                        let _ = event_sender.send(NodeEvent::PeerDiscovered { 
-                            peer_id: peer.to_string() 
-                        }).await;
-                    },
-
-                    // Gossipsub Message (Chat Data)
-                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Gossipsub(GossipsubEvent::Message {
-                        propagation_source: peer_id,
-                        message_id: _,
+                    }
+                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. })) => {
+                        let _ = event_sender
+                            .send(NodeEvent::PeerDiscovered { peer_id: peer.to_string() })
+                            .await;
+                    }
+                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source,
                         message,
+                        ..
                     })) => {
-                        // Forward the encrypted blob to Kotlin for decryption
-                        let _ = event_sender.send(NodeEvent::MessageReceived {
-                            sender: peer_id.to_string(),
-                            topic: message.topic.into_string(),
-                            data: message.data,
-                        }).await;
-                    },
-                    
-                    _ => {} // Ignore debug/trace events
+                        let _ = event_sender
+                            .send(NodeEvent::MessageReceived {
+                                sender: propagation_source.to_string(),
+                                topic: message.topic.into_string(),
+                                data: message.data,
+                            })
+                            .await;
+                    }
+                    _ => {}
                 }
             }
         }
     }
-}
-
-// Helper to parse string PeerId
-fn text_peer_id_to_peer_id(text: &str) -> Result<PeerId, Box<dyn Error>> {
-    use std::str::FromStr;
-    Ok(PeerId::from_str(text)?)
 }

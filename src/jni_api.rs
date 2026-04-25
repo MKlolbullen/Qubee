@@ -3,43 +3,53 @@
 use jni::{JNIEnv, JavaVM};
 use jni::objects::{JClass, JString, JByteArray, JObject, GlobalRef, JValue};
 use jni::sys::{jboolean, jstring, jbyteArray};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use lazy_static::lazy_static;
-use serde::Serialize;
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::runtime::Runtime;
 
 // Core modules
-use crate::SecureMessenger;
-use crate::calling::signaling::CallSignal;
 use crate::network::p2p_node::{P2PNode, P2PCommand, NodeEvent};
-use crate::identity::identity_key::IdentityKeyPair;
+use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_manager::{GroupId, GroupInvitation, QUBEE_MAX_GROUP_MEMBERS};
-use crate::identity::identity_key::IdentityId;
+use crate::storage::secure_keystore::{
+    KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
+};
+
+const ACTIVE_IDENTITY_KEY: &str = "active_identity";
+
+#[derive(Serialize, Deserialize)]
+struct PersistedActiveIdentity {
+    user_id: String,
+    display_name: String,
+    /// Output of `IdentityKeyPair::serialize_for_keystore`.
+    secret_bytes: Vec<u8>,
+}
 
 // --- Global State ---
 lazy_static! {
-    static ref SESSIONS: Mutex<HashMap<String, SecureMessenger>> = Mutex::new(HashMap::new());
     static ref INITIALIZED: Mutex<bool> = Mutex::new(false);
-    
+
     // Command channel to talk to the background P2P node
     static ref P2P_COMMANDER: Mutex<Option<tokio::sync::mpsc::Sender<P2PCommand>>> = Mutex::new(None);
-    
+
     // JVM Reference for callbacks
     static ref JVM: Mutex<Option<JavaVM>> = Mutex::new(None);
-    
+
     // Callback Object Reference
     static ref CALLBACK_HANDLER: Mutex<Option<GlobalRef>> = Mutex::new(None);
-}
 
-#[derive(Serialize)]
-struct RatchetSessionInfo {
-    session_id: String,
-    state: String,
-    created_at: u64,
+    // Encrypted at-rest keystore opened during nativeInitialize.
+    static ref KEYSTORE: Mutex<Option<SecureKeyStore>> = Mutex::new(None);
+
+    // Cached active identity so we can sign without paying for a keystore
+    // round-trip on every JNI call.
+    static ref ACTIVE_IDENTITY: Mutex<Option<Arc<IdentityKeyPair>>> = Mutex::new(None);
 }
 
 fn catch_unwind_result<F, R>(f: F) -> R
@@ -52,24 +62,96 @@ where
 
 // --- Initialization & Callbacks ---
 
+/// Bootstrap the Rust core. Kotlin must pass `context.filesDir.absolutePath`
+/// as `data_dir` so the encrypted keystore lands inside the app's
+/// private storage. Idempotent.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitialize(
     env: JNIEnv,
     _class: JClass,
+    data_dir: JString,
 ) -> jboolean {
-    let mut init = INITIALIZED.lock().unwrap();
-    if *init { return 1; }
+    let result = catch_unwind_result(|| -> anyhow::Result<()> {
+        let mut init = INITIALIZED.lock().unwrap();
+        if *init {
+            return Ok(());
+        }
 
-    if let Ok(vm) = env.get_java_vm() {
-        *JVM.lock().unwrap() = Some(vm);
+        let dir: String = env
+            .get_string(data_dir)
+            .map_err(|e| anyhow::anyhow!("invalid data_dir: {e}"))?
+            .into();
+
+        if let Ok(vm) = env.get_java_vm() {
+            *JVM.lock().unwrap() = Some(vm);
+        }
+
+        let mut path = PathBuf::from(&dir);
+        path.push("qubee_keys.db");
+        let keystore = SecureKeyStore::new(&path)
+            .map_err(|e| anyhow::anyhow!("keystore open failed: {e}"))?;
+        *KEYSTORE.lock().unwrap() = Some(keystore);
+
+        // Best-effort eager identity load: lets nativeLoadOnboardingBundle
+        // succeed without the caller having to do anything special, and
+        // primes the in-memory cache for subsequent signing.
+        let _ = load_identity_from_keystore();
+
+        *init = true;
+        Ok(())
+    });
+    if result.is_err() {
+        eprintln!("Rust: nativeInitialize failed");
+        return 0;
     }
-
-    unsafe {
-        std::env::set_var("HOME", "/data/user/0/com.qubee.messenger/files");
-    }
-
-    *init = true;
     1
+}
+
+/// Load the persisted active identity (if any) from the keystore into
+/// the in-memory cache. Returns the persisted (user_id, display_name)
+/// metadata so the caller can rebuild the bundle.
+fn load_identity_from_keystore() -> anyhow::Result<Option<(String, String)>> {
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = match ks_guard.as_mut() {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+    let secret = match ks.retrieve_key(ACTIVE_IDENTITY_KEY)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let blob: PersistedActiveIdentity = bincode::deserialize(secret.expose_secret())
+        .map_err(|e| anyhow::anyhow!("active identity decode: {e}"))?;
+    let kp = IdentityKeyPair::deserialize_from_keystore(&blob.secret_bytes)?;
+    *ACTIVE_IDENTITY.lock().unwrap() = Some(Arc::new(kp));
+    Ok(Some((blob.user_id, blob.display_name)))
+}
+
+/// Persist the active identity to the keystore. Replaces any prior value.
+fn store_identity_to_keystore(
+    keypair: &IdentityKeyPair,
+    user_id: &str,
+    display_name: &str,
+) -> anyhow::Result<()> {
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    let blob = PersistedActiveIdentity {
+        user_id: user_id.to_string(),
+        display_name: display_name.to_string(),
+        secret_bytes: keypair.serialize_for_keystore()?,
+    };
+    let bytes = bincode::serialize(&blob)?;
+    let metadata = KeyMetadata {
+        algorithm: "hybrid_ed25519+dilithium2".to_string(),
+        key_size: bytes.len(),
+        usage: vec![KeyUsage::Signing, KeyUsage::Authentication],
+        expiry: None,
+        tags: std::collections::HashMap::new(),
+    };
+    ks.store_key(ACTIVE_IDENTITY_KEY, &bytes, KeyType::IdentityKey, metadata)?;
+    Ok(())
 }
 
 #[no_mangle]
@@ -415,10 +497,10 @@ fn ok_or_null(env: JNIEnv, result: anyhow::Result<serde_json::Value>) -> jstring
     }
 }
 
-/// Generate a fresh hybrid identity, build a ZK proof of key ownership, and
-/// return a JSON document describing the bundle plus a `qubee://identity/...`
-/// share link. The freshly minted keypair is cached in `ACTIVE_IDENTITY`
-/// for subsequent operations during this process lifetime.
+/// Generate a fresh hybrid identity, sign the onboarding bundle, and
+/// **persist** the keypair to the encrypted keystore so it survives
+/// process restarts. The cached keypair is also stashed in
+/// [`ACTIVE_IDENTITY`] for subsequent signing without touching disk.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateOnboardingBundle(
     env: JNIEnv,
@@ -438,20 +520,79 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
 
         let result: anyhow::Result<serde_json::Value> = (|| {
             let keypair = IdentityKeyPair::generate()?;
-            let bundle = OnboardingBundle::create(keypair, &display_name, &user_id)?;
-            let share_link = bundle.to_share_link()?;
-            Ok(json!({
-                "user_id": bundle.user_id,
-                "display_name": bundle.display_name,
-                "identity_id_hex": hex::encode(bundle.identity_id().as_ref()),
-                "fingerprint": bundle.public_key.fingerprint(),
-                "share_link": share_link,
-                "max_group_members": QUBEE_MAX_GROUP_MEMBERS,
-            }))
+            let bundle = OnboardingBundle::create(&keypair, &display_name, &user_id)?;
+            store_identity_to_keystore(&keypair, &user_id, &display_name)?;
+            *ACTIVE_IDENTITY.lock().unwrap() = Some(Arc::new(keypair));
+            bundle_to_json(&bundle)
         })();
 
         ok_or_null(env, result)
     })
+}
+
+/// Re-export the previously persisted onboarding bundle. Re-signs the
+/// canonical bytes with the loaded keypair so the embedded signature
+/// timestamp is fresh — important because the bundle's verifier rejects
+/// anything older than [`crate::onboarding::ONBOARDING_BUNDLE_TTL_SECS`].
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOnboardingBundle(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            // Lazily load if the eager init didn't happen (e.g. keystore
+            // was empty at boot but Kotlin called create afterwards).
+            if ACTIVE_IDENTITY.lock().unwrap().is_none() {
+                load_identity_from_keystore()?;
+            }
+            let identity = ACTIVE_IDENTITY
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no active identity persisted"))?;
+
+            // Read display_name + user_id from the keystore record.
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let secret = ks
+                .retrieve_key(ACTIVE_IDENTITY_KEY)?
+                .ok_or_else(|| anyhow::anyhow!("active identity record missing"))?;
+            let blob: PersistedActiveIdentity = bincode::deserialize(secret.expose_secret())?;
+
+            let bundle = OnboardingBundle::create(
+                identity.as_ref(),
+                blob.display_name.clone(),
+                blob.user_id.clone(),
+            )?;
+            bundle_to_json(&bundle)
+        })();
+
+        match result {
+            Ok(v) => json_to_jstring(env, v),
+            Err(e) => {
+                // No-identity is the *expected* state on first launch —
+                // treat it as null rather than a hard error so the
+                // Kotlin caller can branch cleanly.
+                eprintln!("Rust: nativeLoadOnboardingBundle: {e:#}");
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+fn bundle_to_json(bundle: &OnboardingBundle) -> anyhow::Result<serde_json::Value> {
+    let share_link = bundle.to_share_link()?;
+    Ok(json!({
+        "user_id": bundle.user_id,
+        "display_name": bundle.display_name,
+        "identity_id_hex": hex::encode(bundle.identity_id().as_ref()),
+        "fingerprint": bundle.public_key.fingerprint(),
+        "share_link": share_link,
+        "max_group_members": QUBEE_MAX_GROUP_MEMBERS,
+    }))
 }
 
 /// Verify and decode a `qubee://identity/<token>` deep link. On success,

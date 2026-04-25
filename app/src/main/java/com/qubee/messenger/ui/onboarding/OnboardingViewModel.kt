@@ -26,10 +26,25 @@ class OnboardingViewModel @Inject constructor(
     private val preferences: PreferenceRepository,
 ) : ViewModel() {
 
-    private val _state = MutableStateFlow<OnboardingState>(
-        if (preferences.isOnboarded()) OnboardingState.Complete else OnboardingState.Idle
-    )
+    private val _state = MutableStateFlow<OnboardingState>(OnboardingState.Idle)
     val state = _state.asStateFlow()
+
+    init {
+        // On every launch, ask the Rust core whether it already has a
+        // persisted identity. If yes, jump straight to Complete so the
+        // app surface routes past the onboarding screen. If no, stay
+        // on Idle and wait for the user to enter a display name.
+        viewModelScope.launch {
+            if (qubeeManager.initialize()) {
+                val json = qubeeManager.loadOnboardingBundle()
+                IdentityBundle.fromJson(json)?.let { bundle ->
+                    preferences.saveBundle(bundle)
+                    Timber.d("Restored persisted identity ${bundle.identityIdHex.take(8)}…")
+                    _state.value = OnboardingState.Complete
+                }
+            }
+        }
+    }
 
     fun createIdentity(nickname: String) {
         if (nickname.isBlank()) return
@@ -47,7 +62,7 @@ class OnboardingViewModel @Inject constructor(
             val json = qubeeManager.createOnboardingBundle(nickname.trim(), userId)
             val bundle = IdentityBundle.fromJson(json)
             if (bundle == null) {
-                _state.value = OnboardingState.Error("Could not generate identity / ZK proof")
+                _state.value = OnboardingState.Error("Could not generate identity")
                 return@launch
             }
 

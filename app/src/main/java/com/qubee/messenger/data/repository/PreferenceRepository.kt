@@ -11,19 +11,24 @@ import javax.inject.Singleton
 import timber.log.Timber
 
 /**
- * Persists local user state (identity bundle, display name) inside an
- * `EncryptedSharedPreferences` file.
+ * Persists local user state inside an `EncryptedSharedPreferences` file.
  *
- * If the platform refuses to mint a master key (broken Keystore, locked
- * device, hardware-attested key revoked, …) the repository falls back to
- * plain `SharedPreferences` so the app at least remains usable. That
- * fallback is **not** silent: [storageStatus] / [isEncrypted] surface the
- * outcome to callers, and a Timber warning is logged so we can spot it
- * in bug reports / log captures.
+ * The store is split into two tiers by sensitivity:
  *
- * Callers that handle sensitive material (e.g. anything that survives a
- * full re-onboarding) should check [isEncrypted] before writing, and
- * either prompt the user to retry or refuse to persist on fallback.
+ * * **Public metadata** — user id, display name, identity hash,
+ *   `qubee://identity/...` share link. None of these are secrets (the
+ *   identity hash is `BLAKE3(public_key)` by construction; the share
+ *   link contains a *public* ZK proof). [savePublicMetadata] /
+ *   [saveBundle] persist these in either tier.
+ * * **Secrets** — anything that genuinely needs confidentiality at
+ *   rest. [saveSecret] refuses to write when the backing store fell
+ *   back to plaintext, returning `false` so the caller can decide what
+ *   to do (prompt the user, retry, surface an error).
+ *
+ * Real cryptographic material (Dilithium/Kyber/Ed25519 private keys)
+ * lives in the Rust core's own secure keystore and never touches this
+ * class — the secret tier here exists for future Kotlin-side state
+ * that needs the same protection.
  */
 @Singleton
 class PreferenceRepository @Inject constructor(
@@ -43,7 +48,7 @@ class PreferenceRepository @Inject constructor(
     /** Snapshot of the current storage backend. */
     val storageStatus: StorageStatus get() = opened.status
 
-    /** Convenience boolean for the common "is this safe to write secrets to?" check. */
+    /** Convenience boolean for the "is this safe to write secrets to?" check. */
     val isEncrypted: Boolean get() = storageStatus == StorageStatus.ENCRYPTED
 
     private val prefs: SharedPreferences get() = opened.prefs
@@ -64,28 +69,31 @@ class PreferenceRepository @Inject constructor(
             )
             OpenResult(encrypted, StorageStatus.ENCRYPTED)
         } catch (e: Exception) {
-            // Surface the failure loudly: we don't want this to be a silent
-            // downgrade in production. Callers that genuinely cannot
-            // tolerate plaintext storage should read [isEncrypted] and
-            // refuse to persist sensitive bits.
+            // One-time loud warning at open time. We don't repeat per-write
+            // for public-tier data — that would be cargo-cult noise — but
+            // saveSecret() refuses outright in this state.
             Timber.w(
                 e,
                 "EncryptedSharedPreferences unavailable — falling back to plaintext SharedPreferences. " +
-                    "Sensitive state should not be stored until the Keystore recovers.",
+                    "Public metadata still persists; secret-tier writes will be refused.",
             )
             val plain = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             OpenResult(plain, StorageStatus.UNENCRYPTED_FALLBACK)
         }
     }
 
+    // -------- Public metadata tier (always succeeds) --------
+
     /**
-     * Persist the identity created during onboarding. The hybrid private
-     * key never leaves Rust; we only store identifiers + share link here.
+     * Persist non-secret onboarding state. Safe to call regardless of
+     * [storageStatus]; the values are public by construction.
      */
-    fun saveUserIdentity(userId: String, nickname: String, identityIdHex: String, shareLink: String?) {
-        if (!isEncrypted) {
-            Timber.w("Persisting onboarding state to UNENCRYPTED_FALLBACK store")
-        }
+    fun savePublicMetadata(
+        userId: String,
+        nickname: String,
+        identityIdHex: String,
+        shareLink: String?,
+    ) {
         prefs.edit()
             .putString(KEY_USER_ID, userId)
             .putString(KEY_NICKNAME, nickname)
@@ -97,7 +105,7 @@ class PreferenceRepository @Inject constructor(
 
     /** Convenience that mirrors the JSON envelope returned from Rust. */
     fun saveBundle(bundle: IdentityBundle) {
-        saveUserIdentity(
+        savePublicMetadata(
             userId = bundle.userId,
             nickname = bundle.displayName,
             identityIdHex = bundle.identityIdHex,
@@ -112,6 +120,35 @@ class PreferenceRepository @Inject constructor(
     fun identityIdHex(): String? = prefs.getString(KEY_IDENTITY_ID, null)
     fun shareLink(): String? = prefs.getString(KEY_SHARE_LINK, null)
 
+    // -------- Secret tier (gated by isEncrypted) --------
+
+    /**
+     * Persist a value that genuinely needs confidentiality at rest.
+     * Returns `true` on success, `false` if the backing store is the
+     * unencrypted fallback — in which case nothing is written and the
+     * caller must decide policy (prompt the user, surface an error,
+     * retry once Keystore recovers, …).
+     */
+    fun saveSecret(key: String, value: String): Boolean {
+        if (!isEncrypted) {
+            Timber.w("Refusing to write secret %s to %s store", key, storageStatus)
+            return false
+        }
+        prefs.edit().putString(secretKey(key), value).apply()
+        return true
+    }
+
+    /** Read a secret-tier value. Available regardless of tier so existing
+     *  data isn't orphaned if the Keystore is later restored. */
+    fun readSecret(key: String): String? = prefs.getString(secretKey(key), null)
+
+    /** Remove a secret-tier value. Always succeeds. */
+    fun clearSecret(key: String) {
+        prefs.edit().remove(secretKey(key)).apply()
+    }
+
+    private fun secretKey(key: String): String = "$KEY_SECRET_PREFIX$key"
+
     companion object {
         private const val PREFS_NAME = "qubee_prefs.enc"
         private const val KEY_USER_ID = "user_id"
@@ -119,5 +156,6 @@ class PreferenceRepository @Inject constructor(
         private const val KEY_IDENTITY_ID = "identity_id_hex"
         private const val KEY_SHARE_LINK = "share_link"
         private const val KEY_ONBOARDED = "onboarded"
+        private const val KEY_SECRET_PREFIX = "secret/"
     }
 }

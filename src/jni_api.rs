@@ -19,6 +19,9 @@ use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
     generate_ephemeral_kyber, sign_request_join, GroupHandshake, KeyRotationBody, RequestJoinBody,
 };
+use crate::groups::group_message::{
+    decrypt_group_message, encrypt_group_message, GroupMessageEnvelope,
+};
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
@@ -234,6 +237,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                                         handle_inbound_handshake(handshake);
                                         continue;
                                     }
+                                    if let Some(envelope) = GroupMessageEnvelope::from_wire(data) {
+                                        handle_inbound_group_message(envelope);
+                                        continue;
+                                    }
                                 }
                                 dispatch_event_to_kotlin(event);
                             }
@@ -287,6 +294,70 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
 }
 
 // --- Helper: Dispatch to Kotlin ---
+fn handle_inbound_group_message(envelope: GroupMessageEnvelope) {
+    let result: anyhow::Result<()> = (|| {
+        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+        let gm = gm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+
+        // Re-frame the envelope so the canonical decrypt helper can
+        // verify + AEAD-decrypt it. We have the envelope already, so
+        // we just need to feed wire bytes back in.
+        let wire = envelope.to_wire()?;
+        let decrypted = decrypt_group_message(gm, &wire)?;
+        drop(gm_guard);
+
+        dispatch_group_message_to_kotlin(&decrypted);
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("Rust: group message dropped: {e:#}");
+    }
+}
+
+fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::DecryptedGroupMessage) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let callback_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match callback_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let group_hex = match env.new_string(hex::encode(msg.group_id.as_ref())) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let sender_hex = match env.new_string(hex::encode(msg.sender_id.as_ref())) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let payload = match env.byte_array_from_slice(&msg.plaintext) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let _ = env.call_method(
+        callback_obj,
+        "onGroupMessageReceived",
+        "(Ljava/lang/String;Ljava/lang/String;[BJ)V",
+        &[
+            JValue::Object(group_hex.into()),
+            JValue::Object(sender_hex.into()),
+            JValue::Object(payload.into()),
+            JValue::Long(msg.timestamp as i64),
+        ],
+    );
+}
+
 fn dispatch_event_to_kotlin(event: NodeEvent) {
     let jvm_lock = JVM.lock().unwrap();
     let jvm = match jvm_lock.as_ref() {
@@ -447,6 +518,56 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
                 "invitation_code": invitation.invitation_code,
                 "expires_at": invitation.expires_at,
                 "max_members": payload.max_members,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Encrypt a plaintext group message under the current group key,
+/// sign the envelope with the active identity, and publish it on the
+/// per-group gossipsub topic. Returns JSON
+/// `{group_id_hex, generation, network_published}`.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendGroupMessage(
+    env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    plaintext: JByteArray,
+) -> jstring {
+    catch_unwind_result(|| {
+        let group_id_hex: String = match env.get_string(group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let plaintext = match env.convert_byte_array(plaintext) {
+            Ok(b) => b,
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+
+            let (wire, generation) = {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                let wire = encrypt_group_message(gm, identity.as_ref(), group_id, &plaintext)?;
+                let generation = gm.get_group(&group_id).map(|g| g.version).unwrap_or(0);
+                (wire, generation)
+            };
+
+            let topic = group_topic(&hex::encode(group_id.as_ref()));
+            let published = publish_to_topic(topic, wire);
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "generation": generation,
+                "network_published": published,
             }))
         })();
 

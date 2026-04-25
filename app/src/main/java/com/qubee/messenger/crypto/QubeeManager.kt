@@ -160,6 +160,21 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Encrypt a plaintext group message under the current group key,
+     * sign the envelope, and publish it on the per-group gossipsub
+     * topic. The decrypted result lands in
+     * [NetworkCallback.onGroupMessageReceived] on every other active
+     * member's device.
+     */
+    suspend fun sendGroupMessage(
+        groupIdHex: String,
+        plaintext: ByteArray,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeSendGroupMessage(groupIdHex, plaintext)
+    }
+
+    /**
      * Parse a `qubee://invite/<token>` deep link and return its contents
      * as JSON. Returns null if the link is malformed.
      */
@@ -213,6 +228,10 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         memberIdHex: String,
         reason: String,
+    ): String?
+    private external fun nativeSendGroupMessage(
+        groupIdHex: String,
+        plaintext: ByteArray,
     ): String?
 
     external fun nativeCleanup()

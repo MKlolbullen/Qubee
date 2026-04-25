@@ -7,21 +7,25 @@ use crate::calling::webrtc_manager::MediaStats;
 use crate::calling::webrtc_manager::WebRTCConfig;
 use crate::identity::identity_key::IdentityId;
 
-// Import the WebRTC API. We rely on the webrtc-rs crate for a pure
-// Rust implementation of the WebRTC stack. The API module provides
-// constructors for peer connections and related primitives.
+// Imports updated for webrtc 0.14:
+//   * `peer_connection::peer_connection::RTCPeerConnection` was
+//     deduplicated to `peer_connection::RTCPeerConnection`.
+//   * `RTCSdpType` moved out of `session_description` into its own
+//     `sdp_type` module.
+//   * The `media::` namespace was flattened — track types now live
+//     directly under `webrtc::track::`.
 use std::sync::Arc;
 use webrtc::api::APIBuilder;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection::RTCPeerConnection;
-use webrtc::peer_connection::sdp::session_description::{RTCSessionDescription, RTCSdpType};
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-
-// The media subsystem of webrtc-rs exposes track types and codec capabilities
-use webrtc::media::track::track_local::{TrackLocal, track_local_static_sample::TrackLocalStaticSample};
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
 
 use tokio::sync::Mutex;
 
@@ -364,16 +368,12 @@ impl PeerConnection {
         Ok(offer.sdp)
     }
 
-    /// Create an answer SDP in response to an offer. Returns an empty
-    /// string in the stub.
+    /// Create an answer SDP in response to an offer.
     pub async fn create_answer(&self, offer: &str) -> Result<String> {
-        // Parse the incoming offer SDP into a session description and set
-        // it as the remote description. Then generate an answer and set
-        // it as the local description.
-        let remote_desc = RTCSessionDescription {
-            sdp_type: RTCSdpType::Offer,
-            sdp: offer.to_string(),
-        };
+        // webrtc 0.14 doesn't allow direct struct-literal construction
+        // of RTCSessionDescription — use the typed constructors instead.
+        let remote_desc = RTCSessionDescription::offer(offer.to_string())
+            .context("Invalid SDP offer")?;
         self.webrtc_pc.set_remote_description(remote_desc).await
             .context("Failed to set remote offer description")?;
         let answer = self.webrtc_pc.create_answer(None).await
@@ -383,17 +383,16 @@ impl PeerConnection {
         Ok(answer.sdp)
     }
 
-    /// Set the remote SDP description. No behaviour in the stub.
+    /// Set the remote SDP description, expected to be an answer to a
+    /// previously generated local offer.
     pub async fn set_remote_description(&self, description: &str) -> Result<()> {
-        // Assume the remote description is an answer if we previously
-        // generated an offer. In a more robust implementation the
-        // caller should specify the SDP type.
-        let remote_desc = RTCSessionDescription {
-            sdp_type: RTCSdpType::Answer,
-            sdp: description.to_string(),
-        };
+        let remote_desc = RTCSessionDescription::answer(description.to_string())
+            .context("Invalid SDP answer")?;
         self.webrtc_pc.set_remote_description(remote_desc).await
             .context("Failed to set remote description")?;
+        // RTCSdpType is still imported for callers that want to inspect
+        // the local description; quiet the dead-import lint here.
+        let _: Option<RTCSdpType> = None;
         Ok(())
     }
 

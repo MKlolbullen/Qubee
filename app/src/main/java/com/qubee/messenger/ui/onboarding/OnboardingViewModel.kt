@@ -53,7 +53,10 @@ class OnboardingViewModel @Inject constructor(
 
             preferences.saveBundle(bundle)
             Timber.d("Onboarding complete for ${bundle.identityIdHex.take(8)}…")
-            _state.value = OnboardingState.Success(bundle)
+            _state.value = OnboardingState.Success(
+                bundle = bundle,
+                storageEncrypted = preferences.isEncrypted,
+            )
         }
     }
 
@@ -68,7 +71,11 @@ sealed class OnboardingState {
     object Idle : OnboardingState()
     object Loading : OnboardingState()
     /** Identity was just created — UI should show the QR for sharing. */
-    data class Success(val bundle: IdentityBundle) : OnboardingState()
+    data class Success(
+        val bundle: IdentityBundle,
+        /** False when EncryptedSharedPreferences fell back to plaintext. */
+        val storageEncrypted: Boolean = true,
+    ) : OnboardingState()
     /** Stable post-onboarding state; main UI should take over. */
     object Complete : OnboardingState()
     data class Error(val message: String) : OnboardingState()

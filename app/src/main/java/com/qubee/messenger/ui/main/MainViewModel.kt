@@ -108,26 +108,10 @@ class MainViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(error = null)
     }
 
-    /**
-     * Surface a `qubee://invite/...` link that the OS handed us through a
-     * deep link or Activity intent. Hands it to the invite UI via a
-     * navigation event so the user can review it before joining.
-     */
-    fun onIncomingInviteLink(link: String) {
-        viewModelScope.launch {
-            _navigationEvents.emit(NavigationEvent.OpenInvite(link))
-        }
-    }
-
-    /**
-     * Surface a `qubee://identity/...` share link from a peer. The
-     * verification + add-contact flow is handled by the contacts feature.
-     */
-    fun onIncomingIdentityLink(link: String) {
-        viewModelScope.launch {
-            _navigationEvents.emit(NavigationEvent.OpenAddContact(link))
-        }
-    }
+    // Deep-link routing for `qubee://invite/...` and `qubee://identity/...`
+    // is handled exclusively by the NavController via the <deepLink>
+    // entries in nav_graph.xml — see MainActivity.onNewIntent. That keeps
+    // there a single source of truth for deep-link → destination mapping.
 
     data class MainUiState(
         val isLoading: Boolean = false,
@@ -139,8 +123,6 @@ class MainViewModel @Inject constructor(
         data class OpenChat(val contactId: String) : NavigationEvent()
         object OpenSettings : NavigationEvent()
         object OpenContactSelection : NavigationEvent()
-        data class OpenInvite(val link: String) : NavigationEvent()
-        data class OpenAddContact(val link: String) : NavigationEvent()
     }
 }
 

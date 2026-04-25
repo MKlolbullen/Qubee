@@ -51,6 +51,7 @@ fun OnboardingScreen(
         when (val s = state) {
             is OnboardingState.Success -> SuccessView(
                 bundle = s.bundle,
+                storageEncrypted = s.storageEncrypted,
                 onDone = {
                     viewModel.acknowledge()
                     onOnboardingComplete()
@@ -102,7 +103,11 @@ fun OnboardingScreen(
 }
 
 @Composable
-private fun SuccessView(bundle: IdentityBundle, onDone: () -> Unit) {
+private fun SuccessView(
+    bundle: IdentityBundle,
+    storageEncrypted: Boolean,
+    onDone: () -> Unit,
+) {
     val context = LocalContext.current
     val link = bundle.shareLink
     val bitmap = remember(link) { link?.let { QrUtils.encodeAsBitmap(it) } }
@@ -111,6 +116,16 @@ private fun SuccessView(bundle: IdentityBundle, onDone: () -> Unit) {
     Spacer(Modifier.height(4.dp))
     Text(bundle.displayName, style = MaterialTheme.typography.titleMedium)
     Text("Fingerprint: ${bundle.fingerprint}", style = MaterialTheme.typography.bodySmall)
+
+    if (!storageEncrypted) {
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "⚠ Encrypted storage was unavailable. Identity metadata is stored " +
+                "in plaintext — re-onboard once the device Keystore recovers.",
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
 
     Spacer(Modifier.height(16.dp))
 

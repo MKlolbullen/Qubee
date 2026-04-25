@@ -1,6 +1,7 @@
 package com.qubee.messenger.data.repository
 
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.groups.BuildInviteResponse
 import com.qubee.messenger.groups.GroupInvite
 import com.qubee.messenger.groups.GroupInviteRequest
 import com.qubee.messenger.groups.QUBEE_MAX_GROUP_MEMBERS
@@ -30,9 +31,8 @@ class GroupRepository @Inject constructor(
      * paste into another messenger / SMS.
      */
     suspend fun buildInviteLink(request: GroupInviteRequest): String? = withContext(Dispatchers.IO) {
-        qubeeManager.buildInviteLink(request.toJson())?.let { json ->
-            extractField(json, "link")
-        }
+        val json = qubeeManager.buildInviteLink(request.toJson())
+        BuildInviteResponse.fromJson(json)?.link
     }
 
     /**
@@ -42,21 +42,5 @@ class GroupRepository @Inject constructor(
     suspend fun parseInviteLink(link: String): GroupInvite? = withContext(Dispatchers.IO) {
         val json = qubeeManager.parseInviteLink(link) ?: return@withContext null
         GroupInvite.fromJson(json)
-    }
-
-    private fun extractField(json: String, field: String): String? {
-        // The Rust JNI returns small JSON blobs; pulling a single field
-        // with Gson would be overkill, so we do it by-hand to avoid a
-        // dependency on a heavier model class.
-        val key = "\"$field\""
-        val keyIdx = json.indexOf(key)
-        if (keyIdx < 0) return null
-        val colon = json.indexOf(':', keyIdx + key.length)
-        if (colon < 0) return null
-        val firstQuote = json.indexOf('"', colon + 1)
-        if (firstQuote < 0) return null
-        val secondQuote = json.indexOf('"', firstQuote + 1)
-        if (secondQuote < 0) return null
-        return json.substring(firstQuote + 1, secondQuote)
     }
 }

@@ -55,3 +55,25 @@ data class GroupInviteRequest(
 ) {
     fun toJson(): String = Gson().toJson(this)
 }
+
+/**
+ * Response shape returned from `nativeBuildInviteLink`. Mirrors the JSON
+ * built in `jni_api.rs::Java_..._nativeBuildInviteLink`.
+ */
+data class BuildInviteResponse(
+    @SerializedName("link") val link: String,
+    @SerializedName("max_members") val maxMembers: Int = QUBEE_MAX_GROUP_MEMBERS,
+) {
+    companion object {
+        private val gson = Gson()
+
+        fun fromJson(json: String?): BuildInviteResponse? {
+            if (json.isNullOrBlank()) return null
+            return try {
+                gson.fromJson(json, BuildInviteResponse::class.java)
+            } catch (e: JsonSyntaxException) {
+                null
+            }
+        }
+    }
+}

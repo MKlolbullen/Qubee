@@ -53,18 +53,15 @@
         android:name="com.qubee.messenger.ui.contacts.ContactSelectionFragment"
         android:label="Choose contact" />
 
-    <!-- Group invite / scan flow. Optionally pre-populated with a deep
-         link via the `inviteLink` argument (set by MainActivity when
-         the user opens a qubee://invite/... URI). -->
+    <!-- Group invite / scan flow. The {token} placeholder lets Navigation
+         match the full `qubee://invite/<token>` URI; the fragment reads
+         the original Intent (and thus the full link) via
+         `NavController.KEY_DEEP_LINK_INTENT` rather than relying on an
+         out-of-band activity-side handler. -->
     <fragment
         android:id="@+id/groupInviteFragment"
         android:name="com.qubee.messenger.ui.groups.GroupInviteFragment"
         android:label="Group invite">
-        <argument
-            android:name="inviteLink"
-            app:argType="string"
-            app:nullable="true"
-            android:defaultValue="@null" />
         <deepLink app:uri="qubee://invite/{token}" />
     </fragment>
 
@@ -73,11 +70,6 @@
         android:id="@+id/addContactFragment"
         android:name="com.qubee.messenger.ui.contacts.AddContactFragment"
         android:label="Add contact">
-        <argument
-            android:name="identityLink"
-            app:argType="string"
-            app:nullable="true"
-            android:defaultValue="@null" />
         <deepLink app:uri="qubee://identity/{token}" />
     </fragment>
 

@@ -10,14 +10,20 @@ pub mod ephemeral_keys;
 pub mod sas;
 pub mod oob_secrets;
 
-// Identity, groups, calling, networking, storage, security
+// Identity, groups, networking, storage, security
 pub mod identity;
 pub mod groups;
 pub mod onboarding;
-pub mod calling;
 pub mod network;
 pub mod storage;
 pub mod security;
+
+// WebRTC-backed calling. Behind a feature flag because the in-tree
+// implementation hasn't been ported to webrtc 0.14 yet — see
+// `src/calling/mod.rs` for the audit notes. `cargo build --features
+// calling` is the only way to even attempt it.
+#[cfg(feature = "calling")]
+pub mod calling;
 
 // JNI Bridge (Only compile for Android targets)
 #[cfg(target_os = "android")]

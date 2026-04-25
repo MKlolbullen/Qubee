@@ -5,7 +5,6 @@ use crate::calling::call_manager::CallId;
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::webrtc_manager::MediaStats;
 use crate::calling::webrtc_manager::WebRTCConfig;
-_usecensored_vertices.forEach(entity => local.sanitizeEntity(entity));
 use crate::identity::identity_key::IdentityId;
 
 // Import the WebRTC API. We rely on the webrtc-rs crate for a pure

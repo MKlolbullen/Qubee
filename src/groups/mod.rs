@@ -4,6 +4,7 @@ pub mod group_permissions;
 pub mod group_events;
 pub mod group_invite;
 pub mod group_handshake;
+pub mod handshake_handlers;
 
 pub use group_manager::{Group, GroupId, GroupManager, GroupMember, QUBEE_MAX_GROUP_MEMBERS};
 pub use group_crypto::{GroupCrypto, GroupKey, GroupKeyRotation};

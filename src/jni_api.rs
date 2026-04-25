@@ -16,21 +16,18 @@ use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
-use crate::groups::group_manager::{
-    GroupId, GroupInvitation, GroupManager, GroupMember, MemberStatus, QUBEE_MAX_GROUP_MEMBERS,
-};
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_join_accepted, sign_join_rejected, sign_request_join,
-    verify_join_accepted, verify_request_join, GroupHandshake, GroupMemberSummary,
-    JoinAcceptedBody, JoinRejectedBody, RequestJoinBody, WrappedGroupKey,
+    generate_ephemeral_kyber, sign_request_join, GroupHandshake, RequestJoinBody,
 };
-use crate::groups::group_manager::{GroupSettings, GroupType};
-use zeroize::Zeroize;
-use crate::groups::group_permissions::Role;
-use crate::storage::secure_keystore::{
-    KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
+use crate::groups::group_manager::{
+    GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
+use crate::groups::handshake_handlers::{
+    process_join_accepted, process_request_join, HandshakeOutcome,
+};
+use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use std::collections::HashMap;
+use zeroize::Zeroize;
 
 const ACTIVE_IDENTITY_KEY: &str = "active_identity";
 
@@ -651,12 +648,7 @@ fn handle_inbound_handshake(frame: GroupHandshake) {
 fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
     match frame {
         GroupHandshake::RequestJoin { body, signature } => {
-            // Joiner's signature must be valid for the body's stated
-            // joiner_public_key — otherwise the request is forged.
-            if !verify_request_join(&body, &signature)? {
-                return Err(anyhow::anyhow!("RequestJoin signature failed"));
-            }
-            on_request_join(body)?;
+            on_request_join(body, signature)?;
         }
         GroupHandshake::JoinAccepted { body, signature } => {
             on_join_accepted(body, signature)?;
@@ -680,216 +672,85 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn on_request_join(body: RequestJoinBody) -> anyhow::Result<()> {
+fn on_request_join(
+    body: RequestJoinBody,
+    signature: crate::identity::identity_key::HybridSignature,
+) -> anyhow::Result<()> {
     // We only act on RequestJoins for invitations *we* minted.
     let identity = active_identity()?
         .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
 
-    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-    let gm = gm_guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-
-    let invitation = match gm.get_invitation(&body.invitation_code)? {
-        Some(i) => i,
-        None => {
-            // Not for us — either someone else's invite or we already
-            // garbage-collected ours. Silent no-op.
-            return Ok(());
-        }
+    let outcome = {
+        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+        let gm = gm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+        process_request_join(gm, identity.as_ref(), &body, &signature)?
     };
-    if invitation.group_id != body.group_id {
-        return Err(anyhow::anyhow!("invitation/group mismatch"));
-    }
-    if let Some(exp) = invitation.expires_at {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        if now > exp {
-            send_join_rejected(&identity, &body, "invitation expired")?;
-            return Ok(());
-        }
-    }
-    if let Some(max) = invitation.max_uses {
-        if invitation.current_uses >= max {
-            send_join_rejected(&identity, &body, "invitation exhausted")?;
-            return Ok(());
-        }
-    }
 
-    // Enrol the joiner. add_member enforces the 16-member cap and
-    // double-add protection.
-    let inviter_id = invitation.inviter_id;
-    if let Err(e) = gm.add_member(
-        body.group_id,
-        inviter_id,
-        body.joiner_public_key.identity_id,
-        body.joiner_public_key.clone(),
-        body.joiner_display_name.clone(),
-        Role::Member,
-    ) {
-        // If add_member rejected (cap reached, already a member, etc.)
-        // tell the joiner so they don't sit waiting forever.
-        let reason = format!("{e}");
-        drop(gm_guard);
-        send_join_rejected(&identity, &body, &reason)?;
-        return Ok(());
-    }
-    let _ = gm.mark_invitation_used(&body.invitation_code);
-
-    // Build a member snapshot for the joiner's bootstrap and read the
-    // current group key for KEM-wrapped transport.
-    let group = gm
-        .get_group(&body.group_id)
-        .ok_or_else(|| anyhow::anyhow!("group vanished after add_member"))?;
-    let members: Vec<GroupMemberSummary> = group
-        .members
-        .values()
-        .map(|m| GroupMemberSummary {
-            identity_id: m.identity_id,
-            identity_key: m.identity_key.clone(),
-            display_name: m.display_name.clone(),
-            role: m.role.clone(),
-            joined_at: m.joined_at,
-        })
-        .collect();
-    let group_name = group.name.clone();
-
-    // The group key must already exist (created during create_group);
-    // ensure_group_key is a safety net for older groups that pre-date
-    // explicit key generation.
-    gm.ensure_group_key(body.group_id)?;
-    let mut group_key = gm
-        .export_group_key(&body.group_id)
-        .ok_or_else(|| anyhow::anyhow!("group key missing after ensure"))?;
-    drop(gm_guard);
-
-    let wrapped_group_key = WrappedGroupKey::wrap(&group_key, &body.joiner_kyber_pub)?;
-    // Wipe the plaintext copy now that it's wrapped.
-    group_key.zeroize();
-
-    let accepted_body = JoinAcceptedBody {
-        group_id: body.group_id,
-        invitation_code: body.invitation_code.clone(),
-        group_name,
-        members,
-        joiner_id: body.joiner_public_key.identity_id,
-        wrapped_group_key,
-    };
-    let signed = sign_join_accepted(identity.as_ref(), accepted_body)?;
-    let wire = signed.to_wire()?;
     let topic = group_topic(&hex::encode(body.group_id.as_ref()));
-    let _ = publish_to_topic(topic, wire);
-    Ok(())
-}
-
-fn send_join_rejected(
-    identity: &Arc<IdentityKeyPair>,
-    request: &RequestJoinBody,
-    reason: &str,
-) -> anyhow::Result<()> {
-    let body = JoinRejectedBody {
-        group_id: request.group_id,
-        invitation_code: request.invitation_code.clone(),
-        joiner_id: request.joiner_public_key.identity_id,
-        reason: reason.to_string(),
-    };
-    let signed = sign_join_rejected(identity.as_ref(), body)?;
-    let wire = signed.to_wire()?;
-    let topic = group_topic(&hex::encode(body.group_id.as_ref()));
-    let _ = publish_to_topic(topic, wire);
+    match outcome {
+        HandshakeOutcome::Accept { body: accepted, signature: accepted_sig } => {
+            let signed = GroupHandshake::JoinAccepted {
+                body: accepted,
+                signature: accepted_sig,
+            };
+            let _ = publish_to_topic(topic, signed.to_wire()?);
+        }
+        HandshakeOutcome::Reject { body: rejected, signature: rejected_sig } => {
+            let signed = GroupHandshake::JoinRejected {
+                body: rejected,
+                signature: rejected_sig,
+            };
+            let _ = publish_to_topic(topic, signed.to_wire()?);
+        }
+        HandshakeOutcome::UnknownInvitation => {
+            // The RequestJoin doesn't match any invitation we minted.
+            // Could be a different inviter's flow on the same topic —
+            // silent no-op is the right behaviour.
+        }
+    }
     Ok(())
 }
 
 fn on_join_accepted(
-    body: JoinAcceptedBody,
+    body: crate::groups::group_handshake::JoinAcceptedBody,
     signature: crate::identity::identity_key::HybridSignature,
 ) -> anyhow::Result<()> {
     let identity = active_identity()?
         .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
-    // We only care about acceptances addressed to us.
     if body.joiner_id != identity.identity_id() {
         return Ok(());
     }
 
-    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-    let gm = gm_guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+    // Find the pending receipt to learn the expected inviter id.
+    let expected_inviter_id = {
+        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+        let gm = gm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+        let accepted = gm.list_accepted_external_invites().unwrap_or_default();
+        accepted
+            .into_iter()
+            .find(|e| e.group_id == body.group_id)
+            .ok_or_else(|| anyhow::anyhow!("no pending receipt for group"))?
+            .inviter_id
+    };
 
-    // The receipt we wrote when the user scanned the QR remembers who
-    // the inviter was; use that as the trust anchor for the signature.
-    let accepted = gm.list_accepted_external_invites().unwrap_or_default();
-    let receipt = accepted
-        .into_iter()
-        .find(|e| e.group_id == body.group_id)
-        .ok_or_else(|| anyhow::anyhow!("no pending receipt for group"))?;
-
-    // Locate the inviter's IdentityKey from the snapshot's member list.
-    // Trust comes from "we accepted an invite from this inviter id"
-    // → "this acceptance was signed by an IdentityKey with that id".
-    let inviter_key = body
-        .members
-        .iter()
-        .find(|m| m.identity_id == receipt.inviter_id)
-        .map(|m| m.identity_key.clone())
-        .ok_or_else(|| anyhow::anyhow!("inviter not in member snapshot"))?;
-
-    if !verify_join_accepted(&body, &signature, &inviter_key)? {
-        return Err(anyhow::anyhow!("JoinAccepted signature failed"));
-    }
-
-    // Drop the GroupManager lock while we work with the Kyber secret —
-    // KEM ops shouldn't hold the lock and the secret cache is its own
-    // mutex. We re-acquire below to install the unwrapped key.
-    drop(gm_guard);
-
-    // Recover the ephemeral Kyber secret we cached when we sent the
-    // matching RequestJoin. If it isn't in the cache the JoinAccepted
-    // arrived for a request we don't remember (process restart, manual
-    // wipe, …) — abort rather than guess.
+    // Pull the cached Kyber secret out of the global; the handler
+    // function consumes it once, then we wipe.
     let mut kyber_secret = take_pending_kyber_secret(&body.invitation_code)
         .ok_or_else(|| anyhow::anyhow!("no pending Kyber secret for invitation"))?;
-    let unwrap_result = body.wrapped_group_key.unwrap(&kyber_secret);
+
+    let result = {
+        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+        let gm = gm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+        process_join_accepted(gm, expected_inviter_id, &body, &signature, &kyber_secret)
+    };
     kyber_secret.zeroize();
-    let mut group_key = unwrap_result?;
-
-    // Reconstruct GroupMember records from the wire summary. Unknown
-    // moderation state defaults to active, since the inviter's snapshot
-    // is the canonical view at handshake time.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    let mut members = HashMap::new();
-    for m in &body.members {
-        members.insert(
-            m.identity_id,
-            GroupMember {
-                identity_id: m.identity_id,
-                identity_key: m.identity_key.clone(),
-                display_name: m.display_name.clone(),
-                role: m.role.clone(),
-                joined_at: m.joined_at,
-                last_seen: now,
-                invited_by: Some(receipt.inviter_id),
-                member_status: MemberStatus::Active,
-                custom_permissions: None,
-            },
-        );
-    }
-
-    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-    let gm = gm_guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-    gm.confirm_external_invite_acceptance(
-        body.group_id,
-        body.group_name.clone(),
-        members,
-        &group_key,
-    )?;
-    group_key.zeroize();
-    Ok(())
+    result
 }
 
 /// List all invites the local user has accepted but not yet been

@@ -51,6 +51,7 @@ fun GroupInviteScreen(
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
     var pastedLink by remember { mutableStateOf("") }
+    var newGroupName by remember { mutableStateOf("") }
 
     val scanLauncher = rememberLauncherForActivityResult(QrScannerActivity.contract()) { result ->
         result.contents?.let { scanned ->
@@ -80,6 +81,24 @@ fun GroupInviteScreen(
 
         if (state.isWorking) {
             CircularProgressIndicator()
+            Spacer(Modifier.height(16.dp))
+        }
+
+        // Create-new-group section. Hidden once the user has just minted
+        // an invite, since the QR + scan flows below take over.
+        if (state.generatedLink == null && state.scannedInvite == null) {
+            OutlinedTextField(
+                value = newGroupName,
+                onValueChange = { newGroupName = it },
+                label = { Text("Name a new group") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = { viewModel.createGroupAndInvite(newGroupName) },
+                enabled = newGroupName.isNotBlank() && !state.isWorking,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Create group + invite") }
             Spacer(Modifier.height(16.dp))
         }
 

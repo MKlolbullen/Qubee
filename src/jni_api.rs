@@ -20,10 +20,12 @@ use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupMember, MemberStatus, QUBEE_MAX_GROUP_MEMBERS,
 };
 use crate::groups::group_handshake::{
-    sign_join_accepted, sign_join_rejected, sign_request_join, verify_join_accepted,
-    verify_request_join, GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
-    RequestJoinBody,
+    generate_ephemeral_kyber, sign_join_accepted, sign_join_rejected, sign_request_join,
+    verify_join_accepted, verify_request_join, GroupHandshake, GroupMemberSummary,
+    JoinAcceptedBody, JoinRejectedBody, RequestJoinBody, WrappedGroupKey,
 };
+use crate::groups::group_manager::{GroupSettings, GroupType};
+use zeroize::Zeroize;
 use crate::groups::group_permissions::Role;
 use crate::storage::secure_keystore::{
     KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
@@ -65,6 +67,11 @@ lazy_static! {
     // keep group state separate from the identity record so the two
     // can be reset independently (e.g. "wipe my groups but keep me").
     static ref GROUP_MANAGER: Mutex<Option<GroupManager>> = Mutex::new(None);
+
+    // Ephemeral Kyber-768 secrets the joiner generated when sending a
+    // RequestJoin, indexed by invitation_code. Lives only in process
+    // memory and gets zeroised + dropped on JoinAccepted/JoinRejected.
+    static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, Vec<u8>>> = Mutex::new(HashMap::new());
 }
 
 fn catch_unwind_result<F, R>(f: F) -> R
@@ -319,6 +326,121 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
     }
 }
 
+/// Create a brand new group owned by the active local identity.
+/// Returns JSON `{group_id_hex, name, owner_id_hex}`. The group's
+/// symmetric encryption key is generated and stored alongside the
+/// group record so subsequent invitations can KEM-wrap it for joiners.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateGroup(
+    env: JNIEnv,
+    _class: JClass,
+    name: JString,
+    description: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let name: String = match env.get_string(name) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let description: String = match env.get_string(description) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required before creating a group"))?;
+            let owner_key = identity.public_key();
+            let owner_id = identity.identity_id();
+
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let group_id = gm.create_group(
+                owner_id,
+                owner_key,
+                name.clone(),
+                description,
+                GroupType::Private,
+                GroupSettings::default(),
+            )?;
+            // create_group already mints a key inside group_crypto, but
+            // be explicit so future refactors can't accidentally regress.
+            gm.ensure_group_key(group_id)?;
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "name": name,
+                "owner_id_hex": hex::encode(owner_id.as_ref()),
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Mint a fresh invitation for the named group and return both the
+/// `qubee://invite/<token>` deep link and the underlying invitation
+/// metadata. The invitation record lands in the encrypted group
+/// keystore so the inviter can match incoming RequestJoin frames
+/// against it later.
+///
+/// `expires_at_seconds < 0` means "no expiry"; same convention for
+/// `max_uses`.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateGroupInvite(
+    env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    expires_at_seconds: jni::sys::jlong,
+    max_uses: jni::sys::jint,
+) -> jstring {
+    catch_unwind_result(|| {
+        let group_id_hex: String = match env.get_string(group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required before issuing an invite"))?;
+            let inviter_id = identity.identity_id();
+
+            let group_id_bytes = parse_hex32(Some(group_id_hex.as_str()))?;
+            let group_id = GroupId::from_bytes(group_id_bytes);
+
+            let expires_at = if expires_at_seconds < 0 {
+                None
+            } else {
+                Some(expires_at_seconds as u64)
+            };
+            let max_uses = if max_uses < 0 { None } else { Some(max_uses as u32) };
+
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let invitation = gm.create_invitation(group_id, inviter_id, expires_at, max_uses)?;
+            let payload = InvitePayload::from_invitation(&invitation);
+            let link = payload.to_invite_link()?;
+
+            Ok(json!({
+                "link": link,
+                "group_id_hex": hex::encode(invitation.group_id.as_ref()),
+                "group_name": invitation.group_name,
+                "inviter_id_hex": hex::encode(invitation.inviter_id.as_ref()),
+                "inviter_name": invitation.inviter_name,
+                "invitation_code": invitation.invitation_code,
+                "expires_at": invitation.expires_at,
+                "max_members": payload.max_members,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
 /// Record that the local user accepted a `qubee://invite/...` link
 /// and (best-effort) publish a signed `RequestJoin` over the
 /// gossipsub global topic so the inviter's device can enrol us.
@@ -383,21 +505,43 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
 /// Build, sign, and publish a `RequestJoin` for the given invite payload.
 /// Returns `Ok(true)` on a successful enqueue, `Ok(false)` if the P2P
 /// commander isn't up yet (caller can retry later).
+///
+/// Generates a fresh ephemeral Kyber-768 keypair for this handshake and
+/// stashes the secret in [`PENDING_JOIN_KEMS`] keyed by `invitation_code`
+/// so we can decapsulate the inviter's wrapped group key on reply.
 fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
     let identity = match active_identity()? {
         Some(id) => id,
         None => return Err(anyhow::anyhow!("no active identity to sign RequestJoin")),
     };
 
+    let (kyber_pub, kyber_secret) = generate_ephemeral_kyber();
+    {
+        let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+        // If a previous attempt for this invitation_code is still
+        // pending its reply, drop it — the new attempt invalidates the
+        // old ephemeral.
+        if let Some(mut prev) = pending.insert(payload.invitation_code.clone(), kyber_secret) {
+            prev.zeroize();
+        }
+    }
+
     let body = RequestJoinBody {
         group_id: payload.group_id,
         invitation_code: payload.invitation_code.clone(),
         joiner_public_key: identity.public_key(),
         joiner_display_name: active_display_name().unwrap_or_default(),
+        joiner_kyber_pub: kyber_pub,
     };
     let signed = sign_request_join(identity.as_ref(), body)?;
     let wire = signed.to_wire()?;
     Ok(send_p2p_broadcast(wire))
+}
+
+/// Pop the cached Kyber secret for an invitation, returning ownership
+/// to the caller. The caller is responsible for zeroising once done.
+fn take_pending_kyber_secret(invitation_code: &str) -> Option<Vec<u8>> {
+    PENDING_JOIN_KEMS.lock().unwrap().remove(invitation_code)
 }
 
 /// Try to publish bytes on the gossipsub global topic. Returns true on
@@ -463,6 +607,12 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             // Drop the pending receipt; we'll rely on the inviter
             // signature check before propagating UX, but for now just
             // log so the joiner knows their join didn't land.
+            // Also wipe the cached Kyber secret — without a matching
+            // acceptance there's nothing to unwrap, and leaving it
+            // around just gives attackers more time to grab it.
+            if let Some(mut secret) = take_pending_kyber_secret(&body.invitation_code) {
+                secret.zeroize();
+            }
             eprintln!(
                 "Rust: invite to group {} rejected: {}",
                 body.group_id, body.reason
@@ -529,7 +679,8 @@ fn on_request_join(body: RequestJoinBody) -> anyhow::Result<()> {
     }
     let _ = gm.mark_invitation_used(&body.invitation_code);
 
-    // Build a member snapshot for the joiner's bootstrap.
+    // Build a member snapshot for the joiner's bootstrap and read the
+    // current group key for KEM-wrapped transport.
     let group = gm
         .get_group(&body.group_id)
         .ok_or_else(|| anyhow::anyhow!("group vanished after add_member"))?;
@@ -545,7 +696,19 @@ fn on_request_join(body: RequestJoinBody) -> anyhow::Result<()> {
         })
         .collect();
     let group_name = group.name.clone();
+
+    // The group key must already exist (created during create_group);
+    // ensure_group_key is a safety net for older groups that pre-date
+    // explicit key generation.
+    gm.ensure_group_key(body.group_id)?;
+    let mut group_key = gm
+        .export_group_key(&body.group_id)
+        .ok_or_else(|| anyhow::anyhow!("group key missing after ensure"))?;
     drop(gm_guard);
+
+    let wrapped_group_key = WrappedGroupKey::wrap(&group_key, &body.joiner_kyber_pub)?;
+    // Wipe the plaintext copy now that it's wrapped.
+    group_key.zeroize();
 
     let accepted_body = JoinAcceptedBody {
         group_id: body.group_id,
@@ -553,6 +716,7 @@ fn on_request_join(body: RequestJoinBody) -> anyhow::Result<()> {
         group_name,
         members,
         joiner_id: body.joiner_public_key.identity_id,
+        wrapped_group_key,
     };
     let signed = sign_join_accepted(identity.as_ref(), accepted_body)?;
     let wire = signed.to_wire()?;
@@ -615,6 +779,21 @@ fn on_join_accepted(
         return Err(anyhow::anyhow!("JoinAccepted signature failed"));
     }
 
+    // Drop the GroupManager lock while we work with the Kyber secret —
+    // KEM ops shouldn't hold the lock and the secret cache is its own
+    // mutex. We re-acquire below to install the unwrapped key.
+    drop(gm_guard);
+
+    // Recover the ephemeral Kyber secret we cached when we sent the
+    // matching RequestJoin. If it isn't in the cache the JoinAccepted
+    // arrived for a request we don't remember (process restart, manual
+    // wipe, …) — abort rather than guess.
+    let mut kyber_secret = take_pending_kyber_secret(&body.invitation_code)
+        .ok_or_else(|| anyhow::anyhow!("no pending Kyber secret for invitation"))?;
+    let unwrap_result = body.wrapped_group_key.unwrap(&kyber_secret);
+    kyber_secret.zeroize();
+    let mut group_key = unwrap_result?;
+
     // Reconstruct GroupMember records from the wire summary. Unknown
     // moderation state defaults to active, since the inviter's snapshot
     // is the canonical view at handshake time.
@@ -639,7 +818,17 @@ fn on_join_accepted(
         );
     }
 
-    gm.confirm_external_invite_acceptance(body.group_id, body.group_name.clone(), members)?;
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = gm_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+    gm.confirm_external_invite_acceptance(
+        body.group_id,
+        body.group_name.clone(),
+        members,
+        &group_key,
+    )?;
+    group_key.zeroize();
     Ok(())
 }
 

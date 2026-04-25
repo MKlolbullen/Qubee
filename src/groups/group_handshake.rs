@@ -12,14 +12,26 @@
 //! This module owns just the wire format + signing contract. The
 //! integration glue lives in `jni_api.rs`.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use hkdf::Hkdf;
+use pqcrypto_kyber::kyber768::{
+    self, decapsulate as kyber_decapsulate, encapsulate as kyber_encapsulate, keypair as kyber_keypair,
+    Ciphertext as KyberCiphertext, PublicKey as KyberPublicKey, SecretKey as KyberSecretKey,
+};
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::groups::group_manager::GroupId;
 use crate::groups::group_permissions::Role;
 use crate::identity::identity_key::{
     HybridSignature, IdentityId, IdentityKey, IdentityKeyPair,
 };
+use crate::security::secure_rng;
 
 /// Magic prefix on every handshake frame so the gossipsub dispatch
 /// loop can route handshake traffic to the Rust-side handler instead
@@ -46,12 +58,104 @@ pub struct GroupMemberSummary {
 /// Body of a `RequestJoin` payload that gets bundled into the wire
 /// envelope and signed end-to-end. Pulling it out of the enum lets us
 /// hash the canonical bytes deterministically.
+///
+/// `joiner_kyber_pub` carries an *ephemeral* Kyber-768 public key the
+/// joiner generates fresh for this handshake; the inviter encapsulates
+/// the group key under it inside [`JoinAcceptedBody::wrapped_group_key`].
+/// The matching ephemeral secret is held in process memory by the
+/// joiner until the inviter's reply lands, then dropped — that gives
+/// us forward secrecy on the group-key transport even if the joiner's
+/// long-term identity is later compromised.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestJoinBody {
     pub group_id: GroupId,
     pub invitation_code: String,
     pub joiner_public_key: IdentityKey,
     pub joiner_display_name: String,
+    pub joiner_kyber_pub: Vec<u8>,
+}
+
+/// Group symmetric key wrapped to a single recipient via Kyber-768
+/// KEM + ChaCha20-Poly1305. The KEM produces a shared secret that we
+/// HKDF-derive a wrap key from; the wrap key encrypts the actual
+/// 32-byte group key. This split lets us rotate the group key without
+/// re-doing the KEM per recipient and keeps the KEM secret out of any
+/// per-message calculation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WrappedGroupKey {
+    /// Output of `pqcrypto_kyber::kyber768::encapsulate(joiner_pub)`.
+    pub kem_ciphertext: Vec<u8>,
+    /// AEAD nonce for the wrapped key.
+    pub nonce: [u8; 12],
+    /// `ChaCha20Poly1305(key=HKDF(kem_ss, "qubee_group_wrap_v1"), nonce)`
+    /// over the 32-byte plaintext group key.
+    pub wrapped_key: Vec<u8>,
+}
+
+const GROUP_KEY_WRAP_INFO: &[u8] = b"qubee_group_wrap_v1";
+
+impl WrappedGroupKey {
+    /// Wrap a 32-byte group key for a single recipient using their
+    /// ephemeral Kyber-768 public key.
+    pub fn wrap(group_key: &[u8; 32], joiner_kyber_pub: &[u8]) -> Result<Self> {
+        let pk = KyberPublicKey::from_bytes(joiner_kyber_pub)
+            .map_err(|e| anyhow!("invalid joiner Kyber pubkey: {e}"))?;
+        let (shared_secret, ciphertext) = kyber_encapsulate(&pk);
+
+        let wrap_key = derive_wrap_key(shared_secret.as_bytes())?;
+        let cipher = ChaCha20Poly1305::new((&wrap_key).into());
+        let nonce_bytes = secure_rng::random::array::<12>()?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let wrapped_key = cipher
+            .encrypt(nonce, group_key.as_ref())
+            .map_err(|e| anyhow!("group key wrap failed: {e}"))?;
+
+        Ok(WrappedGroupKey {
+            kem_ciphertext: ciphertext.as_bytes().to_vec(),
+            nonce: nonce_bytes,
+            wrapped_key,
+        })
+    }
+
+    /// Inverse of [`wrap`]. The Kyber secret is consumed (and zeroised
+    /// when the slice is dropped by the caller) so accidental reuse is
+    /// harder.
+    pub fn unwrap(&self, joiner_kyber_secret: &[u8]) -> Result<[u8; 32]> {
+        let sk = KyberSecretKey::from_bytes(joiner_kyber_secret)
+            .map_err(|e| anyhow!("invalid joiner Kyber secret: {e}"))?;
+        let ct = KyberCiphertext::from_bytes(&self.kem_ciphertext)
+            .map_err(|e| anyhow!("invalid KEM ciphertext: {e}"))?;
+        let shared_secret = kyber_decapsulate(&ct, &sk);
+
+        let wrap_key = derive_wrap_key(shared_secret.as_bytes())?;
+        let cipher = ChaCha20Poly1305::new((&wrap_key).into());
+        let nonce = Nonce::from_slice(&self.nonce);
+        let plaintext = cipher
+            .decrypt(nonce, self.wrapped_key.as_ref())
+            .map_err(|e| anyhow!("group key unwrap failed: {e}"))?;
+        if plaintext.len() != 32 {
+            return Err(anyhow!("unwrapped group key has wrong length"));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&plaintext);
+        Ok(out)
+    }
+}
+
+fn derive_wrap_key(shared_secret: &[u8]) -> Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut out = [0u8; 32];
+    hk.expand(GROUP_KEY_WRAP_INFO, &mut out)
+        .map_err(|e| anyhow!("HKDF expand: {e}"))?;
+    Ok(out)
+}
+
+/// Generate a fresh ephemeral Kyber-768 keypair for use in a single
+/// `RequestJoin` exchange. Returned as raw bytes so the caller can
+/// stash the secret in a transient cache.
+pub fn generate_ephemeral_kyber() -> (Vec<u8>, Vec<u8>) {
+    let (pk, sk) = kyber_keypair();
+    (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
 }
 
 /// Body of a `JoinAccepted` payload.
@@ -65,6 +169,9 @@ pub struct JoinAcceptedBody {
     /// Lets the joiner ignore acceptances meant for someone else and
     /// stops a third party from "echoing" a stale acceptance.
     pub joiner_id: IdentityId,
+    /// Group encryption key wrapped to the joiner's ephemeral Kyber-768
+    /// public key from the matching `RequestJoinBody`.
+    pub wrapped_group_key: WrappedGroupKey,
 }
 
 /// Body of a `JoinRejected` payload.
@@ -133,7 +240,7 @@ const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v1";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(128);
+    let mut out = Vec::with_capacity(2048);
     out.extend_from_slice(REQUEST_JOIN_TAG);
     out.push(0u8);
     out.extend_from_slice(body.group_id.as_ref());
@@ -143,11 +250,14 @@ pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     out.extend_from_slice(&bincode::serialize(&body.joiner_public_key)?);
     out.push(0u8);
     out.extend_from_slice(body.joiner_display_name.as_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&(body.joiner_kyber_pub.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body.joiner_kyber_pub);
     Ok(out)
 }
 
 pub fn canonical_join_accepted(body: &JoinAcceptedBody) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(256);
+    let mut out = Vec::with_capacity(2048);
     out.extend_from_slice(JOIN_ACCEPTED_TAG);
     out.push(0u8);
     out.extend_from_slice(body.group_id.as_ref());
@@ -164,6 +274,15 @@ pub fn canonical_join_accepted(body: &JoinAcceptedBody) -> Result<Vec<u8>> {
     for m in &body.members {
         out.extend_from_slice(&bincode::serialize(m)?);
     }
+    out.push(0u8);
+    // Authenticate the wrapped group key — without this an attacker
+    // could swap the KEM ciphertext for one wrapping a key they
+    // control, while the rest of the body verifies fine.
+    out.extend_from_slice(&(body.wrapped_group_key.kem_ciphertext.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body.wrapped_group_key.kem_ciphertext);
+    out.extend_from_slice(&body.wrapped_group_key.nonce);
+    out.extend_from_slice(&(body.wrapped_group_key.wrapped_key.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body.wrapped_group_key.wrapped_key);
     Ok(out)
 }
 
@@ -252,13 +371,32 @@ mod tests {
 
     fn fresh_request_join() -> (IdentityKeyPair, RequestJoinBody) {
         let kp = IdentityKeyPair::generate().unwrap();
+        let (kyber_pub, _kyber_secret) = generate_ephemeral_kyber();
         let body = RequestJoinBody {
             group_id: GroupId::from_bytes([9u8; 32]),
             invitation_code: "abc".to_string(),
             joiner_public_key: kp.public_key(),
             joiner_display_name: "Bob".to_string(),
+            joiner_kyber_pub: kyber_pub,
         };
         (kp, body)
+    }
+
+    #[test]
+    fn wrapped_group_key_round_trip() {
+        let (pk, sk) = generate_ephemeral_kyber();
+        let key = [42u8; 32];
+        let wrapped = WrappedGroupKey::wrap(&key, &pk).unwrap();
+        let unwrapped = wrapped.unwrap(&sk).unwrap();
+        assert_eq!(key, unwrapped);
+    }
+
+    #[test]
+    fn wrapped_group_key_rejects_wrong_secret() {
+        let (pk, _sk1) = generate_ephemeral_kyber();
+        let (_pk2, sk2) = generate_ephemeral_kyber();
+        let wrapped = WrappedGroupKey::wrap(&[7u8; 32], &pk).unwrap();
+        assert!(wrapped.unwrap(&sk2).is_err());
     }
 
     #[test]

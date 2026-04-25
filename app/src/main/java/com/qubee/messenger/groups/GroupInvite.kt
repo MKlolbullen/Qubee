@@ -91,6 +91,53 @@ data class BuildInviteResponse(
  * the inviter's reply will arrive asynchronously and confirm
  * membership.
  */
+/** Result of [com.qubee.messenger.data.repository.GroupRepository.createGroup]. */
+data class CreatedGroup(
+    @SerializedName("group_id_hex") val groupIdHex: String,
+    @SerializedName("name") val name: String,
+    @SerializedName("owner_id_hex") val ownerIdHex: String,
+) {
+    companion object {
+        private val gson = Gson()
+        fun fromJson(json: String?): CreatedGroup? {
+            if (json.isNullOrBlank()) return null
+            return try {
+                gson.fromJson(json, CreatedGroup::class.java)
+            } catch (e: JsonSyntaxException) {
+                null
+            }
+        }
+    }
+}
+
+/**
+ * Result of [com.qubee.messenger.data.repository.GroupRepository.createInvite].
+ * Carries both the QR-friendly deep link and the metadata the UI needs
+ * to render an invite preview.
+ */
+data class CreatedInvite(
+    @SerializedName("link") val link: String,
+    @SerializedName("group_id_hex") val groupIdHex: String,
+    @SerializedName("group_name") val groupName: String,
+    @SerializedName("inviter_id_hex") val inviterIdHex: String,
+    @SerializedName("inviter_name") val inviterName: String,
+    @SerializedName("invitation_code") val invitationCode: String,
+    @SerializedName("expires_at") val expiresAt: Long? = null,
+    @SerializedName("max_members") val maxMembers: Int = QUBEE_MAX_GROUP_MEMBERS,
+) {
+    companion object {
+        private val gson = Gson()
+        fun fromJson(json: String?): CreatedInvite? {
+            if (json.isNullOrBlank()) return null
+            return try {
+                gson.fromJson(json, CreatedInvite::class.java)
+            } catch (e: JsonSyntaxException) {
+                null
+            }
+        }
+    }
+}
+
 data class AcceptInviteResult(
     @SerializedName("group_id_hex") val groupIdHex: String,
     @SerializedName("group_name") val groupName: String,

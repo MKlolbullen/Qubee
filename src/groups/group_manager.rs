@@ -565,7 +565,8 @@ impl GroupManager {
     }
 
     /// Promote an outstanding `accepted_invite_*` receipt into a real
-    /// local `Group` record using a snapshot received over the wire.
+    /// local `Group` record using a snapshot received over the wire,
+    /// and install the negotiated 32-byte symmetric group key.
     /// The previous receipt is deleted so the UI can stop showing
     /// "waiting for handshake".
     pub fn confirm_external_invite_acceptance(
@@ -573,6 +574,7 @@ impl GroupManager {
         group_id: GroupId,
         group_name: String,
         members: HashMap<IdentityId, GroupMember>,
+        group_key: &[u8; 32],
     ) -> Result<()> {
         let receipt_key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
         let _ = self.keystore.delete_key(&receipt_key);
@@ -601,11 +603,31 @@ impl GroupManager {
         }
 
         self.groups.insert(group_id, group);
-        // Generate a placeholder symmetric key. Real shared-key transport
-        // belongs in the next round (group key agreement).
-        let _ = self.group_crypto.create_group_key(group_id);
+        // Install the negotiated group key. This replaces any previous
+        // placeholder so the joiner can immediately decrypt subsequent
+        // group messages. We copy the bytes into a Secret-wrapped
+        // owned array so the caller can zeroise their stack copy.
+        self.group_crypto.set_group_key(group_id, *group_key);
         self.store_group_securely(&group_id)?;
         Ok(())
+    }
+
+    /// Direct accessor for the group's symmetric encryption key.
+    /// Returns `None` if no key has been generated/installed yet.
+    /// Used by the handshake handler to wrap the key for new joiners.
+    pub fn export_group_key(&self, group_id: &GroupId) -> Option<[u8; 32]> {
+        self.group_crypto.export_group_key(group_id)
+    }
+
+    /// Ensure a freshly created group has a symmetric encryption key
+    /// installed. Idempotent — calling it on an already-keyed group
+    /// is a no-op so we can use it from the JNI on every `create_group`
+    /// without worrying about double generation.
+    pub fn ensure_group_key(&mut self, group_id: GroupId) -> Result<()> {
+        if self.group_crypto.export_group_key(&group_id).is_some() {
+            return Ok(());
+        }
+        self.group_crypto.create_group_key(group_id)
     }
 
     /// Record that the local user accepted an invite scanned from a

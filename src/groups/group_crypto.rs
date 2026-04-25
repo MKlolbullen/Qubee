@@ -95,6 +95,32 @@ impl GroupCrypto {
         })
     }
 
+    /// Install a group key received over the network (e.g. via the
+    /// invite handshake's KEM-wrapped key transport). Replaces any
+    /// existing key for the group.
+    pub fn set_group_key(&mut self, group_id: GroupId, key_bytes: [u8; 32]) {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.keys.insert(
+            group_id,
+            GroupKey {
+                key: Secret::new(key_bytes),
+                created_at,
+            },
+        );
+    }
+
+    /// Read a copy of the raw group-key bytes for transport to a new
+    /// member. Callers should immediately KEM-wrap the result and not
+    /// hold onto the plaintext.
+    pub fn export_group_key(&self, group_id: &GroupId) -> Option<[u8; 32]> {
+        self.keys
+            .get(group_id)
+            .map(|k| *k.key.expose_secret())
+    }
+
     /// Retrieve the current key for a group, if any.
     pub fn get_group_key(&self, group_id: &GroupId) -> Option<&GroupKey> {
         self.keys.get(group_id)

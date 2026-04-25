@@ -116,6 +116,35 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Create a brand new group owned by the active local identity.
+     * Returns the JSON `{group_id_hex, name, owner_id_hex}` produced
+     * by Rust, or null if onboarding hasn't happened yet.
+     */
+    suspend fun createGroup(name: String, description: String = ""): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            nativeCreateGroup(name, description)
+        }
+
+    /**
+     * Mint a new invitation for a group we own. Returns the same JSON
+     * shape `nativeBuildInviteLink` produces, plus the underlying
+     * invitation_code so the UI can show "X joins remaining".
+     *
+     * `expiresAtSeconds` and `maxUses` accept negative values to mean
+     * "no limit"; the JNI uses sentinel-negative values to keep the
+     * C ABI simple.
+     */
+    suspend fun createGroupInvite(
+        groupIdHex: String,
+        expiresAtSeconds: Long = -1L,
+        maxUses: Int = -1,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeCreateGroupInvite(groupIdHex, expiresAtSeconds, maxUses)
+    }
+
+    /**
      * Parse a `qubee://invite/<token>` deep link and return its contents
      * as JSON. Returns null if the link is malformed.
      */
@@ -157,6 +186,14 @@ class QubeeManager @Inject constructor(
     private external fun nativeParseInviteLink(link: String): String?
     private external fun nativeAcceptInvite(link: String): String?
     private external fun nativeListAcceptedInvites(): String?
+
+    // Group lifecycle
+    private external fun nativeCreateGroup(name: String, description: String): String?
+    private external fun nativeCreateGroupInvite(
+        groupIdHex: String,
+        expiresAtSeconds: Long,
+        maxUses: Int,
+    ): String?
 
     external fun nativeCleanup()
 }

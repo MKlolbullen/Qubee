@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 780" font-family="Roboto, system-ui, sans-serif">
+  <title>Mockup — Onboarding (Success state)</title>
+  <desc>OnboardingScreen.SuccessView after nativeCreateOnboardingBundle returns. QR encodes the qubee://identity/&lt;token&gt; deep link.</desc>
+
+  <!-- phone frame -->
+  <rect x="0" y="0" width="360" height="780" rx="36" fill="#0F172A"/>
+  <rect x="6" y="6" width="348" height="768" rx="32" fill="#F5F7FB"/>
+
+  <!-- status bar -->
+  <g font-size="11" fill="#0F172A">
+    <text x="22" y="28">9:41</text>
+    <g transform="translate(290 14)">
+      <rect x="0" y="6" width="14" height="10" rx="2" fill="none" stroke="#0F172A"/>
+      <rect x="2" y="8" width="9" height="6" fill="#0F172A"/>
+      <rect x="14" y="9" width="2" height="4" fill="#0F172A"/>
+      <text x="22" y="14">100%</text>
+    </g>
+    <circle cx="240" cy="20" r="3" fill="#0F172A"/>
+    <circle cx="252" cy="20" r="3" fill="#0F172A"/>
+    <circle cx="264" cy="20" r="3" fill="#0F172A"/>
+    <circle cx="276" cy="20" r="2" fill="#0F172A" opacity="0.4"/>
+  </g>
+
+  <g transform="translate(24 0)">
+
+    <!-- headlineMedium "Identity ready" -->
+    <text x="156" y="120" text-anchor="middle" font-size="26" fill="#0F172A">Identity ready</text>
+
+    <!-- titleMedium displayName (placeholder text in mockup) -->
+    <text x="156" y="148" text-anchor="middle" font-size="16" fill="#0F172A">Alice Hamilton</text>
+
+    <!-- bodySmall fingerprint -->
+    <text x="156" y="170" text-anchor="middle" font-size="11" fill="#475569">
+      Fingerprint: A9C2 4F18 7B0E 32D6
+    </text>
+
+    <!-- 240dp QR placeholder, centered in 312dp content width -->
+    <g transform="translate(36 200)">
+      <rect x="0" y="0" width="240" height="240" fill="#FFFFFF" stroke="#CBD5E1"/>
+      <!-- coarse, deliberately fake QR pattern so it's clearly a mockup -->
+      <g fill="#0F172A">
+        <!-- finder squares -->
+        <rect x="16" y="16" width="42" height="42"/>
+        <rect x="20" y="20" width="34" height="34" fill="#FFFFFF"/>
+        <rect x="26" y="26" width="22" height="22"/>
+        <rect x="182" y="16" width="42" height="42"/>
+        <rect x="186" y="20" width="34" height="34" fill="#FFFFFF"/>
+        <rect x="192" y="26" width="22" height="22"/>
+        <rect x="16" y="182" width="42" height="42"/>
+        <rect x="20" y="186" width="34" height="34" fill="#FFFFFF"/>
+        <rect x="26" y="192" width="22" height="22"/>
+      </g>
+      <!-- random scatter to suggest data modules -->
+      <g fill="#0F172A">
+        <rect x="72" y="20" width="6" height="6"/>
+        <rect x="84" y="20" width="6" height="6"/>
+        <rect x="96" y="20" width="6" height="6"/>
+        <rect x="116" y="20" width="6" height="6"/>
+        <rect x="140" y="20" width="6" height="6"/>
+        <rect x="160" y="20" width="6" height="6"/>
+        <rect x="72" y="40" width="6" height="6"/>
+        <rect x="104" y="40" width="6" height="6"/>
+        <rect x="148" y="40" width="6" height="6"/>
+        <rect x="172" y="40" width="6" height="6"/>
+        <rect x="80" y="80" width="6" height="6"/>
+        <rect x="92" y="80" width="6" height="6"/>
+        <rect x="116" y="80" width="6" height="6"/>
+        <rect x="128" y="80" width="6" height="6"/>
+        <rect x="140" y="80" width="6" height="6"/>
+        <rect x="164" y="80" width="6" height="6"/>
+        <rect x="176" y="80" width="6" height="6"/>
+        <rect x="200" y="80" width="6" height="6"/>
+        <rect x="68" y="100" width="6" height="6"/>
+        <rect x="92" y="100" width="6" height="6"/>
+        <rect x="104" y="100" width="6" height="6"/>
+        <rect x="120" y="100" width="6" height="6"/>
+        <rect x="148" y="100" width="6" height="6"/>
+        <rect x="180" y="100" width="6" height="6"/>
+        <rect x="208" y="100" width="6" height="6"/>
+        <rect x="60" y="120" width="6" height="6"/>
+        <rect x="80" y="120" width="6" height="6"/>
+        <rect x="108" y="120" width="6" height="6"/>
+        <rect x="128" y="120" width="6" height="6"/>
+        <rect x="156" y="120" width="6" height="6"/>
+        <rect x="176" y="120" width="6" height="6"/>
+        <rect x="200" y="120" width="6" height="6"/>
+        <rect x="68" y="140" width="6" height="6"/>
+        <rect x="100" y="140" width="6" height="6"/>
+        <rect x="120" y="140" width="6" height="6"/>
+        <rect x="140" y="140" width="6" height="6"/>
+        <rect x="160" y="140" width="6" height="6"/>
+        <rect x="184" y="140" width="6" height="6"/>
+        <rect x="208" y="140" width="6" height="6"/>
+        <rect x="80" y="160" width="6" height="6"/>
+        <rect x="96" y="160" width="6" height="6"/>
+        <rect x="120" y="160" width="6" height="6"/>
+        <rect x="148" y="160" width="6" height="6"/>
+        <rect x="172" y="160" width="6" height="6"/>
+        <rect x="200" y="160" width="6" height="6"/>
+        <rect x="76" y="184" width="6" height="6"/>
+        <rect x="100" y="184" width="6" height="6"/>
+        <rect x="124" y="184" width="6" height="6"/>
+        <rect x="148" y="184" width="6" height="6"/>
+        <rect x="168" y="184" width="6" height="6"/>
+        <rect x="76" y="204" width="6" height="6"/>
+        <rect x="92" y="204" width="6" height="6"/>
+        <rect x="116" y="204" width="6" height="6"/>
+        <rect x="148" y="204" width="6" height="6"/>
+        <rect x="172" y="204" width="6" height="6"/>
+        <rect x="200" y="204" width="6" height="6"/>
+      </g>
+    </g>
+
+    <!-- bodySmall: the share link itself, ellipsised in real life -->
+    <text x="156" y="464" text-anchor="middle" font-size="10" fill="#475569" font-family="monospace">
+      qubee://identity/eyJ1c2VyX2lkIjoiYWxpY2UtdWlkLTAxIi…
+    </text>
+
+    <!-- OutlinedButton "Share link" -->
+    <g transform="translate(0 488)">
+      <rect x="0" y="0" width="312" height="46" rx="23" fill="none" stroke="#1F6FEB"/>
+      <text x="156" y="29" text-anchor="middle" font-size="14" fill="#1F6FEB" font-weight="500">Share link</text>
+    </g>
+
+    <!-- 16dp spacer, Button "Continue" -->
+    <g transform="translate(0 550)">
+      <rect x="0" y="0" width="312" height="46" rx="23" fill="#1F6FEB"/>
+      <text x="156" y="29" text-anchor="middle" font-size="14" fill="#FFFFFF" font-weight="500">Continue</text>
+    </g>
+
+  </g>
+
+  <!-- footer disclaimer -->
+  <text x="180" y="752" text-anchor="middle" font-size="9" fill="#94A3B8">— mockup —</text>
+</svg>

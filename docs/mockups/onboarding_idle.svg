@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 780" font-family="Roboto, system-ui, sans-serif">
+  <title>Mockup — Onboarding (Idle)</title>
+  <desc>Hand-drawn approximation of OnboardingScreen.kt before "Create identity" is tapped.</desc>
+
+  <!-- phone frame -->
+  <rect x="0" y="0" width="360" height="780" rx="36" fill="#0F172A"/>
+  <rect x="6" y="6" width="348" height="768" rx="32" fill="#F5F7FB"/>
+
+  <!-- status bar -->
+  <g font-size="11" fill="#0F172A">
+    <text x="22" y="28">9:41</text>
+    <g transform="translate(290 14)">
+      <rect x="0" y="6" width="14" height="10" rx="2" fill="none" stroke="#0F172A"/>
+      <rect x="2" y="8" width="9" height="6" fill="#0F172A"/>
+      <rect x="14" y="9" width="2" height="4" fill="#0F172A"/>
+      <text x="22" y="14">100%</text>
+    </g>
+    <circle cx="240" cy="20" r="3" fill="#0F172A"/>
+    <circle cx="252" cy="20" r="3" fill="#0F172A"/>
+    <circle cx="264" cy="20" r="3" fill="#0F172A"/>
+    <circle cx="276" cy="20" r="2" fill="#0F172A" opacity="0.4"/>
+  </g>
+
+  <!-- vertically-centered content (Column with Arrangement.Center, padding 24dp) -->
+  <g transform="translate(24 0)">
+
+    <!-- headlineMedium "Welcome to Qubee" -->
+    <text x="156" y="252" text-anchor="middle" font-size="26" fill="#0F172A">Welcome to Qubee</text>
+
+    <!-- bodyMedium description (wraps in real Compose; mocked as 2 lines) -->
+    <text x="156" y="282" text-anchor="middle" font-size="13" fill="#334155">
+      Generate your post-quantum identity and share it
+    </text>
+    <text x="156" y="298" text-anchor="middle" font-size="13" fill="#334155">
+      via QR — your private key never leaves the device.
+    </text>
+
+    <!-- 32dp spacer, then OutlinedTextField "Display name" -->
+    <g transform="translate(0 332)">
+      <rect x="0" y="0" width="312" height="56" rx="6" fill="none" stroke="#94A3B8"/>
+      <text x="14" y="22" font-size="11" fill="#64748B">Display name</text>
+      <text x="14" y="42" font-size="14" fill="#94A3B8">(empty)</text>
+    </g>
+
+    <!-- 24dp spacer, then disabled "Create identity" button (nickname blank) -->
+    <g transform="translate(0 412)">
+      <rect x="0" y="0" width="312" height="46" rx="23" fill="#1F6FEB" opacity="0.32"/>
+      <text x="156" y="29" text-anchor="middle" font-size="14" fill="#FFFFFF" font-weight="500">Create identity</text>
+    </g>
+
+  </g>
+
+  <!-- footer disclaimer -->
+  <text x="180" y="752" text-anchor="middle" font-size="9" fill="#94A3B8">— mockup —</text>
+</svg>

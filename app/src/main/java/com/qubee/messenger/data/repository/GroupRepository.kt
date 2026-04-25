@@ -1,6 +1,7 @@
 package com.qubee.messenger.data.repository
 
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.groups.AcceptInviteResult
 import com.qubee.messenger.groups.BuildInviteResponse
 import com.qubee.messenger.groups.GroupInvite
 import com.qubee.messenger.groups.GroupInviteRequest
@@ -45,14 +46,13 @@ class GroupRepository @Inject constructor(
     }
 
     /**
-     * Record acceptance of a scanned/pasted invite link. Returns the
-     * resulting [GroupInvite] on success, or null if the JNI rejected
-     * the link or the core wasn't ready. The acceptance is persisted
-     * in the encrypted group keystore — group membership itself only
-     * lands once the inviter's device receives the handshake.
+     * Record acceptance of a scanned/pasted invite link and (best-effort)
+     * publish a signed `RequestJoin` over gossipsub. Returns the
+     * structured outcome — including whether the network handshake
+     * actually went out — or null if the JNI rejected the link.
      */
-    suspend fun acceptInvite(link: String): GroupInvite? = withContext(Dispatchers.IO) {
+    suspend fun acceptInvite(link: String): AcceptInviteResult? = withContext(Dispatchers.IO) {
         val json = qubeeManager.acceptInvite(link) ?: return@withContext null
-        GroupInvite.fromJson(json)
+        AcceptInviteResult.fromJson(json)
     }
 }

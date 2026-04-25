@@ -16,10 +16,19 @@ use crate::network::p2p_node::{P2PNode, P2PCommand, NodeEvent};
 use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
-use crate::groups::group_manager::{GroupId, GroupInvitation, GroupManager, QUBEE_MAX_GROUP_MEMBERS};
+use crate::groups::group_manager::{
+    GroupId, GroupInvitation, GroupManager, GroupMember, MemberStatus, QUBEE_MAX_GROUP_MEMBERS,
+};
+use crate::groups::group_handshake::{
+    sign_join_accepted, sign_join_rejected, sign_request_join, verify_join_accepted,
+    verify_request_join, GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
+    RequestJoinBody,
+};
+use crate::groups::group_permissions::Role;
 use crate::storage::secure_keystore::{
     KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
 };
+use std::collections::HashMap;
 
 const ACTIVE_IDENTITY_KEY: &str = "active_identity";
 
@@ -206,6 +215,16 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
 
                         tokio::spawn(async move {
                             while let Some(event) = rx_event.recv().await {
+                                // Intercept group-handshake traffic before
+                                // the regular Kotlin callback so the
+                                // Rust core can run protocol logic
+                                // without needing a JNI round-trip.
+                                if let NodeEvent::MessageReceived { data, .. } = &event {
+                                    if let Some(handshake) = GroupHandshake::from_wire(data) {
+                                        handle_inbound_handshake(handshake);
+                                        continue;
+                                    }
+                                }
                                 dispatch_event_to_kotlin(event);
                             }
                         });
@@ -300,11 +319,14 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
     }
 }
 
-/// Record that the local user accepted a `qubee://invite/...` link.
-/// This is a *receipt* of acceptance, not a synchronous join — the
-/// minting peer's GroupManager only enrols us as a member once a
-/// network handshake reaches them. Returns JSON describing the
-/// accepted invite, or null on parse failure.
+/// Record that the local user accepted a `qubee://invite/...` link
+/// and (best-effort) publish a signed `RequestJoin` over the
+/// gossipsub global topic so the inviter's device can enrol us.
+///
+/// The local receipt is always written so the UI can show "accepted,
+/// awaiting handshake". Network publication may fail (network not up,
+/// channel full) — that's reported via the `network_published` flag in
+/// the returned JSON; the caller can retry by re-invoking accept.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAcceptInvite(
     env: JNIEnv,
@@ -319,29 +341,306 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
 
         let result: anyhow::Result<serde_json::Value> = (|| {
             let payload = InvitePayload::from_invite_link(&link)?;
-            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-            let gm = gm_guard
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-            gm.record_external_invite_acceptance(
-                payload.group_id,
-                &payload.group_name,
-                payload.inviter_id,
-                &payload.inviter_name,
-                &payload.invitation_code,
-            )?;
+            {
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                gm.record_external_invite_acceptance(
+                    payload.group_id,
+                    &payload.group_name,
+                    payload.inviter_id,
+                    &payload.inviter_name,
+                    &payload.invitation_code,
+                )?;
+            }
+
+            // Best-effort network publication.
+            let network_published = publish_request_join(&payload).unwrap_or_else(|e| {
+                eprintln!("Rust: publish_request_join failed: {e:#}");
+                false
+            });
+
             Ok(json!({
                 "group_id_hex": hex::encode(payload.group_id.as_ref()),
                 "group_name": payload.group_name,
                 "inviter_id_hex": hex::encode(payload.inviter_id.as_ref()),
                 "inviter_name": payload.inviter_name,
                 "max_members": payload.max_members,
-                "status": "accepted_pending_handshake",
+                "status": if network_published {
+                    "accepted_handshake_sent"
+                } else {
+                    "accepted_pending_network"
+                },
+                "network_published": network_published,
             }))
         })();
 
         ok_or_null(env, result)
     })
+}
+
+/// Build, sign, and publish a `RequestJoin` for the given invite payload.
+/// Returns `Ok(true)` on a successful enqueue, `Ok(false)` if the P2P
+/// commander isn't up yet (caller can retry later).
+fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
+    let identity = match active_identity()? {
+        Some(id) => id,
+        None => return Err(anyhow::anyhow!("no active identity to sign RequestJoin")),
+    };
+
+    let body = RequestJoinBody {
+        group_id: payload.group_id,
+        invitation_code: payload.invitation_code.clone(),
+        joiner_public_key: identity.public_key(),
+        joiner_display_name: active_display_name().unwrap_or_default(),
+    };
+    let signed = sign_request_join(identity.as_ref(), body)?;
+    let wire = signed.to_wire()?;
+    Ok(send_p2p_broadcast(wire))
+}
+
+/// Try to publish bytes on the gossipsub global topic. Returns true on
+/// successful enqueue, false if the commander isn't initialised yet.
+fn send_p2p_broadcast(data: Vec<u8>) -> bool {
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return false,
+    };
+    let cmd = P2PCommand::SendMessage {
+        peer_id: String::new(),
+        data,
+    };
+    matches!(commander.try_send(cmd), Ok(()))
+}
+
+/// Snapshot the active identity Arc without holding the mutex across
+/// awaits. Returns `Ok(None)` if onboarding hasn't happened yet.
+fn active_identity() -> anyhow::Result<Option<Arc<IdentityKeyPair>>> {
+    Ok(ACTIVE_IDENTITY.lock().unwrap().clone())
+}
+
+/// Read the persisted display name from the keystore. Used to label
+/// outbound `RequestJoin` payloads so the inviter sees a name.
+fn active_display_name() -> anyhow::Result<String> {
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    let secret = ks
+        .retrieve_key(ACTIVE_IDENTITY_KEY)?
+        .ok_or_else(|| anyhow::anyhow!("no persisted identity"))?;
+    let blob: PersistedActiveIdentity = bincode::deserialize(secret.expose_secret())?;
+    Ok(blob.display_name)
+}
+
+/// Dispatch a handshake frame received from another peer.
+///
+/// Errors are logged but never bubbled — handshake processing is
+/// best-effort: we don't want a malformed frame from a hostile peer to
+/// take down the dispatch task.
+fn handle_inbound_handshake(frame: GroupHandshake) {
+    if let Err(e) = process_handshake(frame) {
+        eprintln!("Rust: handshake rejected: {e:#}");
+    }
+}
+
+fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
+    match frame {
+        GroupHandshake::RequestJoin { body, signature } => {
+            // Joiner's signature must be valid for the body's stated
+            // joiner_public_key — otherwise the request is forged.
+            if !verify_request_join(&body, &signature)? {
+                return Err(anyhow::anyhow!("RequestJoin signature failed"));
+            }
+            on_request_join(body)?;
+        }
+        GroupHandshake::JoinAccepted { body, signature } => {
+            on_join_accepted(body, signature)?;
+        }
+        GroupHandshake::JoinRejected { body, signature: _ } => {
+            // Drop the pending receipt; we'll rely on the inviter
+            // signature check before propagating UX, but for now just
+            // log so the joiner knows their join didn't land.
+            eprintln!(
+                "Rust: invite to group {} rejected: {}",
+                body.group_id, body.reason
+            );
+        }
+    }
+    Ok(())
+}
+
+fn on_request_join(body: RequestJoinBody) -> anyhow::Result<()> {
+    // We only act on RequestJoins for invitations *we* minted.
+    let identity = active_identity()?
+        .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = gm_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+
+    let invitation = match gm.get_invitation(&body.invitation_code)? {
+        Some(i) => i,
+        None => {
+            // Not for us — either someone else's invite or we already
+            // garbage-collected ours. Silent no-op.
+            return Ok(());
+        }
+    };
+    if invitation.group_id != body.group_id {
+        return Err(anyhow::anyhow!("invitation/group mismatch"));
+    }
+    if let Some(exp) = invitation.expires_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        if now > exp {
+            send_join_rejected(&identity, &body, "invitation expired")?;
+            return Ok(());
+        }
+    }
+    if let Some(max) = invitation.max_uses {
+        if invitation.current_uses >= max {
+            send_join_rejected(&identity, &body, "invitation exhausted")?;
+            return Ok(());
+        }
+    }
+
+    // Enrol the joiner. add_member enforces the 16-member cap and
+    // double-add protection.
+    let inviter_id = invitation.inviter_id;
+    if let Err(e) = gm.add_member(
+        body.group_id,
+        inviter_id,
+        body.joiner_public_key.identity_id,
+        body.joiner_public_key.clone(),
+        body.joiner_display_name.clone(),
+        Role::Member,
+    ) {
+        // If add_member rejected (cap reached, already a member, etc.)
+        // tell the joiner so they don't sit waiting forever.
+        let reason = format!("{e}");
+        drop(gm_guard);
+        send_join_rejected(&identity, &body, &reason)?;
+        return Ok(());
+    }
+    let _ = gm.mark_invitation_used(&body.invitation_code);
+
+    // Build a member snapshot for the joiner's bootstrap.
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow::anyhow!("group vanished after add_member"))?;
+    let members: Vec<GroupMemberSummary> = group
+        .members
+        .values()
+        .map(|m| GroupMemberSummary {
+            identity_id: m.identity_id,
+            identity_key: m.identity_key.clone(),
+            display_name: m.display_name.clone(),
+            role: m.role.clone(),
+            joined_at: m.joined_at,
+        })
+        .collect();
+    let group_name = group.name.clone();
+    drop(gm_guard);
+
+    let accepted_body = JoinAcceptedBody {
+        group_id: body.group_id,
+        invitation_code: body.invitation_code.clone(),
+        group_name,
+        members,
+        joiner_id: body.joiner_public_key.identity_id,
+    };
+    let signed = sign_join_accepted(identity.as_ref(), accepted_body)?;
+    let wire = signed.to_wire()?;
+    let _ = send_p2p_broadcast(wire);
+    Ok(())
+}
+
+fn send_join_rejected(
+    identity: &Arc<IdentityKeyPair>,
+    request: &RequestJoinBody,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let body = JoinRejectedBody {
+        group_id: request.group_id,
+        invitation_code: request.invitation_code.clone(),
+        joiner_id: request.joiner_public_key.identity_id,
+        reason: reason.to_string(),
+    };
+    let signed = sign_join_rejected(identity.as_ref(), body)?;
+    let wire = signed.to_wire()?;
+    let _ = send_p2p_broadcast(wire);
+    Ok(())
+}
+
+fn on_join_accepted(
+    body: JoinAcceptedBody,
+    signature: crate::identity::identity_key::HybridSignature,
+) -> anyhow::Result<()> {
+    let identity = active_identity()?
+        .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    // We only care about acceptances addressed to us.
+    if body.joiner_id != identity.identity_id() {
+        return Ok(());
+    }
+
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = gm_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+
+    // The receipt we wrote when the user scanned the QR remembers who
+    // the inviter was; use that as the trust anchor for the signature.
+    let accepted = gm.list_accepted_external_invites().unwrap_or_default();
+    let receipt = accepted
+        .into_iter()
+        .find(|e| e.group_id == body.group_id)
+        .ok_or_else(|| anyhow::anyhow!("no pending receipt for group"))?;
+
+    // Locate the inviter's IdentityKey from the snapshot's member list.
+    // Trust comes from "we accepted an invite from this inviter id"
+    // → "this acceptance was signed by an IdentityKey with that id".
+    let inviter_key = body
+        .members
+        .iter()
+        .find(|m| m.identity_id == receipt.inviter_id)
+        .map(|m| m.identity_key.clone())
+        .ok_or_else(|| anyhow::anyhow!("inviter not in member snapshot"))?;
+
+    if !verify_join_accepted(&body, &signature, &inviter_key)? {
+        return Err(anyhow::anyhow!("JoinAccepted signature failed"));
+    }
+
+    // Reconstruct GroupMember records from the wire summary. Unknown
+    // moderation state defaults to active, since the inviter's snapshot
+    // is the canonical view at handshake time.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let mut members = HashMap::new();
+    for m in &body.members {
+        members.insert(
+            m.identity_id,
+            GroupMember {
+                identity_id: m.identity_id,
+                identity_key: m.identity_key.clone(),
+                display_name: m.display_name.clone(),
+                role: m.role.clone(),
+                joined_at: m.joined_at,
+                last_seen: now,
+                invited_by: Some(receipt.inviter_id),
+                member_status: MemberStatus::Active,
+                custom_permissions: None,
+            },
+        );
+    }
+
+    gm.confirm_external_invite_acceptance(body.group_id, body.group_name.clone(), members)?;
+    Ok(())
 }
 
 /// List all invites the local user has accepted but not yet been

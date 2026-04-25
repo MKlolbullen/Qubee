@@ -3,6 +3,7 @@ package com.qubee.messenger.ui.groups
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.data.repository.GroupRepository
+import com.qubee.messenger.groups.AcceptInviteResult
 import com.qubee.messenger.groups.GroupInvite
 import com.qubee.messenger.groups.GroupInviteRequest
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -84,9 +85,11 @@ class GroupInviteViewModel @Inject constructor(
     }
 
     /**
-     * Persist acceptance of the invite the user just inspected. This
-     * does not yet contact the inviter's device — see
-     * [GroupRepository.acceptInvite] for the longer-term plan.
+     * Persist acceptance of the invite the user just inspected and
+     * publish a signed `RequestJoin` over the network. The UI gets
+     * back the structured outcome so it can tell the user whether
+     * the handshake actually went out or whether they need to try
+     * again once they're on a network.
      */
     fun acceptInvite() {
         val link = _state.value.scannedLink ?: return
@@ -96,8 +99,8 @@ class GroupInviteViewModel @Inject constructor(
             _state.value = if (accepted != null) {
                 _state.value.copy(
                     isWorking = false,
-                    scannedInvite = accepted,
                     accepted = true,
+                    acceptanceResult = accepted,
                 )
             } else {
                 _state.value.copy(
@@ -113,6 +116,7 @@ class GroupInviteViewModel @Inject constructor(
             scannedInvite = null,
             scannedLink = null,
             accepted = false,
+            acceptanceResult = null,
         )
     }
 
@@ -129,5 +133,7 @@ data class InviteUiState(
     val scannedLink: String? = null,
     /** The invite has been recorded in the encrypted group keystore. */
     val accepted: Boolean = false,
+    /** Network publication outcome — null until accept is invoked. */
+    val acceptanceResult: AcceptInviteResult? = null,
     val error: String? = null,
 )

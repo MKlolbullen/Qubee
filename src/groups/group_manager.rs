@@ -530,6 +530,84 @@ impl GroupManager {
         Ok(invitation.group_id)
     }
 
+    /// Look up an invitation we previously minted by its code. Used by
+    /// the network handshake handler to verify that a `RequestJoin`
+    /// matches a real, unexpired invitation we know about.
+    pub fn get_invitation(&mut self, invitation_code: &str) -> Result<Option<GroupInvitation>> {
+        let key = format!("invitation_{}", invitation_code);
+        let secret = match self.keystore.retrieve_key(&key)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
+        Ok(Some(invitation))
+    }
+
+    /// Bump an invitation's `current_uses` after a successful enrolment.
+    pub fn mark_invitation_used(&mut self, invitation_code: &str) -> Result<()> {
+        let key = format!("invitation_{}", invitation_code);
+        let mut invitation = match self.get_invitation(invitation_code)? {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        invitation.current_uses = invitation.current_uses.saturating_add(1);
+        let serialized = bincode::serialize(&invitation)?;
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: invitation.expires_at,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key, &serialized, KeyType::EncryptionKey, metadata)?;
+        Ok(())
+    }
+
+    /// Promote an outstanding `accepted_invite_*` receipt into a real
+    /// local `Group` record using a snapshot received over the wire.
+    /// The previous receipt is deleted so the UI can stop showing
+    /// "waiting for handshake".
+    pub fn confirm_external_invite_acceptance(
+        &mut self,
+        group_id: GroupId,
+        group_name: String,
+        members: HashMap<IdentityId, GroupMember>,
+    ) -> Result<()> {
+        let receipt_key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
+        let _ = self.keystore.delete_key(&receipt_key);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let group = Group {
+            id: group_id,
+            name: group_name,
+            description: String::new(),
+            group_type: GroupType::Private,
+            members: members.clone(),
+            permissions: GroupPermissions::default(),
+            settings: GroupSettings::default(),
+            metadata: GroupMetadata::default(),
+            created_at: now,
+            last_updated: now,
+            version: 1,
+        };
+
+        // Update the member->groups index for everyone in the snapshot.
+        for member_id in members.keys() {
+            self.member_groups
+                .entry(*member_id)
+                .or_insert_with(HashSet::new)
+                .insert(group_id);
+        }
+
+        self.groups.insert(group_id, group);
+        // Generate a placeholder symmetric key. Real shared-key transport
+        // belongs in the next round (group key agreement).
+        let _ = self.group_crypto.create_group_key(group_id);
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Record that the local user accepted an invite scanned from a
     /// peer's QR. This is a *receipt*, not a synchronous join: the
     /// peer's `GroupManager` will only enrol us as a member once the

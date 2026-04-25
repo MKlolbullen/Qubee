@@ -139,12 +139,17 @@ fun GroupInviteScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
-            if (state.accepted) {
-                Text(
-                    "Saved. The inviter's device will add you when it next " +
-                        "syncs with this device over the network.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+            state.acceptanceResult?.let { result ->
+                val msg = if (result.networkPublished) {
+                    "Saved. A signed handshake was sent — the inviter's " +
+                        "device will enrol you as soon as it sees it on " +
+                        "the network."
+                } else {
+                    "Saved locally. Couldn't reach the network yet — open " +
+                        "the chat once you're connected to retry the " +
+                        "handshake."
+                }
+                Text(msg, style = MaterialTheme.typography.bodySmall)
             }
             Spacer(Modifier.height(8.dp))
             Button(

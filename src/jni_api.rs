@@ -16,7 +16,7 @@ use crate::network::p2p_node::{P2PNode, P2PCommand, NodeEvent};
 use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
-use crate::groups::group_manager::{GroupId, GroupInvitation, QUBEE_MAX_GROUP_MEMBERS};
+use crate::groups::group_manager::{GroupId, GroupInvitation, GroupManager, QUBEE_MAX_GROUP_MEMBERS};
 use crate::storage::secure_keystore::{
     KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
 };
@@ -44,12 +44,18 @@ lazy_static! {
     // Callback Object Reference
     static ref CALLBACK_HANDLER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 
-    // Encrypted at-rest keystore opened during nativeInitialize.
+    // Encrypted at-rest keystore opened during nativeInitialize, used for
+    // the active identity record.
     static ref KEYSTORE: Mutex<Option<SecureKeyStore>> = Mutex::new(None);
 
     // Cached active identity so we can sign without paying for a keystore
     // round-trip on every JNI call.
     static ref ACTIVE_IDENTITY: Mutex<Option<Arc<IdentityKeyPair>>> = Mutex::new(None);
+
+    // Persistent GroupManager backed by its own encrypted keystore. We
+    // keep group state separate from the identity record so the two
+    // can be reset independently (e.g. "wipe my groups but keep me").
+    static ref GROUP_MANAGER: Mutex<Option<GroupManager>> = Mutex::new(None);
 }
 
 fn catch_unwind_result<F, R>(f: F) -> R
@@ -86,11 +92,20 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
             *JVM.lock().unwrap() = Some(vm);
         }
 
-        let mut path = PathBuf::from(&dir);
-        path.push("qubee_keys.db");
-        let keystore = SecureKeyStore::new(&path)
-            .map_err(|e| anyhow::anyhow!("keystore open failed: {e}"))?;
-        *KEYSTORE.lock().unwrap() = Some(keystore);
+        let mut id_path = PathBuf::from(&dir);
+        id_path.push("qubee_keys.db");
+        let id_keystore = SecureKeyStore::new(&id_path)
+            .map_err(|e| anyhow::anyhow!("identity keystore open failed: {e}"))?;
+        *KEYSTORE.lock().unwrap() = Some(id_keystore);
+
+        let mut groups_path = PathBuf::from(&dir);
+        groups_path.push("qubee_groups.db");
+        let groups_keystore = SecureKeyStore::new(&groups_path)
+            .map_err(|e| anyhow::anyhow!("groups keystore open failed: {e}"))?;
+        let mut group_mgr = GroupManager::new(groups_keystore)
+            .map_err(|e| anyhow::anyhow!("group manager init failed: {e}"))?;
+        let _ = group_mgr.load_groups_from_storage();
+        *GROUP_MANAGER.lock().unwrap() = Some(group_mgr);
 
         // Best-effort eager identity load: lets nativeLoadOnboardingBundle
         // succeed without the caller having to do anything special, and
@@ -285,6 +300,83 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
     }
 }
 
+/// Record that the local user accepted a `qubee://invite/...` link.
+/// This is a *receipt* of acceptance, not a synchronous join — the
+/// minting peer's GroupManager only enrols us as a member once a
+/// network handshake reaches them. Returns JSON describing the
+/// accepted invite, or null on parse failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAcceptInvite(
+    env: JNIEnv,
+    _class: JClass,
+    link: JString,
+) -> jstring {
+    catch_unwind_result(|| {
+        let link: String = match env.get_string(link) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let payload = InvitePayload::from_invite_link(&link)?;
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            gm.record_external_invite_acceptance(
+                payload.group_id,
+                &payload.group_name,
+                payload.inviter_id,
+                &payload.inviter_name,
+                &payload.invitation_code,
+            )?;
+            Ok(json!({
+                "group_id_hex": hex::encode(payload.group_id.as_ref()),
+                "group_name": payload.group_name,
+                "inviter_id_hex": hex::encode(payload.inviter_id.as_ref()),
+                "inviter_name": payload.inviter_name,
+                "max_members": payload.max_members,
+                "status": "accepted_pending_handshake",
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// List all invites the local user has accepted but not yet been
+/// confirmed into. Returns a JSON array.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListAcceptedInvites(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let entries = gm.list_accepted_external_invites()?;
+            let arr = entries
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "group_id_hex": hex::encode(e.group_id.as_ref()),
+                        "group_name": e.group_name,
+                        "inviter_id_hex": hex::encode(e.inviter_id.as_ref()),
+                        "inviter_name": e.inviter_name,
+                        "invitation_code": e.invitation_code,
+                        "accepted_at": e.accepted_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::Value::Array(arr))
+        })();
+        ok_or_null(env, result)
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanup(
     _env: JNIEnv,
@@ -292,6 +384,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanu
 ) {
     *ACTIVE_IDENTITY.lock().unwrap() = None;
     *KEYSTORE.lock().unwrap() = None;
+    *GROUP_MANAGER.lock().unwrap() = None;
     *INITIALIZED.lock().unwrap() = false;
 }
 

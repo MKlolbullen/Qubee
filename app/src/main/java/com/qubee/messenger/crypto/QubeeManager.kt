@@ -124,6 +124,23 @@ class QubeeManager @Inject constructor(
         nativeParseInviteLink(link)
     }
 
+    /**
+     * Accept a scanned/pasted Qubee invite. Records the acceptance in
+     * the encrypted group keystore so it survives restarts; the actual
+     * group-membership confirmation comes back over the network once
+     * the inviter's device gets the handshake.
+     */
+    suspend fun acceptInvite(link: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeAcceptInvite(link)
+    }
+
+    /** List invites the local user has accepted-but-not-yet-confirmed. */
+    suspend fun listAcceptedInvites(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeListAcceptedInvites()
+    }
+
     // --- Native Definitions ---
     private external fun nativeInitialize(dataDir: String): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
@@ -138,6 +155,8 @@ class QubeeManager @Inject constructor(
     // Group invite links
     private external fun nativeBuildInviteLink(invitationJson: String): String?
     private external fun nativeParseInviteLink(link: String): String?
+    private external fun nativeAcceptInvite(link: String): String?
+    private external fun nativeListAcceptedInvites(): String?
 
     external fun nativeCleanup()
 }

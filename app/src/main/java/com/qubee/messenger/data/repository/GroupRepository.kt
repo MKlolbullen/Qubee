@@ -43,4 +43,16 @@ class GroupRepository @Inject constructor(
         val json = qubeeManager.parseInviteLink(link) ?: return@withContext null
         GroupInvite.fromJson(json)
     }
+
+    /**
+     * Record acceptance of a scanned/pasted invite link. Returns the
+     * resulting [GroupInvite] on success, or null if the JNI rejected
+     * the link or the core wasn't ready. The acceptance is persisted
+     * in the encrypted group keystore — group membership itself only
+     * lands once the inviter's device receives the handshake.
+     */
+    suspend fun acceptInvite(link: String): GroupInvite? = withContext(Dispatchers.IO) {
+        val json = qubeeManager.acceptInvite(link) ?: return@withContext null
+        GroupInvite.fromJson(json)
+    }
 }

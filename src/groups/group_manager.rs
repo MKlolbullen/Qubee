@@ -1,17 +1,16 @@
-use anyhow::{Context, Result};
-use serde::{Serialize, Deserialize};
+use anyhow::Result;
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use blake3::Hasher;
 
-use crate::identity::identity_key::{IdentityId, IdentityKey, HybridSignature};
-use crate::groups::group_crypto::{GroupCrypto, GroupKey};
+use crate::identity::identity_key::{IdentityId, IdentityKey};
+use crate::groups::group_crypto::GroupCrypto;
 use crate::groups::group_permissions::{GroupPermissions, Permission, Role};
-use crate::groups::group_events::{GroupEvent, GroupEventType, GroupEventLog};
-use crate::storage::secure_keystore::{SecureKeystore, KeyType, KeyMetadata, KeyUsage};
+use crate::groups::group_events::{GroupEvent, GroupEventType};
+use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeystore};
 use std::collections::HashMap as StdHashMap;
-use bincode;
-use hex;
 
 /// Hard cap on the number of members in a single Qubee group, including
 /// the creator. Enforced both in `create_group` (via the default settings)
@@ -118,6 +117,19 @@ pub struct GroupMetadata {
     pub category: Option<String>,
     pub external_links: Vec<String>,
     pub custom_fields: HashMap<String, String>,
+}
+
+/// Receipt that the local user accepted an invite minted by another
+/// device. Stored in the keystore so the UI can show "groups I'm
+/// waiting on" across launches.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcceptedExternalInvite {
+    pub group_id: GroupId,
+    pub group_name: String,
+    pub inviter_id: IdentityId,
+    pub inviter_name: String,
+    pub invitation_code: String,
+    pub accepted_at: u64,
 }
 
 /// Group invitation
@@ -440,8 +452,16 @@ impl GroupManager {
         // Store invitation
         let invitation_key = format!("invitation_{}", invitation.invitation_code);
         let serialized = bincode::serialize(&invitation)?;
-        self.keystore.store_key(&invitation_key, &serialized)?;
-        
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: invitation.expires_at,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&invitation_key, &serialized, KeyType::EncryptionKey, metadata)?;
+
         // Log event
         self.log_group_event(
             group_id,
@@ -449,11 +469,17 @@ impl GroupManager {
             GroupEventType::InvitationCreated,
             format!("Invitation created with code {}", invitation.invitation_code),
         )?;
-        
+
         Ok(invitation)
     }
     
-    /// Join a group using an invitation
+    /// Join a group using an invitation that was originally minted on
+    /// **this** device.
+    ///
+    /// NOTE: distributed join (Alice scans Bob's QR, Alice's device
+    /// learns Bob's group) requires a network handshake that doesn't
+    /// exist in the crate yet. For that flow, see
+    /// [`record_external_invite_acceptance`].
     pub fn join_group_with_invitation(
         &mut self,
         invitation_code: String,
@@ -461,29 +487,25 @@ impl GroupManager {
         member_key: IdentityKey,
         display_name: String,
     ) -> Result<GroupId> {
-        // Retrieve invitation
         let invitation_key = format!("invitation_{}", invitation_code);
-        let invitation_data = self.keystore.retrieve_key(&invitation_key)?;
-        let mut invitation: GroupInvitation = bincode::deserialize(&invitation_data)?;
-        
-        // Check invitation validity
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+        let secret = self
+            .keystore
+            .retrieve_key(&invitation_key)?
+            .ok_or_else(|| anyhow::anyhow!("Invitation not found locally"))?;
+        let mut invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
+
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         if let Some(expires_at) = invitation.expires_at {
             if current_time > expires_at {
                 return Err(anyhow::anyhow!("Invitation has expired"));
             }
         }
-        
         if let Some(max_uses) = invitation.max_uses {
             if invitation.current_uses >= max_uses {
                 return Err(anyhow::anyhow!("Invitation has reached maximum uses"));
             }
         }
-        
-        // Add member to group
+
         self.add_member(
             invitation.group_id,
             invitation.inviter_id,
@@ -492,13 +514,75 @@ impl GroupManager {
             display_name,
             Role::Member,
         )?;
-        
-        // Update invitation usage
+
         invitation.current_uses += 1;
         let serialized = bincode::serialize(&invitation)?;
-        self.keystore.store_key(&invitation_key, &serialized)?;
-        
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: invitation.expires_at,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&invitation_key, &serialized, KeyType::EncryptionKey, metadata)?;
+
         Ok(invitation.group_id)
+    }
+
+    /// Record that the local user accepted an invite scanned from a
+    /// peer's QR. This is a *receipt*, not a synchronous join: the
+    /// peer's `GroupManager` will only enrol us as a member once the
+    /// network handshake (TODO) reaches them.
+    ///
+    /// The accepted invites live in the keystore so the UI can list
+    /// "groups I'm waiting to be added to" across launches.
+    pub fn record_external_invite_acceptance(
+        &mut self,
+        group_id: GroupId,
+        group_name: &str,
+        inviter_id: IdentityId,
+        inviter_name: &str,
+        invitation_code: &str,
+    ) -> Result<()> {
+        let entry = AcceptedExternalInvite {
+            group_id,
+            group_name: group_name.to_string(),
+            inviter_id,
+            inviter_name: inviter_name.to_string(),
+            invitation_code: invitation_code.to_string(),
+            accepted_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        };
+        let key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
+        let serialized = bincode::serialize(&entry)?;
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: None,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key, &serialized, KeyType::EncryptionKey, metadata)?;
+        Ok(())
+    }
+
+    /// List external invites the local user has accepted but for which
+    /// no membership confirmation has come back yet.
+    pub fn list_accepted_external_invites(&mut self) -> Result<Vec<AcceptedExternalInvite>> {
+        let mut out = Vec::new();
+        let key_ids = self.keystore.list_keys();
+        for key_id in key_ids {
+            if !key_id.starts_with("accepted_invite_") {
+                continue;
+            }
+            if let Some(secret) = self.keystore.retrieve_key(&key_id)? {
+                if let Ok(entry) = bincode::deserialize::<AcceptedExternalInvite>(secret.expose_secret()) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
     }
     
     /// Leave a group

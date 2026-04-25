@@ -139,12 +139,22 @@ fun GroupInviteScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+            if (state.accepted) {
+                Text(
+                    "Saved. The inviter's device will add you when it next " +
+                        "syncs with this device over the network.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Button(
-                onClick = { state.scannedLink?.let(onAcceptInvite) },
-                enabled = !invite.isExpired && state.scannedLink != null,
+                onClick = {
+                    viewModel.acceptInvite()
+                    state.scannedLink?.let(onAcceptInvite)
+                },
+                enabled = !invite.isExpired && state.scannedLink != null && !state.accepted,
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Join ${invite.groupName}") }
+            ) { Text(if (state.accepted) "Saved" else "Join ${invite.groupName}") }
             OutlinedButton(
                 onClick = { viewModel.clearScanned() },
                 modifier = Modifier.fillMaxWidth(),

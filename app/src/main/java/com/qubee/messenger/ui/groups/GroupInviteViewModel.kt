@@ -83,8 +83,37 @@ class GroupInviteViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Persist acceptance of the invite the user just inspected. This
+     * does not yet contact the inviter's device — see
+     * [GroupRepository.acceptInvite] for the longer-term plan.
+     */
+    fun acceptInvite() {
+        val link = _state.value.scannedLink ?: return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(isWorking = true, error = null)
+            val accepted = groupRepository.acceptInvite(link)
+            _state.value = if (accepted != null) {
+                _state.value.copy(
+                    isWorking = false,
+                    scannedInvite = accepted,
+                    accepted = true,
+                )
+            } else {
+                _state.value.copy(
+                    isWorking = false,
+                    error = "Could not record invite acceptance",
+                )
+            }
+        }
+    }
+
     fun clearScanned() {
-        _state.value = _state.value.copy(scannedInvite = null, scannedLink = null)
+        _state.value = _state.value.copy(
+            scannedInvite = null,
+            scannedLink = null,
+            accepted = false,
+        )
     }
 
     companion object {
@@ -98,5 +127,7 @@ data class InviteUiState(
     val generatedLink: String? = null,
     val scannedInvite: GroupInvite? = null,
     val scannedLink: String? = null,
+    /** The invite has been recorded in the encrypted group keystore. */
+    val accepted: Boolean = false,
     val error: String? = null,
 )

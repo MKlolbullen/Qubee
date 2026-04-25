@@ -23,7 +23,6 @@ import com.qubee.messenger.databinding.ActivityMainBinding
 import com.qubee.messenger.service.MessageService
 import com.qubee.messenger.ui.settings.SettingsActivity
 import com.qubee.messenger.util.PermissionHelper
-import com.qubee.messenger.util.QrUtils
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -60,23 +59,21 @@ class MainActivity : AppCompatActivity() {
         // Start the P2P background service
         MessageService.start(this)
 
-        // Surface any qubee:// link the user opened us with.
-        handleDeepLink(intent)
-
         Timber.d("MainActivity created & Service started")
     }
 
+    /**
+     * `launchMode="singleTask"` means subsequent `qubee://...` deep
+     * links arrive here instead of restarting the activity. Hand them
+     * back to the NavController so the `<deepLink>` entries in
+     * `nav_graph.xml` (the single source of truth for deep-link
+     * routing) take effect.
+     */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleDeepLink(intent)
-    }
-
-    private fun handleDeepLink(intent: Intent?) {
-        val data = intent?.data?.toString() ?: return
-        if (!QrUtils.isQubeeLink(data)) return
-        when {
-            QrUtils.isInviteLink(data) -> viewModel.onIncomingInviteLink(data)
-            QrUtils.isIdentityLink(data) -> viewModel.onIncomingIdentityLink(data)
+        setIntent(intent)
+        if (::navController.isInitialized) {
+            navController.handleDeepLink(intent)
         }
     }
 
@@ -153,21 +150,6 @@ class MainActivity : AppCompatActivity() {
                     }
                     is MainViewModel.NavigationEvent.OpenContactSelection -> {
                         navController.navigate(R.id.contactSelectionFragment)
-                    }
-                    is MainViewModel.NavigationEvent.OpenInvite -> {
-                        val bundle = Bundle().apply { putString("inviteLink", event.link) }
-                        // The destination is registered in nav_graph.xml as
-                        // groupInviteFragment. If the destination is not
-                        // present (e.g. on older builds), swallow silently.
-                        runCatching {
-                            navController.navigate(R.id.groupInviteFragment, bundle)
-                        }
-                    }
-                    is MainViewModel.NavigationEvent.OpenAddContact -> {
-                        val bundle = Bundle().apply { putString("identityLink", event.link) }
-                        runCatching {
-                            navController.navigate(R.id.addContactFragment, bundle)
-                        }
                     }
                 }
             }

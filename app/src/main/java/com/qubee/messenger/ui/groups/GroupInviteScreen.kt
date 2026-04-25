@@ -51,6 +51,7 @@ fun GroupInviteScreen(
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
     var pastedLink by remember { mutableStateOf("") }
+    var newGroupName by remember { mutableStateOf("") }
 
     val scanLauncher = rememberLauncherForActivityResult(QrScannerActivity.contract()) { result ->
         result.contents?.let { scanned ->
@@ -80,6 +81,24 @@ fun GroupInviteScreen(
 
         if (state.isWorking) {
             CircularProgressIndicator()
+            Spacer(Modifier.height(16.dp))
+        }
+
+        // Create-new-group section. Hidden once the user has just minted
+        // an invite, since the QR + scan flows below take over.
+        if (state.generatedLink == null && state.scannedInvite == null) {
+            OutlinedTextField(
+                value = newGroupName,
+                onValueChange = { newGroupName = it },
+                label = { Text("Name a new group") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = { viewModel.createGroupAndInvite(newGroupName) },
+                enabled = newGroupName.isNotBlank() && !state.isWorking,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Create group + invite") }
             Spacer(Modifier.height(16.dp))
         }
 
@@ -139,12 +158,27 @@ fun GroupInviteScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+            state.acceptanceResult?.let { result ->
+                val msg = if (result.networkPublished) {
+                    "Saved. A signed handshake was sent — the inviter's " +
+                        "device will enrol you as soon as it sees it on " +
+                        "the network."
+                } else {
+                    "Saved locally. Couldn't reach the network yet — open " +
+                        "the chat once you're connected to retry the " +
+                        "handshake."
+                }
+                Text(msg, style = MaterialTheme.typography.bodySmall)
+            }
             Spacer(Modifier.height(8.dp))
             Button(
-                onClick = { state.scannedLink?.let(onAcceptInvite) },
-                enabled = !invite.isExpired && state.scannedLink != null,
+                onClick = {
+                    viewModel.acceptInvite()
+                    state.scannedLink?.let(onAcceptInvite)
+                },
+                enabled = !invite.isExpired && state.scannedLink != null && !state.accepted,
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Join ${invite.groupName}") }
+            ) { Text(if (state.accepted) "Saved" else "Join ${invite.groupName}") }
             OutlinedButton(
                 onClick = { viewModel.clearScanned() },
                 modifier = Modifier.fillMaxWidth(),

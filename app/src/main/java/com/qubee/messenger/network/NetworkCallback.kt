@@ -18,4 +18,24 @@ interface NetworkCallback {
      * @param peerId The Peer ID of the discovered node.
      */
     fun onPeerDiscovered(peerId: String)
+
+    /**
+     * Called when an encrypted group message has been received,
+     * verified (sender is an active member, signature passes), and
+     * AEAD-decrypted with the current group key. Default impl is a
+     * no-op so existing callers don't have to opt in immediately.
+     *
+     * @param groupIdHex hex-encoded GroupId (32 bytes → 64 chars).
+     * @param senderIdHex hex-encoded sender IdentityId.
+     * @param plaintext the decrypted message body.
+     * @param timestampSeconds sender's send time as Unix seconds.
+     */
+    fun onGroupMessageReceived(
+        groupIdHex: String,
+        senderIdHex: String,
+        plaintext: ByteArray,
+        timestampSeconds: Long,
+    ) {
+        // default no-op
+    }
 }

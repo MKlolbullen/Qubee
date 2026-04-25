@@ -1,5 +1,6 @@
 package com.qubee.messenger.ui.contacts
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -32,6 +33,7 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.navigation.NavController
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.identity.IdentityBundle
 import com.qubee.messenger.util.QrUtils
@@ -58,15 +60,18 @@ class AddContactFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?,
     ): View {
-        val link = arguments?.getString(ARG_IDENTITY_LINK)
+        // Pull the full `qubee://identity/...` URI off the deep-link
+        // intent that Navigation hands us via KEY_DEEP_LINK_INTENT.
+        val link = deepLinkUri()
         return ComposeView(requireContext()).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             setContent { AddContactScreen(viewModel, initialLink = link) }
         }
     }
 
-    companion object {
-        const val ARG_IDENTITY_LINK = "identityLink"
+    private fun deepLinkUri(): String? {
+        val intent: Intent? = arguments?.getParcelable(NavController.KEY_DEEP_LINK_INTENT)
+        return intent?.data?.toString()
     }
 }
 

@@ -1,6 +1,8 @@
 package com.qubee.messenger.crypto
 
+import android.content.Context
 import com.qubee.messenger.network.NetworkCallback
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import timber.log.Timber
@@ -8,7 +10,9 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class QubeeManager @Inject constructor() {
+class QubeeManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+) {
 
     private var isInitialized = false
 
@@ -16,11 +20,15 @@ class QubeeManager @Inject constructor() {
         try {
             if (isInitialized) return@withContext true
             System.loadLibrary("qubee_crypto")
-            
-            val result = nativeInitialize()
+
+            // Pass the app's private dir to Rust so the encrypted keystore
+            // lands inside it. Hard-coding the package path inside Rust
+            // (the previous behaviour) silently broke whenever the
+            // applicationId changed.
+            val result = nativeInitialize(context.filesDir.absolutePath)
             if (result) {
                 isInitialized = true
-                Timber.d("Qubee initialized")
+                Timber.d("Qubee initialized at %s", context.filesDir.absolutePath)
             }
             result
         } catch (e: Exception) {
@@ -55,49 +63,21 @@ class QubeeManager @Inject constructor() {
         nativeSendP2PMessage(peerId, data)
     }
 
-    // --- Wrapper Methods ---
+    // The Ratchet/Sealed-Sender message-encryption wrappers
+    // (generateIdentityKeyPair / createRatchetSession / encryptMessage /
+    // decryptMessage / encryptSignaling) used to live here, but their
+    // Rust counterparts were placeholder stubs that never actually
+    // tied into a real `SecureMessenger`. They've been removed until
+    // the message pipeline is implemented end-to-end; QubeeManager only
+    // exposes JNI surfaces backed by working code.
 
-    suspend fun generateIdentityKeyPair(): IdentityKeyPair? = withContext(Dispatchers.IO) {
-        val bytes = nativeGenerateIdentityKeyPair()
-        if (bytes != null) IdentityKeyPair.fromBytes(bytes) else null
-    }
-
-    suspend fun createRatchetSession(
-        contactId: String,
-        theirPublicKey: ByteArray,
-        isInitiator: Boolean
-    ): RatchetSession? = withContext(Dispatchers.IO) {
-        val bytes = nativeCreateRatchetSession(contactId, theirPublicKey, isInitiator)
-        if (bytes != null) RatchetSession.fromBytes(bytes) else null
-    }
-
-    suspend fun encryptMessage(sessionId: String, plaintext: String): EncryptedMessage? = withContext(Dispatchers.IO) {
-        val bytes = nativeEncryptMessage(sessionId, plaintext.toByteArray())
-        if (bytes != null) EncryptedMessage.fromBytes(bytes) else null
-    }
-
-    suspend fun decryptMessage(sessionId: String, encryptedMessage: EncryptedMessage): String? = withContext(Dispatchers.IO) {
-        val bytes = nativeDecryptMessage(sessionId, encryptedMessage.toBytes())
-        if (bytes != null) String(bytes) else null
-    }
-
-    // We can add wrapper for encryptSignaling if needed by ViewModel,
-    // but typically signaling is internal or handled by CallManager.
-    suspend fun encryptSignaling(
-        sessionId: String,
-        callId: String,
-        sdpJson: String
-    ): EncryptedMessage? = withContext(Dispatchers.IO) {
-        val bytes = nativeEncryptSignaling(sessionId, callId, sdpJson)
-        if (bytes != null) EncryptedMessage.fromBytes(bytes) else null
-    }
-
-    // --- ZK-proof onboarding & invite links ---
+    // --- Onboarding & invite links ---
 
     /**
-     * Generate a fresh hybrid identity, build a ZK proof of key ownership,
-     * and return a share-able JSON document that includes a
-     * `qubee://identity/...` deep link plus QR-friendly metadata.
+     * Generate a fresh hybrid identity, hybrid-sign the onboarding bundle,
+     * persist the keypair to the encrypted keystore, and return a JSON
+     * document with the `qubee://identity/...` deep link plus QR-friendly
+     * metadata.
      */
     suspend fun createOnboardingBundle(
         displayName: String,
@@ -105,6 +85,15 @@ class QubeeManager @Inject constructor() {
     ): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         nativeCreateOnboardingBundle(displayName, userId)
+    }
+
+    /**
+     * Re-export the previously persisted onboarding bundle, if any.
+     * Returns `null` on first launch (no identity yet).
+     */
+    suspend fun loadOnboardingBundle(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeLoadOnboardingBundle()
     }
 
     /**
@@ -127,6 +116,65 @@ class QubeeManager @Inject constructor() {
     }
 
     /**
+     * Create a brand new group owned by the active local identity.
+     * Returns the JSON `{group_id_hex, name, owner_id_hex}` produced
+     * by Rust, or null if onboarding hasn't happened yet.
+     */
+    suspend fun createGroup(name: String, description: String = ""): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            nativeCreateGroup(name, description)
+        }
+
+    /**
+     * Mint a new invitation for a group we own. Returns the same JSON
+     * shape `nativeBuildInviteLink` produces, plus the underlying
+     * invitation_code so the UI can show "X joins remaining".
+     *
+     * `expiresAtSeconds` and `maxUses` accept negative values to mean
+     * "no limit"; the JNI uses sentinel-negative values to keep the
+     * C ABI simple.
+     */
+    suspend fun createGroupInvite(
+        groupIdHex: String,
+        expiresAtSeconds: Long = -1L,
+        maxUses: Int = -1,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeCreateGroupInvite(groupIdHex, expiresAtSeconds, maxUses)
+    }
+
+    /**
+     * Remove a member from a group we own. Internally rotates the
+     * group's symmetric key and broadcasts a signed `KeyRotation` so
+     * the remaining members converge on the fresh key — the kicked
+     * member can no longer decrypt new traffic.
+     */
+    suspend fun removeMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        reason: String = "",
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeRemoveMember(groupIdHex, memberIdHex, reason)
+    }
+
+    /**
+     * Encrypt a plaintext group message under the current group key,
+     * sign the envelope, and publish it on the per-group gossipsub
+     * topic. The decrypted result lands in
+     * [NetworkCallback.onGroupMessageReceived] on every other active
+     * member's device.
+     */
+    suspend fun sendGroupMessage(
+        groupIdHex: String,
+        plaintext: ByteArray,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeSendGroupMessage(groupIdHex, plaintext)
+    }
+
+    /**
      * Parse a `qubee://invite/<token>` deep link and return its contents
      * as JSON. Returns null if the link is malformed.
      */
@@ -135,30 +183,56 @@ class QubeeManager @Inject constructor() {
         nativeParseInviteLink(link)
     }
 
+    /**
+     * Accept a scanned/pasted Qubee invite. Records the acceptance in
+     * the encrypted group keystore so it survives restarts; the actual
+     * group-membership confirmation comes back over the network once
+     * the inviter's device gets the handshake.
+     */
+    suspend fun acceptInvite(link: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeAcceptInvite(link)
+    }
+
+    /** List invites the local user has accepted-but-not-yet-confirmed. */
+    suspend fun listAcceptedInvites(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeListAcceptedInvites()
+    }
+
     // --- Native Definitions ---
-    private external fun nativeInitialize(): Boolean
+    private external fun nativeInitialize(dataDir: String): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
-    private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean // NEW
+    private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean
 
-    private external fun nativeGenerateIdentityKeyPair(): ByteArray?
-    private external fun nativeCreateRatchetSession(cid: String, key: ByteArray, init: Boolean): ByteArray?
-    private external fun nativeEncryptMessage(sid: String, data: ByteArray): ByteArray?
-    private external fun nativeDecryptMessage(sid: String, data: ByteArray): ByteArray?
-    private external fun nativeEncryptSignaling(sid: String, callId: String, sdp: String): ByteArray?
-
-    // ZK onboarding / invite links
+    // Onboarding / identity
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
+    private external fun nativeLoadOnboardingBundle(): String?
     private external fun nativeVerifyOnboardingLink(link: String): String?
+
+    // Group invite links
     private external fun nativeBuildInviteLink(invitationJson: String): String?
     private external fun nativeParseInviteLink(link: String): String?
-    
-    // Legacy / Utils
-    private external fun nativeGenerateEphemeralKeys(): ByteArray?
-    private external fun nativeVerifyIdentityKey(cid: String, key: ByteArray, sig: ByteArray): Boolean
-    private external fun nativeGenerateSAS(k1: ByteArray, k2: ByteArray): String?
-    private external fun nativeEncryptFile(sid: String, data: ByteArray): ByteArray?
-    private external fun nativeDecryptFile(sid: String, data: ByteArray): ByteArray?
-    
+    private external fun nativeAcceptInvite(link: String): String?
+    private external fun nativeListAcceptedInvites(): String?
+
+    // Group lifecycle
+    private external fun nativeCreateGroup(name: String, description: String): String?
+    private external fun nativeCreateGroupInvite(
+        groupIdHex: String,
+        expiresAtSeconds: Long,
+        maxUses: Int,
+    ): String?
+    private external fun nativeRemoveMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        reason: String,
+    ): String?
+    private external fun nativeSendGroupMessage(
+        groupIdHex: String,
+        plaintext: ByteArray,
+    ): String?
+
     external fun nativeCleanup()
 }

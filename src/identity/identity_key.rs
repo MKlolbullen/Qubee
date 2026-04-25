@@ -79,6 +79,17 @@ pub struct DevicePublicKey {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeviceId([u8; 16]);
 
+/// Encrypted-at-rest representation of an [`IdentityKeyPair`]. Lives in
+/// the secure keystore only; bytes are never exposed to Kotlin / JNI.
+#[derive(Serialize, Deserialize)]
+struct PersistedIdentitySecrets {
+    classical_private: [u8; 32],
+    pq_private: Vec<u8>,
+    classical_public: [u8; 32],
+    pq_public: Vec<u8>,
+    created_at: u64,
+}
+
 /// Hybrid signature combining classical and post-quantum signatures
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HybridSignature {
@@ -229,6 +240,34 @@ impl IdentityKeyPair {
     pub fn identity_id(&self) -> IdentityId {
         self.identity_id
     }
+
+    /// Serialise the full keypair (private + public) to a byte buffer
+    /// suitable for the encrypted [`SecureKeyStore`]. The caller is
+    /// responsible for storing the result behind ChaCha20Poly1305 — the
+    /// returned bytes contain raw private key material.
+    pub fn serialize_for_keystore(&self) -> Result<Vec<u8>> {
+        let secrets = PersistedIdentitySecrets {
+            classical_private: self.classical_private.expose_secret().to_bytes(),
+            pq_private: self.pq_private.expose_secret().as_bytes().to_vec(),
+            classical_public: self.classical_public.to_bytes(),
+            pq_public: self.pq_public.as_bytes().to_vec(),
+            created_at: self.created_at,
+        };
+        bincode::serialize(&secrets).context("identity secrets serialize failed")
+    }
+
+    /// Inverse of [`serialize_for_keystore`].
+    pub fn deserialize_from_keystore(bytes: &[u8]) -> Result<Self> {
+        let s: PersistedIdentitySecrets =
+            bincode::deserialize(bytes).context("identity secrets deserialize failed")?;
+        Self::from_bytes(
+            &s.classical_private,
+            &s.pq_private,
+            &s.classical_public,
+            &s.pq_public,
+            s.created_at,
+        )
+    }
     
     /// Derive identity ID from public keys
     fn derive_identity_id(classical_public: &VerifyingKey, pq_public: &PQPublicKey) -> IdentityId {
@@ -243,41 +282,53 @@ impl IdentityKeyPair {
 }
 
 impl IdentityKey {
-    /// Verify a hybrid signature
+    /// Default acceptable signature age (5 minutes) for ratcheted message
+    /// flows. Use [`verify_with_max_age`] for QR / onboarding flows that
+    /// need a longer window.
+    const DEFAULT_MAX_SIGNATURE_AGE_SECS: u64 = 300;
+
+    /// Verify a hybrid signature with the default 5-minute freshness window.
     pub fn verify(&self, data: &[u8], signature: &HybridSignature) -> Result<bool> {
-        // Verify signer identity matches
+        self.verify_with_max_age(data, signature, Self::DEFAULT_MAX_SIGNATURE_AGE_SECS)
+    }
+
+    /// Verify a hybrid signature with a caller-supplied freshness window.
+    /// Both signature halves must validate; the signer identity must
+    /// match this key; and the signature timestamp must be no older
+    /// than `max_age_secs`.
+    pub fn verify_with_max_age(
+        &self,
+        data: &[u8],
+        signature: &HybridSignature,
+        max_age_secs: u64,
+    ) -> Result<bool> {
         if signature.signer_identity != self.identity_id {
             return Ok(false);
         }
-        
-        // Check signature freshness (within 5 minutes)
+
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        
-        if current_time.saturating_sub(signature.timestamp) > 300 {
+        if current_time.saturating_sub(signature.timestamp) > max_age_secs {
             return Ok(false);
         }
-        
-        // Reconstruct signed message
+
         let mut message = Vec::new();
         message.extend_from_slice(data);
         message.extend_from_slice(&signature.timestamp.to_le_bytes());
         message.extend_from_slice(&self.identity_id.0);
-        
-        // Verify classical signature
-        let classical_valid = self.classical_public
+
+        let classical_valid = self
+            .classical_public
             .verify(&message, &signature.classical_signature)
             .is_ok();
-        
-        // Verify post-quantum signature
         let pq_valid = dilithium2::verify_detached_signature(
             &signature.pq_signature,
             &message,
             &self.pq_public,
-        ).is_ok();
-        
-        // Both signatures must be valid
+        )
+        .is_ok();
+
         Ok(classical_valid && pq_valid)
     }
     

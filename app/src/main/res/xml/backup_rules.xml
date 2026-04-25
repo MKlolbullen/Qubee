@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Qubee identity material lives in the encrypted SecureKeyStore
+         and EncryptedSharedPreferences. The user must re-onboard on a
+         new device, so we exclude all app data from auto-backup to
+         avoid leaking key material into Google's cloud. -->
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+</full-backup-content>

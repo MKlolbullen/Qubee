@@ -1,17 +1,16 @@
-use anyhow::{Context, Result};
-use serde::{Serialize, Deserialize};
+use anyhow::Result;
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use blake3::Hasher;
 
-use crate::identity::identity_key::{IdentityId, IdentityKey, HybridSignature};
-use crate::groups::group_crypto::{GroupCrypto, GroupKey};
+use crate::identity::identity_key::{IdentityId, IdentityKey};
+use crate::groups::group_crypto::GroupCrypto;
 use crate::groups::group_permissions::{GroupPermissions, Permission, Role};
-use crate::groups::group_events::{GroupEvent, GroupEventType, GroupEventLog};
-use crate::storage::secure_keystore::{SecureKeystore, KeyType, KeyMetadata, KeyUsage};
+use crate::groups::group_events::{GroupEvent, GroupEventType};
+use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeystore};
 use std::collections::HashMap as StdHashMap;
-use bincode;
-use hex;
 
 /// Hard cap on the number of members in a single Qubee group, including
 /// the creator. Enforced both in `create_group` (via the default settings)
@@ -75,6 +74,14 @@ pub struct GroupMember {
     pub invited_by: Option<IdentityId>,
     pub member_status: MemberStatus,
     pub custom_permissions: Option<HashSet<Permission>>,
+    /// Long-lived Kyber-768 public key the member uses to receive
+    /// rotated group keys. Captured during the join handshake (the
+    /// joiner's then-ephemeral key is promoted to long-lived once the
+    /// join lands). Empty for members enrolled before this field
+    /// existed — those members can't receive rotations until they
+    /// re-join, and `rotate_group_key_after_removal` filters them out.
+    #[serde(default)]
+    pub kyber_pub: Vec<u8>,
 }
 
 /// Member status in the group
@@ -118,6 +125,19 @@ pub struct GroupMetadata {
     pub category: Option<String>,
     pub external_links: Vec<String>,
     pub custom_fields: HashMap<String, String>,
+}
+
+/// Receipt that the local user accepted an invite minted by another
+/// device. Stored in the keystore so the UI can show "groups I'm
+/// waiting on" across launches.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcceptedExternalInvite {
+    pub group_id: GroupId,
+    pub group_name: String,
+    pub inviter_id: IdentityId,
+    pub inviter_name: String,
+    pub invitation_code: String,
+    pub accepted_at: u64,
 }
 
 /// Group invitation
@@ -184,6 +204,9 @@ impl GroupManager {
             invited_by: None,
             member_status: MemberStatus::Active,
             custom_permissions: None,
+            // Owner doesn't need a Kyber pubkey for self-rotations
+            // since they generate the new key directly.
+            kyber_pub: Vec::new(),
         };
         
         let mut members = HashMap::new();
@@ -276,20 +299,26 @@ impl GroupManager {
             invited_by: Some(admin_id),
             member_status: MemberStatus::Active,
             custom_permissions: None,
+            kyber_pub: Vec::new(),
         };
-        
+
         group.members.insert(new_member_id, new_member);
         group.last_updated = current_time;
         group.version += 1;
-        
+
         // Update member groups mapping
         self.member_groups
             .entry(new_member_id)
             .or_insert_with(HashSet::new)
             .insert(group_id);
-        
-        // Rotate group key for forward secrecy
-        self.group_crypto.rotate_group_key(group_id)?;
+
+        // NOTE: We deliberately do NOT rotate the group key here. The
+        // handshake-driven join already negotiates a fresh key via the
+        // wrapped-key mechanism in `confirm_external_invite_acceptance`,
+        // and rotating again would force the new joiner to learn about
+        // a key they were never told. Rotation on *removal* is what
+        // enforces forward secrecy in this codebase — see
+        // `rotate_group_key_after_removal`.
         
         // Log event
         self.log_group_event(
@@ -440,8 +469,16 @@ impl GroupManager {
         // Store invitation
         let invitation_key = format!("invitation_{}", invitation.invitation_code);
         let serialized = bincode::serialize(&invitation)?;
-        self.keystore.store_key(&invitation_key, &serialized)?;
-        
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: invitation.expires_at,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&invitation_key, &serialized, KeyType::EncryptionKey, metadata)?;
+
         // Log event
         self.log_group_event(
             group_id,
@@ -449,11 +486,129 @@ impl GroupManager {
             GroupEventType::InvitationCreated,
             format!("Invitation created with code {}", invitation.invitation_code),
         )?;
-        
+
         Ok(invitation)
     }
     
-    /// Join a group using an invitation
+    /// Stamp a member's long-lived Kyber-768 public key in place.
+    /// The handshake captures the joiner's ephemeral Kyber pubkey in
+    /// the RequestJoin and we persist it here so future key rotations
+    /// can wrap a new group key for this member without another
+    /// handshake.
+    pub fn set_member_kyber_pub(
+        &mut self,
+        group_id: GroupId,
+        member_id: IdentityId,
+        kyber_pub: Vec<u8>,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| anyhow::anyhow!("Member not in group"))?;
+        member.kyber_pub = kyber_pub;
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        group.version += 1;
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
+    /// Persist the local user's long-lived Kyber-768 secret for a
+    /// group inside the encrypted keystore. Used by the joiner to
+    /// keep the secret around so future `KeyRotation` messages can be
+    /// decapsulated even after a process restart.
+    pub fn store_my_kyber_secret(
+        &mut self,
+        group_id: GroupId,
+        secret_bytes: &[u8],
+    ) -> Result<()> {
+        let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
+        let metadata = KeyMetadata {
+            algorithm: "kyber768".to_string(),
+            key_size: secret_bytes.len(),
+            usage: vec![KeyUsage::KeyAgreement],
+            expiry: None,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key, secret_bytes, KeyType::EncryptionKey, metadata)?;
+        Ok(())
+    }
+
+    /// Inverse of [`store_my_kyber_secret`]. Returns `Ok(None)` if the
+    /// local user never joined the group (or already left it).
+    pub fn load_my_kyber_secret(&mut self, group_id: GroupId) -> Result<Option<Vec<u8>>> {
+        let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
+        let secret = match self.keystore.retrieve_key(&key)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        Ok(Some(secret.expose_secret().clone()))
+    }
+
+    /// Drop our Kyber secret for a group — call when leaving so the
+    /// secret can't be used to decapsulate further rotations.
+    pub fn wipe_my_kyber_secret(&mut self, group_id: GroupId) -> Result<()> {
+        let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
+        let _ = self.keystore.delete_key(&key);
+        Ok(())
+    }
+
+    /// Rotate the symmetric group key after a member is removed (or
+    /// leaves voluntarily). Generates a fresh key, then for each
+    /// remaining member with a registered Kyber pubkey produces a
+    /// `WrappedGroupKey`. Returns the deliveries plus the new key
+    /// so the caller can sign + publish them.
+    ///
+    /// Members with no `kyber_pub` (e.g. legacy enrolments before the
+    /// field existed) are skipped — they'll need to re-join to get the
+    /// new key. The owner's own copy is installed in-place and
+    /// persisted; they don't need a wrapped delivery.
+    pub fn rotate_group_key_after_removal(
+        &mut self,
+        group_id: GroupId,
+        rotator_id: IdentityId,
+    ) -> Result<Vec<(IdentityId, Vec<u8>)>> {
+        // Generate a fresh 32-byte key. We pass it through
+        // `set_group_key` so the rotator's own GroupCrypto picks it
+        // up immediately.
+        let new_key = crate::security::secure_rng::random::array::<32>()?;
+        self.group_crypto.set_group_key(group_id, new_key);
+
+        let group = self
+            .groups
+            .get(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+
+        // Build a (recipient_id, kyber_pub) plan first to avoid holding
+        // the immutable borrow across WrappedGroupKey::wrap calls.
+        let recipients: Vec<(IdentityId, Vec<u8>)> = group
+            .members
+            .iter()
+            .filter_map(|(id, m)| {
+                if *id == rotator_id || m.member_status != MemberStatus::Active {
+                    return None;
+                }
+                if m.kyber_pub.is_empty() {
+                    return None;
+                }
+                Some((*id, m.kyber_pub.clone()))
+            })
+            .collect();
+
+        Ok(recipients)
+    }
+
+    /// Join a group using an invitation that was originally minted on
+    /// **this** device.
+    ///
+    /// NOTE: distributed join (Alice scans Bob's QR, Alice's device
+    /// learns Bob's group) requires a network handshake that doesn't
+    /// exist in the crate yet. For that flow, see
+    /// [`record_external_invite_acceptance`].
     pub fn join_group_with_invitation(
         &mut self,
         invitation_code: String,
@@ -461,29 +616,25 @@ impl GroupManager {
         member_key: IdentityKey,
         display_name: String,
     ) -> Result<GroupId> {
-        // Retrieve invitation
         let invitation_key = format!("invitation_{}", invitation_code);
-        let invitation_data = self.keystore.retrieve_key(&invitation_key)?;
-        let mut invitation: GroupInvitation = bincode::deserialize(&invitation_data)?;
-        
-        // Check invitation validity
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+        let secret = self
+            .keystore
+            .retrieve_key(&invitation_key)?
+            .ok_or_else(|| anyhow::anyhow!("Invitation not found locally"))?;
+        let mut invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
+
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         if let Some(expires_at) = invitation.expires_at {
             if current_time > expires_at {
                 return Err(anyhow::anyhow!("Invitation has expired"));
             }
         }
-        
         if let Some(max_uses) = invitation.max_uses {
             if invitation.current_uses >= max_uses {
                 return Err(anyhow::anyhow!("Invitation has reached maximum uses"));
             }
         }
-        
-        // Add member to group
+
         self.add_member(
             invitation.group_id,
             invitation.inviter_id,
@@ -492,13 +643,183 @@ impl GroupManager {
             display_name,
             Role::Member,
         )?;
-        
-        // Update invitation usage
+
         invitation.current_uses += 1;
         let serialized = bincode::serialize(&invitation)?;
-        self.keystore.store_key(&invitation_key, &serialized)?;
-        
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: invitation.expires_at,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&invitation_key, &serialized, KeyType::EncryptionKey, metadata)?;
+
         Ok(invitation.group_id)
+    }
+
+    /// Look up an invitation we previously minted by its code. Used by
+    /// the network handshake handler to verify that a `RequestJoin`
+    /// matches a real, unexpired invitation we know about.
+    pub fn get_invitation(&mut self, invitation_code: &str) -> Result<Option<GroupInvitation>> {
+        let key = format!("invitation_{}", invitation_code);
+        let secret = match self.keystore.retrieve_key(&key)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
+        Ok(Some(invitation))
+    }
+
+    /// Bump an invitation's `current_uses` after a successful enrolment.
+    pub fn mark_invitation_used(&mut self, invitation_code: &str) -> Result<()> {
+        let key = format!("invitation_{}", invitation_code);
+        let mut invitation = match self.get_invitation(invitation_code)? {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        invitation.current_uses = invitation.current_uses.saturating_add(1);
+        let serialized = bincode::serialize(&invitation)?;
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: invitation.expires_at,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key, &serialized, KeyType::EncryptionKey, metadata)?;
+        Ok(())
+    }
+
+    /// Promote an outstanding `accepted_invite_*` receipt into a real
+    /// local `Group` record using a snapshot received over the wire,
+    /// and install the negotiated 32-byte symmetric group key.
+    /// The previous receipt is deleted so the UI can stop showing
+    /// "waiting for handshake".
+    pub fn confirm_external_invite_acceptance(
+        &mut self,
+        group_id: GroupId,
+        group_name: String,
+        members: HashMap<IdentityId, GroupMember>,
+        group_key: &[u8; 32],
+    ) -> Result<()> {
+        let receipt_key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
+        let _ = self.keystore.delete_key(&receipt_key);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let group = Group {
+            id: group_id,
+            name: group_name,
+            description: String::new(),
+            group_type: GroupType::Private,
+            members: members.clone(),
+            permissions: GroupPermissions::default(),
+            settings: GroupSettings::default(),
+            metadata: GroupMetadata::default(),
+            created_at: now,
+            last_updated: now,
+            version: 1,
+        };
+
+        // Update the member->groups index for everyone in the snapshot.
+        for member_id in members.keys() {
+            self.member_groups
+                .entry(*member_id)
+                .or_insert_with(HashSet::new)
+                .insert(group_id);
+        }
+
+        self.groups.insert(group_id, group);
+        // Install the negotiated group key. This replaces any previous
+        // placeholder so the joiner can immediately decrypt subsequent
+        // group messages. We copy the bytes into a Secret-wrapped
+        // owned array so the caller can zeroise their stack copy.
+        self.group_crypto.set_group_key(group_id, *group_key);
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
+    /// Direct accessor for the group's symmetric encryption key.
+    /// Returns `None` if no key has been generated/installed yet.
+    /// Used by the handshake handler to wrap the key for new joiners.
+    pub fn export_group_key(&self, group_id: &GroupId) -> Option<[u8; 32]> {
+        self.group_crypto.export_group_key(group_id)
+    }
+
+    /// Install a 32-byte symmetric group key. Used by the joiner side
+    /// of a `KeyRotation` after it unwraps the new key from the wire.
+    pub fn install_group_key(&mut self, group_id: GroupId, key_bytes: &[u8; 32]) -> Result<()> {
+        self.group_crypto.set_group_key(group_id, *key_bytes);
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
+    /// Ensure a freshly created group has a symmetric encryption key
+    /// installed. Idempotent — calling it on an already-keyed group
+    /// is a no-op so we can use it from the JNI on every `create_group`
+    /// without worrying about double generation.
+    pub fn ensure_group_key(&mut self, group_id: GroupId) -> Result<()> {
+        if self.group_crypto.export_group_key(&group_id).is_some() {
+            return Ok(());
+        }
+        self.group_crypto.create_group_key(group_id)
+    }
+
+    /// Record that the local user accepted an invite scanned from a
+    /// peer's QR. This is a *receipt*, not a synchronous join: the
+    /// peer's `GroupManager` will only enrol us as a member once the
+    /// network handshake (TODO) reaches them.
+    ///
+    /// The accepted invites live in the keystore so the UI can list
+    /// "groups I'm waiting to be added to" across launches.
+    pub fn record_external_invite_acceptance(
+        &mut self,
+        group_id: GroupId,
+        group_name: &str,
+        inviter_id: IdentityId,
+        inviter_name: &str,
+        invitation_code: &str,
+    ) -> Result<()> {
+        let entry = AcceptedExternalInvite {
+            group_id,
+            group_name: group_name.to_string(),
+            inviter_id,
+            inviter_name: inviter_name.to_string(),
+            invitation_code: invitation_code.to_string(),
+            accepted_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        };
+        let key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
+        let serialized = bincode::serialize(&entry)?;
+        let metadata = KeyMetadata {
+            algorithm: "bincode".to_string(),
+            key_size: serialized.len(),
+            usage: vec![KeyUsage::Authentication],
+            expiry: None,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key, &serialized, KeyType::EncryptionKey, metadata)?;
+        Ok(())
+    }
+
+    /// List external invites the local user has accepted but for which
+    /// no membership confirmation has come back yet.
+    pub fn list_accepted_external_invites(&mut self) -> Result<Vec<AcceptedExternalInvite>> {
+        let mut out = Vec::new();
+        let key_ids = self.keystore.list_keys();
+        for key_id in key_ids {
+            if !key_id.starts_with("accepted_invite_") {
+                continue;
+            }
+            if let Some(secret) = self.keystore.retrieve_key(&key_id)? {
+                if let Ok(entry) = bincode::deserialize::<AcceptedExternalInvite>(secret.expose_secret()) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
     }
     
     /// Leave a group

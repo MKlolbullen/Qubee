@@ -1,19 +1,17 @@
 use anyhow::{Context, Result};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
-use std::sync::Arc;
 
-use crate::identity::identity_key::{IdentityId, IdentityKey};
-use crate::identity::identity_key::IdentityKeyPair;
-use crate::calling::webrtc_manager::{WebRTCManager, WebRTCConfig};
 use crate::calling::media_encryption::{MediaEncryption, MediaKey};
-use crate::calling::signaling::{SignalingServer, SignalingMessage, SignalingClient};
 use crate::calling::peer_connection::{PeerConnection, PeerConnectionState};
-use crate::identity::contact_manager::ContactManager;
-use std::sync::Arc;
+use crate::calling::signaling::{SignalingClient, SignalingMessage, SignalingServer};
+use crate::calling::webrtc_manager::{WebRTCConfig, WebRTCManager};
 use crate::groups::group_manager::GroupId;
+use crate::identity::contact_manager::ContactManager;
+use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 
 /// Comprehensive call management system
 pub struct CallManager {

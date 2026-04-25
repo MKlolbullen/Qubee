@@ -4,11 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::identity::identity_key::IdentityId;
-use crate::calling::call_manager::CallId;
+use crate::calling::call_manager::{CallId, TurnServer};
 use crate::calling::media_encryption::MediaKey;
-use crate::calling::peer_connection::{PeerConnection, PeerConnectionState, ICECandidate};
-use crate::calling::signaling::TurnServer;
+use crate::calling::peer_connection::{ICECandidate, PeerConnection, PeerConnectionState};
+use crate::identity::identity_key::IdentityId;
 
 /// WebRTC manager for handling real-time media communication
 pub struct WebRTCManager {

@@ -102,7 +102,10 @@ fun OnboardingScreen(
 }
 
 @Composable
-private fun SuccessView(bundle: IdentityBundle, onDone: () -> Unit) {
+private fun SuccessView(
+    bundle: IdentityBundle,
+    onDone: () -> Unit,
+) {
     val context = LocalContext.current
     val link = bundle.shareLink
     val bitmap = remember(link) { link?.let { QrUtils.encodeAsBitmap(it) } }

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.Qubee" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/qubee_primary</item>
+        <item name="colorPrimaryVariant">@color/qubee_primary_variant</item>
+        <item name="colorOnPrimary">@color/qubee_on_primary</item>
+        <item name="colorSecondary">@color/qubee_secondary</item>
+        <item name="android:statusBarColor" tools:targetApi="l">@color/qubee_primary_variant</item>
+    </style>
+</resources>

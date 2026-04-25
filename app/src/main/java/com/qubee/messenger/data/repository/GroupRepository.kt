@@ -1,6 +1,10 @@
 package com.qubee.messenger.data.repository
 
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.groups.AcceptInviteResult
+import com.qubee.messenger.groups.BuildInviteResponse
+import com.qubee.messenger.groups.CreatedGroup
+import com.qubee.messenger.groups.CreatedInvite
 import com.qubee.messenger.groups.GroupInvite
 import com.qubee.messenger.groups.GroupInviteRequest
 import com.qubee.messenger.groups.QUBEE_MAX_GROUP_MEMBERS
@@ -30,9 +34,8 @@ class GroupRepository @Inject constructor(
      * paste into another messenger / SMS.
      */
     suspend fun buildInviteLink(request: GroupInviteRequest): String? = withContext(Dispatchers.IO) {
-        qubeeManager.buildInviteLink(request.toJson())?.let { json ->
-            extractField(json, "link")
-        }
+        val json = qubeeManager.buildInviteLink(request.toJson())
+        BuildInviteResponse.fromJson(json)?.link
     }
 
     /**
@@ -44,19 +47,39 @@ class GroupRepository @Inject constructor(
         GroupInvite.fromJson(json)
     }
 
-    private fun extractField(json: String, field: String): String? {
-        // The Rust JNI returns small JSON blobs; pulling a single field
-        // with Gson would be overkill, so we do it by-hand to avoid a
-        // dependency on a heavier model class.
-        val key = "\"$field\""
-        val keyIdx = json.indexOf(key)
-        if (keyIdx < 0) return null
-        val colon = json.indexOf(':', keyIdx + key.length)
-        if (colon < 0) return null
-        val firstQuote = json.indexOf('"', colon + 1)
-        if (firstQuote < 0) return null
-        val secondQuote = json.indexOf('"', firstQuote + 1)
-        if (secondQuote < 0) return null
-        return json.substring(firstQuote + 1, secondQuote)
+    /**
+     * Record acceptance of a scanned/pasted invite link and (best-effort)
+     * publish a signed `RequestJoin` over gossipsub. Returns the
+     * structured outcome — including whether the network handshake
+     * actually went out — or null if the JNI rejected the link.
+     */
+    suspend fun acceptInvite(link: String): AcceptInviteResult? = withContext(Dispatchers.IO) {
+        val json = qubeeManager.acceptInvite(link) ?: return@withContext null
+        AcceptInviteResult.fromJson(json)
+    }
+
+    /**
+     * Create a new group owned by the active local identity. Returns the
+     * created group's id + owner so the UI can immediately follow up
+     * with [createInvite] and render a QR code.
+     */
+    suspend fun createGroup(name: String, description: String = ""): CreatedGroup? =
+        withContext(Dispatchers.IO) {
+            val json = qubeeManager.createGroup(name, description) ?: return@withContext null
+            CreatedGroup.fromJson(json)
+        }
+
+    /**
+     * Mint an invitation for a group we own. `expiresAtSeconds` /
+     * `maxUses` accept negatives to mean "no limit".
+     */
+    suspend fun createInvite(
+        groupIdHex: String,
+        expiresAtSeconds: Long = -1L,
+        maxUses: Int = -1,
+    ): CreatedInvite? = withContext(Dispatchers.IO) {
+        val json = qubeeManager.createGroupInvite(groupIdHex, expiresAtSeconds, maxUses)
+            ?: return@withContext null
+        CreatedInvite.fromJson(json)
     }
 }

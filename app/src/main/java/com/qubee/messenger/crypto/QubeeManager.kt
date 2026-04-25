@@ -81,7 +81,7 @@ class QubeeManager @Inject constructor() {
         if (bytes != null) String(bytes) else null
     }
 
-    // We can add wrapper for encryptSignaling if needed by ViewModel, 
+    // We can add wrapper for encryptSignaling if needed by ViewModel,
     // but typically signaling is internal or handled by CallManager.
     suspend fun encryptSignaling(
         sessionId: String,
@@ -91,7 +91,50 @@ class QubeeManager @Inject constructor() {
         val bytes = nativeEncryptSignaling(sessionId, callId, sdpJson)
         if (bytes != null) EncryptedMessage.fromBytes(bytes) else null
     }
-    
+
+    // --- ZK-proof onboarding & invite links ---
+
+    /**
+     * Generate a fresh hybrid identity, build a ZK proof of key ownership,
+     * and return a share-able JSON document that includes a
+     * `qubee://identity/...` deep link plus QR-friendly metadata.
+     */
+    suspend fun createOnboardingBundle(
+        displayName: String,
+        userId: String
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeCreateOnboardingBundle(displayName, userId)
+    }
+
+    /**
+     * Verify a peer's `qubee://identity/...` share link and return their
+     * identity metadata as JSON. Returns null if the link is malformed or
+     * its embedded ZK proof fails verification.
+     */
+    suspend fun verifyOnboardingLink(link: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeVerifyOnboardingLink(link)
+    }
+
+    /**
+     * Build a `qubee://invite/<token>` link from a JSON invitation
+     * descriptor. The Qubee-wide 16-member cap is encoded into the link.
+     */
+    suspend fun buildInviteLink(invitationJson: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeBuildInviteLink(invitationJson)
+    }
+
+    /**
+     * Parse a `qubee://invite/<token>` deep link and return its contents
+     * as JSON. Returns null if the link is malformed.
+     */
+    suspend fun parseInviteLink(link: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeParseInviteLink(link)
+    }
+
     // --- Native Definitions ---
     private external fun nativeInitialize(): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
@@ -103,6 +146,12 @@ class QubeeManager @Inject constructor() {
     private external fun nativeEncryptMessage(sid: String, data: ByteArray): ByteArray?
     private external fun nativeDecryptMessage(sid: String, data: ByteArray): ByteArray?
     private external fun nativeEncryptSignaling(sid: String, callId: String, sdp: String): ByteArray?
+
+    // ZK onboarding / invite links
+    private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
+    private external fun nativeVerifyOnboardingLink(link: String): String?
+    private external fun nativeBuildInviteLink(invitationJson: String): String?
+    private external fun nativeParseInviteLink(link: String): String?
     
     // Legacy / Utils
     private external fun nativeGenerateEphemeralKeys(): ByteArray?

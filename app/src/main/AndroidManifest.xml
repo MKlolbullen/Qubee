@@ -31,12 +31,30 @@
         <activity
             android:name=".ui.main.MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.Qubee">
+            android:theme="@style/Theme.Qubee"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- qubee://invite/<token>  and  qubee://identity/<token> -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="qubee" android:host="invite" />
+                <data android:scheme="qubee" android:host="identity" />
+            </intent-filter>
         </activity>
+
+        <!-- Embedded ZXing QR scanner. Declared so the camera capture
+             activity can run inside our task with our theme. -->
+        <activity
+            android:name=".ui.invite.QrScannerActivity"
+            android:screenOrientation="fullSensor"
+            android:stateNotNeeded="true"
+            android:theme="@style/Theme.AppCompat"
+            android:windowSoftInputMode="stateAlwaysHidden" />
 
         <service
             android:name=".service.MessageService"

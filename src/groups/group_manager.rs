@@ -13,6 +13,13 @@ use std::collections::HashMap as StdHashMap;
 use bincode;
 use hex;
 
+/// Hard cap on the number of members in a single Qubee group, including
+/// the creator. Enforced both in `create_group` (via the default settings)
+/// and in `add_member` regardless of any user-supplied override. This
+/// matches the security/UX requirement that Qubee groups stay small
+/// enough for out-of-band identity verification.
+pub const QUBEE_MAX_GROUP_MEMBERS: usize = 16;
+
 /// Comprehensive group management system
 pub struct GroupManager {
     groups: HashMap<GroupId, Group>,
@@ -241,11 +248,18 @@ impl GroupManager {
             return Err(anyhow::anyhow!("Member already in group"));
         }
         
-        // Check member limit
-        if let Some(max_members) = group.settings.max_members {
-            if group.members.len() >= max_members {
-                return Err(anyhow::anyhow!("Group member limit reached"));
-            }
+        // Check member limit. The group's own setting may be lower, but the
+        // global Qubee cap (16 incl. creator) is always enforced.
+        let effective_cap = group
+            .settings
+            .max_members
+            .map(|n| n.min(QUBEE_MAX_GROUP_MEMBERS))
+            .unwrap_or(QUBEE_MAX_GROUP_MEMBERS);
+        if group.members.len() >= effective_cap {
+            return Err(anyhow::anyhow!(
+                "Group member limit reached (max {} members)",
+                effective_cap
+            ));
         }
         
         let current_time = SystemTime::now()
@@ -815,7 +829,7 @@ impl std::fmt::Debug for GroupId {
 impl Default for GroupSettings {
     fn default() -> Self {
         GroupSettings {
-            max_members: Some(1000),
+            max_members: Some(QUBEE_MAX_GROUP_MEMBERS),
             message_history_retention: None,
             allow_member_invites: true,
             require_admin_approval: false,

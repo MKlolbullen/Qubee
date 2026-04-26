@@ -711,6 +711,12 @@ impl GroupManager {
         group_name: String,
         members: HashMap<IdentityId, GroupMember>,
         group_key: &[u8; 32],
+        // The inviter's view of `group.version` at handshake time.
+        // Generation gates in `decrypt_group_message` and
+        // `process_key_rotation` only work if both sides start from
+        // the same version number — otherwise the joiner's first
+        // received message panics on a bogus mismatch.
+        snapshot_version: u64,
     ) -> Result<()> {
         let receipt_key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
         let _ = self.keystore.delete_key(&receipt_key);
@@ -727,7 +733,7 @@ impl GroupManager {
             metadata: GroupMetadata::default(),
             created_at: now,
             last_updated: now,
-            version: 1,
+            version: snapshot_version,
         };
 
         // Update the member->groups index for everyone in the snapshot.

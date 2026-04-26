@@ -117,6 +117,11 @@ pub fn process_request_join(
         })
         .collect();
     let group_name = group.name.clone();
+    // Snapshot the inviter's `group.version` *after* `add_member`
+    // ran, so the joiner adopts the post-enrolment value. Same
+    // counter the generation gates in `decrypt_group_message` and
+    // `process_key_rotation` compare against.
+    let snapshot_version = group.version;
 
     gm.ensure_group_key(body.group_id)?;
     let mut group_key = gm
@@ -132,6 +137,7 @@ pub fn process_request_join(
         members,
         joiner_id: body.joiner_public_key.identity_id,
         wrapped_group_key,
+        snapshot_version,
     };
     let signed = match sign_join_accepted(inviter_identity, accepted_body)? {
         crate::groups::group_handshake::GroupHandshake::JoinAccepted { body, signature } => {
@@ -203,6 +209,7 @@ pub fn process_join_accepted(
         body.group_name.clone(),
         members,
         &group_key,
+        body.snapshot_version,
     )?;
     group_key.zeroize();
 
@@ -328,6 +335,21 @@ pub fn process_key_rotation(
     let group = gm
         .get_group(&body.group_id)
         .ok_or_else(|| anyhow!("KeyRotation for unknown group"))?;
+
+    // Generation gate (symmetric to `decrypt_group_message`): drop
+    // rotations whose generation isn't strictly newer than our
+    // current view. Stale rotations (old generation) are no-ops we'd
+    // otherwise apply on top of a newer key; equal-generation
+    // rotations would reset us to the same key version we're already
+    // on. Both are safety bugs in waiting.
+    if body.generation <= group.version {
+        return Err(anyhow!(
+            "KeyRotation generation not newer than local (frame={}, local={})",
+            body.generation,
+            group.version
+        ));
+    }
+
     let rotator = group
         .members
         .get(&body.rotator_id)

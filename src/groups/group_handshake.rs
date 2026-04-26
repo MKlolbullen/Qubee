@@ -172,6 +172,13 @@ pub struct JoinAcceptedBody {
     /// Group encryption key wrapped to the joiner's ephemeral Kyber-768
     /// public key from the matching `RequestJoinBody`.
     pub wrapped_group_key: WrappedGroupKey,
+    /// Inviter's view of `group.version` at the moment the join lands.
+    /// The joiner adopts this verbatim so subsequent generation-counter
+    /// gates (`decrypt_group_message`, `process_key_rotation`) line up
+    /// across the two devices. Without this the joiner starts at
+    /// `version = 1` while the inviter is at N>1, and every
+    /// post-join group message bounces on "generation mismatch".
+    pub snapshot_version: u64,
 }
 
 /// Body of a `JoinRejected` payload.
@@ -317,6 +324,8 @@ pub fn canonical_join_accepted(body: &JoinAcceptedBody) -> Result<Vec<u8>> {
     out.extend_from_slice(&body.wrapped_group_key.nonce);
     out.extend_from_slice(&(body.wrapped_group_key.wrapped_key.len() as u32).to_le_bytes());
     out.extend_from_slice(&body.wrapped_group_key.wrapped_key);
+    out.push(0u8);
+    out.extend_from_slice(&body.snapshot_version.to_le_bytes());
     Ok(out)
 }
 

@@ -60,6 +60,7 @@ fn canonical_join_accepted_starts_with_versioned_tag() {
         members: Vec::new(),
         joiner_id: IdentityId::from([0u8; 32]),
         wrapped_group_key: wrapped,
+        snapshot_version: 1,
     };
     let canonical = canonical_join_accepted(&body).unwrap();
     assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v1"));

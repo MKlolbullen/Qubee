@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use secrecy::{Secret, ExposeSecret, Zeroize};
-use zeroize::ZeroizeOnDrop;
-use serde::{Serialize, Deserialize};
+use secrecy::{ExposeSecret, Secret};
+use serde::{Deserialize, Serialize};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
@@ -12,13 +11,17 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use crate::security::secure_rng;
 
-/// Secure key storage with encryption and integrity protection
-#[derive(ZeroizeOnDrop)]
+/// Secure key storage with encryption and integrity protection.
+///
+/// Drop behaviour: we use a manual `impl Drop` (further down) that
+/// best-effort flushes the keystore to disk. The `master_key` field
+/// is wrapped in `Secret<[u8; 32]>` which already zeroises on drop,
+/// so we don't need `#[derive(ZeroizeOnDrop)]` — combining that
+/// derive with the manual impl produced two `Drop` impls and an
+/// E0119 conflict.
 pub struct SecureKeyStore {
-    #[zeroize(skip)]
     storage_path: PathBuf,
     master_key: Secret<[u8; 32]>,
-    #[zeroize(skip)]
     keys: HashMap<String, EncryptedKeyEntry>,
 }
 

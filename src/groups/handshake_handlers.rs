@@ -187,6 +187,13 @@ pub fn process_join_accepted(
                 invited_by: Some(expected_inviter_id),
                 member_status: MemberStatus::Active,
                 custom_permissions: None,
+                // Snapshot from the wire doesn't carry per-member
+                // Kyber pubkeys today — the joiner only learns the
+                // inviter's metadata and the member list. Future
+                // KeyRotation deliveries to legacy members get
+                // skipped because of the empty-vec gate in
+                // rotate_group_key_after_removal.
+                kyber_pub: Vec::new(),
             },
         );
     }

@@ -71,6 +71,13 @@ crc32fast = "1.4"
 url = "2.5"
 percent-encoding = "2.3"
 
+[target.'cfg(unix)'.dependencies]
+# Required by src/security/secure_memory.rs for mlock/munlock and by
+# the entropy mixer in secure_rng.rs. Was previously called from
+# `unsafe { libc::... }` blocks without ever being declared, which is
+# why the crate had been failing to resolve.
+libc = "0.2"
+
 [features]
 default = []
 # Pull in the WebRTC stack and the in-progress `calling` module. It

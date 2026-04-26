@@ -1007,6 +1007,61 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanu
     *INITIALIZED.lock().unwrap() = false;
 }
 
+/// Wipe the on-disk identity + group keystores plus all in-memory
+/// caches, then mark the core as uninitialised. Used by Settings →
+/// "Reset identity" to recover from a desynced state (e.g. the user
+/// nuked the keystore files outside the app, or the persisted bundle
+/// no longer matches the in-process keys).
+///
+/// After this returns, Kotlin must call `nativeInitialize(dataDir)`
+/// again before any further JNI call. The next launch will see a
+/// fresh keystore and route through onboarding again.
+///
+/// `data_dir` should be the same `context.filesDir.absolutePath` that
+/// was passed to `nativeInitialize` so we delete the right files.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetIdentity(
+    env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let dir: String = match env.get_string(data_dir) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+
+        // Drop in-memory state first so any pending operation can't
+        // race the file deletes and write a stale record back.
+        *ACTIVE_IDENTITY.lock().unwrap() = None;
+        *KEYSTORE.lock().unwrap() = None;
+        *GROUP_MANAGER.lock().unwrap() = None;
+        PENDING_JOIN_KEMS.lock().unwrap().clear();
+        *INITIALIZED.lock().unwrap() = false;
+
+        // SecureKeyStore stores its data file at <path>.db and the
+        // password-derived master key at <path>.master — wipe both
+        // for both the identity and groups stores. Best-effort:
+        // missing files are fine, anything else gets logged but
+        // doesn't fail the reset.
+        let path = std::path::Path::new(&dir);
+        for name in &[
+            "qubee_keys.db",
+            "qubee_keys.master",
+            "qubee_groups.db",
+            "qubee_groups.master",
+        ] {
+            let p = path.join(name);
+            if let Err(e) = std::fs::remove_file(&p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("Rust: reset failed to delete {p:?}: {e}");
+                }
+            }
+        }
+        1
+    })
+}
+
 // ---------------------------------------------------------------------------
 // ZK Onboarding & invite-link surface (added for the identity/groups feature)
 // ---------------------------------------------------------------------------

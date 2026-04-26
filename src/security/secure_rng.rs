@@ -133,18 +133,18 @@ impl SecureRng {
         // Add process-specific entropy
         hasher.update(&std::process::id().to_le_bytes());
         
-        // Add thread-specific entropy
-        hasher.update(&std::thread::current().id().as_u64().to_le_bytes());
-        
+        // Thread-id entropy removed — ThreadId::as_u64 is still
+        // unstable. The other sources below are plenty.
+
         // Add memory address entropy (ASLR)
         let stack_addr = &buffer as *const _ as usize;
         hasher.update(&stack_addr.to_le_bytes());
-        
+
         #[cfg(unix)]
         {
-            // Add Unix-specific entropy
-            use std::os::unix::process::CommandExt;
-            let pid = unsafe { libc::getpid() };
+            // std::process::id is portable and matches libc::getpid on
+            // Unix; using it dodges an extra libc round-trip.
+            let pid = std::process::id();
             hasher.update(&pid.to_le_bytes());
         }
         

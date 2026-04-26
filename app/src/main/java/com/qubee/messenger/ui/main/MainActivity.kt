@@ -93,18 +93,19 @@ class MainActivity : AppCompatActivity() {
             .findFragmentById(R.id.nav_host_fragment) as NavHostFragment
         navController = navHostFragment.navController
 
-        // Only override the start destination on a fresh launch — on
-        // rotation/process death-restore, NavController rehydrates its
-        // own back stack and a manual graph swap would clobber it
-        // (sending the user back to the start destination unexpectedly).
+        // The layout no longer carries `app:navGraph`, so we always
+        // inflate here. Only the *start destination* is conditional on
+        // a fresh launch — on rotation/process-death-restore, the
+        // controller restores its previous back stack from saved state
+        // when the graph is reassigned.
+        val graph = navController.navInflater.inflate(R.navigation.nav_graph)
         if (isFreshLaunch) {
-            val graph = navController.navInflater.inflate(R.navigation.nav_graph)
             graph.setStartDestination(
                 if (preferences.isOnboarded()) R.id.navigation_conversations
                 else R.id.onboardingFragment
             )
-            navController.graph = graph
         }
+        navController.graph = graph
 
         // Setup bottom navigation
         binding.bottomNavigation.setupWithNavController(navController)

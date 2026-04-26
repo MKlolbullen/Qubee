@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
+import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
@@ -19,10 +20,12 @@ import androidx.navigation.ui.setupActionBarWithNavController
 import androidx.navigation.ui.setupWithNavController
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.qubee.messenger.R
+import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.databinding.ActivityMainBinding
 import com.qubee.messenger.service.MessageService
 import com.qubee.messenger.ui.settings.SettingsActivity
 import com.qubee.messenger.util.PermissionHelper
+import javax.inject.Inject
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -35,6 +38,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var appBarConfiguration: AppBarConfiguration
     
     private val viewModel: MainViewModel by viewModels()
+
+    @Inject
+    lateinit var preferences: PreferenceRepository
 
     // Permission launcher
     private val permissionLauncher = registerForActivityResult(
@@ -50,7 +56,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         setupToolbar()
-        setupNavigation()
+        setupNavigation(isFreshLaunch = savedInstanceState == null)
         setupObservers()
         
         // Check and request permissions
@@ -82,10 +88,23 @@ class MainActivity : AppCompatActivity() {
         supportActionBar?.setDisplayShowTitleEnabled(true)
     }
 
-    private fun setupNavigation() {
+    private fun setupNavigation(isFreshLaunch: Boolean) {
         val navHostFragment = supportFragmentManager
             .findFragmentById(R.id.nav_host_fragment) as NavHostFragment
         navController = navHostFragment.navController
+
+        // Only override the start destination on a fresh launch — on
+        // rotation/process death-restore, NavController rehydrates its
+        // own back stack and a manual graph swap would clobber it
+        // (sending the user back to the start destination unexpectedly).
+        if (isFreshLaunch) {
+            val graph = navController.navInflater.inflate(R.navigation.nav_graph)
+            graph.setStartDestination(
+                if (preferences.isOnboarded()) R.id.navigation_conversations
+                else R.id.onboardingFragment
+            )
+            navController.graph = graph
+        }
 
         // Setup bottom navigation
         binding.bottomNavigation.setupWithNavController(navController)
@@ -102,6 +121,15 @@ class MainActivity : AppCompatActivity() {
 
         // Handle navigation changes
         navController.addOnDestinationChangedListener { _, destination, _ ->
+            // Onboarding gets the full screen — no toolbar, no bottom
+            // nav, since the user hasn't picked an identity yet and
+            // there's nowhere meaningful to navigate to.
+            val isOnboarding = destination.id == R.id.onboardingFragment
+            binding.appBarLayout.visibility =
+                if (isOnboarding) View.GONE else View.VISIBLE
+            binding.bottomNavigation.visibility =
+                if (isOnboarding) View.GONE else View.VISIBLE
+
             when (destination.id) {
                 R.id.navigation_conversations -> {
                     supportActionBar?.title = getString(R.string.title_conversations)
@@ -249,6 +277,13 @@ class MainActivity : AppCompatActivity() {
             R.id.action_new_chat -> {
                 // Navigate to contact selection
                 navController.navigate(R.id.contactSelectionFragment)
+                true
+            }
+            R.id.action_new_group -> {
+                // Top-level entry to the create-or-scan group flow.
+                // groupInviteFragment hosts both halves: minting a new
+                // group (with a fresh invite QR) and accepting one.
+                navController.navigate(R.id.groupInviteFragment)
                 true
             }
             R.id.action_settings -> {

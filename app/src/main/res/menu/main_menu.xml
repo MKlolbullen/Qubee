@@ -12,6 +12,11 @@
         android:title="New chat"
         app:showAsAction="ifRoom" />
     <item
+        android:id="@+id/action_new_group"
+        android:icon="@android:drawable/ic_menu_share"
+        android:title="New group"
+        app:showAsAction="ifRoom" />
+    <item
         android:id="@+id/action_settings"
         android:icon="@android:drawable/ic_menu_preferences"
         android:title="Settings"

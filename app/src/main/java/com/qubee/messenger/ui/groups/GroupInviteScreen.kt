@@ -2,7 +2,6 @@ package com.qubee.messenger.ui.groups
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,8 +16,12 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,6 +43,10 @@ import com.qubee.messenger.util.QrUtils
  * - Bottom half: scan an inbound QR or paste an invite link to inspect &
  *   accept it.
  *
+ * Errors arrive via [InviteUiState.error] and are surfaced as a
+ * Snackbar — `viewModel.consumeError()` is called once the message is
+ * shown so it doesn't re-trigger on every recomposition.
+ *
  * The actual "join the group" call is delegated to [onAcceptInvite] so
  * this composable stays decoupled from the network/repository layer.
  */
@@ -50,6 +57,7 @@ fun GroupInviteScreen(
 ) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
+    val snackbarHost = remember { SnackbarHostState() }
     var pastedLink by remember { mutableStateOf("") }
     var newGroupName by remember { mutableStateOf("") }
 
@@ -61,133 +69,138 @@ fun GroupInviteScreen(
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(20.dp)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            "Group invite",
-            style = MaterialTheme.typography.headlineSmall,
-        )
-        Text(
-            "Up to ${viewModel.maxMembers} members per group (creator included).",
-            style = MaterialTheme.typography.bodySmall,
-        )
+    LaunchedEffect(state.error) {
+        val msg = state.error ?: return@LaunchedEffect
+        snackbarHost.showSnackbar(msg)
+        viewModel.consumeError()
+    }
 
-        Spacer(Modifier.height(16.dp))
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHost) },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(20.dp)
+                .verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            // The fragment's nav-graph label ("Group invite") already
+            // shows in the toolbar — only the bodySmall caption stays
+            // here so we don't duplicate the title.
+            Text(
+                "Up to ${viewModel.maxMembers} members per group (creator included).",
+                style = MaterialTheme.typography.bodySmall,
+            )
 
-        if (state.isWorking) {
-            CircularProgressIndicator()
             Spacer(Modifier.height(16.dp))
-        }
 
-        // Create-new-group section. Hidden once the user has just minted
-        // an invite, since the QR + scan flows below take over.
-        if (state.generatedLink == null && state.scannedInvite == null) {
+            if (state.isWorking) {
+                CircularProgressIndicator()
+                Spacer(Modifier.height(16.dp))
+            }
+
+            // Create-new-group section. Hidden once the user has just
+            // minted an invite, since the QR + scan flows below take over.
+            if (state.generatedLink == null && state.scannedInvite == null) {
+                OutlinedTextField(
+                    value = newGroupName,
+                    onValueChange = { newGroupName = it },
+                    label = { Text("Name a new group") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = { viewModel.createGroupAndInvite(newGroupName) },
+                    enabled = newGroupName.isNotBlank() && !state.isWorking,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Create group + invite") }
+                Spacer(Modifier.height(16.dp))
+            }
+
+            state.generatedLink?.let { link ->
+                val bitmap = remember(link) { QrUtils.encodeAsBitmap(link) }
+                Text(
+                    state.groupName ?: "Invite",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Spacer(Modifier.height(8.dp))
+                bitmap?.let {
+                    Image(
+                        bitmap = it.asImageBitmap(),
+                        contentDescription = "Group invite QR code",
+                        modifier = Modifier.size(240.dp),
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    link,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+
+            OutlinedButton(
+                onClick = { scanLauncher.launch(QrScannerActivity.options(context)) },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Scan invite QR") }
+
+            Spacer(Modifier.height(12.dp))
+
             OutlinedTextField(
-                value = newGroupName,
-                onValueChange = { newGroupName = it },
-                label = { Text("Name a new group") },
+                value = pastedLink,
+                onValueChange = { pastedLink = it },
+                label = { Text("Or paste qubee://invite/...") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             Button(
-                onClick = { viewModel.createGroupAndInvite(newGroupName) },
-                enabled = newGroupName.isNotBlank() && !state.isWorking,
+                onClick = { viewModel.decodeScannedLink(pastedLink.trim()) },
+                enabled = QrUtils.isInviteLink(pastedLink.trim()) && !state.isWorking,
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Create group + invite") }
-            Spacer(Modifier.height(16.dp))
-        }
+            ) { Text("Inspect link") }
 
-        state.generatedLink?.let { link ->
-            val bitmap = remember(link) { QrUtils.encodeAsBitmap(link) }
-            Text(
-                state.groupName ?: "Invite",
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Spacer(Modifier.height(8.dp))
-            bitmap?.let {
-                Image(
-                    bitmap = it.asImageBitmap(),
-                    contentDescription = "Group invite QR code",
-                    modifier = Modifier.size(240.dp),
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                link,
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Spacer(Modifier.height(16.dp))
-        }
-
-        OutlinedButton(
-            onClick = { scanLauncher.launch(QrScannerActivity.options(context)) },
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Scan invite QR") }
-
-        Spacer(Modifier.height(12.dp))
-
-        OutlinedTextField(
-            value = pastedLink,
-            onValueChange = { pastedLink = it },
-            label = { Text("Or paste qubee://invite/...") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Button(
-            onClick = { viewModel.decodeScannedLink(pastedLink.trim()) },
-            enabled = QrUtils.isInviteLink(pastedLink.trim()) && !state.isWorking,
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Inspect link") }
-
-        state.scannedInvite?.let { invite ->
-            Spacer(Modifier.height(16.dp))
-            Text(
-                "Invitation from ${invite.inviterName}",
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text("Group: ${invite.groupName}")
-            Text("Members allowed: ${invite.maxMembers}")
-            if (invite.isExpired) {
+            state.scannedInvite?.let { invite ->
+                Spacer(Modifier.height(16.dp))
                 Text(
-                    "This invite has expired.",
-                    color = MaterialTheme.colorScheme.error,
+                    "Invitation from ${invite.inviterName}",
+                    style = MaterialTheme.typography.titleMedium,
                 )
-            }
-            state.acceptanceResult?.let { result ->
-                val msg = if (result.networkPublished) {
-                    "Saved. A signed handshake was sent — the inviter's " +
-                        "device will enrol you as soon as it sees it on " +
-                        "the network."
-                } else {
-                    "Saved locally. Couldn't reach the network yet — open " +
-                        "the chat once you're connected to retry the " +
-                        "handshake."
+                Text("Group: ${invite.groupName}")
+                Text("Members allowed: ${invite.maxMembers}")
+                if (invite.isExpired) {
+                    Text(
+                        "This invite has expired.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
-                Text(msg, style = MaterialTheme.typography.bodySmall)
+                state.acceptanceResult?.let { result ->
+                    val msg = if (result.networkPublished) {
+                        "Saved. A signed handshake was sent — the inviter's " +
+                            "device will enrol you as soon as it sees it on " +
+                            "the network."
+                    } else {
+                        "Saved locally. Couldn't reach the network yet — open " +
+                            "the chat once you're connected to retry the " +
+                            "handshake."
+                    }
+                    Text(msg, style = MaterialTheme.typography.bodySmall)
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        viewModel.acceptInvite()
+                        state.scannedLink?.let(onAcceptInvite)
+                    },
+                    enabled = !invite.isExpired && state.scannedLink != null && !state.accepted,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(if (state.accepted) "Saved" else "Join ${invite.groupName}") }
+                OutlinedButton(
+                    onClick = { viewModel.clearScanned() },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Discard") }
             }
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = {
-                    viewModel.acceptInvite()
-                    state.scannedLink?.let(onAcceptInvite)
-                },
-                enabled = !invite.isExpired && state.scannedLink != null && !state.accepted,
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text(if (state.accepted) "Saved" else "Join ${invite.groupName}") }
-            OutlinedButton(
-                onClick = { viewModel.clearScanned() },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Discard") }
-        }
-
-        state.error?.let {
-            Spacer(Modifier.height(8.dp))
-            Text(it, color = MaterialTheme.colorScheme.error)
         }
     }
 }

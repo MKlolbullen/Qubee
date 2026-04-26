@@ -1,17 +1,13 @@
 use std::collections::HashMap;
-use crate::storage::secure_keystore::{SecureKeystore, KeyType, KeyMetadata, KeyUsage};
-use tokio::sync::Mutex;
-use std::sync::Arc;
-use bincode;
-use hex;
 use std::collections::HashMap as StdHashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use serde::{Serialize, Deserialize};
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::identity::identity_key::{IdentityId, IdentityKey};
+use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeystore};
 
 /// Represents the verification status of a contact. Applications may
 /// choose different trust models (e.g. TOFU, cross‑signature). For

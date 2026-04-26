@@ -10,7 +10,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0.98"
-rand = "0.9.2"
+# Pinned to 0.8 because the AEAD/RNG ecosystem here (chacha20poly1305
+# 0.10, rand_chacha 0.3, ed25519-dalek 2.x) all standardised on
+# rand_core 0.6 which `rand 0.8` re-exports. Bumping to rand 0.9 ↔
+# rand_core 0.9 cascaded into trait-bound mismatches across half the
+# crate; pinning here is the smallest correct fix.
+rand = "0.8"
 tokio = { version = "1.47.0", features = ["full"] }
 futures = "0.3"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -21,8 +26,10 @@ pqcrypto-dilithium = "0.5.0"
 pqcrypto-traits = "0.3"
 chacha20poly1305 = "0.10.1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
-secrecy = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand_chacha = "0.3"
+getrandom = "0.2"
+secrecy = "0.10"
 thiserror = "1.0"
 blake3 = "1.4"
 hkdf = "0.12"
@@ -65,7 +72,7 @@ libp2p = { version = "0.53", features = [
 ] }
 
 # Identity / ZK / Invite-link plumbing
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde", "zeroize"] }
 base64 = "0.22"
 crc32fast = "1.4"
 url = "2.5"
@@ -85,6 +92,11 @@ default = []
 # version of webrtc-rs and several files reference types that have
 # moved. Enabling this is for active development, not for users.
 calling = ["dep:webrtc"]
+# Compile the legacy prototype modules (`hybrid_ratchet`,
+# `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
+# They reference dependency APIs that have since drifted; enabling
+# this is for porting work, not for downstream consumers.
+legacy = []
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -85,7 +85,7 @@ pub struct GroupMember {
 }
 
 /// Member status in the group
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemberStatus {
     /// Active member
     Active,
@@ -398,35 +398,42 @@ impl GroupManager {
     ) -> Result<()> {
         // Check permissions
         self.check_permission(group_id, admin_id, Permission::ManageRoles)?;
-        
-        let group = self.groups.get_mut(&group_id)
-            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
-        // Cannot change owner role
-        if let Some(member) = group.members.get(&member_id) {
-            if member.role == Role::Owner {
-                return Err(anyhow::anyhow!("Cannot change owner role"));
+
+        // Mutate the group inside a scoped borrow so we can call back
+        // through `&mut self` (log_group_event, store_group_securely)
+        // after the borrow is released. Capture the log message to fire
+        // later — the actual side effect runs outside the scope.
+        let log_msg = {
+            let group = self
+                .groups
+                .get_mut(&group_id)
+                .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+
+            if let Some(member) = group.members.get(&member_id) {
+                if member.role == Role::Owner {
+                    return Err(anyhow::anyhow!("Cannot change owner role"));
+                }
             }
+
+            let msg = if let Some(member) = group.members.get_mut(&member_id) {
+                let old_role = member.role.clone();
+                member.role = new_role.clone();
+                Some(format!(
+                    "Member {} role changed from {:?} to {:?}",
+                    member_id, old_role, new_role
+                ))
+            } else {
+                None
+            };
+
+            group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            group.version += 1;
+            msg
+        };
+
+        if let Some(msg) = log_msg {
+            self.log_group_event(group_id, admin_id, GroupEventType::RoleChanged, msg)?;
         }
-        
-        // Update role
-        if let Some(member) = group.members.get_mut(&member_id) {
-            let old_role = member.role.clone();
-            member.role = new_role.clone();
-            
-            // Log event
-            self.log_group_event(
-                group_id,
-                admin_id,
-                GroupEventType::RoleChanged,
-                format!("Member {} role changed from {:?} to {:?}", member_id, old_role, new_role),
-            )?;
-        }
-        
-        group.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        group.version += 1;
         
         self.store_group_securely(&group_id)?;
         
@@ -996,7 +1003,7 @@ impl GroupManager {
     
     /// Log a group event
     fn log_group_event(
-        &self,
+        &mut self,
         group_id: GroupId,
         actor_id: IdentityId,
         event_type: GroupEventType,
@@ -1032,7 +1039,7 @@ impl GroupManager {
     }
     
     /// Store group securely
-    fn store_group_securely(&self, group_id: &GroupId) -> Result<()> {
+    fn store_group_securely(&mut self, group_id: &GroupId) -> Result<()> {
         if let Some(group) = self.groups.get(group_id) {
             let serialized = bincode::serialize(group)?;
             let key_name = format!("group_{}", hex::encode(group_id.as_ref()));

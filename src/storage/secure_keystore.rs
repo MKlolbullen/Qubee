@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
@@ -15,13 +15,13 @@ use crate::security::secure_rng;
 ///
 /// Drop behaviour: we use a manual `impl Drop` (further down) that
 /// best-effort flushes the keystore to disk. The `master_key` field
-/// is wrapped in `Secret<[u8; 32]>` which already zeroises on drop,
+/// is wrapped in `SecretBox<[u8; 32]>` which already zeroises on drop,
 /// so we don't need `#[derive(ZeroizeOnDrop)]` — combining that
 /// derive with the manual impl produced two `Drop` impls and an
 /// E0119 conflict.
 pub struct SecureKeyStore {
     storage_path: PathBuf,
-    master_key: Secret<[u8; 32]>,
+    master_key: SecretBox<[u8; 32]>,
     keys: HashMap<String, EncryptedKeyEntry>,
 }
 
@@ -139,7 +139,7 @@ impl SecureKeyStore {
     }
     
     /// Retrieve a key from the secure keystore
-    pub fn retrieve_key(&mut self, key_id: &str) -> Result<Option<Secret<Vec<u8>>>> {
+    pub fn retrieve_key(&mut self, key_id: &str) -> Result<Option<SecretBox<Vec<u8>>>> {
         let entry = match self.keys.get_mut(key_id) {
             Some(entry) => entry,
             None => return Ok(None),
@@ -158,7 +158,7 @@ impl SecureKeyStore {
             .decrypt(nonce, entry.encrypted_data.as_ref())
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
         
-        Ok(Some(Secret::new(decrypted_data)))
+        Ok(Some(SecretBox::new(Box::new(decrypted_data))))
     }
     
     /// Delete a key from the keystore
@@ -188,7 +188,7 @@ impl SecureKeyStore {
     /// Rotate the master key (re-encrypt all stored keys)
     pub fn rotate_master_key(&mut self) -> Result<()> {
         // Generate new master key
-        let new_master_key = Secret::new(secure_rng::random::array::<32>()?);
+        let new_master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
         
         // Re-encrypt all keys with new master key
         let old_cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
@@ -248,19 +248,19 @@ impl SecureKeyStore {
         Ok(removed_count)
     }
     
-    fn load_or_generate_master_key(storage_path: &Path) -> Result<Secret<[u8; 32]>> {
+    fn load_or_generate_master_key(storage_path: &Path) -> Result<SecretBox<[u8; 32]>> {
         let master_key_path = storage_path.with_extension("master");
         
         if master_key_path.exists() {
             Self::load_master_key(&master_key_path)
         } else {
-            let master_key = Secret::new(secure_rng::random::array::<32>()?);
+            let master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
             Self::save_master_key_to_path(&master_key, &master_key_path)?;
             Ok(master_key)
         }
     }
     
-    fn load_master_key(path: &Path) -> Result<Secret<[u8; 32]>> {
+    fn load_master_key(path: &Path) -> Result<SecretBox<[u8; 32]>> {
         let encrypted_data = fs::read(path)
             .context("Failed to read master key file")?;
         
@@ -269,7 +269,7 @@ impl SecureKeyStore {
         let password = Self::get_user_password()?;
         let derived_key = Self::derive_key_from_password(&password)?;
         
-        let cipher = ChaCha20Poly1305::new(&derived_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
         let nonce = Nonce::from_slice(&encrypted_data[..12]);
         let ciphertext = &encrypted_data[12..];
         
@@ -284,7 +284,7 @@ impl SecureKeyStore {
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(&decrypted);
         
-        Ok(Secret::new(key_array))
+        Ok(SecretBox::new(Box::new(key_array)))
     }
     
     fn save_master_key(&self) -> Result<()> {
@@ -292,11 +292,11 @@ impl SecureKeyStore {
         Self::save_master_key_to_path(&self.master_key, &master_key_path)
     }
     
-    fn save_master_key_to_path(master_key: &Secret<[u8; 32]>, path: &Path) -> Result<()> {
+    fn save_master_key_to_path(master_key: &SecretBox<[u8; 32]>, path: &Path) -> Result<()> {
         let password = Self::get_user_password()?;
         let derived_key = Self::derive_key_from_password(&password)?;
         
-        let cipher = ChaCha20Poly1305::new(&derived_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
         let nonce_bytes = secure_rng::random::array::<12>()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         

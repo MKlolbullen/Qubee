@@ -1,133 +1,138 @@
 # Build status — verification snapshot
 
-This document captures what `cargo check` and Gradle plugin resolution
-reported when run against the repo on the verification pass that
-followed rounds 8–9 + the "fix all 4 UI gaps" work. It is a snapshot,
-not a continuous status — re-run the commands below to refresh.
+This document captures what `cargo` and Gradle reported when run
+against the repo on the rounds q–t verification pass. Re-run the
+commands below to refresh.
 
 ```
-RUSTUP_TOOLCHAIN=stable cargo check
-gradle --offline tasks
+cargo check
+cargo test
+./gradlew :app:assembleDebug
+./gradlew :app:recordPaparazziDebug
 ```
 
-## Rust core
+## Rust core — `cargo check` + `cargo test`
 
-**Result**: still does not compile. The pass started at **162 errors**
-and got down to **141** after the fixes listed under "addressed in
-this pass" below. The remaining errors are *not* from the recent
-rounds — they're long-standing API-drift between the dependencies
-declared in `Cargo.toml` and the code that uses them.
+**Result: GREEN.** Default `cargo build` compiles clean, all 33
+in-tree unit tests pass, all 16 integration tests pass.
 
-### Addressed in this pass
+```
+$ cargo test
+   Compiling qubee_crypto v0.2.0 (/home/user/Qubee)
+    Finished `test` profile [unoptimized + debuginfo] target(s)
+     Running unittests src/lib.rs
+test result: ok. 33 passed; 0 failed; 0 ignored
+     Running tests/group_handshake_e2e.rs
+test result: ok. 5 passed; 0 failed; 0 ignored
+     Running tests/group_message_e2e.rs
+test result: ok. 3 passed; 0 failed; 0 ignored
+     Running tests/wire_stability.rs
+test result: ok. 8 passed; 0 failed; 0 ignored
+```
 
-* **Removed the duplicate `src/security/secure_keystore.rs`.** Two
-  identical copies of `SecureKeyStore` lived under `security/` and
-  `storage/`; both derived `ZeroizeOnDrop` *and* declared a manual
-  `impl Drop`, producing a hard E0119 conflict. `crate::storage::*`
-  is the canonical path (every caller already used it); the
-  `security` copy is gone.
-* **Fixed the Drop conflict in `storage/secure_keystore.rs`.** The
-  `#[derive(ZeroizeOnDrop)]` was redundant with the manual `impl
-  Drop` (which flushes keys to disk on drop). The derive is gone;
-  `master_key: Secret<[u8;32]>` already zeroises on its own drop.
-* **Added `libc` as a target-conditional dep** for `cfg(unix)`.
-  `secure_memory.rs` was calling `libc::mlock`/`munlock` and
-  `secure_rng.rs` was calling `libc::getpid` from inside `unsafe {}`
-  blocks without ever declaring the dep, so the crate failed to
-  resolve before reaching the type checker.
-* **Replaced the unstable `ThreadId::as_u64()` call** in
-  `secure_rng.rs` with a comment + a lean on the existing
-  `std::process::id` + stack-address + timing entropy sources. The
-  thread-id contribution was a few bits at most and not worth
-  carrying an unstable feature for.
-* **Added the missing `kyber_pub` field** to one `GroupMember`
-  literal in `handshake_handlers.rs::process_join_accepted` that
-  Round 9f had introduced without updating its struct-literal
-  initialisation.
+### What it took to get here
 
-### Remaining categories (~141 errors, all pre-existing)
+The verification pass started at 162 errors. Steps:
 
-These are **dependency-API drift**, not regressions from any recent
-round. The grouped histogram from `cargo check`:
+1. **Feature-gated the legacy modules** behind `#[cfg(feature =
+   "legacy")]`: `audio`, `hybrid_ratchet`, `secure_message`,
+   `file_transfer`, `signal_protocol`, `sas`, `oob_secrets`,
+   `secure_memory`. They reference dependency APIs that have since
+   drifted; nothing on the JNI surface uses them. Compile them when
+   you're ready to port: `cargo check --features legacy`. (Today
+   that's still a 100+ error fix-up project — the gating is
+   protective, not a green light.)
+2. **Upgraded `secrecy 0.8` → `0.10`** and switched
+   `Secret<NonCopyType>` to `SecretBox<NonCopyType>` everywhere it
+   appeared: `identity/identity_key.rs`, `groups/group_crypto.rs`,
+   `storage/secure_keystore.rs`, `identity/contact_manager.rs`.
+3. **Pinned `rand` to 0.8** because `chacha20poly1305 = "0.10"`,
+   `rand_chacha = "0.3"`, and `ed25519-dalek = "2.x"` all standardise
+   on `rand_core 0.6` which `rand 0.8` re-exports. Added
+   `rand_chacha = "0.3"` and `getrandom = "0.2"` as direct deps.
+4. **Added `libc` as a `cfg(unix)`** dep so `secure_rng.rs` compiles
+   on Linux/macOS/Android.
+5. **Ed25519-dalek**: enabled `serde` + `zeroize` features so
+   `IdentityKey` and `HybridSignature` can derive serde + zeroise
+   private bytes.
+6. **Custom serde for `IdentityKey` and `HybridSignature`** —
+   pqcrypto types don't impl `serde::{Serialize, Deserialize}`, so
+   `identity/identity_key.rs` round-trips them through their byte
+   form via `WireIdentityKey` / `WireHybridSignature` shadow structs.
+7. **Custom `Debug` impls** for `IdentityKey`, `HybridSignature`,
+   `DevicePublicKey` (the contained pqcrypto types don't impl
+   `Debug` either; we print summary fields without the opaque
+   secrets).
+8. **Refactored `IdentityKeyPair` internals** to store private key
+   material as raw byte buffers (`[u8; 32]` and `Vec<u8>`) wrapped in
+   manual `Drop` + `zeroize`. The pqcrypto secret types don't impl
+   `Zeroize` directly, so `SecretBox<DilithiumSecret>` would have
+   needed an orphan-rule-bypassing wrapper. Storing bytes is cleaner.
+9. **Bug fix**: `secure_rng::collect_additional_entropy` was filling
+   a `[u8; 64]` buffer from BLAKE3's 32-byte digest via
+   `copy_from_slice`, which panicked on every call. Switched to BLAKE3
+   XOF mode (`finalize_xof().fill(...)`). This is why every test that
+   touched `IdentityKeyPair::generate()` had been crashing.
+10. **Borrow-checker fix** in `group_manager::update_member_role` —
+    moved `log_group_event` outside the `&mut group` borrow scope.
+11. **Misc**: `chacha20poly1305::aead::Aead` import in
+    `group_crypto.rs`, `chacha20poly1305::Error` doesn't impl
+    `Display` so swapped `.context(...)` for `.map_err(...)`,
+    `MemberStatus` got `Debug` for the `assert_eq!` in tests,
+    `IdentityKey` lost `Eq` (the pq pubkey doesn't impl it).
 
-| count | error / cause |
-|------:|--------------|
-| 8 | `HybridSignature` / `IdentityKey` doesn't implement `Debug` — used in error formatting (`{e:?}`); add `#[derive(Debug)]` upstream. |
-| 6 | `pqcrypto_kyber::PublicKey: serde::Deserialize` not satisfied — `IdentityKey` derives `Serialize/Deserialize` but contains a Kyber pubkey that doesn't impl them. Either drop the derive or wrap the pubkey in a custom `(De)Serialize` for byte-encoded form. |
-| 5 | `OsRng::fill_bytes` trait bound — `chacha20poly1305 = "0.10"` expects `rand_core 0.6` traits, but `Cargo.toml` pins `rand = "0.9"` which uses 0.9 traits. Pin `rand` to 0.8 or upgrade chacha20poly1305 (and the rest of the AEAD chain) to a version that follows rand 0.9. |
-| 5 | `SigningKey: DefaultIsZeroes` / `SecretKey: DefaultIsZeroes` — `Secret<T>` requires `T: DefaultIsZeroes` in `secrecy = "0.8"`. The wrapped types don't satisfy it. Either upgrade `secrecy` to 0.10 (which dropped the trait) or wrap with `Box<dyn ...>`. |
-| 4 | `ChaChaPoly1305::encrypt`/`decrypt` not found — `chacha20poly1305 = "0.10"` requires the `aead` feature for those methods. Add `features = ["aead"]` to the dep. |
-| 4 | `pqcrypto_dilithium::PublicKey::from_bytes` not found — `pqcrypto-dilithium = "0.5"` moved that to the `pqcrypto-traits` `sign::PublicKey` trait. `use pqcrypto_traits::sign::PublicKey as _;` in the consuming files. |
-| 4 | `type annotations needed` — cascades from the others; resolve the upstream and these go away. |
-| ~ | smaller counts: `crate::HybridRatchet` not at crate root, `crate::PQ_REKEY_PERIOD` missing, `double_ratchet` crate not declared, `dilithium2::Signature` / `dilithium2::verify` removed, `Secret::expose_secret` on the wrong wrapper type in `contact_manager.rs`, etc. All in modules my recent rounds don't touch (`audio`, `hybrid_ratchet`, `secure_message`, `file_transfer`, `signal_protocol`, `sas`, `oob_secrets`, `logging`). |
+## Android module — Gradle
 
-### What actually runs today
+**Result: scaffolding works, plugin resolution downloads, build
+needs the Android SDK.**
 
-Nothing. `cargo check` doesn't pass, so neither do the integration
-tests under `tests/group_handshake_e2e.rs`,
-`tests/group_message_e2e.rs`, or `tests/wire_stability.rs`. Those
-test files are written against the public API I added in rounds
-8–9 and *should* pass cleanly the moment the lib compiles, but I
-can't claim that until someone actually runs them.
-
-### Recommended cleanup order
-
-1. **Pin `secrecy = "0.10"`** + clean up the `Secret<...>` API at the
-   call sites. This removes 5+ errors.
-2. **Pin `rand = "0.8"`** OR upgrade the AEAD stack. Removes ~9
-   errors.
-3. **Add `features = ["aead"]` to chacha20poly1305**. Removes 4
-   errors.
-4. **Add `use pqcrypto_traits::sign::{PublicKey, SecretKey, ...} as _;`**
-   to every file that touches Dilithium. Removes 4+ errors.
-5. **Custom `Serialize`/`Deserialize` for `IdentityKey`** that
-   round-trips the Kyber + Dilithium pubkeys as byte arrays. Removes
-   6 errors.
-6. **Feature-gate the legacy modules** (`audio`, `hybrid_ratchet`,
-   `secure_message`, `file_transfer`, `signal_protocol`, `sas`,
-   `oob_secrets`) behind a `legacy` feature so default `cargo
-   build` doesn't try to compile them. They're not on any code
-   path the JNI surface reaches today.
-
-After steps 1–4 the recent rounds' code should cleanly build and the
-integration tests should run.
-
-## Android module (Gradle)
-
-**Result**: scaffolding parses, plugin resolution fails offline.
-
-* Added `settings.gradle`, `build.gradle`, and `gradle.properties` at
-  the repo root for the first time. Without them, `app/build.gradle`
-  was unbuildable — nothing was telling Gradle that `:app` exists or
-  what plugin versions to use.
-* The build now gets through bootstrap and tries to resolve
-  `com.android.application:8.4.0`, `org.jetbrains.kotlin.android:1.9.22`,
-  `com.google.dagger.hilt.android:2.48`,
-  `androidx.navigation.safeargs.kotlin:2.7.7`, and
-  `app.cash.paparazzi:1.3.4`. With the sandbox in `--offline` mode
-  resolution fails, but that's expected — on a machine with internet
-  access the plugin downloads succeed.
-* No Gradle wrapper (`gradlew` + `gradle/wrapper/*.jar`) is committed
-  yet because the wrapper jar is binary and I can't generate one
-  without running `gradle wrapper`. **First step on a new clone**:
+* The Gradle wrapper now exists (`gradlew`, `gradlew.bat`,
+  `gradle/wrapper/gradle-wrapper.{jar,properties}`). Generated with
+  `gradle wrapper --gradle-version 8.7`.
+* Plugin metadata downloaded successfully: AGP 8.4.0,
+  Kotlin 1.9.22, Hilt 2.48, Navigation 2.7.7, Paparazzi 1.3.4.
+* `gradle :app:recordPaparazziDebug` now fails on:
   ```
-  cd Qubee
-  gradle wrapper --gradle-version 8.7
-  git add gradlew gradlew.bat gradle/wrapper
-  git commit -m "Add Gradle wrapper"
+  SDK location not found. Define a valid SDK location with an
+  ANDROID_HOME environment variable or by setting the sdk.dir path
+  in your project's local properties file at
+  '/home/user/Qubee/local.properties'.
   ```
+  …which is the expected message on a machine without the Android
+  SDK installed. The sandbox doesn't have it; running this on a real
+  dev/CI machine with `ANDROID_HOME=/path/to/sdk` should succeed.
 
-## Paparazzi
-
-A minimal screenshot test (`ResetButtonScreenshotTest.kt`) exists as
-the baseline. It snapshots the destructive "Reset identity" button so
-later UI changes have something to diff against. Once `:app` builds
-end-to-end, run:
+### Bootstrapping the Android build on a clean machine
 
 ```bash
+# Install Android SDK + cmdline-tools + platform-tools, then:
+echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+# First-time wrapper bootstrap (just downloads gradle 8.7 to ~/.gradle):
+./gradlew --version
+
+# Build the debug APK and run unit tests (Rust .so files must already
+# be in app/src/main/jniLibs — built by `build_rust.sh`):
+./gradlew :app:assembleDebug
+./gradlew :app:testDebugUnitTest
+
+# Compose screenshot baselines (first time):
 ./gradlew :app:recordPaparazziDebug
 git add app/src/test/snapshots/
+git commit -m "Add Paparazzi baselines"
+
+# CI (every PR):
+./gradlew :app:verifyPaparazziDebug
 ```
 
-…to commit the baseline PNGs. The pattern for adding more tests is
-documented in `docs/screenshot-tests.md`.
+## Recommended next steps
+
+* (q-tail) Port the legacy modules behind `--features legacy` once
+  there's an actual consumer. Today's gating is honest; the modules
+  have ~100 errors waiting and aren't worth fixing speculatively.
+* (s-cont) Run Paparazzi on a real machine to commit the baseline
+  PNGs. With the SDK present and the wrapper jar already in the
+  repo, this is one command on a dev box.
+* (u) CI: add a GitHub Actions workflow that runs `cargo test` on
+  every PR. The Android side requires more setup but a pure-Rust CI
+  job is two lines of YAML and immediately catches future regressions.

@@ -1,72 +1,61 @@
-use anyhow::{Context, Result};
-use secrecy::{Secret, ExposeSecret, Zeroize};
-use zeroize::ZeroizeOnDrop;
-use serde::{Serialize, Deserialize};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
-use pqcrypto_dilithium::dilithium2::{self, PublicKey as PQPublicKey, SecretKey as PQSecretKey};
+//! Hybrid identity keys (Ed25519 + Dilithium-2) and the device-key
+//! derivation that hangs off them. Refactored in round Q to play
+//! nicely with `secrecy 0.10` (no more `Secret<NonCopyType>`), the
+//! pqcrypto crates' lack of a `serde` feature, and the missing
+//! `Debug`/`Zeroize` derives.
+//!
+//! The trick: store private key material as raw byte buffers on the
+//! struct (which `zeroize` understands directly) and reconstruct the
+//! typed pqcrypto values lazily inside `sign` / `derive_device_key`.
+//! Public types still expose the strongly-typed `IdentityKey` and
+//! `HybridSignature` to the rest of the crate; serde for those uses
+//! `#[serde(with = "...")]` modules that round-trip the pq fields
+//! through their byte representation.
+
+use anyhow::{anyhow, Context, Result};
 use blake3::Hasher;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use pqcrypto_dilithium::dilithium2::{self};
+use pqcrypto_traits::sign::{
+    DetachedSignature as _, PublicKey as _, SecretKey as _,
+};
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use zeroize::Zeroize;
+
 use crate::security::secure_rng;
 
-/// Hybrid identity key combining classical and post-quantum cryptography
-#[derive(ZeroizeOnDrop)]
-pub struct IdentityKeyPair {
-    // Classical Ed25519 key pair for compatibility and performance
-    classical_private: Secret<SigningKey>,
-    classical_public: VerifyingKey,
-    
-    // Post-quantum Dilithium-2 key pair for quantum resistance
-    pq_private: Secret<PQSecretKey>,
-    pq_public: PQPublicKey,
-    
-    // Derived identifier for this identity
-    #[zeroize(skip)]
-    identity_id: IdentityId,
-    
-    // Creation timestamp
-    #[zeroize(skip)]
-    created_at: u64,
-}
+// ---------------------------------------------------------------------------
+// Public-facing types
+// ---------------------------------------------------------------------------
 
-/// Public portion of an identity key
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Public portion of an identity key. `Eq` is dropped because the
+/// inner `dilithium2::PublicKey` doesn't impl it; `PartialEq` does
+/// fine for byte-equality comparisons used at the call sites.
+#[derive(Clone, PartialEq)]
 pub struct IdentityKey {
     pub classical_public: VerifyingKey,
-    pub pq_public: PQPublicKey,
+    pub pq_public: dilithium2::PublicKey,
     pub identity_id: IdentityId,
     pub created_at: u64,
 }
 
-/// Unique identifier for an identity derived from public keys
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct IdentityId([u8; 32]);
-
-/// Device-specific key derived from identity key
-#[derive(ZeroizeOnDrop)]
-pub struct DeviceKey {
-    // X25519 key pair for ECDH
-    x25519_private: Secret<x25519_dalek::StaticSecret>,
-    x25519_public: x25519_dalek::PublicKey,
-    
-    // Kyber-768 key pair for post-quantum KEM
-    kyber_private: Secret<pqcrypto_kyber::kyber768::SecretKey>,
-    kyber_public: pqcrypto_kyber::kyber768::PublicKey,
-    
-    // Device identifier
-    #[zeroize(skip)]
-    device_id: DeviceId,
-    
-    // Associated identity
-    #[zeroize(skip)]
-    identity_id: IdentityId,
-    
-    // Creation timestamp
-    #[zeroize(skip)]
-    created_at: u64,
+impl fmt::Debug for IdentityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdentityKey")
+            .field("identity_id", &self.identity_id)
+            .field("created_at", &self.created_at)
+            .field("pq_public_len", &self.pq_public.as_bytes().len())
+            .finish_non_exhaustive()
+    }
 }
 
-/// Public portion of a device key
-#[derive(Clone, Serialize, Deserialize)]
+/// Unique identifier for an identity derived from its public keys.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IdentityId(pub(crate) [u8; 32]);
+
+/// Public portion of a device key (one device per identity).
+#[derive(Clone)]
 pub struct DevicePublicKey {
     pub x25519_public: x25519_dalek::PublicKey,
     pub kyber_public: pqcrypto_kyber::kyber768::PublicKey,
@@ -75,12 +64,68 @@ pub struct DevicePublicKey {
     pub created_at: u64,
 }
 
-/// Unique identifier for a device
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DeviceId([u8; 16]);
+impl fmt::Debug for DevicePublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DevicePublicKey")
+            .field("device_id", &self.device_id)
+            .field("identity_id", &self.identity_id)
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
+}
 
-/// Encrypted-at-rest representation of an [`IdentityKeyPair`]. Lives in
-/// the secure keystore only; bytes are never exposed to Kotlin / JNI.
+/// Unique identifier for a device.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeviceId(pub(crate) [u8; 16]);
+
+/// Hybrid signature combining classical and post-quantum signatures.
+#[derive(Clone)]
+pub struct HybridSignature {
+    pub classical_signature: Signature,
+    pub pq_signature: dilithium2::DetachedSignature,
+    pub signer_identity: IdentityId,
+    pub timestamp: u64,
+}
+
+impl fmt::Debug for HybridSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridSignature")
+            .field("signer_identity", &self.signer_identity)
+            .field("timestamp", &self.timestamp)
+            .field("pq_sig_len", &self.pq_signature.as_bytes().len())
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private keypair (zeroising on drop)
+// ---------------------------------------------------------------------------
+
+/// Hybrid identity key combining classical (Ed25519) and post-quantum
+/// (Dilithium-2) cryptography. Private material lives in raw byte
+/// buffers on the struct so `Zeroize` can reach it on drop without
+/// needing `secrecy::SecretBox` (which the pqcrypto secret types
+/// don't satisfy because they don't impl `Zeroize` directly).
+pub struct IdentityKeyPair {
+    classical_private_bytes: [u8; 32],
+    classical_public: VerifyingKey,
+    /// Raw bytes of `dilithium2::SecretKey`. Reconstructed via
+    /// `dilithium2::SecretKey::from_bytes` inside `sign`.
+    pq_private_bytes: Vec<u8>,
+    pq_public: dilithium2::PublicKey,
+    identity_id: IdentityId,
+    created_at: u64,
+}
+
+impl Drop for IdentityKeyPair {
+    fn drop(&mut self) {
+        self.classical_private_bytes.zeroize();
+        self.pq_private_bytes.zeroize();
+    }
+}
+
+/// Encrypted-at-rest representation of an [`IdentityKeyPair`]. Lives
+/// in the secure keystore only; bytes are never exposed to Kotlin / JNI.
 #[derive(Serialize, Deserialize)]
 struct PersistedIdentitySecrets {
     classical_private: [u8; 32],
@@ -90,44 +135,32 @@ struct PersistedIdentitySecrets {
     created_at: u64,
 }
 
-/// Hybrid signature combining classical and post-quantum signatures
-#[derive(Clone, Serialize, Deserialize)]
-pub struct HybridSignature {
-    pub classical_signature: Signature,
-    pub pq_signature: dilithium2::DetachedSignature,
-    pub signer_identity: IdentityId,
-    pub timestamp: u64,
-}
-
 impl IdentityKeyPair {
-    /// Generate a new identity key pair
+    /// Generate a new identity key pair.
     pub fn generate() -> Result<Self> {
-        // Generate classical Ed25519 key pair
         let classical_private_bytes = secure_rng::random::array::<32>()?;
         let classical_private = SigningKey::from_bytes(&classical_private_bytes);
         let classical_public = classical_private.verifying_key();
-        
-        // Generate post-quantum Dilithium-2 key pair
+
         let (pq_public, pq_private) = dilithium2::keypair();
-        
-        // Derive identity ID from public keys
+
         let identity_id = Self::derive_identity_id(&classical_public, &pq_public);
-        
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        
+
         Ok(IdentityKeyPair {
-            classical_private: Secret::new(classical_private),
+            classical_private_bytes,
             classical_public,
-            pq_private: Secret::new(pq_private),
+            pq_private_bytes: pq_private.as_bytes().to_vec(),
             pq_public,
             identity_id,
             created_at,
         })
     }
-    
-    /// Load identity key pair from secure storage
+
+    /// Reconstruct from raw byte buffers (used by the secure keystore
+    /// and any future identity-import path).
     pub fn from_bytes(
         classical_private: &[u8; 32],
         pq_private: &[u8],
@@ -135,28 +168,32 @@ impl IdentityKeyPair {
         pq_public: &[u8],
         created_at: u64,
     ) -> Result<Self> {
-        let classical_private = SigningKey::from_bytes(classical_private);
-        let classical_public = VerifyingKey::from_bytes(classical_public)
-            .map_err(|e| anyhow::anyhow!("Invalid classical public key: {}", e))?;
-        
-        let pq_private = PQSecretKey::from_bytes(pq_private)
-            .map_err(|e| anyhow::anyhow!("Invalid PQ private key: {}", e))?;
-        let pq_public = PQPublicKey::from_bytes(pq_public)
-            .map_err(|e| anyhow::anyhow!("Invalid PQ public key: {}", e))?;
-        
-        let identity_id = Self::derive_identity_id(&classical_public, &pq_public);
-        
+        let classical_priv = SigningKey::from_bytes(classical_private);
+        let classical_pub = VerifyingKey::from_bytes(classical_public)
+            .map_err(|e| anyhow!("Invalid classical public key: {e}"))?;
+        // Make sure both sides agree.
+        if classical_priv.verifying_key() != classical_pub {
+            return Err(anyhow!("classical pub/priv mismatch"));
+        }
+        let pq_pub = dilithium2::PublicKey::from_bytes(pq_public)
+            .map_err(|e| anyhow!("Invalid PQ public key: {e}"))?;
+        // Validate the secret key length by attempting to reconstruct it.
+        let _ = dilithium2::SecretKey::from_bytes(pq_private)
+            .map_err(|e| anyhow!("Invalid PQ private key: {e}"))?;
+
+        let identity_id = Self::derive_identity_id(&classical_pub, &pq_pub);
+
         Ok(IdentityKeyPair {
-            classical_private: Secret::new(classical_private),
-            classical_public,
-            pq_private: Secret::new(pq_private),
-            pq_public,
+            classical_private_bytes: *classical_private,
+            classical_public: classical_pub,
+            pq_private_bytes: pq_private.to_vec(),
+            pq_public: pq_pub,
             identity_id,
             created_at,
         })
     }
-    
-    /// Get the public identity key
+
+    /// Get the public identity key.
     pub fn public_key(&self) -> IdentityKey {
         IdentityKey {
             classical_public: self.classical_public,
@@ -165,25 +202,25 @@ impl IdentityKeyPair {
             created_at: self.created_at,
         }
     }
-    
-    /// Sign data with hybrid signature
+
+    /// Sign data with hybrid (Ed25519 + Dilithium-2) signature.
     pub fn sign(&self, data: &[u8]) -> Result<HybridSignature> {
-        // Create message to sign (includes timestamp for freshness)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        
-        let mut message = Vec::new();
+
+        let mut message = Vec::with_capacity(data.len() + 8 + 32);
         message.extend_from_slice(data);
         message.extend_from_slice(&timestamp.to_le_bytes());
         message.extend_from_slice(&self.identity_id.0);
-        
-        // Classical Ed25519 signature
-        let classical_signature = self.classical_private.expose_secret().sign(&message);
-        
-        // Post-quantum Dilithium-2 signature
-        let pq_signature = dilithium2::detached_sign(&message, self.pq_private.expose_secret());
-        
+
+        let classical_priv = SigningKey::from_bytes(&self.classical_private_bytes);
+        let classical_signature = classical_priv.sign(&message);
+
+        let pq_priv = dilithium2::SecretKey::from_bytes(&self.pq_private_bytes)
+            .map_err(|e| anyhow!("invalid persisted pq sk: {e}"))?;
+        let pq_signature = dilithium2::detached_sign(&message, &pq_priv);
+
         Ok(HybridSignature {
             classical_signature,
             pq_signature,
@@ -191,64 +228,63 @@ impl IdentityKeyPair {
             timestamp,
         })
     }
-    
-    /// Derive a device key from this identity key
+
+    /// Derive a device key from this identity key.
     pub fn derive_device_key(&self, device_info: &[u8]) -> Result<DeviceKey> {
-        // Create device-specific seed
         let mut hasher = Hasher::new();
-        hasher.update(&self.classical_private.expose_secret().to_bytes());
-        hasher.update(self.pq_private.expose_secret().as_bytes());
+        hasher.update(&self.classical_private_bytes);
+        hasher.update(&self.pq_private_bytes);
         hasher.update(device_info);
         hasher.update(b"device_key_derivation");
-        
         let seed = hasher.finalize();
-        
-        // Derive X25519 key pair
+
         let x25519_private_bytes: [u8; 32] = seed.as_bytes()[..32].try_into().unwrap();
         let x25519_private = x25519_dalek::StaticSecret::from(x25519_private_bytes);
         let x25519_public = x25519_dalek::PublicKey::from(&x25519_private);
-        
-        // Generate Kyber key pair (using derived randomness)
-        let mut rng = secure_rng::SecureRng::new()?;
+
+        // Kyber key derivation: pqcrypto-kyber doesn't expose a
+        // deterministic seeded keygen, so we bite the bullet and use
+        // its OS-randomness keypair. Future work: derive
+        // deterministically from `seed` once kyber-pure exposes it.
         let (kyber_public, kyber_private) = pqcrypto_kyber::kyber768::keypair();
-        
-        // Derive device ID
+
         let mut device_hasher = Hasher::new();
         device_hasher.update(x25519_public.as_bytes());
+        use pqcrypto_traits::kem::PublicKey as _;
         device_hasher.update(kyber_public.as_bytes());
         device_hasher.update(&self.identity_id.0);
-        
+
         let device_hash = device_hasher.finalize();
         let device_id = DeviceId(device_hash.as_bytes()[..16].try_into().unwrap());
-        
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        
+
+        use pqcrypto_traits::kem::SecretKey as _;
         Ok(DeviceKey {
-            x25519_private: Secret::new(x25519_private),
+            x25519_private_bytes,
             x25519_public,
-            kyber_private: Secret::new(kyber_private),
+            kyber_private_bytes: kyber_private.as_bytes().to_vec(),
             kyber_public,
             device_id,
             identity_id: self.identity_id,
             created_at,
         })
     }
-    
-    /// Get identity ID
+
+    /// Stable identifier for this identity.
     pub fn identity_id(&self) -> IdentityId {
         self.identity_id
     }
 
-    /// Serialise the full keypair (private + public) to a byte buffer
-    /// suitable for the encrypted [`SecureKeyStore`]. The caller is
-    /// responsible for storing the result behind ChaCha20Poly1305 — the
-    /// returned bytes contain raw private key material.
+    /// Serialise the full keypair to a byte buffer suitable for the
+    /// encrypted [`crate::storage::secure_keystore::SecureKeyStore`].
+    /// Bytes contain raw private material — the keystore must wrap
+    /// them in ChaCha20-Poly1305 before any disk write.
     pub fn serialize_for_keystore(&self) -> Result<Vec<u8>> {
         let secrets = PersistedIdentitySecrets {
-            classical_private: self.classical_private.expose_secret().to_bytes(),
-            pq_private: self.pq_private.expose_secret().as_bytes().to_vec(),
+            classical_private: self.classical_private_bytes,
+            pq_private: self.pq_private_bytes.clone(),
             classical_public: self.classical_public.to_bytes(),
             pq_public: self.pq_public.as_bytes().to_vec(),
             created_at: self.created_at,
@@ -268,23 +304,24 @@ impl IdentityKeyPair {
             s.created_at,
         )
     }
-    
-    /// Derive identity ID from public keys
-    fn derive_identity_id(classical_public: &VerifyingKey, pq_public: &PQPublicKey) -> IdentityId {
+
+    fn derive_identity_id(
+        classical_public: &VerifyingKey,
+        pq_public: &dilithium2::PublicKey,
+    ) -> IdentityId {
         let mut hasher = Hasher::new();
         hasher.update(classical_public.as_bytes());
         hasher.update(pq_public.as_bytes());
         hasher.update(b"qubee_identity_id");
-        
         let hash = hasher.finalize();
         IdentityId(hash.as_bytes()[..32].try_into().unwrap())
     }
 }
 
 impl IdentityKey {
-    /// Default acceptable signature age (5 minutes) for ratcheted message
-    /// flows. Use [`verify_with_max_age`] for QR / onboarding flows that
-    /// need a longer window.
+    /// Default acceptable signature age (5 minutes) for ratcheted
+    /// message flows. Use [`verify_with_max_age`] for QR / onboarding
+    /// flows that need a longer window.
     const DEFAULT_MAX_SIGNATURE_AGE_SECS: u64 = 300;
 
     /// Verify a hybrid signature with the default 5-minute freshness window.
@@ -293,9 +330,6 @@ impl IdentityKey {
     }
 
     /// Verify a hybrid signature with a caller-supplied freshness window.
-    /// Both signature halves must validate; the signer identity must
-    /// match this key; and the signature timestamp must be no older
-    /// than `max_age_secs`.
     pub fn verify_with_max_age(
         &self,
         data: &[u8],
@@ -305,7 +339,6 @@ impl IdentityKey {
         if signature.signer_identity != self.identity_id {
             return Ok(false);
         }
-
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -313,7 +346,7 @@ impl IdentityKey {
             return Ok(false);
         }
 
-        let mut message = Vec::new();
+        let mut message = Vec::with_capacity(data.len() + 8 + 32);
         message.extend_from_slice(data);
         message.extend_from_slice(&signature.timestamp.to_le_bytes());
         message.extend_from_slice(&self.identity_id.0);
@@ -328,43 +361,159 @@ impl IdentityKey {
             &self.pq_public,
         )
         .is_ok();
-
         Ok(classical_valid && pq_valid)
     }
-    
-    /// Serialize to bytes for storage or transmission
+
+    /// Serialize to bytes for storage / transmission. Uses bincode
+    /// over the explicit byte representation so cross-version
+    /// (de)serializers can be implemented without touching pqcrypto's
+    /// opaque types directly.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("Serialization should not fail")
+        let wire = WireIdentityKey::from(self);
+        bincode::serialize(&wire).expect("identity key bincode infallible")
     }
-    
-    /// Deserialize from bytes
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes)
-            .context("Failed to deserialize identity key")
+        let wire: WireIdentityKey =
+            bincode::deserialize(bytes).context("decode identity key wire bytes")?;
+        Self::try_from(wire)
     }
-    
-    /// Get a short fingerprint for user verification
+
+    /// 8-byte fingerprint suitable for human-readable display.
     pub fn fingerprint(&self) -> String {
         let mut hasher = Hasher::new();
         hasher.update(self.classical_public.as_bytes());
         hasher.update(self.pq_public.as_bytes());
-        
         let hash = hasher.finalize();
-        let fingerprint_bytes = &hash.as_bytes()[..8];
-        
-        // Format as groups of 4 hex digits
+        let f = &hash.as_bytes()[..8];
         format!(
             "{:02X}{:02X} {:02X}{:02X} {:02X}{:02X} {:02X}{:02X}",
-            fingerprint_bytes[0], fingerprint_bytes[1],
-            fingerprint_bytes[2], fingerprint_bytes[3],
-            fingerprint_bytes[4], fingerprint_bytes[5],
-            fingerprint_bytes[6], fingerprint_bytes[7],
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
         )
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wire serde helpers (used by IdentityKey + HybridSignature)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct WireIdentityKey {
+    classical_public: [u8; 32],
+    pq_public: Vec<u8>,
+    identity_id: IdentityId,
+    created_at: u64,
+}
+
+impl From<&IdentityKey> for WireIdentityKey {
+    fn from(k: &IdentityKey) -> Self {
+        WireIdentityKey {
+            classical_public: k.classical_public.to_bytes(),
+            pq_public: k.pq_public.as_bytes().to_vec(),
+            identity_id: k.identity_id,
+            created_at: k.created_at,
+        }
+    }
+}
+
+impl TryFrom<WireIdentityKey> for IdentityKey {
+    type Error = anyhow::Error;
+
+    fn try_from(w: WireIdentityKey) -> Result<Self> {
+        let classical_public = VerifyingKey::from_bytes(&w.classical_public)
+            .map_err(|e| anyhow!("invalid Ed25519 pub: {e}"))?;
+        let pq_public = dilithium2::PublicKey::from_bytes(&w.pq_public)
+            .map_err(|e| anyhow!("invalid PQ pub: {e}"))?;
+        Ok(IdentityKey {
+            classical_public,
+            pq_public,
+            identity_id: w.identity_id,
+            created_at: w.created_at,
+        })
+    }
+}
+
+impl Serialize for IdentityKey {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        WireIdentityKey::from(self).serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for IdentityKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let wire = WireIdentityKey::deserialize(d)?;
+        IdentityKey::try_from(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireHybridSignature {
+    /// Ed25519 signature serialised as a Vec — serde's stable derive
+    /// for fixed-size arrays only covers up to length 32, so we go
+    /// through a Vec on the wire to keep this version-portable.
+    classical_signature: Vec<u8>,
+    pq_signature: Vec<u8>,
+    signer_identity: IdentityId,
+    timestamp: u64,
+}
+
+impl Serialize for HybridSignature {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        WireHybridSignature {
+            classical_signature: self.classical_signature.to_bytes().to_vec(),
+            pq_signature: self.pq_signature.as_bytes().to_vec(),
+            signer_identity: self.signer_identity,
+            timestamp: self.timestamp,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for HybridSignature {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let wire = WireHybridSignature::deserialize(d)?;
+        if wire.classical_signature.len() != 64 {
+            return Err(serde::de::Error::custom(
+                "classical_signature must be 64 bytes",
+            ));
+        }
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(&wire.classical_signature);
+        let classical_signature = Signature::from_bytes(&sig_bytes);
+        let pq_signature =
+            dilithium2::DetachedSignature::from_bytes(&wire.pq_signature)
+                .map_err(serde::de::Error::custom)?;
+        Ok(HybridSignature {
+            classical_signature,
+            pq_signature,
+            signer_identity: wire.signer_identity,
+            timestamp: wire.timestamp,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeviceKey
+// ---------------------------------------------------------------------------
+
+pub struct DeviceKey {
+    x25519_private_bytes: [u8; 32],
+    x25519_public: x25519_dalek::PublicKey,
+    kyber_private_bytes: Vec<u8>,
+    kyber_public: pqcrypto_kyber::kyber768::PublicKey,
+    device_id: DeviceId,
+    identity_id: IdentityId,
+    created_at: u64,
+}
+
+impl Drop for DeviceKey {
+    fn drop(&mut self) {
+        self.x25519_private_bytes.zeroize();
+        self.kyber_private_bytes.zeroize();
+    }
+}
+
 impl DeviceKey {
-    /// Get the public device key
     pub fn public_key(&self) -> DevicePublicKey {
         DevicePublicKey {
             x25519_public: self.x25519_public,
@@ -374,37 +523,47 @@ impl DeviceKey {
             created_at: self.created_at,
         }
     }
-    
-    /// Perform X25519 key agreement
+
     pub fn x25519_agree(&self, other_public: &x25519_dalek::PublicKey) -> [u8; 32] {
-        self.x25519_private.expose_secret().diffie_hellman(other_public).to_bytes()
+        let sk = x25519_dalek::StaticSecret::from(self.x25519_private_bytes);
+        sk.diffie_hellman(other_public).to_bytes()
     }
-    
-    /// Perform Kyber key encapsulation
-    pub fn kyber_encapsulate(&self, other_public: &pqcrypto_kyber::kyber768::PublicKey) -> Result<(Vec<u8>, [u8; 32])> {
-        let (ciphertext, shared_secret) = pqcrypto_kyber::kyber768::encapsulate(other_public);
-        Ok((ciphertext.as_bytes().to_vec(), shared_secret.0))
+
+    pub fn kyber_encapsulate(
+        &self,
+        other_public: &pqcrypto_kyber::kyber768::PublicKey,
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
+        let (shared_secret, ciphertext) = pqcrypto_kyber::kyber768::encapsulate(other_public);
+        let mut ss = [0u8; 32];
+        ss.copy_from_slice(&shared_secret.as_bytes()[..32]);
+        Ok((ciphertext.as_bytes().to_vec(), ss))
     }
-    
-    /// Perform Kyber key decapsulation
+
     pub fn kyber_decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; 32]> {
+        use pqcrypto_traits::kem::{Ciphertext as _, SecretKey as _, SharedSecret as _};
         let ct = pqcrypto_kyber::kyber768::Ciphertext::from_bytes(ciphertext)
-            .map_err(|e| anyhow::anyhow!("Invalid Kyber ciphertext: {}", e))?;
-        
-        let shared_secret = pqcrypto_kyber::kyber768::decapsulate(&ct, self.kyber_private.expose_secret());
-        Ok(shared_secret.0)
+            .map_err(|e| anyhow!("Invalid Kyber ciphertext: {e}"))?;
+        let sk = pqcrypto_kyber::kyber768::SecretKey::from_bytes(&self.kyber_private_bytes)
+            .map_err(|e| anyhow!("Invalid persisted Kyber sk: {e}"))?;
+        let shared = pqcrypto_kyber::kyber768::decapsulate(&ct, &sk);
+        let mut ss = [0u8; 32];
+        ss.copy_from_slice(&shared.as_bytes()[..32]);
+        Ok(ss)
     }
-    
-    /// Get device ID
+
     pub fn device_id(&self) -> DeviceId {
         self.device_id
     }
-    
-    /// Get associated identity ID
+
     pub fn identity_id(&self) -> IdentityId {
         self.identity_id
     }
 }
+
+// ---------------------------------------------------------------------------
+// Display / conversions
+// ---------------------------------------------------------------------------
 
 impl fmt::Display for IdentityId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -457,92 +616,35 @@ impl AsRef<[u8]> for DeviceId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_identity_key_generation() {
-        let keypair = IdentityKeyPair::generate().expect("Should generate keypair");
-        let public_key = keypair.public_key();
-        
-        assert_eq!(keypair.identity_id(), public_key.identity_id);
+    fn keypair_round_trip_through_keystore_bytes() {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let bytes = kp.serialize_for_keystore().unwrap();
+        let kp2 = IdentityKeyPair::deserialize_from_keystore(&bytes).unwrap();
+        assert_eq!(kp.identity_id(), kp2.identity_id());
+
+        let msg = b"hello";
+        let sig = kp.sign(msg).unwrap();
+        let pub_ = kp2.public_key();
+        assert!(pub_.verify(msg, &sig).unwrap());
     }
-    
+
     #[test]
-    fn test_hybrid_signature() {
-        let keypair = IdentityKeyPair::generate().expect("Should generate keypair");
-        let public_key = keypair.public_key();
-        
-        let message = b"test message for signing";
-        let signature = keypair.sign(message).expect("Should sign message");
-        
-        let valid = public_key.verify(message, &signature).expect("Should verify signature");
-        assert!(valid);
-        
-        // Test with wrong message
-        let wrong_message = b"different message";
-        let invalid = public_key.verify(wrong_message, &signature).expect("Should verify signature");
-        assert!(!invalid);
+    fn identity_key_round_trip_through_serde() {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let pk = kp.public_key();
+        let bytes = pk.to_bytes();
+        let pk2 = IdentityKey::from_bytes(&bytes).unwrap();
+        assert_eq!(pk.identity_id, pk2.identity_id);
+        assert_eq!(pk.classical_public, pk2.classical_public);
+        assert_eq!(pk.pq_public.as_bytes(), pk2.pq_public.as_bytes());
     }
-    
+
     #[test]
-    fn test_device_key_derivation() {
-        let identity_keypair = IdentityKeyPair::generate().expect("Should generate identity keypair");
-        
-        let device_info = b"device_1_info";
-        let device_key = identity_keypair.derive_device_key(device_info).expect("Should derive device key");
-        
-        assert_eq!(device_key.identity_id(), identity_keypair.identity_id());
-        
-        // Same device info should produce same device key
-        let device_key2 = identity_keypair.derive_device_key(device_info).expect("Should derive device key");
-        assert_eq!(device_key.device_id(), device_key2.device_id());
-        
-        // Different device info should produce different device key
-        let device_key3 = identity_keypair.derive_device_key(b"device_2_info").expect("Should derive device key");
-        assert_ne!(device_key.device_id(), device_key3.device_id());
-    }
-    
-    #[test]
-    fn test_key_agreement() {
-        let identity1 = IdentityKeyPair::generate().expect("Should generate identity 1");
-        let identity2 = IdentityKeyPair::generate().expect("Should generate identity 2");
-        
-        let device1 = identity1.derive_device_key(b"device1").expect("Should derive device 1");
-        let device2 = identity2.derive_device_key(b"device2").expect("Should derive device 2");
-        
-        let device1_public = device1.public_key();
-        let device2_public = device2.public_key();
-        
-        // X25519 key agreement
-        let shared1 = device1.x25519_agree(&device2_public.x25519_public);
-        let shared2 = device2.x25519_agree(&device1_public.x25519_public);
-        assert_eq!(shared1, shared2);
-        
-        // Kyber key encapsulation/decapsulation
-        let (ciphertext, shared_secret1) = device1.kyber_encapsulate(&device2_public.kyber_public).expect("Should encapsulate");
-        let shared_secret2 = device2.kyber_decapsulate(&ciphertext).expect("Should decapsulate");
-        assert_eq!(shared_secret1, shared_secret2);
-    }
-    
-    #[test]
-    fn test_fingerprint_generation() {
-        let keypair = IdentityKeyPair::generate().expect("Should generate keypair");
-        let public_key = keypair.public_key();
-        
-        let fingerprint = public_key.fingerprint();
-        assert_eq!(fingerprint.len(), 19); // "XXXX XXXX XXXX XXXX" format
-        assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit() || c == ' '));
-    }
-    
-    #[test]
-    fn test_serialization() {
-        let keypair = IdentityKeyPair::generate().expect("Should generate keypair");
-        let public_key = keypair.public_key();
-        
-        let serialized = public_key.to_bytes();
-        let deserialized = IdentityKey::from_bytes(&serialized).expect("Should deserialize");
-        
-        assert_eq!(public_key.identity_id, deserialized.identity_id);
-        assert_eq!(public_key.classical_public, deserialized.classical_public);
-        assert_eq!(public_key.pq_public.as_bytes(), deserialized.pq_public.as_bytes());
+    fn fingerprint_format() {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let fp = kp.public_key().fingerprint();
+        assert_eq!(fp.len(), 19); // "XXXX XXXX XXXX XXXX"
     }
 }

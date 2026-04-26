@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Qubee logo mark">
+  <defs>
+    <linearGradient id="qg" x1="210" y1="190" x2="790" y2="780" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8CFF72"/>
+      <stop offset="0.48" stop-color="#12EAD8"/>
+      <stop offset="1" stop-color="#00A7FF"/>
+    </linearGradient>
+    <linearGradient id="kg" x1="650" y1="720" x2="820" y2="890" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6DFF8E"/>
+      <stop offset="1" stop-color="#00D6FF"/>
+    </linearGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feColorMatrix in="blur" type="matrix"
+        values="0 0 0 0 0.0
+                0 0 0 0 1.0
+                0 0 0 0 0.86
+                0 0 0 0.65 0" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Main Q ring -->
+  <g filter="url(#softGlow)">
+    <circle cx="465" cy="420" r="235" fill="none" stroke="url(#qg)" stroke-width="82" stroke-linecap="round"/>
+
+    <!-- Q tail flowing into bee abdomen -->
+    <path d="M585 585 C648 616 704 666 735 735"
+          fill="none" stroke="url(#qg)" stroke-width="78" stroke-linecap="round"/>
+
+    <!-- Bee stripe cuts / bands -->
+    <path d="M675 642 C710 657 737 680 760 713" fill="none" stroke="#06101D" stroke-width="22" stroke-linecap="round" opacity="0.88"/>
+    <path d="M706 684 C734 701 756 724 774 752" fill="none" stroke="#06101D" stroke-width="20" stroke-linecap="round" opacity="0.88"/>
+
+    <!-- Wings -->
+    <path d="M704 545 C780 430 878 390 875 470 C870 545 794 586 704 545Z"
+          fill="#17DDE8" fill-opacity="0.22" stroke="#22F4FF" stroke-width="14"/>
+    <path d="M720 606 C795 547 870 540 850 607 C831 668 771 680 720 606Z"
+          fill="#17DDE8" fill-opacity="0.20" stroke="#22F4FF" stroke-width="13"/>
+
+    <!-- Key-shaped stinger -->
+    <g transform="translate(742 748) rotate(42)">
+      <circle cx="0" cy="0" r="37" fill="none" stroke="url(#kg)" stroke-width="20"/>
+      <path d="M36 0 H142" stroke="url(#kg)" stroke-width="22" stroke-linecap="round"/>
+      <path d="M105 0 V40" stroke="url(#kg)" stroke-width="18" stroke-linecap="round"/>
+      <path d="M136 0 V26" stroke="url(#kg)" stroke-width="18" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

@@ -1,12 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="qubee_primary">#1F6FEB</color>
-    <color name="qubee_primary_variant">#0D47A1</color>
-    <color name="qubee_secondary">#5E35B1</color>
-    <color name="qubee_background">#F5F7FB</color>
-    <color name="qubee_surface">#FFFFFF</color>
-    <color name="qubee_on_primary">#FFFFFF</color>
-    <color name="qubee_on_background">#0F172A</color>
+    <!-- Qubee quantum/secure brand palette -->
+    <color name="qubee_primary">#12EAD8</color>
+    <color name="qubee_primary_variant">#00A7FF</color>
+    <color name="qubee_secondary">#8CFF72</color>
+    <color name="qubee_background">#040C16</color>
+    <color name="qubee_surface">#081421</color>
+    <color name="qubee_on_primary">#031018</color>
+    <color name="qubee_on_background">#EAFBFF</color>
+
+    <color name="qubee_quantum_cyan">#12EAD8</color>
+    <color name="qubee_quantum_blue">#00A7FF</color>
+    <color name="qubee_quantum_green">#8CFF72</color>
+    <color name="qubee_deep_space">#040C16</color>
+
     <color name="black">#000000</color>
     <color name="white">#FFFFFF</color>
 </resources>

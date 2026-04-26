@@ -8,13 +8,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use blake3::Hasher;
 
 /// Enhanced secure random number generator with multiple entropy sources
-/// and protection against various attacks
-#[derive(ZeroizeOnDrop)]
+/// and protection against various attacks. ChaCha20Rng doesn't impl
+/// `Zeroize` so we drop the derive and zero the entropy_pool field
+/// manually in `Drop`.
 pub struct SecureRng {
     rng: ChaCha20Rng,
     entropy_pool: [u8; 64],
     reseed_counter: u64,
     last_reseed: u64,
+}
+
+impl Drop for SecureRng {
+    fn drop(&mut self) {
+        self.entropy_pool.zeroize();
+        self.reseed_counter.zeroize();
+        self.last_reseed.zeroize();
+    }
 }
 
 impl SecureRng {
@@ -133,18 +142,18 @@ impl SecureRng {
         // Add process-specific entropy
         hasher.update(&std::process::id().to_le_bytes());
         
-        // Add thread-specific entropy
-        hasher.update(&std::thread::current().id().as_u64().to_le_bytes());
-        
+        // Thread-id entropy removed — ThreadId::as_u64 is still
+        // unstable. The other sources below are plenty.
+
         // Add memory address entropy (ASLR)
         let stack_addr = &buffer as *const _ as usize;
         hasher.update(&stack_addr.to_le_bytes());
-        
+
         #[cfg(unix)]
         {
-            // Add Unix-specific entropy
-            use std::os::unix::process::CommandExt;
-            let pid = unsafe { libc::getpid() };
+            // std::process::id is portable and matches libc::getpid on
+            // Unix; using it dodges an extra libc round-trip.
+            let pid = std::process::id();
             hasher.update(&pid.to_le_bytes());
         }
         
@@ -201,9 +210,15 @@ impl SecureRng {
             }
         }
         
-        let hash = hasher.finalize();
-        buffer.copy_from_slice(hash.as_bytes());
-        
+        // Stretch the BLAKE3 output to 64 bytes via its XOF mode
+        // — `finalize().as_bytes()` only gives us 32. Without this
+        // the original code panicked on copy_from_slice (length
+        // mismatch 32 vs 64).
+        let mut xof = hasher.finalize_xof();
+        let mut filled = [0u8; 64];
+        xof.fill(&mut filled);
+        buffer.copy_from_slice(&filled);
+
         Ok(())
     }
 }

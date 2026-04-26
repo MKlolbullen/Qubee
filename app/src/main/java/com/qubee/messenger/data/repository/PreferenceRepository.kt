@@ -147,6 +147,16 @@ class PreferenceRepository @Inject constructor(
         prefs.edit().remove(secretKey(key)).apply()
     }
 
+    /**
+     * Wipe everything we persist — public metadata, secrets, the
+     * onboarded flag. Used by Settings → "Reset identity" alongside
+     * the JNI keystore wipe; after this `isOnboarded()` returns false
+     * and the next launch routes through onboarding again.
+     */
+    fun clearAll() {
+        prefs.edit().clear().apply()
+    }
+
     private fun secretKey(key: String): String = "$KEY_SECRET_PREFIX$key"
 
     companion object {

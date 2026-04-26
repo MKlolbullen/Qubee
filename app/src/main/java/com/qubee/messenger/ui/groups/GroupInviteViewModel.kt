@@ -162,6 +162,17 @@ class GroupInviteViewModel @Inject constructor(
         )
     }
 
+    /**
+     * Acknowledge that the UI has surfaced the latest error (e.g. via
+     * a Snackbar). Without this the same error would re-trigger on
+     * every recomposition that observes `state`.
+     */
+    fun consumeError() {
+        if (_state.value.error != null) {
+            _state.value = _state.value.copy(error = null)
+        }
+    }
+
     companion object {
         const val DEFAULT_INVITE_TTL_SECONDS: Long = 24 * 60 * 60
     }

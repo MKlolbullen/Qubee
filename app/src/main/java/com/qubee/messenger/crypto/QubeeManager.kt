@@ -175,6 +175,28 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Wipe the local identity + group keystores and mark the core as
+     * uninitialised. Used by Settings → "Reset identity".
+     *
+     * After this returns true the caller must `initialize()` again
+     * before issuing any other JNI call.
+     */
+    suspend fun resetIdentity(): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) {
+            // Nothing to wipe — but still try in case the on-disk
+            // files exist from a previous process.
+            val ok = nativeResetIdentity(context.filesDir.absolutePath)
+            return@withContext ok
+        }
+        val ok = nativeResetIdentity(context.filesDir.absolutePath)
+        if (ok) {
+            isInitialized = false
+            Timber.d("Qubee identity reset; core needs re-initialise")
+        }
+        ok
+    }
+
+    /**
      * Parse a `qubee://invite/<token>` deep link and return its contents
      * as JSON. Returns null if the link is malformed.
      */
@@ -233,6 +255,7 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         plaintext: ByteArray,
     ): String?
+    private external fun nativeResetIdentity(dataDir: String): Boolean
 
     external fun nativeCleanup()
 }

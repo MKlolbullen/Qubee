@@ -1,11 +1,12 @@
 use anyhow::Result;
-use secrecy::Secret;
+use secrecy::SecretBox;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::groups::group_manager::GroupId;
 use crate::security::secure_rng;
 
+use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use secrecy::ExposeSecret;
 use anyhow::Context;
@@ -17,7 +18,7 @@ use anyhow::Context;
 pub struct GroupKey {
     /// Raw 256‑bit key material. Wrapped in `Secret` to prevent
     /// accidental disclosure.
-    pub key: Secret<[u8; 32]>,
+    pub key: SecretBox<[u8; 32]>,
     /// Unix timestamp when the key was created.
     pub created_at: u64,
 }
@@ -62,7 +63,7 @@ impl GroupCrypto {
             .duration_since(UNIX_EPOCH)?
             .as_secs();
         let group_key = GroupKey {
-            key: Secret::new(key_bytes),
+            key: SecretBox::new(Box::new(key_bytes)),
             created_at,
         };
         self.keys.insert(group_id, group_key);
@@ -83,7 +84,7 @@ impl GroupCrypto {
             .duration_since(UNIX_EPOCH)?
             .as_secs();
         let group_key = GroupKey {
-            key: Secret::new(new_key_bytes),
+            key: SecretBox::new(Box::new(new_key_bytes)),
             created_at: new_created_at,
         };
         self.keys.insert(group_id, group_key);
@@ -106,7 +107,7 @@ impl GroupCrypto {
         self.keys.insert(
             group_id,
             GroupKey {
-                key: Secret::new(key_bytes),
+                key: SecretBox::new(Box::new(key_bytes)),
                 created_at,
             },
         );
@@ -139,10 +140,11 @@ impl GroupCrypto {
         // Generate a random 96‑bit nonce
         let nonce_bytes = secure_rng::random::array::<12>()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        // Encrypt the plaintext
+        // Encrypt the plaintext. chacha20poly1305::Error doesn't impl
+        // Display so we can't use anyhow's `.context`; map manually.
         let ciphertext = cipher
             .encrypt(nonce, plaintext)
-            .context("Group message encryption failed")?;
+            .map_err(|e| anyhow::anyhow!("Group message encryption failed: {e:?}"))?;
         // Prepend nonce to ciphertext
         let mut output = Vec::with_capacity(12 + ciphertext.len());
         output.extend_from_slice(&nonce_bytes);
@@ -165,7 +167,7 @@ impl GroupCrypto {
         let nonce = Nonce::from_slice(nonce_bytes);
         let plaintext = cipher
             .decrypt(nonce, ciphertext)
-            .context("Group message decryption failed")?;
+            .map_err(|e| anyhow::anyhow!("Group message decryption failed: {e:?}"))?;
         Ok(plaintext)
     }
 }

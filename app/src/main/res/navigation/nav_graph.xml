@@ -5,6 +5,16 @@
     android:id="@+id/nav_graph"
     app:startDestination="@id/navigation_conversations">
 
+    <!-- First-launch identity creation. MainActivity overrides the
+         graph's start destination at runtime to point here instead of
+         conversations whenever PreferenceRepository.isOnboarded() is
+         false; navigation back to conversations happens inside the
+         fragment via popUpTo. -->
+    <fragment
+        android:id="@+id/onboardingFragment"
+        android:name="com.qubee.messenger.ui.onboarding.OnboardingFragment"
+        android:label="Welcome" />
+
     <fragment
         android:id="@+id/navigation_conversations"
         android:name="com.qubee.messenger.ui.main.ConversationsFragment"

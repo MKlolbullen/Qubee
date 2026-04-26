@@ -23,13 +23,19 @@
             
     </com.google.android.material.appbar.AppBarLayout>
 
+    <!-- NavHostFragment is created without `app:navGraph` so the
+         graph is inflated *exclusively* by MainActivity. That avoids
+         a single-frame flash of the wrong destination on first
+         launch (the auto-inflated start was navigation_conversations
+         even when the user hadn't onboarded yet). MainActivity
+         decides the start destination at runtime based on
+         PreferenceRepository.isOnboarded(). -->
     <androidx.fragment.app.FragmentContainerView
         android:id="@+id/nav_host_fragment"
         android:name="androidx.navigation.fragment.NavHostFragment"
         android:layout_width="0dp"
         android:layout_height="0dp"
         app:defaultNavHost="true"
-        app:navGraph="@navigation/nav_graph"
         app:layout_constraintBottom_toTopOf="@id/bottom_navigation"
         app:layout_constraintLeft_toLeftOf="parent"
         app:layout_constraintRight_toRightOf="parent"

@@ -58,7 +58,7 @@ jni = "0.21.1"
 lazy_static = "1.4.0"
 
 # P2P Network Layer
-libp2p = { version = "0.53", features = [
+libp2p = { version = "0.55", features = [
     "tcp",
     "dns",
     "websocket",

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use secrecy::{Secret, ExposeSecret, Zeroize};
-use zeroize::ZeroizeOnDrop;
+use secrecy::{ExposeSecret, SecretBox};
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zeroize::Zeroize;
 
 /// Secure memory allocator that provides protected memory regions
 /// for storing sensitive cryptographic material
@@ -187,11 +187,12 @@ impl<'a> Drop for SecureMemoryRegion<'a> {
     }
 }
 
-/// A secure buffer that automatically manages its memory
-#[derive(ZeroizeOnDrop)]
+/// A secure buffer that automatically manages its memory.
+/// Manual `Drop` (further down) zeroises `data`; we don't combine
+/// with `#[derive(ZeroizeOnDrop)]` because that would synthesise a
+/// second `Drop` impl and trigger E0119.
 pub struct SecureBuffer {
     data: Vec<u8>,
-    #[zeroize(skip)]
     is_locked: bool,
 }
 
@@ -305,25 +306,24 @@ impl Drop for SecureBuffer {
     }
 }
 
-/// A secure string that zeroizes its contents on drop
-#[derive(ZeroizeOnDrop)]
+/// A secure string. The underlying [`SecretBox`] zeroises on drop so
+/// no extra `ZeroizeOnDrop` derive is needed (and would conflict).
 pub struct SecureString {
-    #[zeroize(skip)]
-    inner: Secret<String>,
+    inner: SecretBox<String>,
 }
 
 impl SecureString {
     /// Create a new secure string
     pub fn new(s: String) -> Self {
         SecureString {
-            inner: Secret::new(s),
+            inner: SecretBox::new(Box::new(s)),
         }
     }
     
     /// Create a secure string from a str
     pub fn from_str(s: &str) -> Self {
         SecureString {
-            inner: Secret::new(s.to_string()),
+            inner: SecretBox::new(Box::new(s.to_string())),
         }
     }
     

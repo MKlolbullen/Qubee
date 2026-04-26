@@ -164,8 +164,13 @@ impl P2PNode {
                     }
                     Some(P2PCommand::Unsubscribe { topic }) => {
                         let topic = gossipsub::IdentTopic::new(topic);
-                        if let Err(e) = self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
-                            eprintln!("Unsubscribe error for {topic}: {e:?}");
+                        // libp2p 0.55 changed `gossipsub.unsubscribe` to
+                        // return `bool` (true if we were subscribed) —
+                        // it no longer fails. Log a hint when we
+                        // weren't subscribed so the dispatcher's
+                        // intent is still observable.
+                        if !self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                            eprintln!("Unsubscribe no-op for {topic} (not subscribed)");
                         }
                     }
                     Some(P2PCommand::PublishToTopic { topic, data }) => {

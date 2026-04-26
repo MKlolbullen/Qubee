@@ -18,7 +18,8 @@ import timber.log.Timber
  * * **Public metadata** — user id, display name, identity hash,
  *   `qubee://identity/...` share link. None of these are secrets (the
  *   identity hash is `BLAKE3(public_key)` by construction; the share
- *   link contains a *public* ZK proof). [savePublicMetadata] /
+ *   link is a hybrid-signature-protected bundle that anyone can verify
+ *   from the advertised public key). [savePublicMetadata] /
  *   [saveBundle] persist these in either tier.
  * * **Secrets** — anything that genuinely needs confidentiality at
  *   rest. [saveSecret] refuses to write when the backing store fell

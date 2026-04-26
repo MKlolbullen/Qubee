@@ -83,7 +83,7 @@ fun OnboardingScreen(
                 if (s is OnboardingState.Loading) {
                     CircularProgressIndicator()
                     Spacer(Modifier.height(8.dp))
-                    Text("Generating Kyber/Dilithium keys + ZK proof…")
+                    Text("Generating Ed25519 + Dilithium-2 keys, signing identity bundle…")
                 } else {
                     Button(
                         onClick = { viewModel.createIdentity(nickname) },

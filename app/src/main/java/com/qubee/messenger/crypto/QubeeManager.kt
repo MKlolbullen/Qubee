@@ -98,8 +98,9 @@ class QubeeManager @Inject constructor(
 
     /**
      * Verify a peer's `qubee://identity/...` share link and return their
-     * identity metadata as JSON. Returns null if the link is malformed or
-     * its embedded ZK proof fails verification.
+     * identity metadata as JSON. Returns null if the link is malformed
+     * or its embedded hybrid Ed25519+Dilithium-2 signature fails to
+     * verify against the advertised public key.
      */
     suspend fun verifyOnboardingLink(link: String): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null

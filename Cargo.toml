@@ -71,7 +71,8 @@ libp2p = { version = "0.55", features = [
     "macros",
 ] }
 
-# Identity / ZK / Invite-link plumbing
+# Identity / hybrid-signature / invite-link plumbing
+# (no ZK — see jni_api.rs onboarding banner + README "Why no ZK")
 ed25519-dalek = { version = "2.1", features = ["rand_core", "serde", "zeroize"] }
 base64 = "0.22"
 crc32fast = "1.4"

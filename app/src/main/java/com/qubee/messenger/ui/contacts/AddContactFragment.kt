@@ -47,8 +47,9 @@ import kotlinx.coroutines.launch
 
 /**
  * Lands users here when a peer sends them a `qubee://identity/<token>`
- * link (or after they scan one). Verifies the embedded ZK proof via the
- * Rust core and previews the contact before they accept.
+ * link (or after they scan one). Verifies the embedded hybrid
+ * Ed25519+Dilithium signature via the Rust core and previews the
+ * contact before they accept.
  */
 @AndroidEntryPoint
 class AddContactFragment : Fragment() {

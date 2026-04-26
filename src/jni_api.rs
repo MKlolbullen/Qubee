@@ -1063,7 +1063,16 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
 }
 
 // ---------------------------------------------------------------------------
-// ZK Onboarding & invite-link surface (added for the identity/groups feature)
+// Onboarding & invite-link surface (hybrid-signed, not ZK)
+//
+// The earlier prototype framed these calls as "ZK proofs" but every
+// claim Qubee needs to make about an identity is "I hold the secret
+// for this advertised public key" — which is a signature, not a
+// zero-knowledge statement. We sign the canonical bytes of the
+// onboarding bundle / invite token with the same hybrid Ed25519 +
+// Dilithium-2 keypair the bundle advertises, and verifiers re-derive
+// those bytes and check the signature. See README's Security model
+// section for why we won't be reintroducing ZK.
 // ---------------------------------------------------------------------------
 
 fn json_to_jstring(env: JNIEnv, value: serde_json::Value) -> jstring {
@@ -1183,7 +1192,7 @@ fn bundle_to_json(bundle: &OnboardingBundle) -> anyhow::Result<serde_json::Value
 
 /// Verify and decode a `qubee://identity/<token>` deep link. On success,
 /// returns a JSON object describing the remote identity. Returns NULL if
-/// the link is malformed or the embedded ZK proof fails verification.
+/// the link is malformed or the embedded hybrid signature fails verification.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerifyOnboardingLink(
     env: JNIEnv,

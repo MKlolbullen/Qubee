@@ -282,24 +282,31 @@ class ContactsFragment : Fragment() {
             .show()
     }
     
+    // NOTE: The other verification methods (NFC, video call, shared
+    // secret) reference a `ContactVerificationActivity` that doesn't
+    // exist anywhere in the source tree — the whole block is
+    // pre-existing scaffolding that won't compile until each method
+    // is wired through. Kept as-is for now; the ZK_PROOF option was
+    // removed as part of the "no ZK" decision (see jni_api.rs banner
+    // + README "Why no ZK"). When the verification flow is properly
+    // implemented post-alpha, the right thing here is fingerprint
+    // tap-to-verify (priority 5 in the pre-alpha plan).
     private fun showVerificationOptions(contact: Contact) {
         val options = arrayOf(
             getString(R.string.verify_qr_code),
             getString(R.string.verify_nfc),
-            getString(R.string.verify_zk_proof),
             getString(R.string.verify_video_call),
             getString(R.string.verify_shared_secret)
         )
-        
+
         MaterialAlertDialogBuilder(requireContext())
             .setTitle(getString(R.string.verify_contact_title, contact.displayName))
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> verifyWithQRCode(contact)
                     1 -> verifyWithNFC(contact)
-                    2 -> verifyWithZKProof(contact)
-                    3 -> verifyWithVideoCall(contact)
-                    4 -> verifyWithSharedSecret(contact)
+                    2 -> verifyWithVideoCall(contact)
+                    3 -> verifyWithSharedSecret(contact)
                 }
             }
             .show()
@@ -319,15 +326,6 @@ class ContactsFragment : Fragment() {
             requireContext(),
             contact.identityId,
             ContactVerificationActivity.VerificationMethod.NFC
-        )
-        startActivity(intent)
-    }
-    
-    private fun verifyWithZKProof(contact: Contact) {
-        val intent = ContactVerificationActivity.createIntent(
-            requireContext(),
-            contact.identityId,
-            ContactVerificationActivity.VerificationMethod.ZK_PROOF
         )
         startActivity(intent)
     }

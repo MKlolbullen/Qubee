@@ -28,12 +28,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.findNavController
 import com.qubee.messenger.R
+import com.qubee.messenger.ui.theme.QubeeMutedText
+import com.qubee.messenger.ui.theme.QubeePalette
+import com.qubee.messenger.ui.theme.QubeePanel
+import com.qubee.messenger.ui.theme.QubeeScreen
+import com.qubee.messenger.ui.theme.QubeeSecondaryButton
+import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.QubeeTheme
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
@@ -72,87 +80,96 @@ private fun SettingsContent(
     viewModel: SettingsViewModel,
     onResetComplete: () -> Unit,
 ) {
-    val state by viewModel.state.collectAsState()
-    var confirmOpen by remember { mutableStateOf(false) }
+    QubeeTheme {
+        val state by viewModel.state.collectAsState()
+        var confirmOpen by remember { mutableStateOf(false) }
 
-    LaunchedEffect(state) {
-        if (state is SettingsResetState.Done) {
-            onResetComplete()
-            viewModel.acknowledgeReset()
-        }
-    }
-
-    Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.Top,
-    ) {
-        Text("Settings", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Real settings (theme, network bootstrap, contact " +
-                "verification) will land here as the app grows. For now " +
-                "we expose the one destructive action that matters: " +
-                "wiping the identity.",
-            style = MaterialTheme.typography.bodySmall,
-        )
-
-        Spacer(Modifier.height(32.dp))
-
-        Text("Identity", style = MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Reset deletes the local identity keystore (private keys " +
-                "and group state) and forces re-onboarding. Peers in " +
-                "your existing groups will not be notified — they'll " +
-                "still see your previous identity until you re-share " +
-                "your new one.",
-            style = MaterialTheme.typography.bodySmall,
-        )
-
-        Spacer(Modifier.height(12.dp))
-
-        when (state) {
-            SettingsResetState.Working -> {
-                CircularProgressIndicator()
-            }
-            is SettingsResetState.Error -> {
-                Text(
-                    (state as SettingsResetState.Error).message,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Spacer(Modifier.height(8.dp))
-                ResetButton(enabled = true) { confirmOpen = true }
-            }
-            else -> ResetButton(enabled = state !is SettingsResetState.Done) {
-                confirmOpen = true
+        LaunchedEffect(state) {
+            if (state is SettingsResetState.Done) {
+                onResetComplete()
+                viewModel.acknowledgeReset()
             }
         }
-    }
 
-    if (confirmOpen) {
-        AlertDialog(
-            onDismissRequest = { confirmOpen = false },
-            title = { Text("Reset identity?") },
-            text = {
+        QubeeScreen {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.Top,
+            ) {
+                QubeeStatusPill("LOCAL DEVICE CONTROL")
+                Spacer(Modifier.height(14.dp))
                 Text(
-                    "This deletes your local private keys and group " +
-                        "state. You'll be sent back to onboarding to " +
-                        "generate a new identity. This can't be undone.",
+                    "Settings",
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.headlineLarge,
+                    fontWeight = FontWeight.Black,
                 )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        confirmOpen = false
-                        viewModel.resetIdentity()
-                    },
-                ) { Text("Reset", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmOpen = false }) { Text("Cancel") }
-            },
-        )
+                Spacer(Modifier.height(6.dp))
+                QubeeMutedText(
+                    "Theme, network bootstrap, contact verification and privacy controls belong here. Today this screen exposes the one dangerous switch that matters: destroying the local identity.",
+                )
+
+                Spacer(Modifier.height(26.dp))
+
+                QubeePanel {
+                    QubeeStatusPill("KEY MATERIAL")
+                    Spacer(Modifier.height(14.dp))
+                    Text("Reset identity", style = MaterialTheme.typography.titleLarge)
+                    Spacer(Modifier.height(6.dp))
+                    QubeeMutedText(
+                        "Reset deletes the local identity keystore, private keys and group state, then forces onboarding again. Existing peers are not notified and will still know the previous identity until you re-share the new one.",
+                    )
+
+                    Spacer(Modifier.height(18.dp))
+
+                    when (state) {
+                        SettingsResetState.Working -> {
+                            CircularProgressIndicator(color = QubeePalette.Cyan)
+                        }
+                        is SettingsResetState.Error -> {
+                            Text(
+                                (state as SettingsResetState.Error).message,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            ResetButton(enabled = true) { confirmOpen = true }
+                        }
+                        else -> ResetButton(enabled = state !is SettingsResetState.Done) {
+                            confirmOpen = true
+                        }
+                    }
+                }
+            }
+        }
+
+        if (confirmOpen) {
+            AlertDialog(
+                onDismissRequest = { confirmOpen = false },
+                containerColor = QubeePalette.PanelAlt,
+                titleContentColor = QubeePalette.Text,
+                textContentColor = QubeePalette.MutedText,
+                title = { Text("Reset identity?") },
+                text = {
+                    Text(
+                        "This deletes your local private keys and group state. You'll be sent back to onboarding to generate a new identity. This can't be undone.",
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            confirmOpen = false
+                            viewModel.resetIdentity()
+                        },
+                    ) { Text("Reset", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmOpen = false }) { Text("Cancel") }
+                },
+            )
+        }
     }
 }
 
@@ -162,9 +179,12 @@ private fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
         onClick = onClick,
         enabled = enabled,
         modifier = Modifier.fillMaxWidth(),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
         colors = ButtonDefaults.buttonColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
-            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            containerColor = QubeePalette.Danger,
+            contentColor = QubeePalette.Void,
+            disabledContainerColor = QubeePalette.PanelAlt,
+            disabledContentColor = QubeePalette.MutedText,
         ),
-    ) { Text("Reset identity") }
+    ) { Text("Destroy local identity", fontWeight = FontWeight.Bold) }
 }

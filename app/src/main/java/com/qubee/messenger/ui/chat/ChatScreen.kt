@@ -2,9 +2,11 @@ package com.qubee.messenger.ui.chat
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -36,16 +38,20 @@ import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.VerifiedUser
-import androidx.compose.material3.Divider
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -65,13 +71,16 @@ import androidx.compose.ui.unit.dp
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeePanelBorder
+import com.qubee.messenger.ui.theme.QubeePrimaryButton
 import com.qubee.messenger.ui.theme.QubeeQuantumBrush
+import com.qubee.messenger.ui.theme.QubeeSecondaryButton
 import com.qubee.messenger.ui.theme.QubeeStatusPill
 import com.qubee.messenger.ui.theme.QubeeTheme
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
@@ -79,15 +88,28 @@ fun ChatScreen(
 ) {
     QubeeTheme {
         val uiState by viewModel.uiState.collectAsState()
+        val snackbarHostState = remember { SnackbarHostState() }
         var inputText by remember { mutableStateOf("") }
+        var showDetails by remember { mutableStateOf(false) }
+
+        LaunchedEffect(viewModel) {
+            viewModel.events.collect { event ->
+                when (event) {
+                    is ChatUiEvent.Notice -> snackbarHostState.showSnackbar(event.message)
+                }
+            }
+        }
 
         Scaffold(
             containerColor = QubeePalette.Void,
+            snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
                 SecureChatTopBar(
                     contactName = uiState.contactName,
                     securityState = uiState.securityState,
                     onBackClick = onBackClick,
+                    onSecureCallClick = viewModel::requestSecureCall,
+                    onDetailsClick = { showDetails = true },
                 )
             },
             bottomBar = {
@@ -124,6 +146,22 @@ fun ChatScreen(
                     }
                 }
             }
+        }
+
+        if (showDetails) {
+            ConversationDetailsSheet(
+                contactName = uiState.contactName,
+                securityState = uiState.securityState,
+                details = uiState.details,
+                onDismiss = { showDetails = false },
+                onVerifyClick = viewModel::requestContactVerification,
+                onTimerClick = viewModel::changeDisappearingTimer,
+                onClearChatClick = {
+                    showDetails = false
+                    viewModel.clearChat()
+                },
+                onResetSessionClick = viewModel::resetSecureSession,
+            )
         }
     }
 }
@@ -181,6 +219,8 @@ private fun SecureChatTopBar(
     contactName: String,
     securityState: ConversationSecurityState,
     onBackClick: () -> Unit,
+    onSecureCallClick: () -> Unit,
+    onDetailsClick: () -> Unit,
 ) {
     Surface(
         color = Color(0xFF111815).copy(alpha = 0.98f),
@@ -193,11 +233,7 @@ private fun SecureChatTopBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBackClick) {
-                Icon(
-                    Icons.Default.ArrowBack,
-                    contentDescription = "Back",
-                    tint = QubeePalette.Text,
-                )
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = QubeePalette.Text)
             }
             PeerAvatar(contactName)
             Spacer(Modifier.width(12.dp))
@@ -227,19 +263,11 @@ private fun SecureChatTopBar(
                     )
                 }
             }
-            IconButton(onClick = { /* TODO: secure call */ }) {
-                Icon(
-                    Icons.Default.Lock,
-                    contentDescription = "Secure call",
-                    tint = QubeePalette.Cyan,
-                )
+            IconButton(onClick = onSecureCallClick) {
+                Icon(Icons.Default.Lock, contentDescription = "Secure call", tint = QubeePalette.Cyan)
             }
-            IconButton(onClick = { /* TODO: conversation details */ }) {
-                Icon(
-                    Icons.Default.MoreVert,
-                    contentDescription = "Conversation options",
-                    tint = QubeePalette.MutedText,
-                )
+            IconButton(onClick = onDetailsClick) {
+                Icon(Icons.Default.MoreVert, contentDescription = "Conversation details", tint = QubeePalette.MutedText)
             }
         }
     }
@@ -325,20 +353,11 @@ private fun EmptyChatState(contactName: String) {
                 border = BorderStroke(1.dp, QubeeQuantumBrush),
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.Lock,
-                        contentDescription = null,
-                        tint = QubeePalette.Cyan,
-                        modifier = Modifier.size(32.dp),
-                    )
+                    Icon(Icons.Default.Lock, contentDescription = null, tint = QubeePalette.Cyan, modifier = Modifier.size(32.dp))
                 }
             }
             Spacer(Modifier.height(18.dp))
-            Text(
-                text = "Secure channel ready",
-                color = QubeePalette.Text,
-                style = MaterialTheme.typography.headlineSmall,
-            )
+            Text("Secure channel ready", color = QubeePalette.Text, style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.height(8.dp))
             QubeeMutedText(
                 text = "Send the first encrypted message to $contactName. The ratchet does not judge.",
@@ -362,41 +381,21 @@ private fun MessageItem(msg: UiMessage) {
 fun MessageBubble(msg: UiMessage) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
     val bubbleBrush = if (msg.isFromMe) {
-        Brush.linearGradient(
-            colors = listOf(
-                QubeePalette.Cyan.copy(alpha = 0.26f),
-                QubeePalette.Green.copy(alpha = 0.11f),
-            ),
-        )
+        Brush.linearGradient(colors = listOf(QubeePalette.Cyan.copy(alpha = 0.26f), QubeePalette.Green.copy(alpha = 0.11f)))
     } else {
-        Brush.linearGradient(
-            colors = listOf(
-                Color(0xFF262B29).copy(alpha = 0.96f),
-                Color(0xFF1C2220).copy(alpha = 0.96f),
-            ),
-        )
+        Brush.linearGradient(colors = listOf(Color(0xFF262B29).copy(alpha = 0.96f), Color(0xFF1C2220).copy(alpha = 0.96f)))
     }
-    val shape = if (msg.isFromMe) {
-        RoundedCornerShape(22.dp, 22.dp, 4.dp, 22.dp)
-    } else {
-        RoundedCornerShape(22.dp, 22.dp, 22.dp, 4.dp)
-    }
+    val shape = if (msg.isFromMe) RoundedCornerShape(22.dp, 22.dp, 4.dp, 22.dp) else RoundedCornerShape(22.dp, 22.dp, 22.dp, 4.dp)
     val width = if (msg.text.length > 120) 0.90f else 0.76f
 
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = align,
-    ) {
+    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
         Surface(
             color = Color.Transparent,
             shape = shape,
             border = BorderStroke(
                 width = 1.dp,
                 brush = if (msg.isFromMe) QubeePanelBorder else Brush.linearGradient(
-                    listOf(
-                        QubeePalette.Cyan.copy(alpha = 0.14f),
-                        QubeePalette.Green.copy(alpha = 0.08f),
-                    ),
+                    listOf(QubeePalette.Cyan.copy(alpha = 0.14f), QubeePalette.Green.copy(alpha = 0.08f)),
                 ),
             ),
         ) {
@@ -406,11 +405,7 @@ fun MessageBubble(msg: UiMessage) {
                     .background(bubbleBrush)
                     .padding(start = 14.dp, end = 10.dp, top = 9.dp, bottom = 7.dp),
             ) {
-                Text(
-                    text = msg.text,
-                    color = QubeePalette.Text,
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                Text(text = msg.text, color = QubeePalette.Text, style = MaterialTheme.typography.bodyLarge)
                 Spacer(Modifier.height(6.dp))
                 MessageMeta(msg)
             }
@@ -419,16 +414,9 @@ fun MessageBubble(msg: UiMessage) {
 }
 
 @Composable
-private fun MediaMessageCard(
-    msg: UiMessage,
-    icon: ImageVector,
-    title: String,
-) {
+private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = align,
-    ) {
+    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
         Surface(
             modifier = Modifier.fillMaxWidth(0.82f),
             shape = RoundedCornerShape(24.dp),
@@ -443,21 +431,12 @@ private fun MediaMessageCard(
                         .clip(RoundedCornerShape(18.dp))
                         .background(
                             Brush.linearGradient(
-                                listOf(
-                                    QubeePalette.Cyan.copy(alpha = 0.24f),
-                                    QubeePalette.Green.copy(alpha = 0.10f),
-                                    Color.Black.copy(alpha = 0.18f),
-                                ),
+                                listOf(QubeePalette.Cyan.copy(alpha = 0.24f), QubeePalette.Green.copy(alpha = 0.10f), Color.Black.copy(alpha = 0.18f)),
                             ),
                         ),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        imageVector = icon,
-                        contentDescription = null,
-                        tint = QubeePalette.Cyan,
-                        modifier = Modifier.size(46.dp),
-                    )
+                    Icon(imageVector = icon, contentDescription = null, tint = QubeePalette.Cyan, modifier = Modifier.size(46.dp))
                 }
                 Spacer(Modifier.height(10.dp))
                 Text(title, color = QubeePalette.Text, style = MaterialTheme.typography.titleMedium)
@@ -472,10 +451,7 @@ private fun MediaMessageCard(
 @Composable
 private fun AudioMessageCard(msg: UiMessage) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = align,
-    ) {
+    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
         Surface(
             modifier = Modifier.fillMaxWidth(0.82f),
             shape = RoundedCornerShape(24.dp),
@@ -484,11 +460,7 @@ private fun AudioMessageCard(msg: UiMessage) {
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Surface(
-                        modifier = Modifier.size(58.dp),
-                        shape = RoundedCornerShape(18.dp),
-                        color = QubeePalette.Green.copy(alpha = 0.72f),
-                    ) {
+                    Surface(modifier = Modifier.size(58.dp), shape = RoundedCornerShape(18.dp), color = QubeePalette.Green.copy(alpha = 0.72f)) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(Icons.Default.PlayArrow, contentDescription = "Play", tint = QubeePalette.Void)
                         }
@@ -507,11 +479,7 @@ private fun AudioMessageCard(msg: UiMessage) {
 
 @Composable
 private fun AudioWaveform(modifier: Modifier = Modifier) {
-    Row(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
+    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
         val bars = listOf(18, 34, 48, 28, 12, 22, 40, 54, 30, 16, 38, 46, 20)
         bars.forEach { height ->
             Box(
@@ -527,31 +495,13 @@ private fun AudioWaveform(modifier: Modifier = Modifier) {
 
 @Composable
 private fun MessageMeta(msg: UiMessage) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = msg.status.icon,
-            contentDescription = msg.status.label,
-            tint = msg.status.color,
-            modifier = Modifier.size(13.dp),
-        )
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+        Icon(imageVector = msg.status.icon, contentDescription = msg.status.label, tint = msg.status.color, modifier = Modifier.size(13.dp))
         Spacer(Modifier.width(4.dp))
-        Text(
-            text = formatMessageTime(msg.timestamp),
-            color = QubeePalette.MutedText,
-            style = MaterialTheme.typography.bodySmall,
-        )
+        Text(text = formatMessageTime(msg.timestamp), color = QubeePalette.MutedText, style = MaterialTheme.typography.bodySmall)
         if (msg.isFromMe) {
             Spacer(Modifier.width(6.dp))
-            Text(
-                text = msg.status.label,
-                color = msg.status.color,
-                style = MaterialTheme.typography.bodySmall,
-                fontWeight = FontWeight.Bold,
-            )
+            Text(text = msg.status.label, color = msg.status.color, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -565,9 +515,7 @@ fun ChatInputBar(
     onCamera: () -> Unit,
     onMic: () -> Unit,
 ) {
-    Surface(
-        color = Color.Transparent,
-    ) {
+    Surface(color = Color.Transparent) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -575,23 +523,15 @@ fun ChatInputBar(
                 .imePadding()
                 .padding(horizontal = 10.dp, vertical = 8.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Surface(
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(28.dp),
                     color = Color(0xFF111815).copy(alpha = 0.98f),
                     border = BorderStroke(1.dp, QubeePalette.Cyan.copy(alpha = 0.16f)),
                 ) {
-                    Row(
-                        modifier = Modifier.padding(start = 4.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        IconButton(onClick = onCamera) {
-                            Icon(Icons.Default.CameraAlt, "Camera", tint = QubeePalette.Text)
-                        }
+                    Row(modifier = Modifier.padding(start = 4.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = onCamera) { Icon(Icons.Default.CameraAlt, "Camera", tint = QubeePalette.Text) }
                         TextField(
                             value = text,
                             onValueChange = onTextChanged,
@@ -605,14 +545,10 @@ fun ChatInputBar(
                                 focusedIndicatorColor = Color.Transparent,
                                 unfocusedIndicatorColor = Color.Transparent,
                             ),
-                            placeholder = {
-                                Text("Message", color = QubeePalette.MutedText)
-                            },
+                            placeholder = { Text("Message", color = QubeePalette.MutedText) },
                             maxLines = 5,
                         )
-                        IconButton(onClick = onAttach) {
-                            Icon(Icons.Default.AttachFile, "Attach file", tint = QubeePalette.Text)
-                        }
+                        IconButton(onClick = onAttach) { Icon(Icons.Default.AttachFile, "Attach file", tint = QubeePalette.Text) }
                     }
                 }
 
@@ -622,10 +558,7 @@ fun ChatInputBar(
                     onClick = if (text.isBlank()) onMic else onSend,
                     modifier = Modifier
                         .size(58.dp)
-                        .background(
-                            brush = QubeeQuantumBrush,
-                            shape = CircleShape,
-                        ),
+                        .background(brush = QubeeQuantumBrush, shape = CircleShape),
                 ) {
                     Icon(
                         imageVector = if (text.isBlank()) Icons.Default.Mic else Icons.Default.Send,
@@ -635,6 +568,157 @@ fun ChatInputBar(
                     )
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ConversationDetailsSheet(
+    contactName: String,
+    securityState: ConversationSecurityState,
+    details: ConversationDetailsUi,
+    onDismiss: () -> Unit,
+    onVerifyClick: () -> Unit,
+    onTimerClick: () -> Unit,
+    onClearChatClick: () -> Unit,
+    onResetSessionClick: () -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF0B1516),
+        tonalElevation = 0.dp,
+        dragHandle = null,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 18.dp, vertical = 14.dp),
+        ) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .width(46.dp)
+                    .height(4.dp),
+                shape = RoundedCornerShape(999.dp),
+                color = QubeePalette.Cyan.copy(alpha = 0.35f),
+            ) {}
+
+            Spacer(Modifier.height(16.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                PeerAvatar(contactName)
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = contactName,
+                        color = QubeePalette.Text,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Black,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(securityState.icon, contentDescription = null, tint = securityState.color, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = securityState.label,
+                            color = securityState.color,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(18.dp))
+
+            DetailsSection(title = "Identity & trust") {
+                DetailsRow("Fingerprint", details.fingerprint)
+                DetailsRow("Verification", details.verificationLabel)
+                Spacer(Modifier.height(12.dp))
+                QubeePrimaryButton(text = "Verify contact", onClick = onVerifyClick)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            DetailsSection(title = "Session security") {
+                DetailsRow("Session", details.sessionLabel)
+                DetailsRow("Disappearing messages", details.disappearingTimerLabel)
+                Spacer(Modifier.height(8.dp))
+                QubeeMutedText(details.sessionNote)
+                Spacer(Modifier.height(12.dp))
+                QubeeSecondaryButton(text = "Change disappearing timer", onClick = onTimerClick)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            DetailsSection(title = "Media & files") {
+                DetailsRow("Media", details.mediaCount.toString())
+                DetailsRow("Files", details.fileCount.toString())
+                DetailsRow("Voice notes", details.audioCount.toString())
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            DetailsSection(title = "Danger zone") {
+                QubeeSecondaryButton(text = "Clear local chat", onClick = onClearChatClick)
+                Spacer(Modifier.height(10.dp))
+                DangerButton(text = "Reset secure session", onClick = onResetSessionClick)
+            }
+
+            Spacer(Modifier.height(18.dp))
+        }
+    }
+}
+
+@Composable
+private fun DetailsSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        color = Color(0xFF101B1C).copy(alpha = 0.95f),
+        border = BorderStroke(1.dp, QubeePalette.Cyan.copy(alpha = 0.16f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(text = title, color = QubeePalette.Text, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            content()
+        }
+    }
+}
+
+@Composable
+private fun DetailsRow(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Text(text = label, color = QubeePalette.MutedText, style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.width(12.dp))
+        Text(
+            text = value,
+            color = QubeePalette.Text,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun DangerButton(text: String, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xFF3A1018),
+        border = BorderStroke(1.dp, QubeePalette.Danger.copy(alpha = 0.55f)),
+    ) {
+        Box(modifier = Modifier.padding(vertical = 14.dp), contentAlignment = Alignment.Center) {
+            Text(text = text, color = Color(0xFFFFB3C1), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         }
     }
 }

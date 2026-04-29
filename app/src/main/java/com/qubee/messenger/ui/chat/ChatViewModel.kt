@@ -112,17 +112,17 @@ class ChatViewModel @Inject constructor(
 
     fun onAttachFile() {
         Timber.d("Attach file clicked")
-        // TODO: Implement file picker logic.
+        // TODO: Implement file picker logic and persist a FILE UiMessage.
     }
 
     fun onTakePhoto() {
         Timber.d("Take photo clicked")
-        // TODO: Implement camera logic.
+        // TODO: Implement camera logic and persist an IMAGE UiMessage.
     }
 
     fun onRecordAudio() {
         Timber.d("Record audio clicked")
-        // TODO: Implement voice recorder logic.
+        // TODO: Implement recorder logic and persist an AUDIO UiMessage.
     }
 }
 

@@ -55,6 +55,13 @@
             android:theme="@style/Theme.AppCompat"
             android:windowSoftInputMode="stateAlwaysHidden" />
 
+        <!-- Pre-alpha placeholder verification UI. The fingerprint
+             tap-to-verify gesture lands post-alpha. -->
+        <activity
+            android:name=".ui.contacts.verification.ContactVerificationActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Qubee" />
+
         <service
             android:name=".service.MessageService"
             android:enabled="true"

@@ -9,7 +9,6 @@
 use qubee_crypto::groups::group_handshake::{
     generate_ephemeral_kyber, sign_request_join, GroupHandshake, RequestJoinBody,
 };
-use qubee_crypto::groups::group_invite::InvitePayload;
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType, MemberStatus};
 use qubee_crypto::groups::group_message::{decrypt_group_message, encrypt_group_message};
 use qubee_crypto::groups::handshake_handlers::{
@@ -100,7 +99,7 @@ fn round_trip_encrypted_group_message() {
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
 
-    let (_bob_dir, bob_kp, bob_gm) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, bob_gm) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,

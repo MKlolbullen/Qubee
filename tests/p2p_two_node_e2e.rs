@@ -417,7 +417,7 @@ async fn p2p_key_rotation_e2e() {
     // this test — Bob's libp2p side isn't part of the assertion
     // (Bob just gets removed; we verify locally that his exported
     // key is unchanged after the rotation handler runs).
-    let mut alice_node = spawn_test_node("alice").await;
+    let alice_node = spawn_test_node("alice").await;
     let mut carol_node = spawn_test_node("carol").await;
 
     send_cmd(

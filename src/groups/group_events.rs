@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::groups::group_manager::GroupId;
 use crate::identity::identity_key::IdentityId;

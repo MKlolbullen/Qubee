@@ -349,13 +349,17 @@ impl GroupManager {
     /// `MemberAdded` so that existing members learn about a late
     /// joiner — including the late joiner's per-group Kyber pubkey,
     /// which is the only way subsequent rotations from this device
-    /// can deliver to them. No permission check, no key rotation, no
-    /// version bump (which would otherwise trip the strict generation
-    /// gate in `decrypt_group_message`).
+    /// can deliver to them. No permission check, no key rotation.
+    ///
+    /// `new_version` is the inviter's `group.version` after the join
+    /// landed; receivers install it verbatim so the strict generation
+    /// gate in `decrypt_group_message` doesn't bounce subsequent
+    /// messages from the inviter on a stale local view.
     pub fn apply_member_added(
         &mut self,
         group_id: GroupId,
         new_member: GroupMember,
+        new_version: u64,
     ) -> Result<()> {
         let new_member_id = new_member.identity_id;
         let group = self
@@ -363,6 +367,16 @@ impl GroupManager {
             .get_mut(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
         if group.members.contains_key(&new_member_id) {
+            // Idempotent: nothing to insert. Still adopt the inviter's
+            // version in case a duplicate broadcast carries a newer
+            // value than what we already had.
+            if new_version > group.version {
+                group.version = new_version;
+                group.last_updated = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)?
+                    .as_secs();
+                self.store_group_securely(&group_id)?;
+            }
             return Ok(());
         }
         let effective_cap = group
@@ -380,6 +394,9 @@ impl GroupManager {
         group.last_updated = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_secs();
+        // Adopt the inviter's post-enrolment version verbatim so the
+        // strict generation gate in `decrypt_group_message` lines up.
+        group.version = new_version;
         self.member_groups
             .entry(new_member_id)
             .or_insert_with(HashSet::new)
@@ -443,6 +460,79 @@ impl GroupManager {
         Ok(())
     }
     
+    /// Owner-only role promotion (or demotion). Mutates the local
+    /// view via `update_member_role`, then returns a `RoleChangeBody`
+    /// the caller can sign + broadcast via `sign_role_change`. Returns
+    /// `Err` if the promoter is not the group owner or the target is
+    /// the owner.
+    pub fn promote_member(
+        &mut self,
+        group_id: GroupId,
+        promoter_id: IdentityId,
+        member_id: IdentityId,
+        new_role: Role,
+    ) -> Result<crate::groups::group_handshake::RoleChangeBody> {
+        // Strict owner-only gate: in this codebase only the Owner
+        // hands out / takes back the Admin / Moderator roles. This
+        // is stricter than `Permission::ManageRoles`, which Admins
+        // also have — relaxing later would require a real promoter
+        // chain of trust.
+        let promoter_is_owner = self
+            .groups
+            .get(&group_id)
+            .and_then(|g| g.members.get(&promoter_id))
+            .map(|m| m.role == Role::Owner)
+            .unwrap_or(false);
+        if !promoter_is_owner {
+            return Err(anyhow::anyhow!("only the group owner may promote members"));
+        }
+        // Re-uses the existing role mutation path (permission check,
+        // version bump, log event, persist).
+        self.update_member_role(group_id, promoter_id, member_id, new_role.clone())?;
+        let new_version = self
+            .get_group(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found after role update"))?
+            .version;
+        Ok(crate::groups::group_handshake::RoleChangeBody {
+            group_id,
+            promoter_id,
+            member_id,
+            new_role,
+            new_version,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        })
+    }
+
+    /// Receiver-side mutation for inviter-broadcast `RoleChange`. Used
+    /// by `process_role_change` to apply the role change to the local
+    /// view and adopt the promoter's post-promotion `group.version`.
+    pub fn apply_role_change(
+        &mut self,
+        group_id: GroupId,
+        member_id: IdentityId,
+        new_role: Role,
+        new_version: u64,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| anyhow::anyhow!("Role change target not in local view"))?;
+        if member.role == Role::Owner {
+            return Err(anyhow::anyhow!("Cannot change owner role"));
+        }
+        member.role = new_role;
+        if new_version > group.version {
+            group.version = new_version;
+        }
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Update member role
     pub fn update_member_role(
         &mut self,

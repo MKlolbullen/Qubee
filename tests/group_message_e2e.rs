@@ -522,4 +522,122 @@ fn existing_members_learn_about_late_joiners() {
          Bob's members: {:?}",
         bob_members.keys().collect::<Vec<_>>(),
     );
+
+    // Stronger invariant: after applying MemberAdded, Bob's local
+    // generation must track Alice's so a subsequent encrypted message
+    // from Alice doesn't bounce on the strict generation gate.
+    let alice_v = alice_gm.get_group(&group_id).unwrap().version;
+    let bob_v = bob_gm.get_group(&group_id).unwrap().version;
+    assert_eq!(
+        bob_v, alice_v,
+        "After MemberAdded, Bob's group version must match Alice's (alice={alice_v}, bob={bob_v})",
+    );
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hello carol+bob").unwrap();
+    let decrypted = decrypt_group_message(&bob_gm, &wire)
+        .expect("Bob must decrypt Alice's post-join message");
+    assert_eq!(decrypted.plaintext, b"hello carol+bob");
+}
+
+// ---------------------------------------------------------------------
+// 5c — promote_member + RoleChange wire frame
+// ---------------------------------------------------------------------
+
+#[test]
+fn owner_can_promote_member_and_broadcast_role_change() {
+    use qubee_crypto::groups::group_handshake::{sign_role_change, GroupHandshake};
+    use qubee_crypto::groups::group_permissions::Role;
+    use qubee_crypto::groups::handshake_handlers::process_role_change;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Alice promotes Bob to Admin.
+    let role_change_body = alice_gm
+        .promote_member(group_id, alice_id, bob_kp.identity_id(), Role::Admin)
+        .expect("owner can promote member");
+
+    // Sign + broadcast as a wire frame; Bob applies it.
+    let signed = sign_role_change(&alice_kp, role_change_body.clone()).unwrap();
+    let (rc_body, rc_sig) = match signed {
+        GroupHandshake::RoleChange { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    process_role_change(&mut bob_gm, &rc_body, &rc_sig).expect("Bob applies the role change");
+
+    // Bob's local view of himself now has Admin role.
+    let bob_view_of_self = bob_gm
+        .get_group(&group_id)
+        .unwrap()
+        .members
+        .get(&bob_kp.identity_id())
+        .unwrap()
+        .role
+        .clone();
+    assert_eq!(bob_view_of_self, Role::Admin);
+
+    // And version coherence: Alice's post-promotion version equals Bob's.
+    let alice_v = alice_gm.get_group(&group_id).unwrap().version;
+    let bob_v = bob_gm.get_group(&group_id).unwrap().version;
+    assert_eq!(alice_v, bob_v, "post-RoleChange version must agree");
+
+    // Subsequent encrypted message round-trips fine.
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"role-change ok").unwrap();
+    let decrypted =
+        decrypt_group_message(&bob_gm, &wire).expect("post-RoleChange decryption works");
+    assert_eq!(decrypted.plaintext, b"role-change ok");
+}
+
+#[test]
+fn non_owner_cannot_promote_member() {
+    use qubee_crypto::groups::group_permissions::Role;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Bob (a Member, not Owner) tries to promote himself on his own
+    // local view. Must fail with the owner-only gate.
+    let result = bob_gm.promote_member(group_id, bob_kp.identity_id(), bob_kp.identity_id(), Role::Admin);
+    assert!(result.is_err(), "non-owner must not be able to promote");
 }

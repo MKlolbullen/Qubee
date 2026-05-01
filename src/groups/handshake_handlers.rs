@@ -15,8 +15,9 @@ use zeroize::Zeroize;
 use crate::groups::group_handshake::{
     sign_join_accepted, sign_join_rejected, sign_key_rotation, sign_member_added,
     verify_join_accepted, verify_key_rotation, verify_member_added, verify_request_join,
-    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, KeyRotationBody,
-    MemberAddedBody, MemberKeyDelivery, RequestJoinBody, WrappedGroupKey,
+    verify_role_change, GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
+    KeyRotationBody, MemberAddedBody, MemberKeyDelivery, RequestJoinBody, RoleChangeBody,
+    WrappedGroupKey,
 };
 use crate::groups::group_manager::{GroupId, GroupManager, GroupMember, MemberStatus};
 use crate::groups::group_permissions::{Permission, Role};
@@ -175,6 +176,7 @@ pub fn process_request_join(
         group_id: body.group_id,
         adder_id: invitation.inviter_id,
         new_member: new_member_summary,
+        new_version: snapshot_version,
         timestamp: now,
     };
     let (member_added_body, member_added_signature) = match sign_member_added(
@@ -304,7 +306,37 @@ pub fn process_member_added(
         custom_permissions: None,
         kyber_pub: body.new_member.kyber_pub.clone(),
     };
-    gm.apply_member_added(body.group_id, new_member)
+    gm.apply_member_added(body.group_id, new_member, body.new_version)
+}
+
+/// Existing-member handler for owner-broadcast `RoleChange`. Verifies
+/// the broadcast was signed by the local view's current owner of the
+/// group and applies the role change.
+pub fn process_role_change(
+    gm: &mut GroupManager,
+    body: &RoleChangeBody,
+    signature: &HybridSignature,
+) -> Result<()> {
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("RoleChange for unknown group"))?;
+    let promoter = group
+        .members
+        .get(&body.promoter_id)
+        .ok_or_else(|| anyhow!("RoleChange promoter is not a current member"))?;
+    if promoter.role != Role::Owner {
+        return Err(anyhow!("RoleChange promoter is not the owner"));
+    }
+    let promoter_key = promoter.identity_key.clone();
+    if !verify_role_change(body, signature, &promoter_key)? {
+        return Err(anyhow!("RoleChange signature failed"));
+    }
+    gm.apply_role_change(
+        body.group_id,
+        body.member_id,
+        body.new_role.clone(),
+        body.new_version,
+    )
 }
 
 fn reject(

@@ -237,6 +237,28 @@ pub struct MemberAddedBody {
     pub group_id: GroupId,
     pub adder_id: IdentityId,
     pub new_member: GroupMemberSummary,
+    /// The inviter's `group.version` immediately after enrolling the
+    /// new member (i.e. after `add_member` + `set_member_kyber_pub`).
+    /// Receivers install this verbatim so the strict generation gate
+    /// in `decrypt_group_message` doesn't bounce subsequent messages
+    /// from the inviter on a stale local view.
+    pub new_version: u64,
+    pub timestamp: u64,
+}
+
+/// Body of a `RoleChange` payload. An owner promotes (or demotes) a
+/// member; existing members apply the change to their local view so
+/// downstream permission checks (rotation broadcasts from a promoted
+/// admin, etc.) line up. `new_version` rides along for the same reason
+/// it does on `MemberAddedBody` — the strict generation gate in
+/// `decrypt_group_message` needs receiver version to track promoter.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoleChangeBody {
+    pub group_id: GroupId,
+    pub promoter_id: IdentityId,
+    pub member_id: IdentityId,
+    pub new_role: Role,
+    pub new_version: u64,
     pub timestamp: u64,
 }
 
@@ -261,6 +283,10 @@ pub enum GroupHandshake {
     },
     MemberAdded {
         body: MemberAddedBody,
+        signature: HybridSignature,
+    },
+    RoleChange {
+        body: RoleChangeBody,
         signature: HybridSignature,
     },
 }
@@ -305,6 +331,7 @@ const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v1";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
+const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);
@@ -369,6 +396,24 @@ pub fn canonical_join_rejected(body: &JoinRejectedBody) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn canonical_role_change(body: &RoleChangeBody) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(ROLE_CHANGE_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.promoter_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.member_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&bincode::serialize(&body.new_role)?);
+    out.push(0u8);
+    out.extend_from_slice(&body.new_version.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    Ok(out)
+}
+
 pub fn canonical_member_added(body: &MemberAddedBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);
     out.extend_from_slice(MEMBER_ADDED_TAG);
@@ -378,6 +423,8 @@ pub fn canonical_member_added(body: &MemberAddedBody) -> Result<Vec<u8>> {
     out.extend_from_slice(body.adder_id.as_ref());
     out.push(0u8);
     out.extend_from_slice(&bincode::serialize(&body.new_member)?);
+    out.push(0u8);
+    out.extend_from_slice(&body.new_version.to_le_bytes());
     out.push(0u8);
     out.extend_from_slice(&body.timestamp.to_le_bytes());
     Ok(out)
@@ -523,6 +570,29 @@ pub fn verify_member_added(
 ) -> Result<bool> {
     let payload = canonical_member_added(body)?;
     expected_adder.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Sign a `RoleChange` payload with the promoter's keypair.
+pub fn sign_role_change(
+    keypair: &IdentityKeyPair,
+    body: RoleChangeBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_role_change(&body)?;
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::RoleChange { body, signature })
+}
+
+/// Verify a `RoleChange` against the promoter's stated `IdentityKey`.
+/// Callers must separately check that the promoter is actually the
+/// owner of the local view of the group; this only verifies
+/// cryptographic authorship and freshness.
+pub fn verify_role_change(
+    body: &RoleChangeBody,
+    signature: &HybridSignature,
+    expected_promoter: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_role_change(body)?;
+    expected_promoter.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
 }
 
 #[cfg(test)]

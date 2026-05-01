@@ -327,7 +327,10 @@ impl GroupHandshake {
 // canonical (HashMap iteration order, struct field reordering, …).
 
 const REQUEST_JOIN_TAG: &[u8] = b"qubee_handshake_request_join_v1";
-const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v1";
+// _v2 because GroupMemberSummary now carries kyber_pub — the canonical
+// bytes of every JoinAccepted body changed in plan revision 2 priority
+// 5b. Other handshake tags didn't grow new fields and stay at _v1.
+const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v2";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";

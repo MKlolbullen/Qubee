@@ -331,3 +331,177 @@ fn wire_format_magic_prefix_is_stable() {
     let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();
     assert!(wire.starts_with(b"QUBEE_GMS\x01"));
 }
+
+// ---------------------------------------------------------------------
+// A1 + A2 regressions. These tests describe the post-fix invariant for
+// the bundled wire-format batch (per-member kem_pub plumbing in
+// JoinAccepted and the new MemberAdded broadcast). They are expected
+// to *fail* on `main` until that batch lands. The bug they pin:
+//
+//   - process_join_accepted reconstructs the snapshot members with
+//     `kyber_pub: Vec::new()` (handshake_handlers.rs ~L202), so the
+//     joiner's local view of every existing member has an empty Kyber
+//     pubkey.
+//   - rotate_group_key_after_removal silently filters out members
+//     with an empty kyber_pub (group_manager.rs ~L602), so a
+//     just-joined peer who tries to rotate ends up broadcasting a
+//     rotation to nobody — without an error.
+//   - There is no MemberAdded broadcast, so existing members (Bob)
+//     never learn about a late joiner (Carol).
+// ---------------------------------------------------------------------
+
+#[test]
+fn newly_joined_member_can_rotate_key_to_inviter() {
+    // After Bob joins Alice's group via the handshake, Bob's local
+    // GroupManager should know Alice's Kyber pubkey — so if Bob is
+    // promoted to admin and rotates the group key, Alice ends up in
+    // the recipients list. Today this list is silently empty.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invitation = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+
+    let (_bob_dir, bob_kp, mut bob_gm) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invitation.invitation_code,
+        invitation.inviter_name,
+    );
+
+    // Bob now plans a rotation on his own local view. The semantic
+    // intent is "Bob is admin, removed someone, now rotates" — we
+    // skip the role plumbing because rotate_group_key_after_removal
+    // doesn't check permissions today (the role gate is upstream of
+    // it). Whether Bob is technically allowed is the subject of A1's
+    // promote_member API; here we only assert the *delivery* works
+    // once a non-owner is doing the rotation.
+    let recipients = bob_gm
+        .rotate_group_key_after_removal(group_id, bob_kp.identity_id())
+        .expect("rotation should succeed");
+
+    assert!(
+        recipients.iter().any(|(id, _)| *id == alice_id),
+        "Bob's rotation must reach Alice (the inviter), but recipients are: {:?}",
+        recipients.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn late_joiner_can_rotate_key_to_all_existing_members() {
+    // Owner + Bob + Carol where Carol joins last. Today, Carol's
+    // local snapshot of Owner and Bob both have empty Kyber pubkeys
+    // (process_join_accepted hardcodes Vec::new()), so any rotation
+    // Carol plans silently delivers to nobody. Post-fix, Carol's
+    // snapshot must carry per-member kem_pub and her rotation must
+    // reach Owner and Bob.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let bob_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, _bob_gm) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        bob_invite.invitation_code,
+        bob_invite.inviter_name,
+    );
+    let carol_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_carol_dir, carol_kp, mut carol_gm) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        carol_invite.invitation_code,
+        carol_invite.inviter_name,
+    );
+
+    let recipients = carol_gm
+        .rotate_group_key_after_removal(group_id, carol_kp.identity_id())
+        .expect("rotation should succeed");
+    let recipient_ids: std::collections::HashSet<_> =
+        recipients.iter().map(|(id, _)| *id).collect();
+    assert!(
+        recipient_ids.contains(&alice_id),
+        "Carol's rotation must reach Alice; recipients: {recipient_ids:?}",
+    );
+    assert!(
+        recipient_ids.contains(&bob_kp.identity_id()),
+        "Carol's rotation must reach Bob; recipients: {recipient_ids:?}",
+    );
+}
+
+#[test]
+fn existing_members_learn_about_late_joiners() {
+    // Alice + Bob, then Carol joins via Alice. Today, Bob never
+    // learns about Carol — there is no MemberAdded broadcast, and
+    // JoinAccepted only reaches the new joiner. Post-fix, Alice
+    // should publish a MemberAdded which Bob processes, so Bob's
+    // local membership map contains Carol.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let bob_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, _bob_kp, bob_gm) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        bob_invite.invitation_code,
+        bob_invite.inviter_name,
+    );
+    let carol_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_carol_dir, carol_kp, _carol_gm) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        carol_invite.invitation_code,
+        carol_invite.inviter_name,
+    );
+
+    let bob_members = &bob_gm.get_group(&group_id).expect("bob has group").members;
+    assert!(
+        bob_members.contains_key(&carol_kp.identity_id()),
+        "Bob must learn about Carol via MemberAdded broadcast; \
+         Bob's members: {:?}",
+        bob_members.keys().collect::<Vec<_>>(),
+    );
+}

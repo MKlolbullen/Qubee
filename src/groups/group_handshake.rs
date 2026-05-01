@@ -18,7 +18,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
-use pqcrypto_kyber::kyber768::{
+use pqcrypto_mlkem::mlkem768::{
     decapsulate as kyber_decapsulate, encapsulate as kyber_encapsulate, keypair as kyber_keypair,
     Ciphertext as KyberCiphertext, PublicKey as KyberPublicKey, SecretKey as KyberSecretKey,
 };
@@ -83,7 +83,7 @@ pub struct RequestJoinBody {
 /// per-message calculation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WrappedGroupKey {
-    /// Output of `pqcrypto_kyber::kyber768::encapsulate(joiner_pub)`.
+    /// Output of `pqcrypto_mlkem::mlkem768::encapsulate(joiner_pub)`.
     pub kem_ciphertext: Vec<u8>,
     /// AEAD nonce for the wrapped key.
     pub nonce: [u8; 12],

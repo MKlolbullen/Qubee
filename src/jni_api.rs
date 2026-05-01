@@ -900,12 +900,24 @@ fn on_request_join(
 
     let topic = group_topic(&hex::encode(body.group_id.as_ref()));
     match outcome {
-        HandshakeOutcome::Accept { body: accepted, signature: accepted_sig } => {
+        HandshakeOutcome::Accept {
+            body: accepted,
+            signature: accepted_sig,
+            member_added_body,
+            member_added_signature,
+        } => {
             let signed = GroupHandshake::JoinAccepted {
                 body: accepted,
                 signature: accepted_sig,
             };
-            let _ = publish_to_topic(topic, signed.to_wire()?);
+            let _ = publish_to_topic(topic.clone(), signed.to_wire()?);
+            // Broadcast MemberAdded so existing members learn about
+            // the new joiner (and their Kyber pubkey).
+            let added = GroupHandshake::MemberAdded {
+                body: member_added_body,
+                signature: member_added_signature,
+            };
+            let _ = publish_to_topic(topic, added.to_wire()?);
         }
         HandshakeOutcome::Reject { body: rejected, signature: rejected_sig } => {
             let signed = GroupHandshake::JoinRejected {

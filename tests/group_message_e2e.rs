@@ -7,14 +7,14 @@
 //! timestamp.
 
 use qubee_crypto::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_request_join, GroupHandshake, RequestJoinBody,
+    generate_ephemeral_kyber, sign_request_join, GroupHandshake, MemberAddedBody, RequestJoinBody,
 };
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType, MemberStatus};
 use qubee_crypto::groups::group_message::{decrypt_group_message, encrypt_group_message};
 use qubee_crypto::groups::handshake_handlers::{
-    process_join_accepted, process_request_join, HandshakeOutcome,
+    process_join_accepted, process_member_added, process_request_join, HandshakeOutcome,
 };
-use qubee_crypto::identity::identity_key::IdentityKeyPair;
+use qubee_crypto::identity::identity_key::{HybridSignature, IdentityKeyPair};
 use qubee_crypto::storage::secure_keystore::SecureKeyStore;
 use tempfile::TempDir;
 
@@ -29,15 +29,23 @@ fn fresh_device(label: &str) -> (TempDir, IdentityKeyPair, GroupManager) {
 
 /// Walk Bob through a join handshake against Alice's group. Returns
 /// a fresh [`GroupManager`] for Bob with the group fully provisioned
-/// (members, key, persisted Kyber secret) so the test can immediately
-/// exchange encrypted messages.
+/// (members, key, persisted Kyber secret) plus the inviter-broadcast
+/// `MemberAdded` body+signature the caller may apply to other
+/// existing members' GroupManagers (e.g. for the "Carol joins after
+/// Bob" scenario).
 fn join_bob_to_alice(
     alice_kp: &IdentityKeyPair,
     alice_gm: &mut GroupManager,
     group_id: qubee_crypto::groups::group_manager::GroupId,
     invitation_code: String,
     inviter_name: String,
-) -> (TempDir, IdentityKeyPair, GroupManager) {
+) -> (
+    TempDir,
+    IdentityKeyPair,
+    GroupManager,
+    MemberAddedBody,
+    HybridSignature,
+) {
     let (bob_dir, bob_kp, mut bob_gm) = fresh_device("bob");
     bob_gm
         .record_external_invite_acceptance(
@@ -64,9 +72,14 @@ fn join_bob_to_alice(
         GroupHandshake::RequestJoin { body, signature } => (body, signature),
         _ => unreachable!(),
     };
-    let (acc_body, acc_sig) =
+    let (acc_body, acc_sig, ma_body, ma_sig) =
         match process_request_join(alice_gm, alice_kp, &req_body, &req_sig).unwrap() {
-            HandshakeOutcome::Accept { body, signature } => (body, signature),
+            HandshakeOutcome::Accept {
+                body,
+                signature,
+                member_added_body,
+                member_added_signature,
+            } => (body, signature, member_added_body, member_added_signature),
             other => panic!("expected Accept, got {other:?}"),
         };
     process_join_accepted(
@@ -77,7 +90,7 @@ fn join_bob_to_alice(
         &kyber_secret,
     )
     .unwrap();
-    (bob_dir, bob_kp, bob_gm)
+    (bob_dir, bob_kp, bob_gm, ma_body, ma_sig)
 }
 
 #[test]
@@ -99,7 +112,7 @@ fn round_trip_encrypted_group_message() {
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
 
-    let (_bob_dir, _bob_kp, bob_gm) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -241,7 +254,7 @@ fn stale_generation_after_rotation_is_rejected() {
     let invitation = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, _bob_kp, bob_gm) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -290,7 +303,7 @@ fn future_generation_is_rejected() {
     let invitation = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, _bob_kp, bob_gm) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -373,7 +386,7 @@ fn newly_joined_member_can_rotate_key_to_inviter() {
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
 
-    let (_bob_dir, bob_kp, mut bob_gm) = join_bob_to_alice(
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -423,7 +436,7 @@ fn late_joiner_can_rotate_key_to_all_existing_members() {
     let bob_invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, bob_kp, _bob_gm) = join_bob_to_alice(
+    let (_bob_dir, bob_kp, _bob_gm, _ma_body_bob, _ma_sig_bob) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -433,7 +446,7 @@ fn late_joiner_can_rotate_key_to_all_existing_members() {
     let carol_invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_carol_dir, carol_kp, mut carol_gm) = join_bob_to_alice(
+    let (_carol_dir, carol_kp, mut carol_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -479,7 +492,7 @@ fn existing_members_learn_about_late_joiners() {
     let bob_invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, _bob_kp, bob_gm) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -489,13 +502,18 @@ fn existing_members_learn_about_late_joiners() {
     let carol_invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_carol_dir, carol_kp, _carol_gm) = join_bob_to_alice(
+    let (_carol_dir, carol_kp, _carol_gm, ma_body_carol, ma_sig_carol) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
         carol_invite.invitation_code,
         carol_invite.inviter_name,
     );
+
+    // Simulate the MemberAdded broadcast hitting Bob's device — in a
+    // real deployment this rides the per-group gossipsub topic.
+    process_member_added(&mut bob_gm, &ma_body_carol, &ma_sig_carol)
+        .expect("Bob applies Alice's MemberAdded broadcast");
 
     let bob_members = &bob_gm.get_group(&group_id).expect("bob has group").members;
     assert!(

@@ -13,10 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 use crate::groups::group_handshake::{
-    sign_join_accepted, sign_join_rejected, sign_key_rotation, verify_join_accepted,
-    verify_key_rotation, verify_request_join, GroupHandshake, GroupMemberSummary,
-    JoinAcceptedBody, JoinRejectedBody, KeyRotationBody, MemberKeyDelivery, RequestJoinBody,
-    WrappedGroupKey,
+    sign_join_accepted, sign_join_rejected, sign_key_rotation, sign_member_added,
+    verify_join_accepted, verify_key_rotation, verify_member_added, verify_request_join,
+    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, KeyRotationBody,
+    MemberAddedBody, MemberKeyDelivery, RequestJoinBody, WrappedGroupKey,
 };
 use crate::groups::group_manager::{GroupId, GroupManager, GroupMember, MemberStatus};
 use crate::groups::group_permissions::{Permission, Role};
@@ -25,10 +25,19 @@ use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, Id
 /// What the inviter wants to publish back after handling a `RequestJoin`.
 #[derive(Debug)]
 pub enum HandshakeOutcome {
-    /// Joiner enrolled successfully; serialise + publish this body.
+    /// Joiner enrolled successfully. The caller should publish:
+    ///   1. `body` + `signature` as the `JoinAccepted` reply addressed
+    ///      to the new joiner.
+    ///   2. `member_added_body` + `member_added_signature` as a
+    ///      `MemberAdded` broadcast on the group topic so the existing
+    ///      members learn about the late joiner — including their
+    ///      Kyber pubkey, which is required for any subsequent rotation
+    ///      to deliver to them.
     Accept {
         body: JoinAcceptedBody,
         signature: HybridSignature,
+        member_added_body: MemberAddedBody,
+        member_added_signature: HybridSignature,
     },
     /// Joiner refused (cap reached, expired, etc.); serialise + publish.
     Reject {
@@ -102,6 +111,9 @@ pub fn process_request_join(
     let _ = gm.mark_invitation_used(&body.invitation_code);
 
     // Build the member snapshot + wrap the group key for the joiner.
+    // The snapshot now carries each member's Kyber pubkey so the
+    // joiner's local view can route subsequent rotations back to
+    // existing members.
     let group = gm
         .get_group(&body.group_id)
         .ok_or_else(|| anyhow!("group vanished after add_member"))?;
@@ -114,6 +126,7 @@ pub fn process_request_join(
             display_name: m.display_name.clone(),
             role: m.role.clone(),
             joined_at: m.joined_at,
+            kyber_pub: m.kyber_pub.clone(),
         })
         .collect();
     let group_name = group.name.clone();
@@ -122,6 +135,15 @@ pub fn process_request_join(
     // counter the generation gates in `decrypt_group_message` and
     // `process_key_rotation` compare against.
     let snapshot_version = group.version;
+
+    // Pull out the new member's snapshot for the broadcast. Cloning
+    // out of the borrow keeps the rest of this function from running
+    // into split-borrow hassles.
+    let new_member_summary = members
+        .iter()
+        .find(|m| m.identity_id == body.joiner_public_key.identity_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("new member missing from snapshot"))?;
 
     gm.ensure_group_key(body.group_id)?;
     let mut group_key = gm
@@ -139,13 +161,38 @@ pub fn process_request_join(
         wrapped_group_key,
         snapshot_version,
     };
-    let signed = match sign_join_accepted(inviter_identity, accepted_body)? {
+    let (accepted_body, accepted_signature) = match sign_join_accepted(
+        inviter_identity,
+        accepted_body,
+    )? {
         crate::groups::group_handshake::GroupHandshake::JoinAccepted { body, signature } => {
-            HandshakeOutcome::Accept { body, signature }
+            (body, signature)
         }
         _ => unreachable!("sign_join_accepted always returns JoinAccepted"),
     };
-    Ok(signed)
+
+    let member_added_payload = MemberAddedBody {
+        group_id: body.group_id,
+        adder_id: invitation.inviter_id,
+        new_member: new_member_summary,
+        timestamp: now,
+    };
+    let (member_added_body, member_added_signature) = match sign_member_added(
+        inviter_identity,
+        member_added_payload,
+    )? {
+        crate::groups::group_handshake::GroupHandshake::MemberAdded { body, signature } => {
+            (body, signature)
+        }
+        _ => unreachable!("sign_member_added always returns MemberAdded"),
+    };
+
+    Ok(HandshakeOutcome::Accept {
+        body: accepted_body,
+        signature: accepted_signature,
+        member_added_body,
+        member_added_signature,
+    })
 }
 
 /// Joiner-side handler: verify the inviter's signed `JoinAccepted`,
@@ -193,13 +240,7 @@ pub fn process_join_accepted(
                 invited_by: Some(expected_inviter_id),
                 member_status: MemberStatus::Active,
                 custom_permissions: None,
-                // Snapshot from the wire doesn't carry per-member
-                // Kyber pubkeys today — the joiner only learns the
-                // inviter's metadata and the member list. Future
-                // KeyRotation deliveries to legacy members get
-                // skipped because of the empty-vec gate in
-                // rotate_group_key_after_removal.
-                kyber_pub: Vec::new(),
+                kyber_pub: m.kyber_pub.clone(),
             },
         );
     }
@@ -222,6 +263,48 @@ pub fn process_join_accepted(
         eprintln!("warning: persisting joiner Kyber secret failed: {e:#}");
     }
     Ok(())
+}
+
+/// Existing-member handler for inviter-broadcast `MemberAdded`. Verifies
+/// the broadcast was signed by an actual current admin/owner of the
+/// local group and applies the new member to the local view so future
+/// rotations from this device can deliver to them. Idempotent — a
+/// repeat broadcast for a member already in the local view is a no-op.
+pub fn process_member_added(
+    gm: &mut GroupManager,
+    body: &MemberAddedBody,
+    signature: &HybridSignature,
+) -> Result<()> {
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("MemberAdded for unknown group"))?;
+    let adder = group
+        .members
+        .get(&body.adder_id)
+        .ok_or_else(|| anyhow!("MemberAdded adder is not a current member"))?;
+    if !matches!(adder.role, Role::Owner | Role::Admin) {
+        return Err(anyhow!("MemberAdded adder lacks Add permission"));
+    }
+    if !verify_member_added(body, signature, &adder.identity_key)? {
+        return Err(anyhow!("MemberAdded signature failed"));
+    }
+    if group.members.contains_key(&body.new_member.identity_id) {
+        // Already known — late or duplicate broadcast.
+        return Ok(());
+    }
+    let new_member = GroupMember {
+        identity_id: body.new_member.identity_id,
+        identity_key: body.new_member.identity_key.clone(),
+        display_name: body.new_member.display_name.clone(),
+        role: body.new_member.role.clone(),
+        joined_at: body.new_member.joined_at,
+        last_seen: body.new_member.joined_at,
+        invited_by: Some(body.adder_id),
+        member_status: MemberStatus::Active,
+        custom_permissions: None,
+        kyber_pub: body.new_member.kyber_pub.clone(),
+    };
+    gm.apply_member_added(body.group_id, new_member)
 }
 
 fn reject(

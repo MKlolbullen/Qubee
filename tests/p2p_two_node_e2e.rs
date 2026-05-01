@@ -236,7 +236,7 @@ async fn p2p_two_node_e2e() {
     let outcome = process_request_join(&mut alice_gm, &alice_kp, &req_body_in, &req_sig_in)
         .expect("process_request_join");
     let (acc_body, acc_sig) = match outcome {
-        HandshakeOutcome::Accept { body, signature } => (body, signature),
+        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
         other => panic!("expected Accept, got {other:?}"),
     };
     let accepted_wire = GroupHandshake::JoinAccepted {
@@ -382,7 +382,7 @@ async fn p2p_key_rotation_e2e() {
         };
         let outcome = process_request_join(owner_gm, owner_kp, &rb, &rs).unwrap();
         let (ab, as_) = match outcome {
-            HandshakeOutcome::Accept { body, signature } => (body, signature),
+            HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
             other => panic!("expected Accept, got {other:?}"),
         };
         process_join_accepted(joiner_gm, owner_kp.identity_id(), &ab, &as_, &kyber_secret).unwrap();

@@ -46,6 +46,12 @@ pub const HANDSHAKE_MAX_AGE_SECS: u64 = 5 * 60;
 /// Flat snapshot of a group member as it travels on the wire. Mirrors
 /// the public-facing fields of `GroupMember` minus the moderation
 /// state, which is per-device.
+///
+/// `kyber_pub` carries the member's *long-lived* per-group Kyber pubkey.
+/// Without it, a joiner's local snapshot of the existing members ends
+/// up with empty Kyber keys, so any rotation the joiner later plans
+/// silently delivers to nobody (closes the A2 bug — see plan revision
+/// 2 priority 5b).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupMemberSummary {
     pub identity_id: IdentityId,
@@ -53,6 +59,7 @@ pub struct GroupMemberSummary {
     pub display_name: String,
     pub role: Role,
     pub joined_at: u64,
+    pub kyber_pub: Vec<u8>,
 }
 
 /// Body of a `RequestJoin` payload that gets bundled into the wire
@@ -219,6 +226,20 @@ pub struct KeyRotationBody {
     pub timestamp: u64,
 }
 
+/// Body of a `MemberAdded` payload. Inviters broadcast this to the
+/// group topic immediately after a successful `RequestJoin` so that
+/// existing members learn about the late joiner — including the late
+/// joiner's per-group Kyber pubkey, which is the only way subsequent
+/// rotations from existing members can deliver to the new joiner
+/// (closes A2; see plan revision 2 priority 5b).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemberAddedBody {
+    pub group_id: GroupId,
+    pub adder_id: IdentityId,
+    pub new_member: GroupMemberSummary,
+    pub timestamp: u64,
+}
+
 /// Top-level handshake frame.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GroupHandshake {
@@ -236,6 +257,10 @@ pub enum GroupHandshake {
     },
     KeyRotation {
         body: KeyRotationBody,
+        signature: HybridSignature,
+    },
+    MemberAdded {
+        body: MemberAddedBody,
         signature: HybridSignature,
     },
 }
@@ -279,6 +304,7 @@ const REQUEST_JOIN_TAG: &[u8] = b"qubee_handshake_request_join_v1";
 const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v1";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
+const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);
@@ -340,6 +366,20 @@ pub fn canonical_join_rejected(body: &JoinRejectedBody) -> Result<Vec<u8>> {
     out.extend_from_slice(body.joiner_id.as_ref());
     out.push(0u8);
     out.extend_from_slice(body.reason.as_bytes());
+    Ok(out)
+}
+
+pub fn canonical_member_added(body: &MemberAddedBody) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(2048);
+    out.extend_from_slice(MEMBER_ADDED_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.adder_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&bincode::serialize(&body.new_member)?);
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
     Ok(out)
 }
 
@@ -460,6 +500,29 @@ pub fn verify_key_rotation(
 ) -> Result<bool> {
     let payload = canonical_key_rotation(body)?;
     expected_rotator.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Sign a `MemberAdded` payload with the adder's (inviter's) keypair.
+pub fn sign_member_added(
+    keypair: &IdentityKeyPair,
+    body: MemberAddedBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_member_added(&body)?;
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::MemberAdded { body, signature })
+}
+
+/// Verify a `MemberAdded` against the adder's stated `IdentityKey`.
+/// Callers must check separately that the adder is actually a member
+/// with `Permission::AddMembers` in the local view of the group; this
+/// only verifies cryptographic authorship and freshness.
+pub fn verify_member_added(
+    body: &MemberAddedBody,
+    signature: &HybridSignature,
+    expected_adder: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_member_added(body)?;
+    expected_adder.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
 }
 
 #[cfg(test)]

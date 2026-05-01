@@ -106,7 +106,7 @@ fn invite_handshake_converges_on_shared_group_state() {
     let outcome = process_request_join(&mut alice_gm, &alice_kp, &req_body_in, &req_sig_in)
         .expect("process_request_join");
     let (accepted_body, accepted_sig) = match outcome {
-        HandshakeOutcome::Accept { body, signature } => (body, signature),
+        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
         other => panic!("expected Accept, got {other:?}"),
     };
 
@@ -295,7 +295,7 @@ fn key_rotation_after_removal_converges_on_new_key() {
         _ => unreachable!(),
     };
     let bob_accepted = match process_request_join(&mut alice_gm, &alice_kp, &bob_request.0, &bob_request.1).unwrap() {
-        HandshakeOutcome::Accept { body, signature } => (body, signature),
+        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
         _ => panic!("expected Accept for Bob"),
     };
     process_join_accepted(
@@ -334,7 +334,7 @@ fn key_rotation_after_removal_converges_on_new_key() {
         _ => unreachable!(),
     };
     let carol_accepted = match process_request_join(&mut alice_gm, &alice_kp, &carol_request.0, &carol_request.1).unwrap() {
-        HandshakeOutcome::Accept { body, signature } => (body, signature),
+        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
         _ => panic!("expected Accept for Carol"),
     };
     process_join_accepted(

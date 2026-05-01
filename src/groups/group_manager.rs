@@ -188,11 +188,20 @@ impl GroupManager {
         settings: GroupSettings,
     ) -> Result<GroupId> {
         let group_id = self.generate_group_id(&name, &creator_id)?;
-        
+
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_secs();
-        
+
+        // Generate the owner's long-lived per-group Kyber keypair so
+        // future rotations from a promoted admin can deliver back to
+        // the owner. The secret is persisted in the keystore (same
+        // mechanism as joiners use); the public key is stamped on
+        // the owner's GroupMember and travels in every JoinAccepted
+        // snapshot.
+        let (owner_kyber_pub, owner_kyber_secret) =
+            crate::groups::group_handshake::generate_ephemeral_kyber();
+
         // Create creator as admin member
         let creator_member = GroupMember {
             identity_id: creator_id,
@@ -204,9 +213,7 @@ impl GroupManager {
             invited_by: None,
             member_status: MemberStatus::Active,
             custom_permissions: None,
-            // Owner doesn't need a Kyber pubkey for self-rotations
-            // since they generate the new key directly.
-            kyber_pub: Vec::new(),
+            kyber_pub: owner_kyber_pub,
         };
         
         let mut members = HashMap::new();
@@ -228,13 +235,17 @@ impl GroupManager {
         
         // Generate group key
         self.group_crypto.create_group_key(group_id)?;
-        
+
         // Store group
         self.groups.insert(group_id, group);
         self.member_groups
             .entry(creator_id)
             .or_insert_with(HashSet::new)
             .insert(group_id);
+
+        // Persist the owner's Kyber secret so KeyRotation broadcasts
+        // from a promoted admin can be unwrapped after process restart.
+        self.store_my_kyber_secret(group_id, &owner_kyber_secret)?;
         
         // Log group creation event
         self.log_group_event(
@@ -333,6 +344,50 @@ impl GroupManager {
         Ok(())
     }
     
+    /// Insert a member into the local view of an existing group. Used
+    /// by `process_member_added` when an inviter broadcasts a
+    /// `MemberAdded` so that existing members learn about a late
+    /// joiner — including the late joiner's per-group Kyber pubkey,
+    /// which is the only way subsequent rotations from this device
+    /// can deliver to them. No permission check, no key rotation, no
+    /// version bump (which would otherwise trip the strict generation
+    /// gate in `decrypt_group_message`).
+    pub fn apply_member_added(
+        &mut self,
+        group_id: GroupId,
+        new_member: GroupMember,
+    ) -> Result<()> {
+        let new_member_id = new_member.identity_id;
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        if group.members.contains_key(&new_member_id) {
+            return Ok(());
+        }
+        let effective_cap = group
+            .settings
+            .max_members
+            .map(|n| n.min(QUBEE_MAX_GROUP_MEMBERS))
+            .unwrap_or(QUBEE_MAX_GROUP_MEMBERS);
+        if group.members.len() >= effective_cap {
+            return Err(anyhow::anyhow!(
+                "Group member limit reached (max {} members)",
+                effective_cap,
+            ));
+        }
+        group.members.insert(new_member_id, new_member);
+        group.last_updated = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+        self.member_groups
+            .entry(new_member_id)
+            .or_insert_with(HashSet::new)
+            .insert(group_id);
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Remove a member from a group
     pub fn remove_member(
         &mut self,

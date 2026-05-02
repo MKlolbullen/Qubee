@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!--
+        Qubee logo mark: a stylised Q with a subtle bee abdomen and
+        key-shaped stinger. This is the scalable Android fallback and
+        monochrome/adaptive-icon base. The SVG master lives in
+        docs/branding/qubee_mark_master.svg.
+
+        Note: Android VectorDrawable has limited gradient/filter support
+        compared with SVG, so the production launcher can still use PNG
+        foreground exports for glow while this vector stays sharp in-app.
+    -->
+    <path
+        android:strokeColor="#16EAD8"
+        android:strokeWidth="8.5"
+        android:strokeLineCap="round"
+        android:fillColor="@android:color/transparent"
+        android:pathData="M49,23a25,25 0,1 0,0.1 0" />
+    <path
+        android:strokeColor="#15E3C8"
+        android:strokeWidth="8"
+        android:strokeLineCap="round"
+        android:fillColor="@android:color/transparent"
+        android:pathData="M61,61 C69,65 74,70 79,78" />
+    <path
+        android:fillColor="#083045"
+        android:pathData="M70,67 C74,69 78,72 81,76 L78,79 C75,75 72,72 68,70 Z" />
+    <path
+        android:fillColor="#20F2F0"
+        android:fillAlpha="0.30"
+        android:strokeColor="#20F2F0"
+        android:strokeWidth="1.2"
+        android:pathData="M75,57 C84,44 94,42 93,50 C92,58 84,62 75,57 Z" />
+    <path
+        android:fillColor="#20F2F0"
+        android:fillAlpha="0.25"
+        android:strokeColor="#20F2F0"
+        android:strokeWidth="1.2"
+        android:pathData="M77,64 C85,58 92,59 89,65 C86,70 81,71 77,64 Z" />
+    <path
+        android:strokeColor="#6DFF8E"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:fillColor="@android:color/transparent"
+        android:pathData="M81,80 m-3,0 a3,3 0,1 0,6 0 a3,3 0,1 0,-6 0 M84,80 L96,92 M92,88 L89,91 M95,91 L92,94" />
+</vector>

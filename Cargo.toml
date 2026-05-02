@@ -62,6 +62,8 @@ log = "0.4"
 # JNI Bridge for Android
 jni = "0.21.1"
 lazy_static = "1.4.0"
+yamux = "0.13.10"
+
 
 # P2P Network Layer
 libp2p = { version = "0.55", features = [

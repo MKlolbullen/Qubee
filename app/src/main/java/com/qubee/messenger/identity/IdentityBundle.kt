@@ -5,7 +5,10 @@ import com.google.gson.JsonSyntaxException
 import com.google.gson.annotations.SerializedName
 
 /**
- * JSON-shaped envelope returned by the Rust JNI for ZK onboarding.
+ * JSON-shaped envelope returned by the Rust JNI for hybrid-signed
+ * onboarding (not ZK — the bundle is signed by the advertised
+ * Ed25519+Dilithium identity and verifiers re-derive the canonical
+ * bytes to check it).
  *
  * The private key material never leaves Rust; this class only carries
  * the public identity, the verifier-friendly fingerprint, and the

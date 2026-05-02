@@ -188,11 +188,20 @@ impl GroupManager {
         settings: GroupSettings,
     ) -> Result<GroupId> {
         let group_id = self.generate_group_id(&name, &creator_id)?;
-        
+
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_secs();
-        
+
+        // Generate the owner's long-lived per-group Kyber keypair so
+        // future rotations from a promoted admin can deliver back to
+        // the owner. The secret is persisted in the keystore (same
+        // mechanism as joiners use); the public key is stamped on
+        // the owner's GroupMember and travels in every JoinAccepted
+        // snapshot.
+        let (owner_kyber_pub, owner_kyber_secret) =
+            crate::groups::group_handshake::generate_ephemeral_kyber();
+
         // Create creator as admin member
         let creator_member = GroupMember {
             identity_id: creator_id,
@@ -204,9 +213,7 @@ impl GroupManager {
             invited_by: None,
             member_status: MemberStatus::Active,
             custom_permissions: None,
-            // Owner doesn't need a Kyber pubkey for self-rotations
-            // since they generate the new key directly.
-            kyber_pub: Vec::new(),
+            kyber_pub: owner_kyber_pub,
         };
         
         let mut members = HashMap::new();
@@ -228,13 +235,17 @@ impl GroupManager {
         
         // Generate group key
         self.group_crypto.create_group_key(group_id)?;
-        
+
         // Store group
         self.groups.insert(group_id, group);
         self.member_groups
             .entry(creator_id)
             .or_insert_with(HashSet::new)
             .insert(group_id);
+
+        // Persist the owner's Kyber secret so KeyRotation broadcasts
+        // from a promoted admin can be unwrapped after process restart.
+        self.store_my_kyber_secret(group_id, &owner_kyber_secret)?;
         
         // Log group creation event
         self.log_group_event(
@@ -333,6 +344,67 @@ impl GroupManager {
         Ok(())
     }
     
+    /// Insert a member into the local view of an existing group. Used
+    /// by `process_member_added` when an inviter broadcasts a
+    /// `MemberAdded` so that existing members learn about a late
+    /// joiner — including the late joiner's per-group Kyber pubkey,
+    /// which is the only way subsequent rotations from this device
+    /// can deliver to them. No permission check, no key rotation.
+    ///
+    /// `new_version` is the inviter's `group.version` after the join
+    /// landed; receivers install it verbatim so the strict generation
+    /// gate in `decrypt_group_message` doesn't bounce subsequent
+    /// messages from the inviter on a stale local view.
+    pub fn apply_member_added(
+        &mut self,
+        group_id: GroupId,
+        new_member: GroupMember,
+        new_version: u64,
+    ) -> Result<()> {
+        let new_member_id = new_member.identity_id;
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        if group.members.contains_key(&new_member_id) {
+            // Idempotent: nothing to insert. Still adopt the inviter's
+            // version in case a duplicate broadcast carries a newer
+            // value than what we already had.
+            if new_version > group.version {
+                group.version = new_version;
+                group.last_updated = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)?
+                    .as_secs();
+                self.store_group_securely(&group_id)?;
+            }
+            return Ok(());
+        }
+        let effective_cap = group
+            .settings
+            .max_members
+            .map(|n| n.min(QUBEE_MAX_GROUP_MEMBERS))
+            .unwrap_or(QUBEE_MAX_GROUP_MEMBERS);
+        if group.members.len() >= effective_cap {
+            return Err(anyhow::anyhow!(
+                "Group member limit reached (max {} members)",
+                effective_cap,
+            ));
+        }
+        group.members.insert(new_member_id, new_member);
+        group.last_updated = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+        // Adopt the inviter's post-enrolment version verbatim so the
+        // strict generation gate in `decrypt_group_message` lines up.
+        group.version = new_version;
+        self.member_groups
+            .entry(new_member_id)
+            .or_insert_with(HashSet::new)
+            .insert(group_id);
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Remove a member from a group
     pub fn remove_member(
         &mut self,
@@ -388,6 +460,79 @@ impl GroupManager {
         Ok(())
     }
     
+    /// Owner-only role promotion (or demotion). Mutates the local
+    /// view via `update_member_role`, then returns a `RoleChangeBody`
+    /// the caller can sign + broadcast via `sign_role_change`. Returns
+    /// `Err` if the promoter is not the group owner or the target is
+    /// the owner.
+    pub fn promote_member(
+        &mut self,
+        group_id: GroupId,
+        promoter_id: IdentityId,
+        member_id: IdentityId,
+        new_role: Role,
+    ) -> Result<crate::groups::group_handshake::RoleChangeBody> {
+        // Strict owner-only gate: in this codebase only the Owner
+        // hands out / takes back the Admin / Moderator roles. This
+        // is stricter than `Permission::ManageRoles`, which Admins
+        // also have — relaxing later would require a real promoter
+        // chain of trust.
+        let promoter_is_owner = self
+            .groups
+            .get(&group_id)
+            .and_then(|g| g.members.get(&promoter_id))
+            .map(|m| m.role == Role::Owner)
+            .unwrap_or(false);
+        if !promoter_is_owner {
+            return Err(anyhow::anyhow!("only the group owner may promote members"));
+        }
+        // Re-uses the existing role mutation path (permission check,
+        // version bump, log event, persist).
+        self.update_member_role(group_id, promoter_id, member_id, new_role.clone())?;
+        let new_version = self
+            .get_group(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found after role update"))?
+            .version;
+        Ok(crate::groups::group_handshake::RoleChangeBody {
+            group_id,
+            promoter_id,
+            member_id,
+            new_role,
+            new_version,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        })
+    }
+
+    /// Receiver-side mutation for inviter-broadcast `RoleChange`. Used
+    /// by `process_role_change` to apply the role change to the local
+    /// view and adopt the promoter's post-promotion `group.version`.
+    pub fn apply_role_change(
+        &mut self,
+        group_id: GroupId,
+        member_id: IdentityId,
+        new_role: Role,
+        new_version: u64,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| anyhow::anyhow!("Role change target not in local view"))?;
+        if member.role == Role::Owner {
+            return Err(anyhow::anyhow!("Cannot change owner role"));
+        }
+        member.role = new_role;
+        if new_version > group.version {
+            group.version = new_version;
+        }
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Update member role
     pub fn update_member_role(
         &mut self,
@@ -711,6 +856,12 @@ impl GroupManager {
         group_name: String,
         members: HashMap<IdentityId, GroupMember>,
         group_key: &[u8; 32],
+        // The inviter's view of `group.version` at handshake time.
+        // Generation gates in `decrypt_group_message` and
+        // `process_key_rotation` only work if both sides start from
+        // the same version number — otherwise the joiner's first
+        // received message panics on a bogus mismatch.
+        snapshot_version: u64,
     ) -> Result<()> {
         let receipt_key = format!("accepted_invite_{}", hex::encode(group_id.as_ref()));
         let _ = self.keystore.delete_key(&receipt_key);
@@ -727,7 +878,7 @@ impl GroupManager {
             metadata: GroupMetadata::default(),
             created_at: now,
             last_updated: now,
-            version: 1,
+            version: snapshot_version,
         };
 
         // Update the member->groups index for everyone in the snapshot.

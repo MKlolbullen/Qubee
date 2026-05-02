@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use getrandom::getrandom;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use blake3::Hasher;

@@ -164,6 +164,23 @@ pub fn decrypt_group_message(
     let group = gm
         .get_group(&body.group_id)
         .ok_or_else(|| anyhow!("decrypt: unknown group"))?;
+
+    // Generation gate: closes the small race where a kicked-then-
+    // rotated member's already-in-flight message lands after the
+    // local rotation but before the gossipsub mesh has fully
+    // settled. `body.generation` is the sender's snapshot of
+    // `group.version` at send time; we accept only equal-version
+    // frames. Strict policy because the alternative — buffer
+    // future-generation frames until the matching KeyRotation
+    // arrives — needs reorder-safe state we don't yet have.
+    if body.generation != group.version {
+        return Err(anyhow!(
+            "decrypt: generation mismatch (frame={}, local={})",
+            body.generation,
+            group.version
+        ));
+    }
+
     let sender = group
         .members
         .get(&body.sender_id)

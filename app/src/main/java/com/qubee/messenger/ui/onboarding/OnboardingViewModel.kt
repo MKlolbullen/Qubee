@@ -14,11 +14,12 @@ import kotlinx.coroutines.launch
 import timber.log.Timber
 
 /**
- * Drives the first-run flow. Generates a hybrid identity inside the Rust
- * core, captures the resulting [IdentityBundle] (public key + ZK proof
- * of ownership + share link), persists the public bits to encrypted
- * prefs, and surfaces the share link so the UI can render it as a QR
- * code for peer-to-peer key exchange.
+ * Drives the first-run flow. Generates a hybrid identity inside the
+ * Rust core, captures the resulting [IdentityBundle] (public key +
+ * a hybrid Ed25519+Dilithium-2 signature over the canonical bundle
+ * bytes + share link), persists the public bits to encrypted prefs,
+ * and surfaces the share link so the UI can render it as a QR code
+ * for peer-to-peer key exchange.
  */
 @HiltViewModel
 class OnboardingViewModel @Inject constructor(

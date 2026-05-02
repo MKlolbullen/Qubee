@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
 use blake3::Hasher;

@@ -2,8 +2,6 @@ package com.qubee.messenger.ui.main
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.qubee.messenger.data.repository.ConversationRepository
-import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.crypto.QubeeManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -16,11 +14,14 @@ import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
 
+// Slimmed down to what MainActivity actually consumes today —
+// initialization status + a navigation event channel. The original
+// version constructor-injected ContactRepository / ConversationRepository
+// to load aspirational dashboards that don't exist yet.
+
 @HiltViewModel
 class MainViewModel @Inject constructor(
-    private val conversationRepository: ConversationRepository,
-    private val contactRepository: ContactRepository,
-    private val qubeeManager: QubeeManager
+    private val qubeeManager: QubeeManager,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MainUiState())
@@ -37,70 +38,23 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 _uiState.value = _uiState.value.copy(isLoading = true)
-                
-                // Initialize Qubee cryptographic system
-                val cryptoInitialized = qubeeManager.initialize()
-                if (!cryptoInitialized) {
-                    throw Exception("Failed to initialize cryptographic system")
-                }
-                
-                // Load initial data
-                loadInitialData()
-                
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    isInitialized = true
-                )
-                
+                val ok = qubeeManager.initialize()
+                if (!ok) throw IllegalStateException("Failed to initialize cryptographic system")
+                _uiState.value = _uiState.value.copy(isLoading = false, isInitialized = true)
                 Timber.d("App initialization completed successfully")
-                
             } catch (e: Exception) {
                 Timber.e(e, "Failed to initialize app")
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
-                    error = e.message ?: "Unknown error occurred"
+                    error = e.message ?: "Unknown error occurred",
                 )
             }
         }
-    }
-
-    private suspend fun loadInitialData() {
-        // Load conversations and contacts
-        // This will be implemented when we create the repositories
-        Timber.d("Loading initial data...")
     }
 
     fun onPermissionsGranted() {
         viewModelScope.launch {
-            try {
-                // Permissions granted, continue with initialization
-                if (!_uiState.value.isInitialized) {
-                    initializeApp()
-                }
-            } catch (e: Exception) {
-                Timber.e(e, "Error after permissions granted")
-                _uiState.value = _uiState.value.copy(
-                    error = e.message ?: "Error initializing after permissions"
-                )
-            }
-        }
-    }
-
-    fun onConversationClicked(contactId: String) {
-        viewModelScope.launch {
-            _navigationEvents.emit(NavigationEvent.OpenChat(contactId))
-        }
-    }
-
-    fun onSettingsClicked() {
-        viewModelScope.launch {
-            _navigationEvents.emit(NavigationEvent.OpenSettings)
-        }
-    }
-
-    fun onNewChatClicked() {
-        viewModelScope.launch {
-            _navigationEvents.emit(NavigationEvent.OpenContactSelection)
+            if (!_uiState.value.isInitialized) initializeApp()
         }
     }
 
@@ -108,15 +62,10 @@ class MainViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(error = null)
     }
 
-    // Deep-link routing for `qubee://invite/...` and `qubee://identity/...`
-    // is handled exclusively by the NavController via the <deepLink>
-    // entries in nav_graph.xml — see MainActivity.onNewIntent. That keeps
-    // there a single source of truth for deep-link → destination mapping.
-
     data class MainUiState(
         val isLoading: Boolean = false,
         val isInitialized: Boolean = false,
-        val error: String? = null
+        val error: String? = null,
     )
 
     sealed class NavigationEvent {
@@ -125,4 +74,3 @@ class MainViewModel @Inject constructor(
         object OpenContactSelection : NavigationEvent()
     }
 }
-

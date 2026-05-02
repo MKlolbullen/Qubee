@@ -15,7 +15,7 @@
 use anyhow::{anyhow, Context, Result};
 use blake3::Hasher;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use pqcrypto_dilithium::dilithium2::{self};
+use pqcrypto_mldsa::mldsa44::{self};
 use pqcrypto_traits::sign::{
     DetachedSignature as _, PublicKey as _, SecretKey as _,
 };
@@ -30,12 +30,12 @@ use crate::security::secure_rng;
 // ---------------------------------------------------------------------------
 
 /// Public portion of an identity key. `Eq` is dropped because the
-/// inner `dilithium2::PublicKey` doesn't impl it; `PartialEq` does
+/// inner `mldsa44::PublicKey` doesn't impl it; `PartialEq` does
 /// fine for byte-equality comparisons used at the call sites.
 #[derive(Clone, PartialEq)]
 pub struct IdentityKey {
     pub classical_public: VerifyingKey,
-    pub pq_public: dilithium2::PublicKey,
+    pub pq_public: mldsa44::PublicKey,
     pub identity_id: IdentityId,
     pub created_at: u64,
 }
@@ -58,7 +58,7 @@ pub struct IdentityId(pub(crate) [u8; 32]);
 #[derive(Clone)]
 pub struct DevicePublicKey {
     pub x25519_public: x25519_dalek::PublicKey,
-    pub kyber_public: pqcrypto_kyber::kyber768::PublicKey,
+    pub kyber_public: pqcrypto_mlkem::mlkem768::PublicKey,
     pub device_id: DeviceId,
     pub identity_id: IdentityId,
     pub created_at: u64,
@@ -82,7 +82,7 @@ pub struct DeviceId(pub(crate) [u8; 16]);
 #[derive(Clone)]
 pub struct HybridSignature {
     pub classical_signature: Signature,
-    pub pq_signature: dilithium2::DetachedSignature,
+    pub pq_signature: mldsa44::DetachedSignature,
     pub signer_identity: IdentityId,
     pub timestamp: u64,
 }
@@ -109,10 +109,10 @@ impl fmt::Debug for HybridSignature {
 pub struct IdentityKeyPair {
     classical_private_bytes: [u8; 32],
     classical_public: VerifyingKey,
-    /// Raw bytes of `dilithium2::SecretKey`. Reconstructed via
-    /// `dilithium2::SecretKey::from_bytes` inside `sign`.
+    /// Raw bytes of `mldsa44::SecretKey`. Reconstructed via
+    /// `mldsa44::SecretKey::from_bytes` inside `sign`.
     pq_private_bytes: Vec<u8>,
-    pq_public: dilithium2::PublicKey,
+    pq_public: mldsa44::PublicKey,
     identity_id: IdentityId,
     created_at: u64,
 }
@@ -142,7 +142,7 @@ impl IdentityKeyPair {
         let classical_private = SigningKey::from_bytes(&classical_private_bytes);
         let classical_public = classical_private.verifying_key();
 
-        let (pq_public, pq_private) = dilithium2::keypair();
+        let (pq_public, pq_private) = mldsa44::keypair();
 
         let identity_id = Self::derive_identity_id(&classical_public, &pq_public);
         let created_at = std::time::SystemTime::now()
@@ -175,10 +175,10 @@ impl IdentityKeyPair {
         if classical_priv.verifying_key() != classical_pub {
             return Err(anyhow!("classical pub/priv mismatch"));
         }
-        let pq_pub = dilithium2::PublicKey::from_bytes(pq_public)
+        let pq_pub = mldsa44::PublicKey::from_bytes(pq_public)
             .map_err(|e| anyhow!("Invalid PQ public key: {e}"))?;
         // Validate the secret key length by attempting to reconstruct it.
-        let _ = dilithium2::SecretKey::from_bytes(pq_private)
+        let _ = mldsa44::SecretKey::from_bytes(pq_private)
             .map_err(|e| anyhow!("Invalid PQ private key: {e}"))?;
 
         let identity_id = Self::derive_identity_id(&classical_pub, &pq_pub);
@@ -217,9 +217,9 @@ impl IdentityKeyPair {
         let classical_priv = SigningKey::from_bytes(&self.classical_private_bytes);
         let classical_signature = classical_priv.sign(&message);
 
-        let pq_priv = dilithium2::SecretKey::from_bytes(&self.pq_private_bytes)
+        let pq_priv = mldsa44::SecretKey::from_bytes(&self.pq_private_bytes)
             .map_err(|e| anyhow!("invalid persisted pq sk: {e}"))?;
-        let pq_signature = dilithium2::detached_sign(&message, &pq_priv);
+        let pq_signature = mldsa44::detached_sign(&message, &pq_priv);
 
         Ok(HybridSignature {
             classical_signature,
@@ -246,7 +246,7 @@ impl IdentityKeyPair {
         // deterministic seeded keygen, so we bite the bullet and use
         // its OS-randomness keypair. Future work: derive
         // deterministically from `seed` once kyber-pure exposes it.
-        let (kyber_public, kyber_private) = pqcrypto_kyber::kyber768::keypair();
+        let (kyber_public, kyber_private) = pqcrypto_mlkem::mlkem768::keypair();
 
         let mut device_hasher = Hasher::new();
         device_hasher.update(x25519_public.as_bytes());
@@ -307,7 +307,7 @@ impl IdentityKeyPair {
 
     fn derive_identity_id(
         classical_public: &VerifyingKey,
-        pq_public: &dilithium2::PublicKey,
+        pq_public: &mldsa44::PublicKey,
     ) -> IdentityId {
         let mut hasher = Hasher::new();
         hasher.update(classical_public.as_bytes());
@@ -355,7 +355,7 @@ impl IdentityKey {
             .classical_public
             .verify(&message, &signature.classical_signature)
             .is_ok();
-        let pq_valid = dilithium2::verify_detached_signature(
+        let pq_valid = mldsa44::verify_detached_signature(
             &signature.pq_signature,
             &message,
             &self.pq_public,
@@ -422,7 +422,7 @@ impl TryFrom<WireIdentityKey> for IdentityKey {
     fn try_from(w: WireIdentityKey) -> Result<Self> {
         let classical_public = VerifyingKey::from_bytes(&w.classical_public)
             .map_err(|e| anyhow!("invalid Ed25519 pub: {e}"))?;
-        let pq_public = dilithium2::PublicKey::from_bytes(&w.pq_public)
+        let pq_public = mldsa44::PublicKey::from_bytes(&w.pq_public)
             .map_err(|e| anyhow!("invalid PQ pub: {e}"))?;
         Ok(IdentityKey {
             classical_public,
@@ -481,7 +481,7 @@ impl<'de> Deserialize<'de> for HybridSignature {
         sig_bytes.copy_from_slice(&wire.classical_signature);
         let classical_signature = Signature::from_bytes(&sig_bytes);
         let pq_signature =
-            dilithium2::DetachedSignature::from_bytes(&wire.pq_signature)
+            mldsa44::DetachedSignature::from_bytes(&wire.pq_signature)
                 .map_err(serde::de::Error::custom)?;
         Ok(HybridSignature {
             classical_signature,
@@ -500,7 +500,7 @@ pub struct DeviceKey {
     x25519_private_bytes: [u8; 32],
     x25519_public: x25519_dalek::PublicKey,
     kyber_private_bytes: Vec<u8>,
-    kyber_public: pqcrypto_kyber::kyber768::PublicKey,
+    kyber_public: pqcrypto_mlkem::mlkem768::PublicKey,
     device_id: DeviceId,
     identity_id: IdentityId,
     created_at: u64,
@@ -531,10 +531,10 @@ impl DeviceKey {
 
     pub fn kyber_encapsulate(
         &self,
-        other_public: &pqcrypto_kyber::kyber768::PublicKey,
+        other_public: &pqcrypto_mlkem::mlkem768::PublicKey,
     ) -> Result<(Vec<u8>, [u8; 32])> {
         use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
-        let (shared_secret, ciphertext) = pqcrypto_kyber::kyber768::encapsulate(other_public);
+        let (shared_secret, ciphertext) = pqcrypto_mlkem::mlkem768::encapsulate(other_public);
         let mut ss = [0u8; 32];
         ss.copy_from_slice(&shared_secret.as_bytes()[..32]);
         Ok((ciphertext.as_bytes().to_vec(), ss))
@@ -542,11 +542,11 @@ impl DeviceKey {
 
     pub fn kyber_decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; 32]> {
         use pqcrypto_traits::kem::{Ciphertext as _, SecretKey as _, SharedSecret as _};
-        let ct = pqcrypto_kyber::kyber768::Ciphertext::from_bytes(ciphertext)
+        let ct = pqcrypto_mlkem::mlkem768::Ciphertext::from_bytes(ciphertext)
             .map_err(|e| anyhow!("Invalid Kyber ciphertext: {e}"))?;
-        let sk = pqcrypto_kyber::kyber768::SecretKey::from_bytes(&self.kyber_private_bytes)
+        let sk = pqcrypto_mlkem::mlkem768::SecretKey::from_bytes(&self.kyber_private_bytes)
             .map_err(|e| anyhow!("Invalid persisted Kyber sk: {e}"))?;
-        let shared = pqcrypto_kyber::kyber768::decapsulate(&ct, &sk);
+        let shared = pqcrypto_mlkem::mlkem768::decapsulate(&ct, &sk);
         let mut ss = [0u8; 32];
         ss.copy_from_slice(&shared.as_bytes()[..32]);
         Ok(ss)

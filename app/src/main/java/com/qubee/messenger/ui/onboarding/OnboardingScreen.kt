@@ -120,7 +120,19 @@ private fun IdentityBootstrapView(
         modifier = Modifier.fillMaxWidth(),
     )
 
-    Spacer(Modifier.height(26.dp))
+                Spacer(Modifier.height(24.dp))
+
+                if (s is OnboardingState.Loading) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(8.dp))
+                    Text("Generating Ed25519 + Dilithium-2 keys, signing identity bundle…")
+                } else {
+                    Button(
+                        onClick = { viewModel.createIdentity(nickname) },
+                        enabled = nickname.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Create identity") }
+                }
 
     QubeePanel {
         Text(

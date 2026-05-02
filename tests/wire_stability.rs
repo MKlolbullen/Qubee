@@ -16,11 +16,13 @@
 
 use qubee_crypto::groups::group_handshake::{
     canonical_join_accepted, canonical_join_rejected, canonical_key_rotation,
-    canonical_request_join, generate_ephemeral_kyber, JoinAcceptedBody, JoinRejectedBody,
-    KeyRotationBody, RequestJoinBody, HANDSHAKE_MAGIC,
+    canonical_member_added, canonical_request_join, canonical_role_change,
+    generate_ephemeral_kyber, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
+    KeyRotationBody, MemberAddedBody, RequestJoinBody, RoleChangeBody, HANDSHAKE_MAGIC,
 };
 use qubee_crypto::groups::group_manager::GroupId;
 use qubee_crypto::groups::group_message::{canonical_group_message, GroupMessageBody, MAGIC_GROUP_MESSAGE};
+use qubee_crypto::groups::group_permissions::Role;
 use qubee_crypto::identity::identity_key::{IdentityId, IdentityKeyPair};
 
 #[test]
@@ -60,9 +62,13 @@ fn canonical_join_accepted_starts_with_versioned_tag() {
         members: Vec::new(),
         joiner_id: IdentityId::from([0u8; 32]),
         wrapped_group_key: wrapped,
+        snapshot_version: 1,
     };
     let canonical = canonical_join_accepted(&body).unwrap();
-    assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v1"));
+    // _v2 — GroupMemberSummary grew a kyber_pub field in plan revision 2
+    // priority 5b. Devices on the old tag will fail signature
+    // verification for new-format frames and vice versa.
+    assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v2"));
 }
 
 #[test]
@@ -102,6 +108,43 @@ fn canonical_group_message_starts_with_versioned_tag() {
     };
     let canonical = canonical_group_message(&body);
     assert!(canonical.starts_with(b"qubee_group_message_v1"));
+}
+
+#[test]
+fn canonical_member_added_starts_with_versioned_tag() {
+    let kp = IdentityKeyPair::generate().unwrap();
+    let (kyber_pub, _) = generate_ephemeral_kyber();
+    let summary = GroupMemberSummary {
+        identity_id: kp.identity_id(),
+        identity_key: kp.public_key(),
+        display_name: "x".to_string(),
+        role: Role::Member,
+        joined_at: 0,
+        kyber_pub,
+    };
+    let body = MemberAddedBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        adder_id: IdentityId::from([0u8; 32]),
+        new_member: summary,
+        new_version: 1,
+        timestamp: 0,
+    };
+    let canonical = canonical_member_added(&body).unwrap();
+    assert!(canonical.starts_with(b"qubee_handshake_member_added_v1"));
+}
+
+#[test]
+fn canonical_role_change_starts_with_versioned_tag() {
+    let body = RoleChangeBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        promoter_id: IdentityId::from([0u8; 32]),
+        member_id: IdentityId::from([0u8; 32]),
+        new_role: Role::Admin,
+        new_version: 1,
+        timestamp: 0,
+    };
+    let canonical = canonical_role_change(&body).unwrap();
+    assert!(canonical.starts_with(b"qubee_handshake_role_change_v1"));
 }
 
 #[test]

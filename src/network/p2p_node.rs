@@ -1,13 +1,13 @@
 // src/network/p2p_node.rs
 //
-// libp2p 0.53 swarm wired to gossipsub + Kademlia + mDNS.
+// libp2p 0.55 swarm wired to gossipsub + Kademlia + (optional) mDNS.
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use libp2p::{
     gossipsub, identity::Keypair, kad, mdns, noise,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, PeerId, Swarm,
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, Swarm,
 };
 use std::str::FromStr;
 use std::time::Duration;
@@ -30,6 +30,10 @@ pub enum P2PCommand {
     /// subscribed for the publish to actually go out — gossipsub
     /// silently drops publishes on topics with no local subscription.
     PublishToTopic { topic: String, data: Vec<u8> },
+    /// Dial a peer at a known multiaddress. Used by integration tests
+    /// that skip mDNS; production peers find each other via Kademlia
+    /// or the local-network mDNS sweep.
+    Dial { multiaddr: String },
 }
 
 /// Public helper so callers (JNI, tests) build the per-group topic
@@ -49,15 +53,62 @@ pub enum NodeEvent {
     },
     /// Discovered a new peer (via mDNS or DHT)
     PeerDiscovered { peer_id: String },
+    /// The swarm picked up a new listen address. Tests use this to
+    /// learn what address node A bound to so node B can dial it.
+    Listening { multiaddr: String },
+}
+
+/// Tunables for `P2PNode`. Production callers should use
+/// [`P2PNodeConfig::default`]; tests should use
+/// [`P2PNodeConfig::for_testing`] which (a) disables mDNS so two
+/// nodes in the same process don't step on each other's discovery,
+/// (b) binds to `127.0.0.1` so test runs don't leak onto the LAN,
+/// and (c) shortens the gossipsub heartbeat so mesh formation
+/// completes inside a normal test timeout.
+#[derive(Clone)]
+pub struct P2PNodeConfig {
+    pub enable_mdns: bool,
+    pub listen_addr: Multiaddr,
+    pub gossipsub_heartbeat: Duration,
+    pub gossipsub_validation_mode: gossipsub::ValidationMode,
+    pub idle_connection_timeout: Duration,
+}
+
+impl Default for P2PNodeConfig {
+    fn default() -> Self {
+        Self {
+            enable_mdns: true,
+            listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
+            gossipsub_heartbeat: Duration::from_secs(10),
+            gossipsub_validation_mode: gossipsub::ValidationMode::Strict,
+            idle_connection_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+impl P2PNodeConfig {
+    /// Test profile: loopback, no mDNS, 100 ms gossipsub heartbeat.
+    /// Used by `tests/p2p_two_node_e2e.rs`.
+    pub fn for_testing() -> Self {
+        Self {
+            enable_mdns: false,
+            listen_addr: "/ip4/127.0.0.1/tcp/0".parse().expect("hardcoded multiaddr"),
+            gossipsub_heartbeat: Duration::from_millis(100),
+            gossipsub_validation_mode: gossipsub::ValidationMode::Strict,
+            idle_connection_timeout: Duration::from_secs(60),
+        }
+    }
 }
 
 /// Composed network behaviour. The derive expands a sibling
 /// `QubeeBehaviourEvent` enum that we match on inside the run loop.
+/// `mdns` is wrapped in `Toggle` so the test profile can disable it
+/// without forking the behaviour struct.
 #[derive(NetworkBehaviour)]
 struct QubeeBehaviour {
     gossipsub: gossipsub::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 // --- The P2P Node ---
@@ -70,13 +121,22 @@ pub struct P2PNode {
 const GLOBAL_TOPIC: &str = "qubee-global";
 
 impl P2PNode {
-    /// Create a new P2P node. Accepts the command channel so the JNI
-    /// layer can drive sends/lookups; the matching event channel is
-    /// passed to [`run`] so callers can fan events back into Kotlin.
+    /// Create a new P2P node with production defaults.
     pub async fn new(
         id_keys: Keypair,
         command_receiver: mpsc::Receiver<P2PCommand>,
     ) -> Result<Self> {
+        Self::with_config(id_keys, command_receiver, P2PNodeConfig::default()).await
+    }
+
+    /// Create a new P2P node from a custom [`P2PNodeConfig`]. Used by
+    /// tests via [`P2PNodeConfig::for_testing`].
+    pub async fn with_config(
+        id_keys: Keypair,
+        command_receiver: mpsc::Receiver<P2PCommand>,
+        config: P2PNodeConfig,
+    ) -> Result<Self> {
+        let cfg_for_behaviour = config.clone();
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
             .with_tokio()
             .with_tcp(
@@ -89,8 +149,8 @@ impl P2PNode {
                 let peer_id = PeerId::from(key.public());
 
                 let gossipsub_cfg = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(10))
-                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .heartbeat_interval(cfg_for_behaviour.gossipsub_heartbeat)
+                    .validation_mode(cfg_for_behaviour.gossipsub_validation_mode.clone())
                     .build()
                     .map_err(|s| std::io::Error::new(std::io::ErrorKind::Other, s))?;
                 let gossipsub = gossipsub::Behaviour::new(
@@ -103,7 +163,15 @@ impl P2PNode {
                 let mut kademlia = kad::Behaviour::new(peer_id, kad_store);
                 kademlia.set_mode(Some(kad::Mode::Server));
 
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+                let mdns: Toggle<mdns::tokio::Behaviour> = if cfg_for_behaviour.enable_mdns {
+                    Some(mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        peer_id,
+                    )?)
+                    .into()
+                } else {
+                    None.into()
+                };
 
                 Ok(QubeeBehaviour {
                     gossipsub,
@@ -112,11 +180,10 @@ impl P2PNode {
                 })
             })
             .map_err(|e| anyhow!("behaviour: {e}"))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .with_swarm_config(|c| c.with_idle_connection_timeout(config.idle_connection_timeout))
             .build();
 
-        // Bind to an OS-assigned TCP port on every interface.
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        swarm.listen_on(config.listen_addr.clone())?;
 
         Ok(Self {
             swarm,
@@ -164,8 +231,13 @@ impl P2PNode {
                     }
                     Some(P2PCommand::Unsubscribe { topic }) => {
                         let topic = gossipsub::IdentTopic::new(topic);
-                        if let Err(e) = self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
-                            eprintln!("Unsubscribe error for {topic}: {e:?}");
+                        // libp2p 0.55 changed `gossipsub.unsubscribe` to
+                        // return `bool` (true if we were subscribed) —
+                        // it no longer fails. Log a hint when we
+                        // weren't subscribed so the dispatcher's
+                        // intent is still observable.
+                        if !self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+                            eprintln!("Unsubscribe no-op for {topic} (not subscribed)");
                         }
                     }
                     Some(P2PCommand::PublishToTopic { topic, data }) => {
@@ -179,10 +251,25 @@ impl P2PNode {
                             eprintln!("PublishToTopic {topic} error: {e:?}");
                         }
                     }
+                    Some(P2PCommand::Dial { multiaddr }) => {
+                        match multiaddr.parse::<Multiaddr>() {
+                            Ok(addr) => {
+                                if let Err(e) = self.swarm.dial(addr) {
+                                    eprintln!("Dial error for {multiaddr}: {e:?}");
+                                }
+                            }
+                            Err(e) => eprintln!("Invalid multiaddr {multiaddr}: {e}"),
+                        }
+                    }
                     None => return,
                 },
 
                 event = self.swarm.select_next_some() => match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let _ = event_sender
+                            .send(NodeEvent::Listening { multiaddr: address.to_string() })
+                            .await;
+                    }
                     SwarmEvent::Behaviour(QubeeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);

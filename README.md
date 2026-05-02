@@ -105,6 +105,31 @@ Qubee implements a **Defense in Depth** model:
 *   **Storage Security:** Keys are stored encrypted using platform-specific keystores (Android Keystore + SQLCipher).
 *   **Audit:** Built-in security audit framework (`security_auditor.rs`) to check for runtime vulnerabilities.
 
+### Why no zero-knowledge proofs
+
+An earlier prototype framed onboarding QRs as carrying a "ZK proof of
+key ownership". They didn't — the math was a byte-wise wrapping_add
+masquerading as Schnorr. We removed it and the documents and the
+language around it. Here's the underlying reasoning so this question
+doesn't get re-litigated:
+
+ZK proofs are the right primitive when the prover wants to convince a
+verifier of a statement *about hidden inputs*: anonymous credentials,
+range proofs, set membership without revealing the set. Qubee never
+needs to do that. Every claim it makes about an identity is "I hold
+the secret for this advertised public key", which is exactly what a
+signature is for. We sign canonical bytes (built by hand, not via
+bincode, under per-variant domain-separation tags) of every onboarding
+bundle, invite, group handshake, key rotation and message envelope
+with a hybrid Ed25519 + Dilithium-2 signature; both halves must verify.
+Adding a ZK layer on top would be more code, more failure modes, and
+a strictly weaker security argument than the signature already gives.
+
+(Full security model — transport-layer Noise XX via libp2p, symmetric
+group key + per-message hybrid signature, BLAKE3 fingerprints for
+out-of-band verification — lands as part of the README rewrite in
+priority 4 of `~/.claude/plans/1-looking-at-our-magical-bachman.md`.)
+
 ## ✅ Tests
 
 ### Rust Tests

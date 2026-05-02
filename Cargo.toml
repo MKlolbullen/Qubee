@@ -21,8 +21,14 @@ futures = "0.3"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
-pqcrypto-kyber = "0.8.1"
-pqcrypto-dilithium = "0.5.0"
+# NIST-standardised post-quantum primitives (FIPS 203 ML-KEM-768 +
+# FIPS 204 ML-DSA-44). Replaced the round-3 pqcrypto-kyber 0.8 /
+# pqcrypto-dilithium 0.5 crates that cargo audit flagged as
+# superseded (RUSTSEC-2024-0381 / RUSTSEC-2024-0380). ML-KEM-768
+# pubkey size is 1184 bytes (same as Kyber-768) so the wire-stability
+# canary keeps tracking; ML-DSA-44 ≈ Dilithium-2.
+pqcrypto-mlkem = "0.1"
+pqcrypto-mldsa = "0.1"
 pqcrypto-traits = "0.3"
 chacha20poly1305 = "0.10.1"
 tracing = "0.1"
@@ -73,7 +79,8 @@ libp2p = { version = "0.55", features = [
     "macros",
 ] }
 
-# Identity / ZK / Invite-link plumbing
+# Identity / hybrid-signature / invite-link plumbing
+# (no ZK — see jni_api.rs onboarding banner + README "Why no ZK")
 ed25519-dalek = { version = "2.1", features = ["rand_core", "serde", "zeroize"] }
 base64 = "0.22"
 crc32fast = "1.4"

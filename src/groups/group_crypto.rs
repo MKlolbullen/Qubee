@@ -9,7 +9,6 @@ use crate::security::secure_rng;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use secrecy::ExposeSecret;
-use anyhow::Context;
 
 /// Symmetric key used for encrypting group messages. It stores the raw
 /// 256‑bit secret along with the creation timestamp. In a complete

@@ -1,7 +1,6 @@
 package com.qubee.messenger.data.repository
 
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.map
 import com.qubee.messenger.data.database.dao.MessageDao
 import com.qubee.messenger.data.database.dao.ConversationDao
 import com.qubee.messenger.data.model.Message
@@ -23,21 +22,21 @@ class MessageRepository @Inject constructor(
     private val qubeeManager: QubeeManager
 ) {
 
-    fun getMessagesForConversation(conversationId: String): Flow<List<Message>> = 
+    fun getMessagesForConversation(conversationId: String): Flow<List<Message>> =
         messageDao.getMessagesForConversation(conversationId)
 
-    fun getMessagesWithSenderForConversation(conversationId: String): Flow<List<MessageWithSender>> = 
+    fun getMessagesWithSenderForConversation(conversationId: String): Flow<List<MessageWithSender>> =
         messageDao.getMessagesWithSenderForConversation(conversationId)
 
     suspend fun getMessageById(messageId: String): Message? = messageDao.getMessageById(messageId)
 
-    suspend fun getLastMessageForConversation(conversationId: String): Message? = 
+    suspend fun getLastMessageForConversation(conversationId: String): Message? =
         messageDao.getLastMessageForConversation(conversationId)
 
-    suspend fun getUnreadMessagesForConversation(conversationId: String): List<Message> = 
+    suspend fun getUnreadMessagesForConversation(conversationId: String): List<Message> =
         messageDao.getUnreadMessagesForConversation(conversationId)
 
-    suspend fun getUnreadMessageCount(conversationId: String): Int = 
+    suspend fun getUnreadMessageCount(conversationId: String): Int =
         messageDao.getUnreadMessageCount(conversationId)
 
     suspend fun getTotalUnreadMessageCount(): Int = messageDao.getTotalUnreadMessageCount()
@@ -62,17 +61,11 @@ class MessageRepository @Inject constructor(
                 replyToMessageId = replyToMessageId
             )
 
-            // Encrypt the message content
             val encryptedContent = encryptMessageContent(conversationId, content)
             val encryptedMessage = message.copy(content = encryptedContent)
 
-            // Insert the message into the database
             messageDao.insertMessage(encryptedMessage)
-
-            // Update conversation's last message
             updateConversationLastMessage(conversationId, encryptedMessage)
-
-            // Set disappearing message timer if enabled
             setDisappearingMessageTimer(encryptedMessage)
 
             Timber.d("Sent text message in conversation $conversationId")
@@ -106,17 +99,11 @@ class MessageRepository @Inject constructor(
                 attachmentSize = fileSize
             )
 
-            // Encrypt the file if it's not already encrypted
             val encryptedFilePath = encryptFile(conversationId, filePath)
             val encryptedMessage = message.copy(attachmentPath = encryptedFilePath)
 
-            // Insert the message into the database
             messageDao.insertMessage(encryptedMessage)
-
-            // Update conversation's last message
             updateConversationLastMessage(conversationId, encryptedMessage)
-
-            // Set disappearing message timer if enabled
             setDisappearingMessageTimer(encryptedMessage)
 
             Timber.d("Sent media message in conversation $conversationId")
@@ -136,7 +123,6 @@ class MessageRepository @Inject constructor(
         attachmentData: ByteArray? = null
     ): Result<Message> {
         return try {
-            // Decrypt the message content
             val decryptedContent = decryptMessageContent(conversationId, encryptedContent)
 
             val message = Message(
@@ -150,7 +136,6 @@ class MessageRepository @Inject constructor(
                 isFromMe = false
             )
 
-            // Handle attachment if present
             val finalMessage = if (attachmentData != null) {
                 val decryptedFilePath = decryptAndSaveFile(conversationId, attachmentData)
                 message.copy(attachmentPath = decryptedFilePath)
@@ -158,13 +143,8 @@ class MessageRepository @Inject constructor(
                 message
             }
 
-            // Insert the message into the database
             messageDao.insertMessage(finalMessage)
-
-            // Update conversation's last message
             updateConversationLastMessage(conversationId, finalMessage)
-
-            // Set disappearing message timer if enabled
             setDisappearingMessageTimer(finalMessage)
 
             Timber.d("Received message in conversation $conversationId from $senderId")
@@ -206,7 +186,6 @@ class MessageRepository @Inject constructor(
                 return Result.failure(Exception("Cannot edit messages from other users"))
             }
 
-            // Encrypt the new content
             val encryptedContent = encryptMessageContent(message.conversationId, newContent)
             messageDao.editMessage(messageId, encryptedContent, Date())
 
@@ -221,10 +200,8 @@ class MessageRepository @Inject constructor(
     suspend fun deleteMessage(messageId: String, deleteForEveryone: Boolean = false): Result<Unit> {
         return try {
             if (deleteForEveryone) {
-                // Mark as deleted but keep in database for sync purposes
                 messageDao.markMessageAsDeleted(messageId, Date())
             } else {
-                // Delete locally only
                 messageDao.deleteMessageById(messageId)
             }
 
@@ -236,20 +213,27 @@ class MessageRepository @Inject constructor(
         }
     }
 
+    suspend fun clearConversationMessages(conversationId: String): Result<Unit> {
+        return try {
+            messageDao.deleteAllMessagesForConversation(conversationId)
+            Timber.d("Cleared all local messages for conversation $conversationId")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to clear local messages for conversation $conversationId")
+            Result.failure(e)
+        }
+    }
+
     suspend fun addReactionToMessage(messageId: String, emoji: String): Result<Unit> {
         return try {
             val message = messageDao.getMessageById(messageId)
                 ?: return Result.failure(Exception("Message not found"))
 
-            // Parse existing reactions
             val reactions = parseReactions(message.reactions)
             val userId = getCurrentUserId()
-
-            // Add or update reaction
             val updatedReactions = reactions.toMutableMap()
             updatedReactions[userId] = emoji
 
-            // Save updated reactions
             val reactionsJson = serializeReactions(updatedReactions)
             messageDao.updateMessageReactions(messageId, reactionsJson)
 
@@ -266,15 +250,11 @@ class MessageRepository @Inject constructor(
             val message = messageDao.getMessageById(messageId)
                 ?: return Result.failure(Exception("Message not found"))
 
-            // Parse existing reactions
             val reactions = parseReactions(message.reactions)
             val userId = getCurrentUserId()
-
-            // Remove reaction
             val updatedReactions = reactions.toMutableMap()
             updatedReactions.remove(userId)
 
-            // Save updated reactions
             val reactionsJson = if (updatedReactions.isEmpty()) null else serializeReactions(updatedReactions)
             messageDao.updateMessageReactions(messageId, reactionsJson)
 
@@ -298,7 +278,7 @@ class MessageRepository @Inject constructor(
         }
     }
 
-    suspend fun getMessageCountForConversation(conversationId: String): Int = 
+    suspend fun getMessageCountForConversation(conversationId: String): Int =
         messageDao.getMessageCountForConversation(conversationId)
 
     suspend fun getMessagesWithAttachments(): List<Message> = messageDao.getMessagesWithAttachments()
@@ -309,7 +289,6 @@ class MessageRepository @Inject constructor(
         return try {
             val encryptedMessage = qubeeManager.encryptMessage(conversationId, content)
             if (encryptedMessage != null) {
-                // Convert encrypted message to base64 string for storage
                 android.util.Base64.encodeToString(
                     encryptedMessage.toBytes(),
                     android.util.Base64.DEFAULT
@@ -339,17 +318,13 @@ class MessageRepository @Inject constructor(
 
     private suspend fun encryptFile(conversationId: String, filePath: String): String {
         return try {
-            // Read file data
             val fileData = java.io.File(filePath).readBytes()
-            
-            // Encrypt file
             val encryptedFile = qubeeManager.encryptFile(conversationId, fileData)
                 ?: throw Exception("Failed to encrypt file")
 
-            // Save encrypted file
             val encryptedFilePath = "${filePath}.encrypted"
             java.io.File(encryptedFilePath).writeBytes(encryptedFile.toBytes())
-            
+
             encryptedFilePath
         } catch (e: Exception) {
             Timber.e(e, "Failed to encrypt file: $filePath")
@@ -359,18 +334,15 @@ class MessageRepository @Inject constructor(
 
     private suspend fun decryptAndSaveFile(conversationId: String, encryptedData: ByteArray): String {
         return try {
-            // Parse encrypted file
             val encryptedFile = com.qubee.messenger.crypto.EncryptedFile.fromBytes(encryptedData)
                 ?: throw Exception("Failed to parse encrypted file")
 
-            // Decrypt file
             val decryptedData = qubeeManager.decryptFile(conversationId, encryptedFile)
                 ?: throw Exception("Failed to decrypt file")
 
-            // Save decrypted file
             val decryptedFilePath = "/data/data/com.qubee.messenger/files/decrypted_${System.currentTimeMillis()}"
             java.io.File(decryptedFilePath).writeBytes(decryptedData)
-            
+
             decryptedFilePath
         } catch (e: Exception) {
             Timber.e(e, "Failed to decrypt and save file")
@@ -419,10 +391,5 @@ class MessageRepository @Inject constructor(
         return com.google.gson.Gson().toJson(reactions)
     }
 
-    private fun getCurrentUserId(): String {
-        // This should return the current user's ID
-        // For now, return a placeholder - this would be implemented based on user management
-        return "current_user_id"
-    }
+    private fun getCurrentUserId(): String = "current_user_id"
 }
-

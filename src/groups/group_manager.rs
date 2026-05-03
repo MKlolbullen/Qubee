@@ -533,6 +533,110 @@ impl GroupManager {
         Ok(())
     }
 
+    /// Build a `RequestStateSyncBody` for the local view of a group.
+    /// Returns `None` if the local view doesn't contain the group.
+    /// Caller signs + broadcasts the body via
+    /// `sign_request_state_sync` on the group's gossipsub topic.
+    pub fn build_state_sync_request(
+        &self,
+        group_id: GroupId,
+        requester_id: IdentityId,
+    ) -> Option<crate::groups::group_handshake::RequestStateSyncBody> {
+        let group = self.groups.get(&group_id)?;
+        Some(crate::groups::group_handshake::RequestStateSyncBody {
+            group_id,
+            requester_id,
+            since_version: group.version,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        })
+    }
+
+    /// Receiver-side mutation for `StateSyncResponse`. Replaces the
+    /// local member roster with the responder's snapshot and adopts
+    /// the responder's `current_version` (if it's newer than ours).
+    /// Active members in our local view that *don't* appear in the
+    /// snapshot are marked as removed — they were dropped while we
+    /// were offline. Members in the snapshot we don't know about
+    /// are inserted with their per-group Kyber pubkey so future
+    /// rotations can reach them.
+    ///
+    /// This is intentionally idempotent: applying the same snapshot
+    /// twice leaves state unchanged.
+    pub fn apply_state_sync(
+        &mut self,
+        group_id: GroupId,
+        snapshot: &[crate::groups::group_handshake::GroupMemberSummary],
+        snapshot_version: u64,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("apply_state_sync: group not found"))?;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let snapshot_ids: HashSet<IdentityId> =
+            snapshot.iter().map(|m| m.identity_id).collect();
+
+        // Mark anyone we have locally but not in the snapshot as
+        // removed; preserves the role / kyber_pub history without
+        // hard-deleting in case the snapshot itself was stale.
+        for (id, member) in group.members.iter_mut() {
+            if !snapshot_ids.contains(id) && member.member_status == MemberStatus::Active {
+                member.member_status = MemberStatus::Removed {
+                    reason: "missing from state-sync snapshot".to_string(),
+                };
+                member.last_seen = now;
+            }
+        }
+
+        // Apply each snapshot row. Update existing members in place
+        // (kyber_pub may be fresher), insert new ones.
+        for summary in snapshot {
+            match group.members.get_mut(&summary.identity_id) {
+                Some(existing) => {
+                    existing.identity_key = summary.identity_key.clone();
+                    existing.display_name = summary.display_name.clone();
+                    existing.role = summary.role.clone();
+                    if !summary.kyber_pub.is_empty() {
+                        existing.kyber_pub = summary.kyber_pub.clone();
+                    }
+                    existing.member_status = MemberStatus::Active;
+                }
+                None => {
+                    group.members.insert(
+                        summary.identity_id,
+                        GroupMember {
+                            identity_id: summary.identity_id,
+                            identity_key: summary.identity_key.clone(),
+                            display_name: summary.display_name.clone(),
+                            role: summary.role.clone(),
+                            joined_at: summary.joined_at,
+                            last_seen: now,
+                            invited_by: None,
+                            member_status: MemberStatus::Active,
+                            custom_permissions: None,
+                            kyber_pub: summary.kyber_pub.clone(),
+                        },
+                    );
+                    self.member_groups
+                        .entry(summary.identity_id)
+                        .or_insert_with(HashSet::new)
+                        .insert(group_id);
+                }
+            }
+        }
+
+        if snapshot_version > group.version {
+            group.version = snapshot_version;
+        }
+        group.last_updated = now;
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Update member role
     pub fn update_member_role(
         &mut self,

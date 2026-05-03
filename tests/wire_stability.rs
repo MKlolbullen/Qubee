@@ -148,6 +148,38 @@ fn canonical_role_change_starts_with_versioned_tag() {
 }
 
 #[test]
+fn canonical_request_state_sync_starts_with_versioned_tag() {
+    use qubee_crypto::groups::group_handshake::{
+        canonical_request_state_sync, RequestStateSyncBody,
+    };
+    let body = RequestStateSyncBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        requester_id: IdentityId::from([0u8; 32]),
+        since_version: 1,
+        timestamp: 0,
+    };
+    let canonical = canonical_request_state_sync(&body).unwrap();
+    assert!(canonical.starts_with(b"qubee_handshake_request_state_sync_v1"));
+}
+
+#[test]
+fn canonical_state_sync_response_starts_with_versioned_tag() {
+    use qubee_crypto::groups::group_handshake::{
+        canonical_state_sync_response, StateSyncResponseBody,
+    };
+    let body = StateSyncResponseBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        responder_id: IdentityId::from([0u8; 32]),
+        requester_id: IdentityId::from([0u8; 32]),
+        members: Vec::new(),
+        current_version: 1,
+        timestamp: 0,
+    };
+    let canonical = canonical_state_sync_response(&body).unwrap();
+    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v1"));
+}
+
+#[test]
 fn canonical_payload_uses_explicit_length_prefixes_not_bincode() {
     // The whole point of `canonical_*` is to be byte-stable across
     // serde / bincode revisions. We test this by checking the

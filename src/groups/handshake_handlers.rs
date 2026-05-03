@@ -14,10 +14,11 @@ use zeroize::Zeroize;
 
 use crate::groups::group_handshake::{
     sign_join_accepted, sign_join_rejected, sign_key_rotation, sign_member_added,
-    verify_join_accepted, verify_key_rotation, verify_member_added, verify_request_join,
-    verify_role_change, GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
-    KeyRotationBody, MemberAddedBody, MemberKeyDelivery, RequestJoinBody, RoleChangeBody,
-    WrappedGroupKey,
+    sign_state_sync_response, verify_join_accepted, verify_key_rotation, verify_member_added,
+    verify_request_join, verify_request_state_sync, verify_role_change,
+    verify_state_sync_response, GroupHandshake, GroupMemberSummary, JoinAcceptedBody,
+    JoinRejectedBody, KeyRotationBody, MemberAddedBody, MemberKeyDelivery, RequestJoinBody,
+    RequestStateSyncBody, RoleChangeBody, StateSyncResponseBody, WrappedGroupKey,
 };
 use crate::groups::group_manager::{GroupId, GroupManager, GroupMember, MemberStatus};
 use crate::groups::group_permissions::{Permission, Role};
@@ -337,6 +338,116 @@ pub fn process_role_change(
         body.new_role.clone(),
         body.new_version,
     )
+}
+
+/// Responder-side handler for `RequestStateSync`. Confirms the
+/// requester is still an active member of the local view, verifies
+/// the request signature, and builds a signed `StateSyncResponse`
+/// carrying the responder's current snapshot. Returns `Ok(None)` if
+/// the local view doesn't contain the group at all (the request was
+/// for someone else's group), or if the requester isn't an active
+/// member here (don't leak roster to ex-members).
+pub fn process_request_state_sync(
+    gm: &GroupManager,
+    responder_identity: &IdentityKeyPair,
+    body: &RequestStateSyncBody,
+    signature: &HybridSignature,
+) -> Result<Option<(StateSyncResponseBody, HybridSignature)>> {
+    let group = match gm.get_group(&body.group_id) {
+        Some(g) => g,
+        None => return Ok(None),
+    };
+    let requester = match group.members.get(&body.requester_id) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    if requester.member_status != MemberStatus::Active {
+        return Ok(None);
+    }
+    if !verify_request_state_sync(body, signature, &requester.identity_key)? {
+        return Err(anyhow!("RequestStateSync signature failed"));
+    }
+
+    // Refuse to respond if the responder isn't themselves an active
+    // member — a former member shouldn't be authoritative about the
+    // current roster. The ContactsViewModel-level local state we
+    // hold for them is "outdated by design".
+    let responder_id = responder_identity.identity_id();
+    let responder = match group.members.get(&responder_id) {
+        Some(m) if m.member_status == MemberStatus::Active => m,
+        _ => return Ok(None),
+    };
+    let _ = responder; // Used only for the active-membership gate.
+
+    let members: Vec<GroupMemberSummary> = group
+        .members
+        .values()
+        .filter(|m| m.member_status == MemberStatus::Active)
+        .map(|m| GroupMemberSummary {
+            identity_id: m.identity_id,
+            identity_key: m.identity_key.clone(),
+            display_name: m.display_name.clone(),
+            role: m.role.clone(),
+            joined_at: m.joined_at,
+            kyber_pub: m.kyber_pub.clone(),
+        })
+        .collect();
+    let response = StateSyncResponseBody {
+        group_id: body.group_id,
+        responder_id,
+        requester_id: body.requester_id,
+        members,
+        current_version: group.version,
+        timestamp: now_secs(),
+    };
+    let (resp_body, resp_sig) =
+        match sign_state_sync_response(responder_identity, response)? {
+            crate::groups::group_handshake::GroupHandshake::StateSyncResponse {
+                body,
+                signature,
+            } => (body, signature),
+            _ => unreachable!("sign_state_sync_response always returns StateSyncResponse"),
+        };
+    Ok(Some((resp_body, resp_sig)))
+}
+
+/// Requester-side handler for inbound `StateSyncResponse`. Verifies
+/// the responder was at one point an active member of the local
+/// view (so a stranger can't poison the snapshot), then merges the
+/// snapshot into local state via `GroupManager::apply_state_sync`.
+///
+/// Drops the response silently when the recipient isn't actually
+/// the addressed `requester_id` — gossipsub fan-out delivers the
+/// reply to everyone on the group topic, so each recipient has to
+/// self-filter.
+pub fn process_state_sync_response(
+    gm: &mut GroupManager,
+    self_id: IdentityId,
+    body: &StateSyncResponseBody,
+    signature: &HybridSignature,
+) -> Result<bool> {
+    if body.requester_id != self_id {
+        return Ok(false);
+    }
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("StateSyncResponse for unknown group"))?;
+    // The responder may have been promoted / demoted since our local
+    // view last updated, but they must still be a current member.
+    // Reject snapshots from someone we don't know — that's the same
+    // posture as MemberAdded / RoleChange.
+    let responder = group
+        .members
+        .get(&body.responder_id)
+        .ok_or_else(|| anyhow!("StateSyncResponse responder is not in local view"))?;
+    if responder.member_status != MemberStatus::Active {
+        return Err(anyhow!("StateSyncResponse responder is not active"));
+    }
+    if !verify_state_sync_response(body, signature, &responder.identity_key)? {
+        return Err(anyhow!("StateSyncResponse signature failed"));
+    }
+    gm.apply_state_sync(body.group_id, &body.members, body.current_version)?;
+    Ok(true)
 }
 
 fn reject(

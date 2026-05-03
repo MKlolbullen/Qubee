@@ -262,6 +262,49 @@ pub struct RoleChangeBody {
     pub timestamp: u64,
 }
 
+/// Body of a `RequestStateSync` payload. A member who's been offline
+/// through one or more `MemberAdded` / `RoleChange` broadcasts uses
+/// this to ask any current member of the group for the latest
+/// roster + version. The responder verifies the requester is still
+/// an active member of the group, then signs and broadcasts a
+/// matching `StateSyncResponseBody` — gossipsub delivers the reply
+/// to anyone subscribed to the group topic, and the requester
+/// merges the snapshot into local state.
+///
+/// `since_version` is informational; the responder always sends the
+/// full current snapshot rather than a delta. Snapshots are bounded
+/// by the 16-member group cap, so the bandwidth waste is small and
+/// the implementation stays simpler than reorder-safe deltas.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestStateSyncBody {
+    pub group_id: GroupId,
+    pub requester_id: IdentityId,
+    pub since_version: u64,
+    pub timestamp: u64,
+}
+
+/// Body of a `StateSyncResponse` payload. Reply to a
+/// `RequestStateSync`; carries the responder's current view of the
+/// group (members + version) so the requester can converge.
+///
+/// Group-key rotation re-send is intentionally NOT bundled here.
+/// The requester learns about new members and role changes; if
+/// they've also missed a `KeyRotation` they'll need a separate
+/// catch-up flow that re-encapsulates the current key under their
+/// Kyber pubkey (post-rev-4 work). Until that lands, a member who
+/// missed both will see a fresh roster but bounce on the strict
+/// generation gate when they try to decrypt — at which point a
+/// human-driven re-join is the recovery path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateSyncResponseBody {
+    pub group_id: GroupId,
+    pub responder_id: IdentityId,
+    pub requester_id: IdentityId,
+    pub members: Vec<GroupMemberSummary>,
+    pub current_version: u64,
+    pub timestamp: u64,
+}
+
 /// Top-level handshake frame.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GroupHandshake {
@@ -287,6 +330,14 @@ pub enum GroupHandshake {
     },
     RoleChange {
         body: RoleChangeBody,
+        signature: HybridSignature,
+    },
+    RequestStateSync {
+        body: RequestStateSyncBody,
+        signature: HybridSignature,
+    },
+    StateSyncResponse {
+        body: StateSyncResponseBody,
         signature: HybridSignature,
     },
 }
@@ -335,6 +386,8 @@ const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
 const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
+const REQUEST_STATE_SYNC_TAG: &[u8] = b"qubee_handshake_request_state_sync_v1";
+const STATE_SYNC_RESPONSE_TAG: &[u8] = b"qubee_handshake_state_sync_response_v1";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);
@@ -396,6 +449,41 @@ pub fn canonical_join_rejected(body: &JoinRejectedBody) -> Result<Vec<u8>> {
     out.extend_from_slice(body.joiner_id.as_ref());
     out.push(0u8);
     out.extend_from_slice(body.reason.as_bytes());
+    Ok(out)
+}
+
+pub fn canonical_request_state_sync(body: &RequestStateSyncBody) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(REQUEST_STATE_SYNC_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.requester_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&body.since_version.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    Ok(out)
+}
+
+pub fn canonical_state_sync_response(body: &StateSyncResponseBody) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(2048);
+    out.extend_from_slice(STATE_SYNC_RESPONSE_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.responder_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.requester_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&(body.members.len() as u32).to_le_bytes());
+    for m in &body.members {
+        out.extend_from_slice(&bincode::serialize(m)?);
+    }
+    out.push(0u8);
+    out.extend_from_slice(&body.current_version.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
     Ok(out)
 }
 
@@ -583,6 +671,53 @@ pub fn sign_role_change(
     let payload = canonical_role_change(&body)?;
     let signature = keypair.sign(&payload)?;
     Ok(GroupHandshake::RoleChange { body, signature })
+}
+
+/// Sign a `RequestStateSync` payload with the requester's keypair.
+pub fn sign_request_state_sync(
+    keypair: &IdentityKeyPair,
+    body: RequestStateSyncBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_request_state_sync(&body)?;
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::RequestStateSync { body, signature })
+}
+
+/// Verify a `RequestStateSync` against the requester's stated
+/// `IdentityKey`. The handler is responsible for confirming the
+/// requester is still an active member of the group; this only
+/// verifies cryptographic authorship and freshness.
+pub fn verify_request_state_sync(
+    body: &RequestStateSyncBody,
+    signature: &HybridSignature,
+    expected_requester: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_request_state_sync(body)?;
+    expected_requester.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Sign a `StateSyncResponse` payload with the responder's keypair.
+pub fn sign_state_sync_response(
+    keypair: &IdentityKeyPair,
+    body: StateSyncResponseBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_state_sync_response(&body)?;
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::StateSyncResponse { body, signature })
+}
+
+/// Verify a `StateSyncResponse` against the responder's stated
+/// `IdentityKey`. The handler is responsible for confirming the
+/// responder was an active member of the group at the version
+/// returned in the snapshot; this only verifies cryptographic
+/// authorship and freshness.
+pub fn verify_state_sync_response(
+    body: &StateSyncResponseBody,
+    signature: &HybridSignature,
+    expected_responder: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_state_sync_response(body)?;
+    expected_responder.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
 }
 
 /// Verify a `RoleChange` against the promoter's stated `IdentityKey`.

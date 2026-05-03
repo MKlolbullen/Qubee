@@ -715,3 +715,202 @@ fn message_older_than_max_age_is_rejected() {
         "stale-timestamp frame must be rejected by the freshness gate",
     );
 }
+
+// ---------------------------------------------------------------------
+// Snapshot resync after extended offline (rev-4 P1).
+//
+// Closes the convergence gap MemberAdded / RoleChange broadcasts can't
+// fix on their own — gossipsub is fire-and-forget, so a member who's
+// been offline through the broadcast doesn't get it replayed when
+// they come back. The new RequestStateSync / StateSyncResponse pair
+// lets the lagging member ask any current member for the current
+// roster, then merge it into local state.
+// ---------------------------------------------------------------------
+
+#[test]
+fn lagging_member_resyncs_after_missing_member_added() {
+    use qubee_crypto::groups::group_handshake::{sign_request_state_sync, GroupHandshake};
+    use qubee_crypto::groups::handshake_handlers::{
+        process_request_state_sync, process_state_sync_response,
+    };
+
+    // Alice + Bob are in the group. Carol joins via Alice. Bob was
+    // offline so he never received the MemberAdded broadcast about
+    // Carol. After requesting a state sync from Alice, Bob's local
+    // view should contain Carol with a non-empty kyber_pub.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    let bob_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        bob_invite.invitation_code,
+        bob_invite.inviter_name,
+    );
+
+    let carol_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    // Carol joins; the broadcast that informs Bob is intentionally
+    // *not* applied to bob_gm (simulates Bob being offline through
+    // the MemberAdded).
+    let (_carol_dir, carol_kp, _carol_gm, _ma_body_carol, _ma_sig_carol) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        carol_invite.invitation_code,
+        carol_invite.inviter_name,
+    );
+    let carol_id = carol_kp.identity_id();
+
+    // Sanity: Bob doesn't know about Carol yet.
+    assert!(
+        !bob_gm
+            .get_group(&group_id)
+            .unwrap()
+            .members
+            .contains_key(&carol_id),
+        "precondition: Bob's local view should not yet contain Carol",
+    );
+
+    // Bob comes back online and asks for a sync. Build + sign the
+    // request body, deliver to Alice as if over gossipsub.
+    let request_body = bob_gm
+        .build_state_sync_request(group_id, bob_kp.identity_id())
+        .expect("Bob has the group");
+    let (req_body, req_sig) = match sign_request_state_sync(&bob_kp, request_body).unwrap() {
+        GroupHandshake::RequestStateSync { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Alice processes the request and produces a signed response.
+    let (resp_body, resp_sig) =
+        process_request_state_sync(&alice_gm, &alice_kp, &req_body, &req_sig)
+            .expect("Alice processes Bob's request without error")
+            .expect("Alice should respond — Bob is still active");
+
+    // Bob applies the response. Now his local view should contain
+    // Carol with a non-empty kyber_pub, and his version should match
+    // Alice's.
+    let applied = process_state_sync_response(
+        &mut bob_gm,
+        bob_kp.identity_id(),
+        &resp_body,
+        &resp_sig,
+    )
+    .expect("Bob applies the response without error");
+    assert!(applied, "Bob should accept a response addressed to him");
+
+    let bob_view = bob_gm.get_group(&group_id).unwrap();
+    let carol_view = bob_view
+        .members
+        .get(&carol_id)
+        .expect("Bob's view must contain Carol after resync");
+    assert!(
+        !carol_view.kyber_pub.is_empty(),
+        "Carol's kyber_pub must be populated in Bob's view (rotations would otherwise skip her)",
+    );
+    let alice_v = alice_gm.get_group(&group_id).unwrap().version;
+    assert!(
+        bob_view.version >= alice_v,
+        "Bob's version ({}) must be at least Alice's ({}) after resync",
+        bob_view.version,
+        alice_v,
+    );
+}
+
+#[test]
+fn state_sync_response_addressed_to_someone_else_is_ignored() {
+    use qubee_crypto::groups::group_handshake::{sign_request_state_sync, GroupHandshake};
+    use qubee_crypto::groups::handshake_handlers::{
+        process_request_state_sync, process_state_sync_response,
+    };
+
+    // Alice + Bob in a group. Bob requests a sync; Alice responds.
+    // Carol (a non-member here, but on the gossipsub topic in the
+    // wider deployment) receives the same broadcast and should
+    // silently ignore it — her self_id != response.requester_id.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    let request_body = bob_gm
+        .build_state_sync_request(group_id, bob_kp.identity_id())
+        .unwrap();
+    let (req_body, req_sig) = match sign_request_state_sync(&bob_kp, request_body).unwrap() {
+        GroupHandshake::RequestStateSync { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    let (resp_body, resp_sig) =
+        process_request_state_sync(&alice_gm, &alice_kp, &req_body, &req_sig)
+            .unwrap()
+            .unwrap();
+
+    // A bystander ("Carol") on the gossipsub topic. She has the
+    // group locally but the response isn't for her.
+    let (_carol_dir, carol_kp, carol_gm) = fresh_device("carol");
+    let carol_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    // Bring carol_gm into the group via a fresh handshake so her
+    // local view contains the group at all.
+    let (_carol_dir2, carol_kp2, mut _carol_gm2, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        carol_invite.invitation_code,
+        carol_invite.inviter_name,
+    );
+    drop(carol_kp);
+    drop(carol_gm);
+    let _ = carol_kp2; // helper named "join_bob_to_alice" but joining Carol here.
+
+    // Carol2 receives Bob's response from gossipsub. She must
+    // silently drop it.
+    let accepted = process_state_sync_response(
+        &mut _carol_gm2,
+        carol_kp2.identity_id(),
+        &resp_body,
+        &resp_sig,
+    )
+    .expect("filtering must not error");
+    assert!(
+        !accepted,
+        "Carol must silently drop a response addressed to Bob",
+    );
+}

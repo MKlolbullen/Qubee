@@ -641,3 +641,77 @@ fn non_owner_cannot_promote_member() {
     let result = bob_gm.promote_member(group_id, bob_kp.identity_id(), bob_kp.identity_id(), Role::Admin);
     assert!(result.is_err(), "non-owner must not be able to promote");
 }
+
+// ---------------------------------------------------------------------
+// Replay-past-freshness gate (rev-3 priority 0).
+//
+// `decrypt_group_message` calls `verify_with_max_age(...,
+// GROUP_MESSAGE_MAX_AGE_SECS)` so a captured frame older than five
+// minutes can't be replayed back at the network. This test forges
+// such a frame directly (bypassing `encrypt_group_message`'s
+// always-now timestamp) and asserts the gate rejects it.
+// ---------------------------------------------------------------------
+
+#[test]
+fn message_older_than_max_age_is_rejected() {
+    use qubee_crypto::groups::group_message::{
+        canonical_group_message, GroupMessageBody, GroupMessageEnvelope,
+        GROUP_MESSAGE_MAX_AGE_SECS,
+    };
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // The freshness gate sits on `HybridSignature.timestamp` (set by
+    // IdentityKeyPair::sign at wall-clock now), and verify_with_max_age
+    // rejects on the timestamp check *before* it does any
+    // cryptography. So forging a stale frame is just: sign normally,
+    // then mutate the public timestamp field on the signature struct
+    // to a value past max_age_secs in the past.
+    let aead_payload = alice_gm
+        .encrypt_group_message(&group_id, b"stale")
+        .unwrap();
+    let body = GroupMessageBody {
+        group_id,
+        sender_id: alice_id,
+        generation: alice_gm.get_group(&group_id).unwrap().version,
+        aead_payload,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let payload = canonical_group_message(&body);
+    let mut signature = alice_kp.sign(&payload).unwrap();
+    // `+ 60` to put us a clean minute past the cliff so we don't race
+    // with the wall clock's second granularity.
+    signature.timestamp = signature.timestamp - GROUP_MESSAGE_MAX_AGE_SECS - 60;
+    let wire = GroupMessageEnvelope { body, signature }.to_wire().unwrap();
+
+    let result = decrypt_group_message(&bob_gm, &wire);
+    assert!(
+        result.is_err(),
+        "stale-timestamp frame must be rejected by the freshness gate",
+    );
+}

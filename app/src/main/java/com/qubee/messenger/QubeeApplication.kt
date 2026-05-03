@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import androidx.core.content.ContextCompat
-import com.qubee.messenger.crypto.QubeeManager
 import dagger.hilt.android.HiltAndroidApp
 import timber.log.Timber
 
@@ -20,18 +19,24 @@ class QubeeApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        
+
         // Initialize logging
         if (BuildConfig.DEBUG) {
             Timber.plant(Timber.DebugTree())
         }
-        
+
         // Create notification channels
         createNotificationChannels()
-        
-        // Initialize Qubee native library
-        QubeeManager.initialize()
-        
+
+        // QubeeManager is a Hilt @Singleton with a *suspend* instance
+        // method; the original `QubeeManager.initialize()` static
+        // call here didn't compile against rev-2's QubeeManager and
+        // was a holdover from a deleted companion object. The real
+        // initialization runs once inside `MainViewModel.init` (and
+        // again inside `MessageService.startP2PNetwork` when the
+        // foreground service spins up), so Application.onCreate
+        // doesn't need to do anything beyond logging + channels.
+
         Timber.d("QubeeApplication initialized")
     }
 

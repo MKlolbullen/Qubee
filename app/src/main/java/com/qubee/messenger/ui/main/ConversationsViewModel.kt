@@ -34,11 +34,10 @@ class ConversationsViewModel @Inject constructor(
         )
 
     private fun Conversation.toSummary(): ConversationSummaryUi {
+        // `participants` is a `List<String>` per `data.model.Conversation`,
+        // not a JSON-encoded string. Pick the first non-self id;
+        // fall back to the conversation id itself for groups.
         val peerId = participants
-            .removePrefix("[")
-            .removeSuffix("]")
-            .split(',')
-            .map { it.trim().trim('"') }
             .firstOrNull { it.isNotBlank() && it != "current_user_id" }
             ?: id
 

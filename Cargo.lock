@@ -2755,6 +2755,7 @@ dependencies = [
  "url",
  "webrtc",
  "x25519-dalek",
+ "yamux 0.13.10",
  "zeroize",
 ]
 

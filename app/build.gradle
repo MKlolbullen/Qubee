@@ -89,6 +89,13 @@ dependencies {
     implementation 'androidx.room:room-ktx:2.6.0'
     kapt 'androidx.room:room-compiler:2.6.0'
 
+    // SQLCipher — encrypted storage for the local SQLite database.
+    // The pre-alpha passphrase is a static placeholder; real key
+    // derivation via Android Keystore is on the rev-4 plan
+    // (see plan file priority "Real SQLCipher passphrase").
+    implementation 'net.zetetic:sqlcipher-android:4.6.0'
+    implementation 'androidx.sqlite:sqlite:2.4.0'
+
     // Dependency Injection
     implementation 'com.google.dagger:hilt-android:2.48'
     kapt 'com.google.dagger:hilt-compiler:2.48'

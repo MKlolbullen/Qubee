@@ -42,7 +42,7 @@ class ChatViewModel @Inject constructor(
     private val messageRepository: MessageRepository,
     private val contactRepository: ContactRepository,
     private val conversationRepository: ConversationRepository,
-    @Suppress("unused") private val qubeeManager: QubeeManager,
+    private val qubeeManager: QubeeManager,
 ) : ViewModel() {
 
     private val contactId: String = savedStateHandle["contactId"] ?: ""
@@ -113,13 +113,193 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    fun onAttachFile() = notice("Attachments not yet implemented")
-    fun onTakePhoto() = notice("Camera capture not yet implemented")
-    fun onRecordAudio() = notice("Voice messages not yet implemented")
-    fun requestSecureCall() = notice("Secure calling lands post-alpha (calling feature flag)")
-    fun requestContactVerification() = notice("Verification gesture lands in the next batch")
-    fun changeDisappearingTimer() = notice("Disappearing-timer UI not yet wired")
-    fun resetSecureSession() = notice("Session reset not yet wired to the Rust core")
+    /**
+     * Queue a file attachment. Placeholder — writes a [Message] of
+     * [MessageType.FILE] with empty content, so the row appears in
+     * the chat. Real selection / encryption / upload lands later.
+     */
+    fun onAttachFile() {
+        if (conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val msg = Message(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                senderId = SELF_SENDER_ID,
+                content = "",
+                contentType = MessageType.FILE,
+                timestamp = now,
+                status = MessageStatus.SENDING,
+                isFromMe = true,
+            )
+            messageRepository.saveMessage(msg)
+            _events.emit(ChatUiEvent.Notice("File attachment queued (encryption not yet implemented)"))
+        }
+    }
+
+    /**
+     * Queue a photo. Placeholder — writes a [Message] of
+     * [MessageType.IMAGE] with empty content. Camera integration +
+     * encryption land later.
+     */
+    fun onTakePhoto() {
+        if (conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val msg = Message(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                senderId = SELF_SENDER_ID,
+                content = "",
+                contentType = MessageType.IMAGE,
+                timestamp = now,
+                status = MessageStatus.SENDING,
+                isFromMe = true,
+            )
+            messageRepository.saveMessage(msg)
+            _events.emit(ChatUiEvent.Notice("Photo queued (camera integration not yet implemented)"))
+        }
+    }
+
+    /**
+     * Queue an audio note. Placeholder — recording / encryption /
+     * playback land later.
+     */
+    fun onRecordAudio() {
+        if (conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val msg = Message(
+                id = UUID.randomUUID().toString(),
+                conversationId = conversationId,
+                senderId = SELF_SENDER_ID,
+                content = "",
+                contentType = MessageType.AUDIO,
+                timestamp = now,
+                status = MessageStatus.SENDING,
+                isFromMe = true,
+            )
+            messageRepository.saveMessage(msg)
+            _events.emit(ChatUiEvent.Notice("Voice note queued (recording not yet implemented)"))
+        }
+    }
+
+    /**
+     * Secure calling — gated on the Rust `calling` feature flag and
+     * a yet-unbuilt signalling layer. Surfaces a notice for now.
+     */
+    fun requestSecureCall() {
+        notice("Secure calling lands post-alpha (calling feature flag)")
+    }
+
+    /**
+     * Smoke-call the JNI verify bridge to confirm the symbol resolves
+     * and the byte plumbing round-trips. Does NOT claim
+     * [ConversationSecurityState.Verified] — the real OOB compare
+     * gesture (display the contact's fingerprint, user types/scans
+     * the expected value, bridge returns true/false) needs UI
+     * affordances that haven't landed. Calling here means a missing
+     * `nativeVerifyIdentityKey` symbol surfaces at this known site
+     * with a recoverable error, not at first user-driven verify.
+     *
+     * Both Rust- and Kotlin-side fingerprint formats live in
+     * different shapes today (Rust hashes `(classical_pub || pq_pub)`
+     * with BLAKE3 and groups as `"AABB CCDD …"`; Kotlin's
+     * [toFingerprint] takes the first 8 raw bytes with dashes), so
+     * the smoke call deliberately uses an empty expected payload —
+     * the bridge will return false but the JNI invocation completes,
+     * which is what we're checking.
+     */
+    fun requestContactVerification() {
+        if (conversationId.isEmpty()) {
+            notice("No conversation to verify")
+            return
+        }
+        viewModelScope.launch {
+            val contact = contactRepository.getContactById(contactId)
+            val peerIdKey = contact?.identityKey
+            if (peerIdKey == null) {
+                _events.emit(ChatUiEvent.Notice("Peer identity not stored — cannot verify yet"))
+                return@launch
+            }
+            val bridgeOk = runCatching {
+                qubeeManager.verifyIdentityKey(contactId, peerIdKey, ByteArray(0))
+            }
+            bridgeOk.onFailure { err ->
+                _events.emit(
+                    ChatUiEvent.Notice("Verification bridge unreachable: ${err.message ?: "unknown error"}"),
+                )
+                return@launch
+            }
+            // Bridge round-trips. Surface the locally-computed
+            // fingerprint for OOB compare, no Verified claim.
+            val displayFingerprint = peerIdKey.toFingerprint()
+            val updatedDetails = _uiState.value.details.copy(
+                fingerprint = displayFingerprint,
+                verificationLabel = "Compare with peer",
+                isVerified = false,
+            )
+            _uiState.value = _uiState.value.copy(details = updatedDetails)
+            _events.emit(
+                ChatUiEvent.Notice("Compare $displayFingerprint with the contact's device"),
+            )
+        }
+    }
+
+    /**
+     * Cycle the disappearing-message timer label through Off → 30s →
+     * 5m → Off. Persistence + the actual timer-driven cleanup land
+     * later — for now this only updates the UI state.
+     */
+    fun changeDisappearingTimer() {
+        viewModelScope.launch {
+            val current = _uiState.value
+            val nextLabel = when (current.details.disappearingTimerLabel) {
+                "Off" -> "30s"
+                "30s" -> "5m"
+                else -> "Off"
+            }
+            _uiState.value = current.copy(
+                details = current.details.copy(disappearingTimerLabel = nextLabel),
+            )
+            _events.emit(ChatUiEvent.Notice("Disappearing timer set to $nextLabel"))
+        }
+    }
+
+    /**
+     * Reset the local identity via [QubeeManager.resetIdentity] and
+     * re-initialise the core. On success, the conversation drops
+     * back to [ConversationSecurityState.Unverified].
+     */
+    fun resetSecureSession() {
+        viewModelScope.launch {
+            val ok = runCatching { qubeeManager.resetIdentity() }
+                .getOrElse { err ->
+                    _events.emit(
+                        ChatUiEvent.Notice("Reset bridge unreachable: ${err.message ?: "unknown error"}"),
+                    )
+                    return@launch
+                }
+            if (!ok) {
+                _events.emit(ChatUiEvent.Notice("Failed to reset secure session"))
+                return@launch
+            }
+            val initOk = runCatching { qubeeManager.initialize() }.getOrDefault(false)
+            if (!initOk) {
+                _events.emit(ChatUiEvent.Notice("Session reset but reinitialisation failed"))
+                return@launch
+            }
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                details = current.details.copy(
+                    isVerified = false,
+                    verificationLabel = "Unverified",
+                ),
+                securityState = ConversationSecurityState.Unverified,
+            )
+            _events.emit(ChatUiEvent.Notice("Secure session reset and reinitialised"))
+        }
+    }
 
     fun clearChat() {
         if (conversationId.isEmpty()) return

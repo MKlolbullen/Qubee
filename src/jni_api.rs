@@ -13,7 +13,7 @@ use tokio::runtime::Runtime;
 
 // Core modules
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
-use crate::identity::identity_key::{IdentityKeyPair, IdentityId};
+use crate::identity::identity_key::{IdentityKey, IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
@@ -30,6 +30,7 @@ use crate::groups::handshake_handlers::{
     HandshakeOutcome,
 };
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
+use blake3::Hasher;
 use std::collections::HashMap;
 use zeroize::Zeroize;
 
@@ -1324,4 +1325,100 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Identity verification & Short Authentication String (SAS)
+// ---------------------------------------------------------------------------
+
+/// Verify a peer's identity key by comparing its fingerprint to a
+/// caller-provided value.
+///
+/// `identity_key_bytes` must be a serialized public `IdentityKey`
+/// (`IdentityKey::to_bytes`). `verification_data` is the expected
+/// fingerprint as ASCII bytes — case + space-insensitive comparison
+/// against `IdentityKey::fingerprint()`.
+///
+/// Returns 1 if the fingerprints match, else 0. Returns 0 (not an
+/// exception) on any decode error so the caller's UI surface stays
+/// recoverable.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerifyIdentityKey(
+    env: JNIEnv,
+    _class: JClass,
+    _contact_id: JString,
+    identity_key_bytes: JByteArray,
+    verification_data: JByteArray,
+) -> jboolean {
+    catch_unwind_result(|| -> anyhow::Result<jboolean> {
+        let id_bytes: Vec<u8> = env
+            .convert_byte_array(identity_key_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid identity key bytes: {e}"))?;
+        let identity = IdentityKey::from_bytes(&id_bytes)
+            .map_err(|e| anyhow::anyhow!("IdentityKey decode failed: {e}"))?;
+        let fp = identity.fingerprint().replace(' ', "").to_ascii_uppercase();
+        let verif: Vec<u8> = env
+            .convert_byte_array(verification_data)
+            .map_err(|e| anyhow::anyhow!("invalid verification data: {e}"))?;
+        let verif_str = String::from_utf8(verif).unwrap_or_default();
+        let normalized = verif_str.replace(' ', "").to_ascii_uppercase();
+        Ok(if fp == normalized { 1 } else { 0 })
+    })
+    .unwrap_or(0)
+}
+
+/// Generate a short authentication string (SAS) from our + a peer's
+/// identity key. Both parties' devices compute the same SAS as long
+/// as the byte inputs match (`IdentityKey::to_bytes` is canonical).
+///
+/// Algorithm:
+///   1. Lexicographically order the two key byte buffers so each side
+///      hashes the same `(first || second)` regardless of who's
+///      calling.
+///   2. BLAKE3 over the concatenation; take the first 4 bytes as a
+///      big-endian u32.
+///   3. Split into two 16-bit halves, reduce each `% 10000` so the
+///      `{:04}` format produces a guaranteed 4-digit group (the
+///      naïve `& 0xFFFF` lets values up to 65535 leak through, which
+///      breaks the visual contract).
+///   4. Format as `"NNNN NNNN"`.
+///
+/// Returns a JNI string on success, or NULL on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateSAS(
+    env: JNIEnv,
+    _class: JClass,
+    our_identity_key: JByteArray,
+    peer_identity_key: JByteArray,
+) -> jstring {
+    catch_unwind_result(|| -> anyhow::Result<jstring> {
+        let our_bytes: Vec<u8> = env
+            .convert_byte_array(our_identity_key)
+            .map_err(|e| anyhow::anyhow!("invalid our_identity_key bytes: {e}"))?;
+        let peer_bytes: Vec<u8> = env
+            .convert_byte_array(peer_identity_key)
+            .map_err(|e| anyhow::anyhow!("invalid peer_identity_key bytes: {e}"))?;
+        let (first, second) = if our_bytes <= peer_bytes {
+            (our_bytes.as_slice(), peer_bytes.as_slice())
+        } else {
+            (peer_bytes.as_slice(), our_bytes.as_slice())
+        };
+        let mut hasher = Hasher::new();
+        hasher.update(first);
+        hasher.update(second);
+        let digest = hasher.finalize();
+        let h = digest.as_bytes();
+        let value: u32 = ((h[0] as u32) << 24)
+            | ((h[1] as u32) << 16)
+            | ((h[2] as u32) << 8)
+            | (h[3] as u32);
+        // Reduce each 16-bit half to 0..=9999 so the {:04} format
+        // spec is a 4-digit ceiling, not just a minimum width.
+        let high = ((value >> 16) & 0xFFFF) % 10_000;
+        let low = (value & 0xFFFF) % 10_000;
+        let sas = format!("{:04} {:04}", high, low);
+        let java_str = env.new_string(sas)?;
+        Ok(java_str.into_raw())
+    })
+    .unwrap_or(std::ptr::null_mut())
 }

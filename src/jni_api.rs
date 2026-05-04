@@ -2,7 +2,7 @@
 
 use jni::{JNIEnv, JavaVM};
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue, GlobalRef};
-use jni::sys::{jboolean, jstring};
+use jni::sys::{jboolean, jbyteArray, jstring};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use lazy_static::lazy_static;
@@ -109,6 +109,14 @@ fn jni_catch_or<T>(
 /// a JNI null-pointer return, which is what every existing call
 /// site already does on a non-panic error path.
 fn jni_catch_jstring(f: impl FnOnce() -> jstring) -> jstring {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `jbyteArray` variant of [`jni_catch_jstring`]. Same shape — a
+/// raw `*mut _jobject` that can't impl `Default`, so we hand-roll
+/// the null fallback.
+fn jni_catch_jbytearray(f: impl FnOnce() -> jbyteArray) -> jbyteArray {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .unwrap_or(std::ptr::null_mut())
 }
@@ -1518,4 +1526,170 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
         Ok(java_str.into_raw())
     })
     .unwrap_or(std::ptr::null_mut())
+}
+
+// ---------------------------------------------------------------------------
+// Message + file crypto
+// ---------------------------------------------------------------------------
+//
+// Kotlin's `QubeeManager.{encrypt,decrypt}{Message,File}` calls these
+// four exports to encrypt / decrypt traffic in a "session". The
+// session model in this codebase is "a 2-member group for 1:1, an
+// N-member group for chats" — there's no separate 1:1 ratchet; the
+// wire format and key handling go through `groups::group_message`
+// for both shapes. The Kotlin-side `sessionId` is the hex-encoded
+// `GroupId` (64 chars / 32 bytes); the caller is responsible for
+// having created the matching group + completed its key exchange
+// via the existing handshake flow before any of these exports get
+// called. Failed lookup / un-keyed group / decrypt failure all
+// surface as a JNI null return, which Kotlin maps to `null` —
+// matching the nullable signatures in `QubeeManager.kt`.
+
+fn parse_session_id(env: &mut JNIEnv, session_id: JString) -> anyhow::Result<GroupId> {
+    let raw: String = env
+        .get_string(&session_id)
+        .map_err(|e| anyhow::anyhow!("invalid session_id: {e}"))?
+        .into();
+    Ok(GroupId::from_bytes(parse_hex32(Some(raw.as_str()))?))
+}
+
+/// Encrypt a UTF-8 plaintext string for a session. Returns the
+/// signed wire envelope (`encrypt_group_message` output, a
+/// `QUBEE_GMS\x01`-prefixed bincode-serialised
+/// `GroupMessageEnvelope`) as a Java `byte[]`. Returns `null` on
+/// any failure — onboarding not done, group not known, group key
+/// not yet installed, etc.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: JString,
+    plaintext: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let group_id = parse_session_id(&mut env, session_id)?;
+            let plaintext_str: String = env
+                .get_string(&plaintext)
+                .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?
+                .into();
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let wire =
+                encrypt_group_message(gm, identity.as_ref(), group_id, plaintext_str.as_bytes())?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Decrypt a wire envelope produced by `nativeEncryptMessage` (or
+/// any peer's `encrypt_group_message`) back into a UTF-8
+/// plaintext string. Returns `null` if decryption fails OR if the
+/// plaintext isn't valid UTF-8 — binary payloads should ride
+/// `nativeDecryptFile` instead.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: JString,
+    encrypted_envelope: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let _group_id = parse_session_id(&mut env, session_id)?;
+            // session_id is required by the Kotlin signature but
+            // decrypt_group_message reads the group_id off the wire
+            // envelope itself; we still parse it to surface a
+            // malformed session_id as a null return rather than a
+            // misleading "decrypt succeeded" against the wrong
+            // session. Caller-side wiring expects the two to match.
+            let wire = env
+                .convert_byte_array(&encrypted_envelope)
+                .map_err(|e| anyhow::anyhow!("invalid encrypted_envelope: {e}"))?;
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let decrypted = decrypt_group_message(gm, &wire)?;
+            let plaintext = String::from_utf8(decrypted.plaintext)
+                .map_err(|e| anyhow::anyhow!("plaintext is not UTF-8: {e}"))?;
+            let java_str = env
+                .new_string(plaintext)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Encrypt arbitrary file bytes for a session. Same wire shape as
+/// `nativeEncryptMessage` — the difference is only that the input
+/// is a `byte[]` rather than a `String`, so binary payloads survive
+/// the round-trip without UTF-8 validation. Returns `null` on
+/// failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: JString,
+    file_data: JByteArray,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let group_id = parse_session_id(&mut env, session_id)?;
+            let plaintext = env
+                .convert_byte_array(&file_data)
+                .map_err(|e| anyhow::anyhow!("invalid file_data: {e}"))?;
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let wire = encrypt_group_message(gm, identity.as_ref(), group_id, &plaintext)?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Decrypt a wire envelope back into the original file bytes.
+/// Companion to `nativeEncryptFile` — same wire format, no UTF-8
+/// constraint on the output. Returns `null` on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    session_id: JString,
+    encrypted_envelope: JByteArray,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let _group_id = parse_session_id(&mut env, session_id)?;
+            let wire = env
+                .convert_byte_array(&encrypted_envelope)
+                .map_err(|e| anyhow::anyhow!("invalid encrypted_envelope: {e}"))?;
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let decrypted = decrypt_group_message(gm, &wire)?;
+            let arr = env
+                .byte_array_from_slice(&decrypted.plaintext)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
 }

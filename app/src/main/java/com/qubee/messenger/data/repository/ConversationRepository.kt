@@ -1,20 +1,27 @@
 package com.qubee.messenger.data.repository
 
+import com.google.gson.JsonParser
+import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.model.Conversation
 import com.qubee.messenger.data.model.ConversationType
 import com.qubee.messenger.data.model.ConversationWithDetails
 import com.qubee.messenger.data.repository.database.dao.ConversationDao
 import com.qubee.messenger.data.repository.database.dao.MessageDao
 import kotlinx.coroutines.flow.Flow
-import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
-// Real Room-backed implementation — rev-3 priority 6.
+// Real Room-backed implementation — rev-3 priority 6, extended in
+// the conv-bridge batch to mint hex-encoded Rust GroupIds for the
+// `id` column. The single `id` field flows unchanged through the
+// JNI sessionId parameter on `nativeEncryptMessage` /
+// `nativeDecryptMessage`, so Kotlin and Rust agree on conversation
+// identity without a separate translation table.
 @Singleton
 class ConversationRepository @Inject constructor(
     private val conversationDao: ConversationDao,
     @Suppress("unused") private val messageDao: MessageDao,
+    private val qubeeManager: QubeeManager,
 ) {
 
     fun getAllConversations(): Flow<List<Conversation>> =
@@ -29,18 +36,32 @@ class ConversationRepository @Inject constructor(
     suspend fun getConversationById(conversationId: String): Conversation? =
         conversationDao.getConversationById(conversationId)
 
-    /// Look up the existing direct conversation with `contactId` (if
-    /// any) or mint a fresh `ConversationType.DIRECT` row and
-    /// return its id. Used by `MessageService.onMessageReceived` to
-    /// route inbound messages to a stable conversation.
+    /// Look up the existing direct conversation with `contactId` and
+    /// return its id (the hex-encoded Rust `GroupId`), or mint a
+    /// fresh one via [QubeeManager.createGroup] and persist it.
+    ///
+    /// The minted group has the local user as its only Rust-side
+    /// member; the remote contact only becomes a Rust-side member
+    /// after the existing invite + handshake flow lands them
+    /// (see `nativeCreateGroupInvite` + `process_request_join`).
+    /// Until then, encrypt round-trips on this conversation will
+    /// return null on the decrypt side because the contact won't
+    /// have the group key yet — that's the honest state to surface
+    /// in UI ("waiting for invite acceptance").
+    ///
+    /// Returns the empty string if onboarding hasn't completed
+    /// (no active identity ⇒ Rust refuses `createGroup`); callers
+    /// should treat empty as "cannot send / receive yet".
     suspend fun getOrCreateConversationId(contactId: String): String {
         val existing = conversationDao.getConversationsByType(ConversationType.DIRECT)
             .firstOrNull { it.participants.contains(contactId) }
         if (existing != null) return existing.id
 
+        val groupIdHex = mintRustGroupForDirect(contactId) ?: return ""
+
         val now = System.currentTimeMillis()
         val conversation = Conversation(
-            id = UUID.randomUUID().toString(),
+            id = groupIdHex,
             type = ConversationType.DIRECT,
             name = "",
             participants = listOf(contactId),
@@ -48,7 +69,23 @@ class ConversationRepository @Inject constructor(
             updatedAt = now,
         )
         conversationDao.insertConversation(conversation)
-        return conversation.id
+        return groupIdHex
+    }
+
+    /// Mint a fresh Rust group representing a 1:1 chat and return
+    /// the hex-encoded `GroupId`. Returns null if `QubeeManager` is
+    /// not yet initialised or the JSON shape is unexpected.
+    ///
+    /// The display-only `name` is the contact's id; the Rust core
+    /// stores it inside the persistent group record but doesn't
+    /// surface it on the wire.
+    private suspend fun mintRustGroupForDirect(contactId: String): String? {
+        val raw = qubeeManager.createGroup(name = "1:1 with $contactId") ?: return null
+        return runCatching {
+            JsonParser.parseString(raw).asJsonObject
+                .get("group_id_hex")?.asString
+                ?.takeIf { it.length == 64 } // 32 bytes hex
+        }.getOrNull()
     }
 
     suspend fun upsertConversation(conversation: Conversation) {

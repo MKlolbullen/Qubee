@@ -38,7 +38,8 @@ pub mod oob_secrets;
 #[cfg(feature = "calling")]
 pub mod calling;
 
-// JNI Bridge (Only compile for Android targets)
-#[cfg(target_os = "android")]
+// JNI Bridge (Only compile for Android targets, plus opt-in host
+// type-check via the `_typecheck_jni` feature flag).
+#[cfg(any(target_os = "android", feature = "_typecheck_jni"))]
 #[allow(non_snake_case)]
 pub mod jni_api;

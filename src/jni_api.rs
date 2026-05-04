@@ -76,12 +76,41 @@ lazy_static! {
     static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, Vec<u8>>> = Mutex::new(HashMap::new());
 }
 
+/// Catch panics from a JNI body that returns a `Default`-able value
+/// (jboolean, jint, integer types, `()`). Panics fold into the
+/// type's default (`0` / `false` / `()`), which matches what JNI
+/// code conventionally returns on error.
 fn catch_unwind_result<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
     R: Default,
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default()
+}
+
+/// Like [`catch_unwind_result`] but for JNI bodies that return
+/// `anyhow::Result<T>` for a `T` that doesn't impl `Default` —
+/// raw pointers (`jstring`, `jobject`) and any caller that wants
+/// errors-and-panics to fold into a caller-provided fallback.
+/// Panics fold into `Err(...)` so the caller can decide the
+/// fallback by chaining `.unwrap_or(...)`.
+fn jni_catch_or<T>(
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("panic during JNI call")),
+    }
+}
+
+/// Catch panics from a JNI body that returns `jstring` directly —
+/// raw `*mut _jobject` pointers don't impl `Default`, so the
+/// generic [`catch_unwind_result`] doesn't work. Folds panics into
+/// a JNI null-pointer return, which is what every existing call
+/// site already does on a non-panic error path.
+fn jni_catch_jstring(f: impl FnOnce() -> jstring) -> jstring {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or(std::ptr::null_mut())
 }
 
 // --- Initialization & Callbacks ---
@@ -91,18 +120,18 @@ where
 /// private storage. Idempotent.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitialize(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
 ) -> jboolean {
-    let result = catch_unwind_result(|| -> anyhow::Result<()> {
+    let result = jni_catch_or(|| -> anyhow::Result<()> {
         let mut init = INITIALIZED.lock().unwrap();
         if *init {
             return Ok(());
         }
 
         let dir: String = env
-            .get_string(data_dir)
+            .get_string(&data_dir)
             .map_err(|e| anyhow::anyhow!("invalid data_dir: {e}"))?
             .into();
 
@@ -202,12 +231,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRegist
 
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartNetwork(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     bootstrap_nodes: JString,
 ) -> jboolean {
     catch_unwind_result(|| {
-        let _bootstrap_str: String = env.get_string(bootstrap_nodes).expect("Invalid string").into();
+        let _bootstrap_str: String = env.get_string(&bootstrap_nodes).expect("Invalid string").into();
 
         std::thread::spawn(|| {
             let rt = Runtime::new().unwrap();
@@ -263,14 +292,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
 /// Send a P2P message (Publish/Direct)
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2PMessage(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     peer_id: JString,
     data: JByteArray,
 ) -> jboolean {
     catch_unwind_result(|| {
-        let peer_id_str: String = env.get_string(peer_id).expect("Invalid peer_id").into();
-        let data_vec = env.convert_byte_array(data).expect("Invalid data");
+        let peer_id_str: String = env.get_string(&peer_id).expect("Invalid peer_id").into();
+        let data_vec = env.convert_byte_array(&data).expect("Invalid data");
 
         let commander_lock = P2P_COMMANDER.lock().unwrap();
         
@@ -351,9 +380,9 @@ fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::Decrypte
         "onGroupMessageReceived",
         "(Ljava/lang/String;Ljava/lang/String;[BJ)V",
         &[
-            JValue::Object(group_hex.into()),
-            JValue::Object(sender_hex.into()),
-            JValue::Object(payload.into()),
+            JValue::Object(&group_hex),
+            JValue::Object(&sender_hex),
+            JValue::Object(&payload),
             JValue::Long(msg.timestamp as i64),
         ],
     );
@@ -386,7 +415,7 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
                 callback_obj,
                 "onMessageReceived",
                 "(Ljava/lang/String;[B)V",
-                &[JValue::Object(j_sender.into()), JValue::Object(j_data.into())]
+                &[JValue::Object(&j_sender), JValue::Object(&j_data)],
             );
         },
         NodeEvent::PeerDiscovered { peer_id } => {
@@ -395,8 +424,14 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
                 callback_obj,
                 "onPeerDiscovered",
                 "(Ljava/lang/String;)V",
-                &[JValue::Object(j_peer.into())]
+                &[JValue::Object(&j_peer)],
             );
+        }
+        NodeEvent::Listening { .. } => {
+            // Bound-address event used by integration tests; no
+            // Kotlin callback exists for it today, so silently
+            // ignore — the swarm is up by the time the JNI thread
+            // sees this and we don't need to forward.
         }
     }
 }
@@ -407,17 +442,17 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
 /// group record so subsequent invitations can KEM-wrap it for joiners.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateGroup(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     name: JString,
     description: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let name: String = match env.get_string(name) {
+    jni_catch_jstring(|| {
+        let name: String = match env.get_string(&name) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let description: String = match env.get_string(description) {
+        let description: String = match env.get_string(&description) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -475,14 +510,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
 /// `max_uses`.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateGroupInvite(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     group_id_hex: JString,
     expires_at_seconds: jni::sys::jlong,
     max_uses: jni::sys::jint,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let group_id_hex: String = match env.get_string(group_id_hex) {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -532,17 +567,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
 /// `{group_id_hex, generation, network_published}`.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendGroupMessage(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     group_id_hex: JString,
     plaintext: JByteArray,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let group_id_hex: String = match env.get_string(group_id_hex) {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let plaintext = match env.convert_byte_array(plaintext) {
+        let plaintext = match env.convert_byte_array(&plaintext) {
             Ok(b) => b,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -582,22 +617,22 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendGr
 /// generation, network_published}`.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemoveMember(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     group_id_hex: JString,
     member_id_hex: JString,
     reason: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let group_id_hex: String = match env.get_string(group_id_hex) {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let member_id_hex: String = match env.get_string(member_id_hex) {
+        let member_id_hex: String = match env.get_string(&member_id_hex) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let reason: String = match env.get_string(reason) {
+        let reason: String = match env.get_string(&reason) {
             Ok(s) => s.into(),
             Err(_) => String::new(),
         };
@@ -653,12 +688,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
 /// the returned JSON; the caller can retry by re-invoking accept.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAcceptInvite(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     link: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let link: String = match env.get_string(link) {
+    jni_catch_jstring(|| {
+        let link: String = match env.get_string(&link) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -861,6 +896,68 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
         GroupHandshake::KeyRotation { body, signature } => {
             on_key_rotation(body, signature)?;
         }
+        GroupHandshake::MemberAdded { body, signature } => {
+            // Existing-member side handler for inviter-broadcast
+            // MemberAdded — keeps our local view convergent with
+            // the inviter's roster (and picks up the new member's
+            // per-group Kyber pubkey, without which any later
+            // rotation we plan would silently skip them).
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            crate::groups::handshake_handlers::process_member_added(gm, &body, &signature)?;
+        }
+        GroupHandshake::RoleChange { body, signature } => {
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            crate::groups::handshake_handlers::process_role_change(gm, &body, &signature)?;
+        }
+        GroupHandshake::RequestStateSync { body, signature } => {
+            // Responder side. Build + sign a snapshot reply and
+            // publish it back on the group's gossipsub topic.
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let topic = group_topic(&hex::encode(body.group_id.as_ref()));
+            let response = {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                crate::groups::handshake_handlers::process_request_state_sync(
+                    gm,
+                    identity.as_ref(),
+                    &body,
+                    &signature,
+                )?
+            };
+            if let Some((resp_body, resp_sig)) = response {
+                let signed = GroupHandshake::StateSyncResponse {
+                    body: resp_body,
+                    signature: resp_sig,
+                };
+                let _ = publish_to_topic(topic, signed.to_wire()?);
+            }
+        }
+        GroupHandshake::StateSyncResponse { body, signature } => {
+            // Requester side — gossipsub fan-out delivers the
+            // reply to everyone on the topic, so process_state_sync_response
+            // self-filters by self_id == body.requester_id.
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let _ = crate::groups::handshake_handlers::process_state_sync_response(
+                gm,
+                identity.identity_id(),
+                &body,
+                &signature,
+            )?;
+        }
     }
     Ok(())
 }
@@ -983,7 +1080,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListAc
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    catch_unwind_result(|| {
+    jni_catch_jstring(|| {
         let result: anyhow::Result<serde_json::Value> = (|| {
             let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
@@ -1034,12 +1131,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanu
 /// was passed to `nativeInitialize` so we delete the right files.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetIdentity(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
 ) -> jboolean {
     catch_unwind_result(|| {
-        let dir: String = match env.get_string(data_dir) {
+        let dir: String = match env.get_string(&data_dir) {
             Ok(s) => s.into(),
             Err(_) => return 0,
         };
@@ -1111,17 +1208,17 @@ fn ok_or_null(env: JNIEnv, result: anyhow::Result<serde_json::Value>) -> jstring
 /// [`ACTIVE_IDENTITY`] for subsequent signing without touching disk.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateOnboardingBundle(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     display_name: JString,
     user_id: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let display_name: String = match env.get_string(display_name) {
+    jni_catch_jstring(|| {
+        let display_name: String = match env.get_string(&display_name) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let user_id: String = match env.get_string(user_id) {
+        let user_id: String = match env.get_string(&user_id) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1147,7 +1244,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    catch_unwind_result(|| {
+    jni_catch_jstring(|| {
         let result: anyhow::Result<serde_json::Value> = (|| {
             // Lazily load if the eager init didn't happen (e.g. keystore
             // was empty at boot but Kotlin called create afterwards).
@@ -1208,12 +1305,12 @@ fn bundle_to_json(bundle: &OnboardingBundle) -> anyhow::Result<serde_json::Value
 /// the link is malformed or the embedded hybrid signature fails verification.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerifyOnboardingLink(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     link: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let link: String = match env.get_string(link) {
+    jni_catch_jstring(|| {
+        let link: String = match env.get_string(&link) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1238,12 +1335,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerify
 /// into the encoded payload; senders cannot raise it.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildInviteLink(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     invitation_json: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let raw: String = match env.get_string(invitation_json) {
+    jni_catch_jstring(|| {
+        let raw: String = match env.get_string(&invitation_json) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1282,12 +1379,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildI
 /// fails verification.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeParseInviteLink(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     link: JString,
 ) -> jstring {
-    catch_unwind_result(|| {
-        let link: String = match env.get_string(link) {
+    jni_catch_jstring(|| {
+        let link: String = match env.get_string(&link) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
@@ -1350,7 +1447,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerify
     identity_key_bytes: JByteArray,
     verification_data: JByteArray,
 ) -> jboolean {
-    catch_unwind_result(|| -> anyhow::Result<jboolean> {
+    jni_catch_or(|| -> anyhow::Result<jboolean> {
         let id_bytes: Vec<u8> = env
             .convert_byte_array(identity_key_bytes)
             .map_err(|e| anyhow::anyhow!("invalid identity key bytes: {e}"))?;
@@ -1391,7 +1488,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
     our_identity_key: JByteArray,
     peer_identity_key: JByteArray,
 ) -> jstring {
-    catch_unwind_result(|| -> anyhow::Result<jstring> {
+    jni_catch_or(|| -> anyhow::Result<jstring> {
         let our_bytes: Vec<u8> = env
             .convert_byte_array(our_identity_key)
             .map_err(|e| anyhow::anyhow!("invalid our_identity_key bytes: {e}"))?;

@@ -18,6 +18,7 @@ import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.model.Message
 import com.qubee.messenger.data.model.MessageStatus
 import com.qubee.messenger.data.model.MessageType
+import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.MessageRepository
 import com.qubee.messenger.network.NetworkCallback
@@ -51,6 +52,7 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var qubeeManager: QubeeManager
     @Inject lateinit var messageRepository: MessageRepository
     @Inject lateinit var conversationRepository: ConversationRepository
+    @Inject lateinit var contactRepository: ContactRepository
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var isRunning = false
@@ -186,14 +188,13 @@ class MessageService : Service(), NetworkCallback {
      * the sender isn't a known contact yet, or the envelope
      * doesn't parse).
      *
-     * No-op if the matched Contact already has a non-null peerId
-     * — matching the existing routing without re-stamping. The
-     * `Index(value = ["peerId"])` on the Contact entity keeps the
-     * lookup cheap.
+     * The actual write goes through ContactRepository.observePeerIdentityLink so the trust policy
+     * can downgrade a previously verified contact if the same peer suddenly maps to a different
+     * Qubee identity.
      */
     private suspend fun populateContactPeerId(senderPeerId: String, wire: ByteArray): com.qubee.messenger.data.model.Contact? {
         val senderIdentityHex = qubeeManager.inspectEnvelopeSender(wire) ?: return null
-        val contact = contactRepository.getContactByIdentityId(senderIdentityHex) ?: run {
+        val contact = contactRepository.observePeerIdentityLink(senderPeerId, senderIdentityHex) ?: run {
             Timber.d(
                 "No Contact for identityId=%s; skipping peerId population for %s",
                 senderIdentityHex,
@@ -201,15 +202,14 @@ class MessageService : Service(), NetworkCallback {
             )
             return null
         }
-        if (contact.peerId == senderPeerId) return contact
-        contactRepository.updatePeerId(contact.id, senderPeerId)
         Timber.d(
-            "Linked Contact[id=%s, identityId=%s] to libp2p peer %s",
+            "Observed Contact[id=%s, identityId=%s, trust=%s] for libp2p peer %s",
             contact.id,
             contact.identityId,
+            contact.trustLevel,
             senderPeerId,
         )
-        return contact.copy(peerId = senderPeerId)
+        return contact
     }
 
     override fun onPeerDiscovered(peerId: String) {
@@ -220,7 +220,7 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Linking peer %s ↔ identity %s", peerId, identityIdHex)
         serviceScope.launch {
             try {
-                val contact = contactRepository.getContactByIdentityId(identityIdHex)
+                val contact = contactRepository.observePeerIdentityLink(peerId, identityIdHex)
                 if (contact == null) {
                     Timber.d(
                         "onPeerLinked: no Contact for identityId=%s; skipping peerId stamp",
@@ -228,8 +228,13 @@ class MessageService : Service(), NetworkCallback {
                     )
                     return@launch
                 }
-                if (contact.peerId == peerId) return@launch
-                contactRepository.updatePeerId(contact.id, peerId)
+                Timber.d(
+                    "onPeerLinked: Contact[id=%s, identityId=%s, trust=%s] linked to peer %s",
+                    contact.id,
+                    contact.identityId,
+                    contact.trustLevel,
+                    peerId,
+                )
             } catch (e: Exception) {
                 Timber.e(e, "onPeerLinked failed for identity=%s", identityIdHex)
             }

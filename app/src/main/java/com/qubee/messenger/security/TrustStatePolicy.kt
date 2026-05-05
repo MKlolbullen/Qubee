@@ -61,6 +61,33 @@ object TrustStatePolicy {
     }
 
     /**
+     * Apply a Qubee identityId observation from the transport/handshake layer.
+     *
+     * This catches a high-risk edge case: the same libp2p PeerId is now linked to a different Qubee
+     * identityId than the contact row previously held. The callback may not have raw public key
+     * bytes yet, but an identityId mismatch is enough to downgrade trust and force re-verification.
+     */
+    fun applyObservedPeerIdentityId(
+        contact: Contact,
+        observedIdentityId: String,
+        nowMillis: Long,
+    ): Contact {
+        if (observedIdentityId.isBlank() || observedIdentityId == contact.identityId) return contact
+
+        val nextTrust = when (contact.trustLevel) {
+            TrustLevel.VERIFIED -> TrustLevel.KEY_CHANGED
+            TrustLevel.COMPROMISED -> TrustLevel.COMPROMISED
+            else -> TrustLevel.UNKNOWN
+        }
+
+        return contact.copy(
+            trustLevel = nextTrust,
+            verificationStatus = ContactVerificationStatus.UNVERIFIED,
+            updatedAt = nowMillis,
+        )
+    }
+
+    /**
      * Whether this contact is allowed to render as high-trust / verified in chat UI.
      */
     fun canRenderAsVerified(contact: Contact?): Boolean =

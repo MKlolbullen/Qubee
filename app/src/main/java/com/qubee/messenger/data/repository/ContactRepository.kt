@@ -7,6 +7,7 @@ import com.qubee.messenger.data.model.ContactWithLastMessage
 import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.database.dao.ContactDao
 import com.qubee.messenger.data.repository.database.dao.CryptoKeyDao
+import com.qubee.messenger.security.TrustStatePolicy
 import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -58,6 +59,28 @@ class ContactRepository @Inject constructor(
 
     suspend fun updatePeerId(contactId: String, peerId: String?) {
         contactDao.updatePeerId(contactId, peerId)
+    }
+
+    /**
+     * Persist an observed contact identity key through the trust-state policy.
+     *
+     * This is the choke point for key-change safety: callers that learn a peer identity from
+     * onboarding, peer-link inspection, inbound message sender inspection, or future sync flows
+     * should call this instead of directly overwriting Contact.identityKey. A previously verified
+     * contact presenting a different key is downgraded to TrustLevel.KEY_CHANGED and must not render
+     * as verified until re-verification succeeds.
+     */
+    suspend fun observeIdentityKey(contactId: String, observedIdentityKey: ByteArray?, nowMillis: Long = System.currentTimeMillis()): Contact? {
+        val existing = contactDao.getContactById(contactId) ?: return null
+        val updated = TrustStatePolicy.applyObservedIdentityKey(
+            contact = existing,
+            observedIdentityKey = observedIdentityKey,
+            nowMillis = nowMillis,
+        )
+        if (updated != existing) {
+            contactDao.updateContact(updated)
+        }
+        return updated
     }
 
     suspend fun getContactName(contactId: String): String =

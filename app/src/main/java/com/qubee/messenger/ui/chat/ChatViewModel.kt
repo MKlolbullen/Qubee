@@ -106,10 +106,39 @@ class ChatViewModel @Inject constructor(
                 isFromMe = true,
             )
             messageRepository.saveMessage(message)
-            // TODO(rev-4): plug QubeeManager.sendP2PMessage into the
-            // Rust message pipeline; bump status to SENT / FAILED on
-            // the JNI callback.
-            _events.emit(ChatUiEvent.Notice("Message queued (P2P delivery not yet connected)"))
+
+            // Encrypt via the Rust JNI bridge. The session id is the
+            // hex-encoded GroupId — same value as conversationId per
+            // ConversationRepository.getOrCreateConversationId.
+            val encrypted = runCatching { qubeeManager.encryptMessage(conversationId, payload) }
+                .getOrNull()
+            if (encrypted == null) {
+                messageRepository.updateMessageStatus(message.id, MessageStatus.FAILED)
+                _events.emit(
+                    ChatUiEvent.Notice(
+                        "Encrypt failed — peer may not have accepted the group invite yet",
+                    ),
+                )
+                return@launch
+            }
+
+            // Publish via libp2p. The "peer id" passed to
+            // sendP2PMessage today is whatever the caller hands in;
+            // we forward the application-level contactId (the same
+            // string ChatFragment received as a nav arg). The Rust
+            // side resolves it; if libp2p doesn't have a route the
+            // command is queued, not actually delivered. Status =
+            // SENT here means "encrypted bytes left this device",
+            // not "peer ack". Real delivery confirmation is a
+            // post-alpha hook.
+            val sendOk = runCatching {
+                qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+            }.getOrDefault(false)
+            val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
+            messageRepository.updateMessageStatus(message.id, newStatus)
+            if (!sendOk) {
+                _events.emit(ChatUiEvent.Notice("P2P send failed"))
+            }
         }
     }
 

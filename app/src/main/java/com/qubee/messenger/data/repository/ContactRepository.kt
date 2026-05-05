@@ -83,6 +83,36 @@ class ContactRepository @Inject constructor(
         return updated
     }
 
+    /**
+     * Link a libp2p peer id to an observed Qubee identity id without bypassing trust policy.
+     *
+     * This handles two cases:
+     * - Known identityId: stamp/update Contact.peerId.
+     * - Existing peerId linked to a different identityId: downgrade that contact to KEY_CHANGED
+     *   before any UI can keep rendering it as verified.
+     */
+    suspend fun observePeerIdentityLink(peerId: String, identityIdHex: String, nowMillis: Long = System.currentTimeMillis()): Contact? {
+        val byPeer = contactDao.getContactByPeerId(peerId)
+        if (byPeer != null && byPeer.identityId != identityIdHex) {
+            val downgraded = TrustStatePolicy.applyObservedPeerIdentityId(
+                contact = byPeer,
+                observedIdentityId = identityIdHex,
+                nowMillis = nowMillis,
+            )
+            if (downgraded != byPeer) {
+                contactDao.updateContact(downgraded)
+            }
+            return downgraded
+        }
+
+        val byIdentity = contactDao.getContactByIdentityId(identityIdHex) ?: return byPeer
+        if (byIdentity.peerId == peerId) return byIdentity
+
+        val updated = byIdentity.copy(peerId = peerId, updatedAt = nowMillis)
+        contactDao.updateContact(updated)
+        return updated
+    }
+
     suspend fun getContactName(contactId: String): String =
         contactDao.getContactById(contactId)?.displayName ?: ""
 

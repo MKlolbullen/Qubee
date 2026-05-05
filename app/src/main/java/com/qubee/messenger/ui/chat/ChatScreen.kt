@@ -76,6 +76,9 @@ import com.qubee.messenger.ui.theme.QubeeQuantumBrush
 import com.qubee.messenger.ui.theme.QubeeSecondaryButton
 import com.qubee.messenger.ui.theme.QubeeStatusPill
 import com.qubee.messenger.ui.theme.QubeeTheme
+import com.qubee.messenger.ui.invite.QrScannerActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.ui.platform.LocalContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -91,6 +94,17 @@ fun ChatScreen(
         val snackbarHostState = remember { SnackbarHostState() }
         var inputText by remember { mutableStateOf("") }
         var showDetails by remember { mutableStateOf(false) }
+        val context = LocalContext.current
+
+        // Embedded ZXing scanner for the verification dialog. The
+        // scanned text is fed straight into the existing
+        // `confirmContactVerification` bridge so QR + typed-input
+        // share the same persistence + UI flip path.
+        val verifyScanLauncher = rememberLauncherForActivityResult(QrScannerActivity.contract()) { result ->
+            result.contents?.let { scanned ->
+                viewModel.confirmContactVerification(scanned)
+            }
+        }
 
         LaunchedEffect(viewModel) {
             viewModel.events.collect { event ->
@@ -176,6 +190,14 @@ fun ChatScreen(
                 sasCode = uiState.pendingSas,
                 onConfirmFingerprint = viewModel::confirmContactVerification,
                 onConfirmSasMatch = viewModel::confirmSasMatch,
+                onScanQr = {
+                    verifyScanLauncher.launch(
+                        QrScannerActivity.options(
+                            context,
+                            prompt = "Scan the contact's verification QR",
+                        ),
+                    )
+                },
                 onDismiss = viewModel::dismissContactVerification,
             )
         }

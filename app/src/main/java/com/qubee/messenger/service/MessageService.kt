@@ -108,7 +108,19 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Encrypted message received from %s (%d bytes)", senderId, data.size)
         serviceScope.launch {
             try {
-                val conversationId = conversationRepository.getOrCreateConversationId(senderId)
+                // Resolve the application-level contact id, if any,
+                // by libp2p PeerId. Once population code lights up
+                // (post-handshake or TOFU on first inbound), this
+                // routes packets to the right Contact row even
+                // though the libp2p PeerId and the application
+                // contact id live in different identity spaces.
+                // Until population lands, getContactByPeerId returns
+                // null and we fall back to using the libp2p sender
+                // id directly as the conversation key — same
+                // behaviour as before this batch.
+                val mappedContact = contactRepository.getContactByPeerId(senderId)
+                val routedSenderId = mappedContact?.id ?: senderId
+                val conversationId = conversationRepository.getOrCreateConversationId(routedSenderId)
                 if (conversationId.isEmpty()) {
                     Timber.w(
                         "Cannot route inbound from %s: conversation setup failed (onboarding?)",
@@ -138,7 +150,7 @@ class MessageService : Service(), NetworkCallback {
                 val msg = Message(
                     id = UUID.randomUUID().toString(),
                     conversationId = conversationId,
-                    senderId = senderId,
+                    senderId = routedSenderId,
                     content = plaintext,
                     contentType = MessageType.TEXT,
                     timestamp = System.currentTimeMillis(),
@@ -146,6 +158,14 @@ class MessageService : Service(), NetworkCallback {
                     isFromMe = false,
                 )
                 messageRepository.saveMessage(msg)
+                // Best-effort online-status bump for the linked
+                // contact. Skipped silently when the contact isn't
+                // known (mappedContact == null) — still functional,
+                // just no presence indicator update.
+                if (mappedContact != null) {
+                    val now = System.currentTimeMillis()
+                    contactRepository.updateOnlineStatus(mappedContact.id, true, now)
+                }
             } catch (e: Exception) {
                 Timber.e(e, "Failed to process inbound message from %s", senderId)
             }

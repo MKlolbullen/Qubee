@@ -35,6 +35,9 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE identityId = :identityId")
     suspend fun getContactByIdentityId(identityId: String): Contact?
 
+    @Query("SELECT * FROM contacts WHERE peerId = :peerId LIMIT 1")
+    suspend fun getContactByPeerId(peerId: String): Contact?
+
     @Query("SELECT * FROM contacts WHERE phoneNumber = :phoneNumber")
     suspend fun getContactByPhoneNumber(phoneNumber: String): Contact?
 
@@ -96,6 +99,9 @@ interface ContactDao {
 
     @Query("UPDATE contacts SET profilePictureUrl = :profilePictureUrl WHERE id = :contactId")
     suspend fun updateProfilePicture(contactId: String, profilePictureUrl: String?)
+
+    @Query("UPDATE contacts SET peerId = :peerId WHERE id = :contactId")
+    suspend fun updatePeerId(contactId: String, peerId: String?)
 
     @Delete
     suspend fun deleteContact(contact: Contact)

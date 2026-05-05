@@ -45,6 +45,19 @@ class ContactRepository @Inject constructor(
     suspend fun getContactById(contactId: String): Contact? =
         contactDao.getContactById(contactId)
 
+    /// Look up a contact by their libp2p PeerId. Returns null if no
+    /// contact has been linked to this PeerId yet — population is
+    /// expected from the post-handshake "remember the peer that
+    /// just sent us this RequestJoin/JoinAccepted" path. Callers
+    /// (notably `MessageService.onMessageReceived`) should fall
+    /// back gracefully on null.
+    suspend fun getContactByPeerId(peerId: String): Contact? =
+        contactDao.getContactByPeerId(peerId)
+
+    suspend fun updatePeerId(contactId: String, peerId: String?) {
+        contactDao.updatePeerId(contactId, peerId)
+    }
+
     suspend fun getContactName(contactId: String): String =
         contactDao.getContactById(contactId)?.displayName ?: ""
 

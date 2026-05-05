@@ -24,6 +24,9 @@ jobs:
       - name: Check JNI symbol contract
         run: bash scripts/check_jni_contracts.sh
 
+      - name: Audit message/file bridge contract
+        run: bash scripts/audit_message_file_bridge.sh
+
       - name: Typecheck Rust JNI surface
         run: |
           if grep -q '^_typecheck_jni = ' Cargo.toml; then

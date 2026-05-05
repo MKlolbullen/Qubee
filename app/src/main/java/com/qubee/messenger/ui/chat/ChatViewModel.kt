@@ -289,11 +289,22 @@ class ChatViewModel @Inject constructor(
                 verificationLabel = "Compare with peer",
                 isVerified = false,
             )
-            _uiState.value = _uiState.value.copy(details = updatedDetails)
+            _uiState.value = _uiState.value.copy(
+                details = updatedDetails,
+                pendingVerification = true,
+            )
             _events.emit(
                 ChatUiEvent.Notice("Compare $canonicalFingerprint with the contact's device"),
             )
         }
+    }
+
+    /**
+     * Close the OOB-verification dialog without making any changes.
+     * Called from the dialog's Cancel button + system back press.
+     */
+    fun dismissContactVerification() {
+        _uiState.value = _uiState.value.copy(pendingVerification = false)
     }
 
     /**
@@ -302,18 +313,17 @@ class ChatViewModel @Inject constructor(
      * device and entered/scanned it locally. Routes through
      * `qubeeManager.verifyIdentityKey` for the actual cryptographic
      * comparison; on success, persists the trust bump to
-     * `ContactRepository` (so a restart keeps the verified state)
-     * and flips the UI to [ConversationSecurityState.Verified].
+     * `ContactRepository` (so a restart keeps the verified state),
+     * flips the UI to [ConversationSecurityState.Verified], and
+     * dismisses the verification dialog.
      *
      * `expectedFingerprint` is matched case- and space-insensitively
      * against `IdentityKey::fingerprint()` on the Rust side, so the
      * user can paste a `"AABB CCDD EEFF GGHH"` string verbatim or
      * type it in lower-case without separators — both work.
      *
-     * The UI affordance that calls this (text input, QR scan, etc.)
-     * is its own batch — wiring this method here unblocks that work
-     * by making sure the persistence + bridge call are already in
-     * place when the UI lands.
+     * On mismatch the dialog stays open so the user can retry
+     * without re-navigating to it.
      */
     fun confirmContactVerification(expectedFingerprint: String) {
         if (conversationId.isEmpty()) {
@@ -356,6 +366,7 @@ class ChatViewModel @Inject constructor(
                     verificationLabel = "Verified",
                 ),
                 securityState = ConversationSecurityState.Verified,
+                pendingVerification = false,
             )
             _events.emit(ChatUiEvent.Notice("Contact verified"))
         }
@@ -454,6 +465,12 @@ data class ChatUiState(
     val messages: List<UiMessage> = emptyList(),
     val details: ConversationDetailsUi = ConversationDetailsUi.placeholder(),
     val securityState: ConversationSecurityState = ConversationSecurityState.Unverified,
+    /// True while the OOB-verification dialog is open. Flipped on by
+    /// `requestContactVerification`, off by `confirmContactVerification`
+    /// on success or `dismissContactVerification` on user cancel.
+    /// On verify-failure (mismatch) it stays true so the dialog stays
+    /// open for retry.
+    val pendingVerification: Boolean = false,
 )
 
 data class ConversationDetailsUi(

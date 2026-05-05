@@ -48,6 +48,9 @@ echo "ANDROID_SDK_ROOT: ${ANDROID_SDK_ROOT:-<unset>}"
 section "JNI Kotlin/Rust symbol contract"
 bash scripts/check_jni_contracts.sh
 
+section "Message/file crypto bridge contract"
+bash scripts/audit_message_file_bridge.sh
+
 section "Rust toolchain availability"
 require_cmd cargo
 

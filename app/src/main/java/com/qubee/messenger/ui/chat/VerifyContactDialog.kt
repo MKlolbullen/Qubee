@@ -8,9 +8,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Divider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -58,6 +62,7 @@ fun VerifyContactDialog(
     sasCode: String?,
     onConfirmFingerprint: (expected: String) -> Unit,
     onConfirmSasMatch: () -> Unit,
+    onScanQr: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     var typed by remember { mutableStateOf("") }
@@ -101,6 +106,23 @@ fun VerifyContactDialog(
                     singleLine = false,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                // QR-scan alternative to typing — launches the
+                // embedded ZXing scanner. The scanned text is fed
+                // straight into `confirmContactVerification`, same
+                // path as a typed value, so a peer who sends their
+                // fingerprint as a QR code is interchangeable with
+                // one who reads it out loud.
+                OutlinedButton(
+                    onClick = onScanQr,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.QrCodeScanner,
+                        contentDescription = null,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Scan QR instead")
+                }
 
                 if (sasCode != null) {
                     Spacer(Modifier.height(4.dp))

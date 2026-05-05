@@ -173,10 +173,12 @@ fn canonical_state_sync_response_starts_with_versioned_tag() {
         requester_id: IdentityId::from([0u8; 32]),
         members: Vec::new(),
         current_version: 1,
+        wrapped_group_key: None,
         timestamp: 0,
     };
     let canonical = canonical_state_sync_response(&body).unwrap();
-    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v1"));
+    // _v2: body grew an Option<WrappedGroupKey> in this batch.
+    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v2"));
 }
 
 #[test]

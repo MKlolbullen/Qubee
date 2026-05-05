@@ -392,12 +392,34 @@ pub fn process_request_state_sync(
             kyber_pub: m.kyber_pub.clone(),
         })
         .collect();
+
+    // Wrap the current group key under the requester's per-group
+    // Kyber pubkey if we have one for them. A blank pubkey
+    // (legacy enrolment, snapshot-drift case) → no key delivery,
+    // requester keeps whatever they had. Failures inside the wrap
+    // step are swallowed for the same reason — a partial response
+    // is better than no response, the receiver just stays in the
+    // "missed-rotation" state until another KeyRotation lands.
+    let wrapped_group_key = if requester.kyber_pub.is_empty() {
+        None
+    } else {
+        match gm.export_group_key(&body.group_id) {
+            Some(mut key_bytes) => {
+                let wrapped = WrappedGroupKey::wrap(&key_bytes, &requester.kyber_pub).ok();
+                key_bytes.zeroize();
+                wrapped
+            }
+            None => None,
+        }
+    };
+
     let response = StateSyncResponseBody {
         group_id: body.group_id,
         responder_id,
         requester_id: body.requester_id,
         members,
         current_version: group.version,
+        wrapped_group_key,
         timestamp: now_secs(),
     };
     let (resp_body, resp_sig) =
@@ -447,6 +469,52 @@ pub fn process_state_sync_response(
         return Err(anyhow!("StateSyncResponse signature failed"));
     }
     gm.apply_state_sync(body.group_id, &body.members, body.current_version)?;
+
+    // Install the wrapped group key if the responder included one.
+    // Unwrap requires our long-lived per-group Kyber secret, set
+    // up either by `record_external_invite_acceptance` (joiner
+    // path) or the owner's `create_group` (rev-2 5b). Failures
+    // here are best-effort: a partial state sync (members +
+    // version installed, key not) leaves the receiver with a
+    // fresh roster but a stale key, which still degrades
+    // gracefully on the next KeyRotation broadcast.
+    if let Some(wrapped) = &body.wrapped_group_key {
+        match gm.load_my_kyber_secret(body.group_id) {
+            Ok(Some(secret_bytes)) => {
+                match wrapped.unwrap(&secret_bytes) {
+                    Ok(mut key_bytes) => {
+                        let install = gm.install_group_key(body.group_id, &key_bytes);
+                        key_bytes.zeroize();
+                        if let Err(e) = install {
+                            eprintln!(
+                                "warning: state-sync key install failed for group {}: {e:#}",
+                                hex::encode(body.group_id.as_ref()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: state-sync key unwrap failed for group {}: {e:#}",
+                            hex::encode(body.group_id.as_ref()),
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "warning: state-sync key delivery for group {} skipped — no local Kyber secret",
+                    hex::encode(body.group_id.as_ref()),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: state-sync Kyber-secret load failed for group {}: {e:#}",
+                    hex::encode(body.group_id.as_ref()),
+                );
+            }
+        }
+    }
+
     Ok(true)
 }
 

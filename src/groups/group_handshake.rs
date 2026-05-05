@@ -302,6 +302,22 @@ pub struct StateSyncResponseBody {
     pub requester_id: IdentityId,
     pub members: Vec<GroupMemberSummary>,
     pub current_version: u64,
+    /// The current group symmetric key, KEM-wrapped under the
+    /// requester's per-group Kyber pubkey (looked up from the
+    /// responder's local view of the requester). `None` when the
+    /// responder doesn't have a Kyber pubkey for the requester
+    /// (legacy enrolment, snapshot drift) — receivers fall back
+    /// to whatever key they already had, accepting that they
+    /// stay out of band on group messages encrypted with the
+    /// fresh key.
+    ///
+    /// Closes the receive-decrypt gap that the rev-4 P1
+    /// `RequestStateSync` flow left open: a member who missed a
+    /// `MemberAdded` *and* a `KeyRotation` previously got their
+    /// roster + version back, but bounced on the strict
+    /// generation gate in `decrypt_group_message` because their
+    /// local key was stale.
+    pub wrapped_group_key: Option<WrappedGroupKey>,
     pub timestamp: u64,
 }
 
@@ -387,7 +403,12 @@ const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
 const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
 const REQUEST_STATE_SYNC_TAG: &[u8] = b"qubee_handshake_request_state_sync_v1";
-const STATE_SYNC_RESPONSE_TAG: &[u8] = b"qubee_handshake_state_sync_response_v1";
+// _v2: the body grew an `Option<WrappedGroupKey>` for KeyRotation
+// re-send (extends the rev-4 P1 resync flow to also recover the
+// current group key). Devices on _v1 will fail signature verify
+// on the new bytes — the version bump is a labeling correction,
+// not enforcement.
+const STATE_SYNC_RESPONSE_TAG: &[u8] = b"qubee_handshake_state_sync_response_v2";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);
@@ -482,6 +503,22 @@ pub fn canonical_state_sync_response(body: &StateSyncResponseBody) -> Result<Vec
     }
     out.push(0u8);
     out.extend_from_slice(&body.current_version.to_le_bytes());
+    out.push(0u8);
+    // Wrapped group key is optional. Frame it with a 1-byte tag
+    // (0 = absent, 1 = present) followed by the wrapped struct's
+    // length-prefixed fields. Same shape the `KeyRotationBody`
+    // canonical bytes use for each delivery — keeps the
+    // serialisation pattern consistent across handshake variants.
+    if let Some(wrapped) = &body.wrapped_group_key {
+        out.push(1u8);
+        out.extend_from_slice(&(wrapped.kem_ciphertext.len() as u32).to_le_bytes());
+        out.extend_from_slice(&wrapped.kem_ciphertext);
+        out.extend_from_slice(&wrapped.nonce);
+        out.extend_from_slice(&(wrapped.wrapped_key.len() as u32).to_le_bytes());
+        out.extend_from_slice(&wrapped.wrapped_key);
+    } else {
+        out.push(0u8);
+    }
     out.push(0u8);
     out.extend_from_slice(&body.timestamp.to_le_bytes());
     Ok(out)

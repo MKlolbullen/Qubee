@@ -251,26 +251,30 @@ class ChatViewModel @Inject constructor(
                 _events.emit(ChatUiEvent.Notice("Peer identity not stored — cannot verify yet"))
                 return@launch
             }
-            val bridgeOk = runCatching {
-                qubeeManager.verifyIdentityKey(contactId, peerIdKey, ByteArray(0))
-            }
-            bridgeOk.onFailure { err ->
+            // Compute the canonical fingerprint via the Rust JNI
+            // bridge. The Kotlin-side `toFingerprint` extension
+            // formats the first 8 raw bytes with dashes and does
+            // NOT match what `IdentityKey::fingerprint()` produces
+            // — using it for OOB compare would have peers staring at
+            // different strings on their two devices and concluding
+            // the verification failed when it didn't.
+            val canonicalFingerprint = runCatching {
+                qubeeManager.computeFingerprint(peerIdKey)
+            }.getOrNull()
+            if (canonicalFingerprint == null) {
                 _events.emit(
-                    ChatUiEvent.Notice("Verification bridge unreachable: ${err.message ?: "unknown error"}"),
+                    ChatUiEvent.Notice("Verification bridge unreachable or peer identity malformed"),
                 )
                 return@launch
             }
-            // Bridge round-trips. Surface the locally-computed
-            // fingerprint for OOB compare, no Verified claim.
-            val displayFingerprint = peerIdKey.toFingerprint()
             val updatedDetails = _uiState.value.details.copy(
-                fingerprint = displayFingerprint,
+                fingerprint = canonicalFingerprint,
                 verificationLabel = "Compare with peer",
                 isVerified = false,
             )
             _uiState.value = _uiState.value.copy(details = updatedDetails)
             _events.emit(
-                ChatUiEvent.Notice("Compare $displayFingerprint with the contact's device"),
+                ChatUiEvent.Notice("Compare $canonicalFingerprint with the contact's device"),
             )
         }
     }

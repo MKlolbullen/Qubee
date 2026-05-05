@@ -1693,3 +1693,36 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
         result.unwrap_or(std::ptr::null_mut())
     })
 }
+
+/// Compute the canonical 8-byte BLAKE3 fingerprint of an
+/// `IdentityKey` and return it as a string in the form
+/// `"AABB CCDD EEFF GGHH"` (4 groups of 2 bytes / 4 hex chars,
+/// space-separated). Same value as `IdentityKey::fingerprint()`,
+/// exposed through JNI so the verify UI can display the same
+/// fingerprint Rust uses internally — closes the format-disagreement
+/// gap from the bridge-checkpoint commit (the Kotlin
+/// `ByteArray.toFingerprint` extension formats the first 8 raw
+/// bytes with dashes, which doesn't match Rust's hash).
+///
+/// Returns `null` on any decode error.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeComputeFingerprint(
+    env: JNIEnv,
+    _class: JClass,
+    identity_key_bytes: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let id_bytes: Vec<u8> = env
+                .convert_byte_array(&identity_key_bytes)
+                .map_err(|e| anyhow::anyhow!("invalid identity key bytes: {e}"))?;
+            let identity = IdentityKey::from_bytes(&id_bytes)
+                .map_err(|e| anyhow::anyhow!("IdentityKey decode failed: {e}"))?;
+            let java_str = env
+                .new_string(identity.fingerprint())
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}

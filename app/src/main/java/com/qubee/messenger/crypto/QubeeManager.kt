@@ -142,6 +142,28 @@ class QubeeManager @Inject constructor(
             }
         }
 
+    /**
+     * Compute the canonical 8-byte BLAKE3 fingerprint of a peer's
+     * `IdentityKey`, formatted as `"AABB CCDD EEFF GGHH"`. Use this
+     * — not the Kotlin `ByteArray.toFingerprint` extension — when
+     * displaying a fingerprint for OOB compare; it matches what
+     * Rust's `IdentityKey::fingerprint()` produces, so two devices
+     * comparing fingerprints are comparing the same string.
+     */
+    suspend fun computeFingerprint(identityKey: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeComputeFingerprint(identityKey)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust fingerprint JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust fingerprint computation failed")
+                null
+            }
+        }
+
     // --- Onboarding & invite links ---
 
     suspend fun createOnboardingBundle(
@@ -244,6 +266,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?
     private external fun nativeVerifyIdentityKey(contactId: String, identityKey: ByteArray, verificationData: ByteArray): Boolean
     private external fun nativeGenerateSAS(ourIdentityKey: ByteArray, peerIdentityKey: ByteArray): String?
+    private external fun nativeComputeFingerprint(identityKey: ByteArray): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

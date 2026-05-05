@@ -173,7 +173,9 @@ fun ChatScreen(
             VerifyContactDialog(
                 contactName = uiState.contactName,
                 localFingerprint = uiState.details.fingerprint,
-                onConfirm = viewModel::confirmContactVerification,
+                sasCode = uiState.pendingSas,
+                onConfirmFingerprint = viewModel::confirmContactVerification,
+                onConfirmSasMatch = viewModel::confirmSasMatch,
                 onDismiss = viewModel::dismissContactVerification,
             )
         }

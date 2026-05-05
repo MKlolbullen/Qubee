@@ -1831,3 +1831,54 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
         result.unwrap_or(std::ptr::null_mut())
     })
 }
+
+/// Generate a Short Authentication String (SAS) between the locally
+/// active identity and the supplied peer `IdentityKey` bytes,
+/// without forcing the caller to first fetch their own identity
+/// bytes. Convenience wrapper over `nativeGenerateSAS` for the
+/// common 1:1 verification UI path.
+///
+/// Returns the SAS as `"NNNN NNNN"` (two zero-padded 4-digit decimal
+/// groups) on success, or null on any failure (no active identity,
+/// invalid peer key, etc.). Both peers compute the same SAS as long
+/// as both supply each other's `IdentityKey::to_bytes()` output.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateSASForContact(
+    env: JNIEnv,
+    _class: JClass,
+    peer_identity_key: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let peer_bytes: Vec<u8> = env
+                .convert_byte_array(&peer_identity_key)
+                .map_err(|e| anyhow::anyhow!("invalid peer_identity_key bytes: {e}"))?;
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let our_bytes = identity.public_key().to_bytes();
+
+            let (first, second) = if our_bytes <= peer_bytes {
+                (our_bytes.as_slice(), peer_bytes.as_slice())
+            } else {
+                (peer_bytes.as_slice(), our_bytes.as_slice())
+            };
+            let mut hasher = Hasher::new();
+            hasher.update(first);
+            hasher.update(second);
+            let digest = hasher.finalize();
+            let h = digest.as_bytes();
+            let value: u32 = ((h[0] as u32) << 24)
+                | ((h[1] as u32) << 16)
+                | ((h[2] as u32) << 8)
+                | (h[3] as u32);
+            let high = ((value >> 16) & 0xFFFF) % 10_000;
+            let low = (value & 0xFFFF) % 10_000;
+            let sas = format!("{:04} {:04}", high, low);
+            let java_str = env
+                .new_string(sas)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}

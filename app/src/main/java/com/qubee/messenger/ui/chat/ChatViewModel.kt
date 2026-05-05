@@ -284,6 +284,12 @@ class ChatViewModel @Inject constructor(
                 )
                 return@launch
             }
+            // SAS is a nice-to-have; the fingerprint compare path
+            // works without it. Failures here just hide the SAS
+            // section of the dialog.
+            val sasCode = runCatching {
+                qubeeManager.generateSASForContact(peerIdKey)
+            }.getOrNull()
             val updatedDetails = _uiState.value.details.copy(
                 fingerprint = canonicalFingerprint,
                 verificationLabel = "Compare with peer",
@@ -292,6 +298,7 @@ class ChatViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(
                 details = updatedDetails,
                 pendingVerification = true,
+                pendingSas = sasCode,
             )
             _events.emit(
                 ChatUiEvent.Notice("Compare $canonicalFingerprint with the contact's device"),
@@ -304,7 +311,48 @@ class ChatViewModel @Inject constructor(
      * Called from the dialog's Cancel button + system back press.
      */
     fun dismissContactVerification() {
-        _uiState.value = _uiState.value.copy(pendingVerification = false)
+        _uiState.value = _uiState.value.copy(pendingVerification = false, pendingSas = null)
+    }
+
+    /**
+     * SAS-compare confirmation. Called when both peers have
+     * independently looked at the same SAS code on their devices
+     * and agreed it matches. Both devices compute the same code
+     * (Rust orders the byte buffers lexicographically before the
+     * BLAKE3 hash), so a "yes they match" claim from the user is
+     * itself the trust ceremony — no `verifyIdentityKey` round-
+     * trip needed.
+     *
+     * Persists `TrustLevel.VERIFIED` +
+     * `ContactVerificationStatus.VERIFIED_ONCE` so a restart
+     * honours the trust bump, flips uiState.securityState to
+     * Verified, and dismisses the dialog. Symmetric end state with
+     * the fingerprint path — they're two routes to the same row
+     * mutation.
+     */
+    fun confirmSasMatch() {
+        if (conversationId.isEmpty()) {
+            notice("No conversation to verify")
+            return
+        }
+        viewModelScope.launch {
+            contactRepository.updateTrustLevel(contactId, TrustLevel.VERIFIED)
+            contactRepository.updateVerificationStatus(
+                contactId,
+                ContactVerificationStatus.VERIFIED_ONCE,
+            )
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                details = current.details.copy(
+                    isVerified = true,
+                    verificationLabel = "Verified",
+                ),
+                securityState = ConversationSecurityState.Verified,
+                pendingVerification = false,
+                pendingSas = null,
+            )
+            _events.emit(ChatUiEvent.Notice("Contact verified via SAS"))
+        }
     }
 
     /**
@@ -367,6 +415,7 @@ class ChatViewModel @Inject constructor(
                 ),
                 securityState = ConversationSecurityState.Verified,
                 pendingVerification = false,
+                pendingSas = null,
             )
             _events.emit(ChatUiEvent.Notice("Contact verified"))
         }
@@ -467,10 +516,17 @@ data class ChatUiState(
     val securityState: ConversationSecurityState = ConversationSecurityState.Unverified,
     /// True while the OOB-verification dialog is open. Flipped on by
     /// `requestContactVerification`, off by `confirmContactVerification`
-    /// on success or `dismissContactVerification` on user cancel.
-    /// On verify-failure (mismatch) it stays true so the dialog stays
-    /// open for retry.
+    /// (fingerprint match) or `confirmSasMatch` (SAS match) on
+    /// success, or `dismissContactVerification` on user cancel.
+    /// On verify-failure (fingerprint mismatch) it stays true so the
+    /// dialog stays open for retry.
     val pendingVerification: Boolean = false,
+    /// SAS code for the pending verification, computed alongside the
+    /// fingerprint when `requestContactVerification` runs. `null`
+    /// when SAS isn't available (no active identity, JNI failure,
+    /// etc.) — the dialog renders the fingerprint half but hides
+    /// the SAS section in that case.
+    val pendingSas: String? = null,
 )
 
 data class ConversationDetailsUi(

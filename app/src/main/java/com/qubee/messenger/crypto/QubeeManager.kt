@@ -190,6 +190,33 @@ class QubeeManager @Inject constructor(
             }
         }
 
+    /**
+     * Compute the Short Authentication String (SAS) between the
+     * locally active identity and a peer's `IdentityKey` bytes.
+     * Both peers' devices independently compute the same string
+     * (Rust orders the byte buffers lexicographically before the
+     * BLAKE3 hash), so the user-side compare ceremony reduces to
+     * "do these two strings match?" — readable over voice in a
+     * few seconds, no typing.
+     *
+     * Returns the SAS as `"NNNN NNNN"` on success, or null on any
+     * failure (no active identity, invalid peer key, JNI not
+     * linked, etc.).
+     */
+    suspend fun generateSASForContact(peerIdentityKey: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeGenerateSASForContact(peerIdentityKey)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust SAS-for-contact JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "SAS-for-contact computation failed")
+                null
+            }
+        }
+
     // --- Onboarding & invite links ---
 
     suspend fun createOnboardingBundle(
@@ -294,6 +321,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeGenerateSAS(ourIdentityKey: ByteArray, peerIdentityKey: ByteArray): String?
     private external fun nativeComputeFingerprint(identityKey: ByteArray): String?
     private external fun nativeInspectEnvelopeSender(wire: ByteArray): String?
+    private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

@@ -270,9 +270,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                                 // the regular Kotlin callback so the
                                 // Rust core can run protocol logic
                                 // without needing a JNI round-trip.
-                                if let NodeEvent::MessageReceived { data, .. } = &event {
+                                if let NodeEvent::MessageReceived { sender, data, .. } = &event {
                                     if let Some(handshake) = GroupHandshake::from_wire(data) {
-                                        handle_inbound_handshake(handshake);
+                                        handle_inbound_handshake(handshake, sender.clone());
                                         continue;
                                     }
                                     if let Some(envelope) = GroupMessageEnvelope::from_wire(data) {
@@ -872,10 +872,79 @@ fn active_display_name() -> anyhow::Result<String> {
 /// Errors are logged but never bubbled — handshake processing is
 /// best-effort: we don't want a malformed frame from a hostile peer to
 /// take down the dispatch task.
-fn handle_inbound_handshake(frame: GroupHandshake) {
+///
+/// `sender_peer_id` is the libp2p PeerId of the peer who delivered
+/// this frame. After a successful handshake, we fire a
+/// `onPeerLinked(peer_id, identity_id_hex)` callback so the Android
+/// side can stamp the corresponding `Contact.peerId` — closes the
+/// chicken-and-egg gap where a contact's `peerId` only got
+/// populated on first inbound encrypted message, with nothing to
+/// route the *first* outbound from before any inbound had landed.
+fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
+    let extracted_identity = extract_peer_identity_hex(&frame);
     if let Err(e) = process_handshake(frame) {
         eprintln!("Rust: handshake rejected: {e:#}");
+        return;
     }
+    if let Some(identity_hex) = extracted_identity {
+        dispatch_peer_linked(sender_peer_id, identity_hex);
+    }
+}
+
+/// Pull the sender's `IdentityId` out of a handshake frame, hex-
+/// encoded. `None` for variants where the sender's identity isn't
+/// directly in the body (`JoinAccepted` / `JoinRejected` — both
+/// signed by the inviter, but the inviter id lives in the joiner's
+/// local invite-receipt, not in the body itself; the receiver
+/// already knows the inviter's identity from `expected_inviter_id`
+/// so a separate linkage from this side isn't needed).
+fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
+    let id: IdentityId = match frame {
+        GroupHandshake::RequestJoin { body, .. } => body.joiner_public_key.identity_id,
+        GroupHandshake::KeyRotation { body, .. } => body.rotator_id,
+        GroupHandshake::MemberAdded { body, .. } => body.adder_id,
+        GroupHandshake::RoleChange { body, .. } => body.promoter_id,
+        GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
+        GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
+        GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
+    };
+    Some(hex::encode(id.as_ref() as &[u8]))
+}
+
+/// Fire the Kotlin-side `onPeerLinked(peer_id, identity_id_hex)`
+/// callback. Best-effort — if the JVM / callback isn't attached
+/// (e.g., during early initialization), the linkage just isn't
+/// fired and the receive-path TOFU population still applies on
+/// the next inbound packet.
+fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread_permanently() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let cb_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match cb_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+    let j_peer = match env.new_string(peer_id) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let j_identity = match env.new_string(identity_id_hex) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = env.call_method(
+        callback_obj,
+        "onPeerLinked",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        &[JValue::Object(&j_peer), JValue::Object(&j_identity)],
+    );
 }
 
 fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {

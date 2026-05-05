@@ -216,6 +216,26 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Discovered new peer: %s", peerId)
     }
 
+    override fun onPeerLinked(peerId: String, identityIdHex: String) {
+        Timber.d("Linking peer %s ↔ identity %s", peerId, identityIdHex)
+        serviceScope.launch {
+            try {
+                val contact = contactRepository.getContactByIdentityId(identityIdHex)
+                if (contact == null) {
+                    Timber.d(
+                        "onPeerLinked: no Contact for identityId=%s; skipping peerId stamp",
+                        identityIdHex,
+                    )
+                    return@launch
+                }
+                if (contact.peerId == peerId) return@launch
+                contactRepository.updatePeerId(contact.id, peerId)
+            } catch (e: Exception) {
+                Timber.e(e, "onPeerLinked failed for identity=%s", identityIdHex)
+            }
+        }
+    }
+
     private fun createServiceNotification(): Notification {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

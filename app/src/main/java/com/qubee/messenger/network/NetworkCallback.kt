@@ -38,4 +38,23 @@ interface NetworkCallback {
     ) {
         // default no-op
     }
+
+    /**
+     * Fired by the Rust core after a successful handshake event
+     * (RequestJoin, KeyRotation, MemberAdded, RoleChange,
+     * RequestStateSync, StateSyncResponse) when the (libp2p PeerId,
+     * Qubee IdentityId) pair becomes known. Lets the Android side
+     * stamp `Contact.peerId` *before* any encrypted message round-
+     * trip — closes the chicken-and-egg gap where the
+     * receive-path TOFU population only fires after at least one
+     * inbound has arrived.
+     *
+     * @param peerId       libp2p PeerId of the peer who delivered
+     *                     the handshake frame.
+     * @param identityIdHex Qubee IdentityId of that peer, hex-encoded
+     *                     (64 chars / 32 bytes).
+     */
+    fun onPeerLinked(peerId: String, identityIdHex: String) {
+        // default no-op
+    }
 }

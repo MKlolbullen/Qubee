@@ -56,6 +56,16 @@ jobs:
       - name: cargo test
         run: cargo test --all-targets
 
+      # Type-check `src/jni_api.rs` on the host so a regression in
+      # the JNI surface (jni-crate API drift, missing match arms for
+      # new GroupHandshake variants, etc.) blocks CI before someone
+      # tries to build for an Android target. The Android JNI module
+      # is gated behind `cfg(target_os = "android")`; the
+      # `_typecheck_jni` feature exposes it on the host so we can
+      # verify it without an NDK installed.
+      - name: cargo build --features _typecheck_jni
+        run: cargo build --features _typecheck_jni
+
   rust-audit:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest

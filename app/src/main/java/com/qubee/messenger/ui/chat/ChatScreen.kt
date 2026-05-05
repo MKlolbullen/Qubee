@@ -742,6 +742,19 @@ enum class ConversationSecurityState(
         color = QubeePalette.Cyan,
         icon = Icons.Default.VerifiedUser,
     ),
+    /**
+     * PQ session has been manually verified by comparing identity fingerprints
+     * or SAS codes out of band. Functionally equivalent to [PqSessionActive]
+     * but signals the user has performed a trust ceremony. Reuses the same
+     * palette + icon; the label is what differentiates the two states.
+     */
+    Verified(
+        label = "Verified",
+        compactLabel = "VERIFIED",
+        description = "Your post-quantum session is active and the contact identity has been verified.",
+        color = QubeePalette.Cyan,
+        icon = Icons.Default.VerifiedUser,
+    ),
     Unverified(
         label = "Unverified contact",
         compactLabel = "VERIFY",

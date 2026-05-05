@@ -7,6 +7,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Update
 import com.qubee.messenger.data.model.Contact
+import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.ContactWithLastMessage
 import com.qubee.messenger.data.model.TrustLevel
 import kotlinx.coroutines.flow.Flow
@@ -83,6 +84,9 @@ interface ContactDao {
 
     @Query("UPDATE contacts SET trustLevel = :trustLevel WHERE id = :contactId")
     suspend fun updateTrustLevel(contactId: String, trustLevel: TrustLevel)
+
+    @Query("UPDATE contacts SET verificationStatus = :status WHERE id = :contactId")
+    suspend fun updateVerificationStatus(contactId: String, status: ContactVerificationStatus)
 
     @Query("UPDATE contacts SET isBlocked = :isBlocked WHERE id = :contactId")
     suspend fun updateBlockedStatus(contactId: String, isBlocked: Boolean)

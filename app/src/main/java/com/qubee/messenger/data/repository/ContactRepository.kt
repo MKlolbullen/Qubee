@@ -2,6 +2,7 @@ package com.qubee.messenger.data.repository
 
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.model.Contact
+import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.ContactWithLastMessage
 import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.database.dao.ContactDao
@@ -67,6 +68,10 @@ class ContactRepository @Inject constructor(
 
     suspend fun updateTrustLevel(contactId: String, level: TrustLevel) {
         contactDao.updateTrustLevel(contactId, level)
+    }
+
+    suspend fun updateVerificationStatus(contactId: String, status: ContactVerificationStatus) {
+        contactDao.updateVerificationStatus(contactId, status)
     }
 
     suspend fun updateOnlineStatus(contactId: String, online: Boolean, lastSeen: Long?) {

@@ -4,9 +4,11 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.Message
 import com.qubee.messenger.data.model.MessageStatus
 import com.qubee.messenger.data.model.MessageType
+import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.MessageRepository
@@ -69,14 +71,29 @@ class ChatViewModel @Inject constructor(
             val contact = contactRepository.getContactById(contactId)
             val name = contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
 
+            // Honour persisted trust state: a contact whose
+            // `trustLevel` is `TrustLevel.VERIFIED` (set by a
+            // previous successful `confirmContactVerification`) opens
+            // straight into the verified security state. Without
+            // this, the badge resets to Unverified on every restart.
+            val isAlreadyVerified = contact?.trustLevel == TrustLevel.VERIFIED
             val initialDetails = ConversationDetailsUi.placeholder().copy(
                 fingerprint = (contact?.identityKey?.toFingerprint() ?: "Not available"),
-                isVerified = false,
-                verificationLabel = if (contact == null) "Unknown" else "Unverified",
+                isVerified = isAlreadyVerified,
+                verificationLabel = when {
+                    isAlreadyVerified -> "Verified"
+                    contact == null -> "Unknown"
+                    else -> "Unverified"
+                },
             )
             _uiState.value = _uiState.value.copy(
                 contactName = name,
                 details = initialDetails,
+                securityState = if (isAlreadyVerified) {
+                    ConversationSecurityState.Verified
+                } else {
+                    ConversationSecurityState.Unverified
+                },
             )
 
             messageRepository
@@ -276,6 +293,71 @@ class ChatViewModel @Inject constructor(
             _events.emit(
                 ChatUiEvent.Notice("Compare $canonicalFingerprint with the contact's device"),
             )
+        }
+    }
+
+    /**
+     * User-driven OOB compare confirmation. Called once the user has
+     * read the peer's fingerprint (or SAS code) on their *other*
+     * device and entered/scanned it locally. Routes through
+     * `qubeeManager.verifyIdentityKey` for the actual cryptographic
+     * comparison; on success, persists the trust bump to
+     * `ContactRepository` (so a restart keeps the verified state)
+     * and flips the UI to [ConversationSecurityState.Verified].
+     *
+     * `expectedFingerprint` is matched case- and space-insensitively
+     * against `IdentityKey::fingerprint()` on the Rust side, so the
+     * user can paste a `"AABB CCDD EEFF GGHH"` string verbatim or
+     * type it in lower-case without separators — both work.
+     *
+     * The UI affordance that calls this (text input, QR scan, etc.)
+     * is its own batch — wiring this method here unblocks that work
+     * by making sure the persistence + bridge call are already in
+     * place when the UI lands.
+     */
+    fun confirmContactVerification(expectedFingerprint: String) {
+        if (conversationId.isEmpty()) {
+            notice("No conversation to verify")
+            return
+        }
+        viewModelScope.launch {
+            val contact = contactRepository.getContactById(contactId)
+            val peerIdKey = contact?.identityKey
+            if (peerIdKey == null) {
+                _events.emit(ChatUiEvent.Notice("Peer identity not stored — cannot verify yet"))
+                return@launch
+            }
+            val expectedBytes = expectedFingerprint.trim().toByteArray()
+            if (expectedBytes.isEmpty()) {
+                _events.emit(ChatUiEvent.Notice("Enter the fingerprint shown on the contact's device"))
+                return@launch
+            }
+            val matches = runCatching {
+                qubeeManager.verifyIdentityKey(contactId, peerIdKey, expectedBytes)
+            }.getOrDefault(false)
+            if (!matches) {
+                _events.emit(
+                    ChatUiEvent.Notice(
+                        "Fingerprints don't match — verification failed. Compare both devices again.",
+                    ),
+                )
+                return@launch
+            }
+            // Persist so a restart honours the trust bump.
+            contactRepository.updateTrustLevel(contactId, TrustLevel.VERIFIED)
+            contactRepository.updateVerificationStatus(
+                contactId,
+                ContactVerificationStatus.VERIFIED_ONCE,
+            )
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                details = current.details.copy(
+                    isVerified = true,
+                    verificationLabel = "Verified",
+                ),
+                securityState = ConversationSecurityState.Verified,
+            )
+            _events.emit(ChatUiEvent.Notice("Contact verified"))
         }
     }
 

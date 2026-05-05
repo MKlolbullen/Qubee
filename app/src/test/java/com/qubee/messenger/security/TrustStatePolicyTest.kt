@@ -50,6 +50,47 @@ class TrustStatePolicyTest {
     }
 
     @Test
+    fun verifiedContactReceivingChangedPeerIdentityIdBecomesKeyChanged() {
+        val contact = verifiedContact(identityKey = byteArrayOf(1, 2, 3, 4)).copy(
+            identityId = "old-identity",
+            peerId = "same-libp2p-peer",
+        )
+
+        val updated = TrustStatePolicy.applyObservedPeerIdentityId(
+            contact = contact,
+            observedIdentityId = "new-identity",
+            nowMillis = 9_000L,
+        )
+
+        assertEquals(TrustLevel.KEY_CHANGED, updated.trustLevel)
+        assertEquals(ContactVerificationStatus.UNVERIFIED, updated.verificationStatus)
+        assertEquals("old-identity", updated.identityId)
+        assertEquals("same-libp2p-peer", updated.peerId)
+        assertEquals(9_000L, updated.updatedAt)
+        assertFalse(TrustStatePolicy.canRenderAsVerified(updated))
+        assertTrue(TrustStatePolicy.requiresKeyChangeWarning(updated))
+    }
+
+    @Test
+    fun verifiedContactReceivingSamePeerIdentityIdRemainsVerified() {
+        val contact = verifiedContact(identityKey = byteArrayOf(1, 2, 3, 4)).copy(
+            identityId = "same-identity",
+            peerId = "same-libp2p-peer",
+        )
+
+        val updated = TrustStatePolicy.applyObservedPeerIdentityId(
+            contact = contact,
+            observedIdentityId = "same-identity",
+            nowMillis = 9_000L,
+        )
+
+        assertEquals(TrustLevel.VERIFIED, updated.trustLevel)
+        assertEquals(ContactVerificationStatus.VERIFIED_ONCE, updated.verificationStatus)
+        assertTrue(TrustStatePolicy.canRenderAsVerified(updated))
+        assertFalse(TrustStatePolicy.requiresKeyChangeWarning(updated))
+    }
+
+    @Test
     fun keyChangedContactCannotSilentlyRenderAsVerifiedOrPqReady() {
         val contact = Contact(
             id = "bob",

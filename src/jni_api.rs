@@ -1726,3 +1726,39 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeComput
         result.unwrap_or(std::ptr::null_mut())
     })
 }
+
+/// Read the `sender_id` field out of a `GroupMessageEnvelope` wire
+/// envelope without decrypting. The signed body carries this in
+/// the clear (it's authenticated, just not confidential), so the
+/// receiver can identify which Qubee identity sent the packet
+/// before going through the AEAD path.
+///
+/// Used by the Android `MessageService.onMessageReceived` flow to
+/// link the libp2p PeerId of an inbound packet to the matching
+/// `Contact.identityId` — the missing piece the
+/// `getContactByPeerId` lookup needed to actually populate.
+///
+/// Returns the sender id as a 64-character hex string on success,
+/// or `null` if the bytes don't parse as a wire envelope.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspectEnvelopeSender(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire_bytes: Vec<u8> = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire bytes: {e}"))?;
+            let envelope = GroupMessageEnvelope::from_wire(&wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("not a group message frame"))?;
+            let hex_id = hex::encode(envelope.body.sender_id.as_ref() as &[u8]);
+            let java_str = env
+                .new_string(hex_id)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}

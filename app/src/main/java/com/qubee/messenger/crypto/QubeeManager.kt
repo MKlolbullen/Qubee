@@ -164,6 +164,32 @@ class QubeeManager @Inject constructor(
             }
         }
 
+    /**
+     * Read the `sender_id` field out of a `GroupMessageEnvelope`
+     * wire envelope without decrypting. The signed body carries
+     * this in the clear (authenticated, not confidential), so we
+     * can identify which Qubee identity sent the packet before
+     * going through the AEAD path. Used by `MessageService` to
+     * populate `Contact.peerId` on first inbound from a known
+     * identity.
+     *
+     * Returns the sender's identity id as a 64-character hex
+     * string, or null if `wire` doesn't parse as an envelope.
+     */
+    suspend fun inspectEnvelopeSender(wire: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeInspectEnvelopeSender(wire)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust envelope-inspect JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Envelope inspection failed")
+                null
+            }
+        }
+
     // --- Onboarding & invite links ---
 
     suspend fun createOnboardingBundle(
@@ -267,6 +293,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeVerifyIdentityKey(contactId: String, identityKey: ByteArray, verificationData: ByteArray): Boolean
     private external fun nativeGenerateSAS(ourIdentityKey: ByteArray, peerIdentityKey: ByteArray): String?
     private external fun nativeComputeFingerprint(identityKey: ByteArray): String?
+    private external fun nativeInspectEnvelopeSender(wire: ByteArray): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

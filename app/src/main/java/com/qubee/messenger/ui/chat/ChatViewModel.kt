@@ -4,9 +4,11 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.Message
 import com.qubee.messenger.data.model.MessageStatus
 import com.qubee.messenger.data.model.MessageType
+import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.MessageRepository
@@ -69,14 +71,29 @@ class ChatViewModel @Inject constructor(
             val contact = contactRepository.getContactById(contactId)
             val name = contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
 
+            // Honour persisted trust state: a contact whose
+            // `trustLevel` is `TrustLevel.VERIFIED` (set by a
+            // previous successful `confirmContactVerification`) opens
+            // straight into the verified security state. Without
+            // this, the badge resets to Unverified on every restart.
+            val isAlreadyVerified = contact?.trustLevel == TrustLevel.VERIFIED
             val initialDetails = ConversationDetailsUi.placeholder().copy(
                 fingerprint = (contact?.identityKey?.toFingerprint() ?: "Not available"),
-                isVerified = false,
-                verificationLabel = if (contact == null) "Unknown" else "Unverified",
+                isVerified = isAlreadyVerified,
+                verificationLabel = when {
+                    isAlreadyVerified -> "Verified"
+                    contact == null -> "Unknown"
+                    else -> "Unverified"
+                },
             )
             _uiState.value = _uiState.value.copy(
                 contactName = name,
                 details = initialDetails,
+                securityState = if (isAlreadyVerified) {
+                    ConversationSecurityState.Verified
+                } else {
+                    ConversationSecurityState.Unverified
+                },
             )
 
             messageRepository
@@ -106,10 +123,39 @@ class ChatViewModel @Inject constructor(
                 isFromMe = true,
             )
             messageRepository.saveMessage(message)
-            // TODO(rev-4): plug QubeeManager.sendP2PMessage into the
-            // Rust message pipeline; bump status to SENT / FAILED on
-            // the JNI callback.
-            _events.emit(ChatUiEvent.Notice("Message queued (P2P delivery not yet connected)"))
+
+            // Encrypt via the Rust JNI bridge. The session id is the
+            // hex-encoded GroupId — same value as conversationId per
+            // ConversationRepository.getOrCreateConversationId.
+            val encrypted = runCatching { qubeeManager.encryptMessage(conversationId, payload) }
+                .getOrNull()
+            if (encrypted == null) {
+                messageRepository.updateMessageStatus(message.id, MessageStatus.FAILED)
+                _events.emit(
+                    ChatUiEvent.Notice(
+                        "Encrypt failed — peer may not have accepted the group invite yet",
+                    ),
+                )
+                return@launch
+            }
+
+            // Publish via libp2p. The "peer id" passed to
+            // sendP2PMessage today is whatever the caller hands in;
+            // we forward the application-level contactId (the same
+            // string ChatFragment received as a nav arg). The Rust
+            // side resolves it; if libp2p doesn't have a route the
+            // command is queued, not actually delivered. Status =
+            // SENT here means "encrypted bytes left this device",
+            // not "peer ack". Real delivery confirmation is a
+            // post-alpha hook.
+            val sendOk = runCatching {
+                qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+            }.getOrDefault(false)
+            val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
+            messageRepository.updateMessageStatus(message.id, newStatus)
+            if (!sendOk) {
+                _events.emit(ChatUiEvent.Notice("P2P send failed"))
+            }
         }
     }
 
@@ -222,27 +268,156 @@ class ChatViewModel @Inject constructor(
                 _events.emit(ChatUiEvent.Notice("Peer identity not stored — cannot verify yet"))
                 return@launch
             }
-            val bridgeOk = runCatching {
-                qubeeManager.verifyIdentityKey(contactId, peerIdKey, ByteArray(0))
-            }
-            bridgeOk.onFailure { err ->
+            // Compute the canonical fingerprint via the Rust JNI
+            // bridge. The Kotlin-side `toFingerprint` extension
+            // formats the first 8 raw bytes with dashes and does
+            // NOT match what `IdentityKey::fingerprint()` produces
+            // — using it for OOB compare would have peers staring at
+            // different strings on their two devices and concluding
+            // the verification failed when it didn't.
+            val canonicalFingerprint = runCatching {
+                qubeeManager.computeFingerprint(peerIdKey)
+            }.getOrNull()
+            if (canonicalFingerprint == null) {
                 _events.emit(
-                    ChatUiEvent.Notice("Verification bridge unreachable: ${err.message ?: "unknown error"}"),
+                    ChatUiEvent.Notice("Verification bridge unreachable or peer identity malformed"),
                 )
                 return@launch
             }
-            // Bridge round-trips. Surface the locally-computed
-            // fingerprint for OOB compare, no Verified claim.
-            val displayFingerprint = peerIdKey.toFingerprint()
+            // SAS is a nice-to-have; the fingerprint compare path
+            // works without it. Failures here just hide the SAS
+            // section of the dialog.
+            val sasCode = runCatching {
+                qubeeManager.generateSASForContact(peerIdKey)
+            }.getOrNull()
             val updatedDetails = _uiState.value.details.copy(
-                fingerprint = displayFingerprint,
+                fingerprint = canonicalFingerprint,
                 verificationLabel = "Compare with peer",
                 isVerified = false,
             )
-            _uiState.value = _uiState.value.copy(details = updatedDetails)
-            _events.emit(
-                ChatUiEvent.Notice("Compare $displayFingerprint with the contact's device"),
+            _uiState.value = _uiState.value.copy(
+                details = updatedDetails,
+                pendingVerification = true,
+                pendingSas = sasCode,
             )
+            _events.emit(
+                ChatUiEvent.Notice("Compare $canonicalFingerprint with the contact's device"),
+            )
+        }
+    }
+
+    /**
+     * Close the OOB-verification dialog without making any changes.
+     * Called from the dialog's Cancel button + system back press.
+     */
+    fun dismissContactVerification() {
+        _uiState.value = _uiState.value.copy(pendingVerification = false, pendingSas = null)
+    }
+
+    /**
+     * SAS-compare confirmation. Called when both peers have
+     * independently looked at the same SAS code on their devices
+     * and agreed it matches. Both devices compute the same code
+     * (Rust orders the byte buffers lexicographically before the
+     * BLAKE3 hash), so a "yes they match" claim from the user is
+     * itself the trust ceremony — no `verifyIdentityKey` round-
+     * trip needed.
+     *
+     * Persists `TrustLevel.VERIFIED` +
+     * `ContactVerificationStatus.VERIFIED_ONCE` so a restart
+     * honours the trust bump, flips uiState.securityState to
+     * Verified, and dismisses the dialog. Symmetric end state with
+     * the fingerprint path — they're two routes to the same row
+     * mutation.
+     */
+    fun confirmSasMatch() {
+        if (conversationId.isEmpty()) {
+            notice("No conversation to verify")
+            return
+        }
+        viewModelScope.launch {
+            contactRepository.updateTrustLevel(contactId, TrustLevel.VERIFIED)
+            contactRepository.updateVerificationStatus(
+                contactId,
+                ContactVerificationStatus.VERIFIED_ONCE,
+            )
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                details = current.details.copy(
+                    isVerified = true,
+                    verificationLabel = "Verified",
+                ),
+                securityState = ConversationSecurityState.Verified,
+                pendingVerification = false,
+                pendingSas = null,
+            )
+            _events.emit(ChatUiEvent.Notice("Contact verified via SAS"))
+        }
+    }
+
+    /**
+     * User-driven OOB compare confirmation. Called once the user has
+     * read the peer's fingerprint (or SAS code) on their *other*
+     * device and entered/scanned it locally. Routes through
+     * `qubeeManager.verifyIdentityKey` for the actual cryptographic
+     * comparison; on success, persists the trust bump to
+     * `ContactRepository` (so a restart keeps the verified state),
+     * flips the UI to [ConversationSecurityState.Verified], and
+     * dismisses the verification dialog.
+     *
+     * `expectedFingerprint` is matched case- and space-insensitively
+     * against `IdentityKey::fingerprint()` on the Rust side, so the
+     * user can paste a `"AABB CCDD EEFF GGHH"` string verbatim or
+     * type it in lower-case without separators — both work.
+     *
+     * On mismatch the dialog stays open so the user can retry
+     * without re-navigating to it.
+     */
+    fun confirmContactVerification(expectedFingerprint: String) {
+        if (conversationId.isEmpty()) {
+            notice("No conversation to verify")
+            return
+        }
+        viewModelScope.launch {
+            val contact = contactRepository.getContactById(contactId)
+            val peerIdKey = contact?.identityKey
+            if (peerIdKey == null) {
+                _events.emit(ChatUiEvent.Notice("Peer identity not stored — cannot verify yet"))
+                return@launch
+            }
+            val expectedBytes = expectedFingerprint.trim().toByteArray()
+            if (expectedBytes.isEmpty()) {
+                _events.emit(ChatUiEvent.Notice("Enter the fingerprint shown on the contact's device"))
+                return@launch
+            }
+            val matches = runCatching {
+                qubeeManager.verifyIdentityKey(contactId, peerIdKey, expectedBytes)
+            }.getOrDefault(false)
+            if (!matches) {
+                _events.emit(
+                    ChatUiEvent.Notice(
+                        "Fingerprints don't match — verification failed. Compare both devices again.",
+                    ),
+                )
+                return@launch
+            }
+            // Persist so a restart honours the trust bump.
+            contactRepository.updateTrustLevel(contactId, TrustLevel.VERIFIED)
+            contactRepository.updateVerificationStatus(
+                contactId,
+                ContactVerificationStatus.VERIFIED_ONCE,
+            )
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                details = current.details.copy(
+                    isVerified = true,
+                    verificationLabel = "Verified",
+                ),
+                securityState = ConversationSecurityState.Verified,
+                pendingVerification = false,
+                pendingSas = null,
+            )
+            _events.emit(ChatUiEvent.Notice("Contact verified"))
         }
     }
 
@@ -339,6 +514,19 @@ data class ChatUiState(
     val messages: List<UiMessage> = emptyList(),
     val details: ConversationDetailsUi = ConversationDetailsUi.placeholder(),
     val securityState: ConversationSecurityState = ConversationSecurityState.Unverified,
+    /// True while the OOB-verification dialog is open. Flipped on by
+    /// `requestContactVerification`, off by `confirmContactVerification`
+    /// (fingerprint match) or `confirmSasMatch` (SAS match) on
+    /// success, or `dismissContactVerification` on user cancel.
+    /// On verify-failure (fingerprint mismatch) it stays true so the
+    /// dialog stays open for retry.
+    val pendingVerification: Boolean = false,
+    /// SAS code for the pending verification, computed alongside the
+    /// fingerprint when `requestContactVerification` runs. `null`
+    /// when SAS isn't available (no active identity, JNI failure,
+    /// etc.) — the dialog renders the fingerprint half but hides
+    /// the SAS section in that case.
+    val pendingSas: String? = null,
 )
 
 data class ConversationDetailsUi(

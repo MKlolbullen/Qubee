@@ -270,9 +270,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                                 // the regular Kotlin callback so the
                                 // Rust core can run protocol logic
                                 // without needing a JNI round-trip.
-                                if let NodeEvent::MessageReceived { data, .. } = &event {
+                                if let NodeEvent::MessageReceived { sender, data, .. } = &event {
                                     if let Some(handshake) = GroupHandshake::from_wire(data) {
-                                        handle_inbound_handshake(handshake);
+                                        handle_inbound_handshake(handshake, sender.clone());
                                         continue;
                                     }
                                     if let Some(envelope) = GroupMessageEnvelope::from_wire(data) {
@@ -872,10 +872,79 @@ fn active_display_name() -> anyhow::Result<String> {
 /// Errors are logged but never bubbled — handshake processing is
 /// best-effort: we don't want a malformed frame from a hostile peer to
 /// take down the dispatch task.
-fn handle_inbound_handshake(frame: GroupHandshake) {
+///
+/// `sender_peer_id` is the libp2p PeerId of the peer who delivered
+/// this frame. After a successful handshake, we fire a
+/// `onPeerLinked(peer_id, identity_id_hex)` callback so the Android
+/// side can stamp the corresponding `Contact.peerId` — closes the
+/// chicken-and-egg gap where a contact's `peerId` only got
+/// populated on first inbound encrypted message, with nothing to
+/// route the *first* outbound from before any inbound had landed.
+fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
+    let extracted_identity = extract_peer_identity_hex(&frame);
     if let Err(e) = process_handshake(frame) {
         eprintln!("Rust: handshake rejected: {e:#}");
+        return;
     }
+    if let Some(identity_hex) = extracted_identity {
+        dispatch_peer_linked(sender_peer_id, identity_hex);
+    }
+}
+
+/// Pull the sender's `IdentityId` out of a handshake frame, hex-
+/// encoded. `None` for variants where the sender's identity isn't
+/// directly in the body (`JoinAccepted` / `JoinRejected` — both
+/// signed by the inviter, but the inviter id lives in the joiner's
+/// local invite-receipt, not in the body itself; the receiver
+/// already knows the inviter's identity from `expected_inviter_id`
+/// so a separate linkage from this side isn't needed).
+fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
+    let id: IdentityId = match frame {
+        GroupHandshake::RequestJoin { body, .. } => body.joiner_public_key.identity_id,
+        GroupHandshake::KeyRotation { body, .. } => body.rotator_id,
+        GroupHandshake::MemberAdded { body, .. } => body.adder_id,
+        GroupHandshake::RoleChange { body, .. } => body.promoter_id,
+        GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
+        GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
+        GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
+    };
+    Some(hex::encode(id.as_ref() as &[u8]))
+}
+
+/// Fire the Kotlin-side `onPeerLinked(peer_id, identity_id_hex)`
+/// callback. Best-effort — if the JVM / callback isn't attached
+/// (e.g., during early initialization), the linkage just isn't
+/// fired and the receive-path TOFU population still applies on
+/// the next inbound packet.
+fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread_permanently() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let cb_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match cb_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+    let j_peer = match env.new_string(peer_id) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let j_identity = match env.new_string(identity_id_hex) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = env.call_method(
+        callback_obj,
+        "onPeerLinked",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        &[JValue::Object(&j_peer), JValue::Object(&j_identity)],
+    );
 }
 
 fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
@@ -1689,6 +1758,126 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
                 .byte_array_from_slice(&decrypted.plaintext)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
             Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Compute the canonical 8-byte BLAKE3 fingerprint of an
+/// `IdentityKey` and return it as a string in the form
+/// `"AABB CCDD EEFF GGHH"` (4 groups of 2 bytes / 4 hex chars,
+/// space-separated). Same value as `IdentityKey::fingerprint()`,
+/// exposed through JNI so the verify UI can display the same
+/// fingerprint Rust uses internally — closes the format-disagreement
+/// gap from the bridge-checkpoint commit (the Kotlin
+/// `ByteArray.toFingerprint` extension formats the first 8 raw
+/// bytes with dashes, which doesn't match Rust's hash).
+///
+/// Returns `null` on any decode error.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeComputeFingerprint(
+    env: JNIEnv,
+    _class: JClass,
+    identity_key_bytes: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let id_bytes: Vec<u8> = env
+                .convert_byte_array(&identity_key_bytes)
+                .map_err(|e| anyhow::anyhow!("invalid identity key bytes: {e}"))?;
+            let identity = IdentityKey::from_bytes(&id_bytes)
+                .map_err(|e| anyhow::anyhow!("IdentityKey decode failed: {e}"))?;
+            let java_str = env
+                .new_string(identity.fingerprint())
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Read the `sender_id` field out of a `GroupMessageEnvelope` wire
+/// envelope without decrypting. The signed body carries this in
+/// the clear (it's authenticated, just not confidential), so the
+/// receiver can identify which Qubee identity sent the packet
+/// before going through the AEAD path.
+///
+/// Used by the Android `MessageService.onMessageReceived` flow to
+/// link the libp2p PeerId of an inbound packet to the matching
+/// `Contact.identityId` — the missing piece the
+/// `getContactByPeerId` lookup needed to actually populate.
+///
+/// Returns the sender id as a 64-character hex string on success,
+/// or `null` if the bytes don't parse as a wire envelope.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspectEnvelopeSender(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire_bytes: Vec<u8> = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire bytes: {e}"))?;
+            let envelope = GroupMessageEnvelope::from_wire(&wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("not a group message frame"))?;
+            let hex_id = hex::encode(envelope.body.sender_id.as_ref() as &[u8]);
+            let java_str = env
+                .new_string(hex_id)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Generate a Short Authentication String (SAS) between the locally
+/// active identity and the supplied peer `IdentityKey` bytes,
+/// without forcing the caller to first fetch their own identity
+/// bytes. Convenience wrapper over `nativeGenerateSAS` for the
+/// common 1:1 verification UI path.
+///
+/// Returns the SAS as `"NNNN NNNN"` (two zero-padded 4-digit decimal
+/// groups) on success, or null on any failure (no active identity,
+/// invalid peer key, etc.). Both peers compute the same SAS as long
+/// as both supply each other's `IdentityKey::to_bytes()` output.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateSASForContact(
+    env: JNIEnv,
+    _class: JClass,
+    peer_identity_key: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let peer_bytes: Vec<u8> = env
+                .convert_byte_array(&peer_identity_key)
+                .map_err(|e| anyhow::anyhow!("invalid peer_identity_key bytes: {e}"))?;
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let our_bytes = identity.public_key().to_bytes();
+
+            let (first, second) = if our_bytes <= peer_bytes {
+                (our_bytes.as_slice(), peer_bytes.as_slice())
+            } else {
+                (peer_bytes.as_slice(), our_bytes.as_slice())
+            };
+            let mut hasher = Hasher::new();
+            hasher.update(first);
+            hasher.update(second);
+            let digest = hasher.finalize();
+            let h = digest.as_bytes();
+            let value: u32 = ((h[0] as u32) << 24)
+                | ((h[1] as u32) << 16)
+                | ((h[2] as u32) << 8)
+                | (h[3] as u32);
+            let high = ((value >> 16) & 0xFFFF) % 10_000;
+            let low = (value & 0xFFFF) % 10_000;
+            let sas = format!("{:04} {:04}", high, low);
+            let java_str = env
+                .new_string(sas)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
         })();
         result.unwrap_or(std::ptr::null_mut())
     })

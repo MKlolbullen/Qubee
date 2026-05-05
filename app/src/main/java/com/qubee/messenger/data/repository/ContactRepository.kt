@@ -2,6 +2,7 @@ package com.qubee.messenger.data.repository
 
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.model.Contact
+import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.ContactWithLastMessage
 import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.database.dao.ContactDao
@@ -44,6 +45,21 @@ class ContactRepository @Inject constructor(
     suspend fun getContactById(contactId: String): Contact? =
         contactDao.getContactById(contactId)
 
+    suspend fun getContactByIdentityId(identityId: String): Contact? =
+        contactDao.getContactByIdentityId(identityId)
+
+    /// Look up a contact by their libp2p PeerId. Returns null if no
+    /// contact has been linked to this PeerId yet — populated by
+    /// `MessageService.onMessageReceived` on first inbound from a
+    /// known identity (via `inspectEnvelopeSender`). Callers should
+    /// fall back gracefully on null.
+    suspend fun getContactByPeerId(peerId: String): Contact? =
+        contactDao.getContactByPeerId(peerId)
+
+    suspend fun updatePeerId(contactId: String, peerId: String?) {
+        contactDao.updatePeerId(contactId, peerId)
+    }
+
     suspend fun getContactName(contactId: String): String =
         contactDao.getContactById(contactId)?.displayName ?: ""
 
@@ -67,6 +83,10 @@ class ContactRepository @Inject constructor(
 
     suspend fun updateTrustLevel(contactId: String, level: TrustLevel) {
         contactDao.updateTrustLevel(contactId, level)
+    }
+
+    suspend fun updateVerificationStatus(contactId: String, status: ContactVerificationStatus) {
+        contactDao.updateVerificationStatus(contactId, status)
     }
 
     suspend fun updateOnlineStatus(contactId: String, online: Boolean, lastSeen: Long?) {

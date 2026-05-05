@@ -22,7 +22,11 @@ import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
         Message::class,
         CryptoKey::class,
     ],
-    version = 1,
+    // v2: Contact gained a `peerId` column (libp2p routing) and a
+    // matching index. fallbackToDestructiveMigration recreates the
+    // DB on the bump; pre-alpha data isn't yet meant to survive
+    // schema changes.
+    version = 2,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)

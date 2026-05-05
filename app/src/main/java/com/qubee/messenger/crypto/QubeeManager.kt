@@ -142,6 +142,81 @@ class QubeeManager @Inject constructor(
             }
         }
 
+    /**
+     * Compute the canonical 8-byte BLAKE3 fingerprint of a peer's
+     * `IdentityKey`, formatted as `"AABB CCDD EEFF GGHH"`. Use this
+     * — not the Kotlin `ByteArray.toFingerprint` extension — when
+     * displaying a fingerprint for OOB compare; it matches what
+     * Rust's `IdentityKey::fingerprint()` produces, so two devices
+     * comparing fingerprints are comparing the same string.
+     */
+    suspend fun computeFingerprint(identityKey: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeComputeFingerprint(identityKey)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust fingerprint JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust fingerprint computation failed")
+                null
+            }
+        }
+
+    /**
+     * Read the `sender_id` field out of a `GroupMessageEnvelope`
+     * wire envelope without decrypting. The signed body carries
+     * this in the clear (authenticated, not confidential), so we
+     * can identify which Qubee identity sent the packet before
+     * going through the AEAD path. Used by `MessageService` to
+     * populate `Contact.peerId` on first inbound from a known
+     * identity.
+     *
+     * Returns the sender's identity id as a 64-character hex
+     * string, or null if `wire` doesn't parse as an envelope.
+     */
+    suspend fun inspectEnvelopeSender(wire: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeInspectEnvelopeSender(wire)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust envelope-inspect JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Envelope inspection failed")
+                null
+            }
+        }
+
+    /**
+     * Compute the Short Authentication String (SAS) between the
+     * locally active identity and a peer's `IdentityKey` bytes.
+     * Both peers' devices independently compute the same string
+     * (Rust orders the byte buffers lexicographically before the
+     * BLAKE3 hash), so the user-side compare ceremony reduces to
+     * "do these two strings match?" — readable over voice in a
+     * few seconds, no typing.
+     *
+     * Returns the SAS as `"NNNN NNNN"` on success, or null on any
+     * failure (no active identity, invalid peer key, JNI not
+     * linked, etc.).
+     */
+    suspend fun generateSASForContact(peerIdentityKey: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeGenerateSASForContact(peerIdentityKey)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust SAS-for-contact JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "SAS-for-contact computation failed")
+                null
+            }
+        }
+
     // --- Onboarding & invite links ---
 
     suspend fun createOnboardingBundle(
@@ -244,6 +319,9 @@ class QubeeManager @Inject constructor(
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?
     private external fun nativeVerifyIdentityKey(contactId: String, identityKey: ByteArray, verificationData: ByteArray): Boolean
     private external fun nativeGenerateSAS(ourIdentityKey: ByteArray, peerIdentityKey: ByteArray): String?
+    private external fun nativeComputeFingerprint(identityKey: ByteArray): String?
+    private external fun nativeInspectEnvelopeSender(wire: ByteArray): String?
+    private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

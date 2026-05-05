@@ -154,13 +154,29 @@ fun ChatScreen(
                 securityState = uiState.securityState,
                 details = uiState.details,
                 onDismiss = { showDetails = false },
-                onVerifyClick = viewModel::requestContactVerification,
+                onVerifyClick = {
+                    // Close the details sheet first so the dialog
+                    // doesn't stack on top of it.
+                    showDetails = false
+                    viewModel.requestContactVerification()
+                },
                 onTimerClick = viewModel::changeDisappearingTimer,
                 onClearChatClick = {
                     showDetails = false
                     viewModel.clearChat()
                 },
                 onResetSessionClick = viewModel::resetSecureSession,
+            )
+        }
+
+        if (uiState.pendingVerification) {
+            VerifyContactDialog(
+                contactName = uiState.contactName,
+                localFingerprint = uiState.details.fingerprint,
+                sasCode = uiState.pendingSas,
+                onConfirmFingerprint = viewModel::confirmContactVerification,
+                onConfirmSasMatch = viewModel::confirmSasMatch,
+                onDismiss = viewModel::dismissContactVerification,
             )
         }
     }

@@ -236,29 +236,53 @@ every PR (`.github/workflows/ci.yml`).
 
 ## Roadmap
 
-Pre-alpha → alpha:
-* OOB / SAS verification gesture (fingerprint tap-to-verify is
-  recommended; SAS number-compare for non-QR exchanges).
-* Two-device manual walkthrough doc (`docs/two-device-walkthrough.md`).
+Already shipped (cleaned out of the list below):
+* OOB compare gesture — fingerprint typed-input + SAS visual-compare
+  in `VerifyContactDialog`. Persistence flips
+  `Contact.trustLevel = VERIFIED` so a restart honours the
+  ceremony.
+* `docs/two-device-walkthrough.md`.
+* Android data layer — `data.model.*` are real Room entities,
+  `ContactRepository` / `MessageRepository` / `ConversationRepository`
+  are DAO-backed, `data/repository/database/QubeeDatabase.kt` opens
+  through SQLCipher's `SupportOpenHelperFactory`, `di/DatabaseModule.kt`
+  wires Hilt providers. `MessageService` decrypts inbound P2P
+  packets and writes through the message store.
+* PeerId ↔ Contact mapping (libp2p `PeerId` ↔ Qubee `IdentityId`)
+  with two population paths: handshake-time
+  `NetworkCallback.onPeerLinked(peerId, identityIdHex)` and
+  receive-path TOFU via `nativeInspectEnvelopeSender`.
+
+Pre-alpha → alpha (still open):
+* QR-scan flavor of `VerifyContactDialog` (today's dialog accepts
+  typed input only; CameraX surface around the same
+  `confirmContactVerification(scanned)` call is roughly 100 lines
+  of Compose).
 * Android instrumented tests (`app/src/androidTest/`) covering
   `nativeStartNetwork` on a real device + a Compose UI test for
-  create-group → invite-QR → scan-QR.
-* Replace the Android data-layer stubs (`data.model.*`,
-  `ContactRepository`, `MessageRepository`, `ConversationRepository`,
-  `MessageService`, the half-built ViewModels and Fragments) with a
-  real implementation backed by Room + SQLCipher.
-* Snapshot resync after extended offline (group-state convergence
-  for a member who comes back after missing many `MemberAdded` /
-  `RoleChange` / `KeyRotation` broadcasts).
+  create-group → invite-QR → scan-QR. Blocked here on emulator
+  access; the test surface is documented in
+  `docs/two-device-walkthrough.md` and the JNI side is
+  type-checked on the host CI via `cargo build --features
+  _typecheck_jni`.
+* Snapshot resync after extended offline. The rev-4 P1
+  `RequestStateSync` / `StateSyncResponse` pair recovers members
+  + version, but a member who *also* missed a `KeyRotation` in
+  between still bounces on the strict generation gate. Fix
+  candidate: extend `StateSyncResponse` to include the current
+  group key wrapped to the requester's Kyber pubkey.
 * Port the legacy modules (`hybrid_ratchet`, `secure_message`,
   `file_transfer`, `audio`, `sas`, `oob_secrets`) to the current
-  dependency versions — currently feature-gated behind `legacy` and
-  documented as broken.
+  dependency versions — currently feature-gated behind `legacy`
+  and documented as broken in `docs/build-status.md`.
 
 Post-alpha:
+* Real delivery confirmation (today `MessageStatus.SENT` only
+  means "encrypted bytes left this device"; needs an ack
+  roundtrip on the Rust P2P layer).
 * Promoted-admin Kyber registration via a continuous re-broadcast
   loop (the immediate gap is closed by the per-member `kyber_pub`
-  in JoinAccepted + `MemberAdded` broadcast, but a member who's
+  in `JoinAccepted` + `MemberAdded` broadcast, but a member who's
   been offline through several rotations still needs an explicit
   resync).
 * Voice / video calls (libp2p WebRTC integration; the `webrtc`

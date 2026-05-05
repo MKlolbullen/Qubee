@@ -53,7 +53,15 @@ data class ContactMetadata(
 
 @Entity(
     tableName = "contacts",
-    indices = [Index(value = ["identityId"], unique = true)],
+    indices = [
+        Index(value = ["identityId"], unique = true),
+        // Indexed (not unique — `peerId` may be null for many
+        // contacts before population code lights up). The lookup
+        // path in `MessageService.onMessageReceived` is by peerId,
+        // so the index keeps it cheap even at the 16-member group
+        // cap times any number of casual contacts.
+        Index(value = ["peerId"]),
+    ],
 )
 data class Contact(
     @PrimaryKey val id: String = "",
@@ -63,6 +71,13 @@ data class Contact(
     val email: String? = null,
     val publicKey: ByteArray? = null,
     val identityKey: ByteArray? = null,
+    /// libp2p PeerId string for routing inbound messages to the
+    /// right contact. Nullable — set after the contact is paired
+    /// via the invite/handshake flow OR observed inbound for the
+    /// first time (TOFU). Null contacts won't match the
+    /// `getContactByPeerId` lookup; the receive path falls back
+    /// to using the libp2p sender id as the conversation key.
+    val peerId: String? = null,
     val trustLevel: TrustLevel = TrustLevel.UNKNOWN,
     val verificationStatus: ContactVerificationStatus = ContactVerificationStatus.UNVERIFIED,
     val isBlocked: Boolean = false,

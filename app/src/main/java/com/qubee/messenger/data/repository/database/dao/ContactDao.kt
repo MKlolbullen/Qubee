@@ -7,6 +7,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Update
 import com.qubee.messenger.data.model.Contact
+import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.ContactWithLastMessage
 import com.qubee.messenger.data.model.TrustLevel
 import kotlinx.coroutines.flow.Flow
@@ -33,6 +34,9 @@ interface ContactDao {
 
     @Query("SELECT * FROM contacts WHERE identityId = :identityId")
     suspend fun getContactByIdentityId(identityId: String): Contact?
+
+    @Query("SELECT * FROM contacts WHERE peerId = :peerId LIMIT 1")
+    suspend fun getContactByPeerId(peerId: String): Contact?
 
     @Query("SELECT * FROM contacts WHERE phoneNumber = :phoneNumber")
     suspend fun getContactByPhoneNumber(phoneNumber: String): Contact?
@@ -84,6 +88,9 @@ interface ContactDao {
     @Query("UPDATE contacts SET trustLevel = :trustLevel WHERE id = :contactId")
     suspend fun updateTrustLevel(contactId: String, trustLevel: TrustLevel)
 
+    @Query("UPDATE contacts SET verificationStatus = :status WHERE id = :contactId")
+    suspend fun updateVerificationStatus(contactId: String, status: ContactVerificationStatus)
+
     @Query("UPDATE contacts SET isBlocked = :isBlocked WHERE id = :contactId")
     suspend fun updateBlockedStatus(contactId: String, isBlocked: Boolean)
 
@@ -92,6 +99,9 @@ interface ContactDao {
 
     @Query("UPDATE contacts SET profilePictureUrl = :profilePictureUrl WHERE id = :contactId")
     suspend fun updateProfilePicture(contactId: String, profilePictureUrl: String?)
+
+    @Query("UPDATE contacts SET peerId = :peerId WHERE id = :contactId")
+    suspend fun updatePeerId(contactId: String, peerId: String?)
 
     @Delete
     suspend fun deleteContact(contact: Contact)

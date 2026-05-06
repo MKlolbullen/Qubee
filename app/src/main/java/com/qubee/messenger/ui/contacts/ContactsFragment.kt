@@ -6,7 +6,7 @@ import android.view.View
 import android.view.ViewGroup
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +31,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -87,6 +90,8 @@ class ContactsFragment : Fragment() {
                 onAddContactClick = {
                     findNavController().navigate(R.id.action_contact_to_add_contact)
                 },
+                onDeleteContact = viewModel::deleteContact,
+                onBlockContact = viewModel::blockContact,
             )
         }
     }
@@ -97,6 +102,8 @@ private fun ContactsScreen(
     state: ContactsUiState,
     onContactClick: (ContactSummaryUi) -> Unit,
     onAddContactClick: () -> Unit,
+    onDeleteContact: (String) -> Unit,
+    onBlockContact: (String) -> Unit,
 ) {
     QubeeTheme {
         QubeeScreen {
@@ -114,6 +121,8 @@ private fun ContactsScreen(
                     else -> ContactList(
                         contacts = state.contacts,
                         onContactClick = onContactClick,
+                        onDeleteContact = onDeleteContact,
+                        onBlockContact = onBlockContact,
                     )
                 }
             }
@@ -186,22 +195,79 @@ private fun EmptyContacts(onAddContactClick: () -> Unit) {
 private fun ContactList(
     contacts: List<ContactSummaryUi>,
     onContactClick: (ContactSummaryUi) -> Unit,
+    onDeleteContact: (String) -> Unit,
+    onBlockContact: (String) -> Unit,
 ) {
+    var pendingDelete by remember { mutableStateOf<ContactSummaryUi?>(null) }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         items(contacts, key = { it.contactId }) { contact ->
-            ContactRow(contact = contact, onClick = { onContactClick(contact) })
+            ContactRow(
+                contact = contact,
+                onClick = { onContactClick(contact) },
+                onRequestDelete = { pendingDelete = contact },
+                onBlock = { onBlockContact(contact.contactId) },
+            )
         }
+    }
+    val target = pendingDelete
+    if (target != null) {
+        ConfirmDeleteContactDialog(
+            contactName = target.displayName,
+            onConfirm = {
+                onDeleteContact(target.contactId)
+                pendingDelete = null
+            },
+            onDismiss = { pendingDelete = null },
+        )
     }
 }
 
 @Composable
-private fun ContactRow(contact: ContactSummaryUi, onClick: () -> Unit) {
+private fun ConfirmDeleteContactDialog(
+    contactName: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Delete $contactName?") },
+        text = {
+            Text(
+                "This removes the contact from your address book on this device. " +
+                    "If you've shared a group with them, they remain a group member " +
+                    "until you explicitly remove them from the group.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onConfirm) {
+                Text("Delete", color = QubeePalette.Cyan)
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun ContactRow(
+    contact: ContactSummaryUi,
+    onClick: () -> Unit,
+    onRequestDelete: () -> Unit,
+    onBlock: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(20.dp))
             .background(QubeePalette.Panel.copy(alpha = 0.92f))
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { menuOpen = true },
+            )
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -230,6 +296,27 @@ private fun ContactRow(contact: ContactSummaryUi, onClick: () -> Unit) {
             }
             Spacer(Modifier.height(2.dp))
             QubeeMutedText(text = subtitleFor(contact))
+        }
+        Box {
+            androidx.compose.material3.DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false },
+            ) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text("Block") },
+                    onClick = {
+                        menuOpen = false
+                        onBlock()
+                    },
+                )
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text("Delete contact") },
+                    onClick = {
+                        menuOpen = false
+                        onRequestDelete()
+                    },
+                )
+            }
         }
     }
 }

@@ -38,6 +38,32 @@ Then `./gradlew recordPaparazziDebug` produces deterministic PNGs in
 
 ## What's in this directory
 
+### Group / chat surface (Galaxy S25 Ultra, 412×892 dp)
+
+These five mock-ups cover the rev-3 → group-UX work end-to-end. They
+sit in 460×950 SVGs that include a stylised phone bezel, status bar,
+and home indicator so the proportions read as a device render.
+
+| # | file | screen |
+|---|------|--------|
+| 1 | `01-inbox.svg`            | Conversations list — direct + group rows after cold-start hydration, FAB, bottom nav. |
+| 2 | `02-group-chat.svg`       | Group chat (`Berlin Sec Crew`, g=4) — top bar with avatar + chevron, message bubbles, encrypted-state ribbon, composer. |
+| 3 | `03-group-details.svg`    | `GroupDetailsSheet` (owner POV) — Add member, member roster with `Role` + `Remove`, "You" badge, Leave group. |
+| 4 | `04-role-picker.svg`      | Role-picker `AlertDialog` — Admin (current, greyed) / Moderator / Member / Observer + Cancel. |
+| 5 | `05-settings-identity.svg`| Settings → My identity — display name, fingerprint, large share-link QR, Copy + Share buttons, prefs. |
+
+Colours match `app/src/main/java/com/qubee/messenger/ui/theme/QubeeDesign.kt`
+exactly (`#040C16` Void, `#0a1726` Panel, `#102234` PanelAlt, `#12EAD8`
+Cyan, `#EAFBFF` Text, `#A3BDCA` MutedText, `#FF5C7A` Danger, `#0E5F59`
+MyBubble darker stop). Render in any browser, or convert to PNG with
+`rsvg-convert -w 920 -o foo.png foo.svg`.
+
+The QR code in mock-up 5 is structurally believable (three finder
+patterns, alignment pattern, timing strips, brand mark in centre)
+but not a scannable encoding of any real link.
+
+### Onboarding / invite (legacy, 360×780 dp)
+
 | file | the screen it approximates |
 |------|----------------------------|
 | `onboarding_idle.svg`        | First-launch identity creation, before "Create identity" is tapped. |
@@ -47,7 +73,7 @@ Then `./gradlew recordPaparazziDebug` produces deterministic PNGs in
 
 ## Form factor
 
-Drawn at 360×780 dp (logical), which is what a Galaxy S25 reports to
-Compose at its default font scale once the system bars are excluded.
-The S25 panel is 1080×2340 px native; at 3x density that maps back to
-~360×780 dp, which is what these SVGs use.
+The legacy four are drawn at 360×780 dp (default S25 reports that
+once system bars are excluded). The five new group-surface mock-ups
+are at 412×892 dp matching the S25 Ultra's larger 6.9″ panel
+(1440×3120 px @ ~505 ppi).

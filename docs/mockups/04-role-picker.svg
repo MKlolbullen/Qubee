@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 950" width="460" height="950" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
+  <!-- Galaxy S25 Ultra mock-up: Role picker dialog over Group Details sheet -->
+  <defs>
+    <linearGradient id="frameGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a22"/>
+      <stop offset="1" stop-color="#050507"/>
+    </linearGradient>
+    <linearGradient id="screenGlare" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#12EAD8" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#12EAD8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="dialogGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0f2034"/>
+      <stop offset="1" stop-color="#091624"/>
+    </linearGradient>
+    <clipPath id="screenClip">
+      <rect x="24" y="28" width="412" height="894" rx="42"/>
+    </clipPath>
+  </defs>
+
+  <!-- Phone body -->
+  <rect x="6" y="10" width="448" height="930" rx="56" fill="url(#frameGloss)"/>
+  <rect x="10" y="14" width="440" height="922" rx="54" fill="#0c0c10" stroke="#23232b" stroke-width="0.7"/>
+  <rect x="3" y="220" width="4" height="80" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="180" width="4" height="60" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="260" width="4" height="100" rx="2" fill="#1a1a22"/>
+  <rect x="24" y="28" width="412" height="894" rx="42" fill="#040C16"/>
+
+  <g clip-path="url(#screenClip)">
+    <!-- Background: dimmed Group Details sheet -->
+    <circle cx="80" cy="80" r="160" fill="url(#cyanGlow)"/>
+
+    <g opacity="0.55">
+      <g font-size="11" fill="#EAFBFF">
+        <text x="44" y="50" font-weight="600">21:48</text>
+      </g>
+      <circle cx="230" cy="46" r="7" fill="#000"/>
+      <!-- Sheet behind the dialog -->
+      <g transform="translate(48,260)">
+        <rect width="364" height="640" rx="28" fill="#0a1726" stroke="#152639"/>
+        <rect x="162" y="10" width="40" height="4" rx="2" fill="#A3BDCA" fill-opacity="0.4"/>
+        <g transform="translate(20,30)">
+          <rect width="124" height="22" rx="11" fill="#12EAD8" fill-opacity="0.18"/>
+          <text x="62" y="15" text-anchor="middle" fill="#12EAD8" font-size="10" font-weight="800" letter-spacing="2">GROUP DETAILS</text>
+          <text x="0" y="58" fill="#EAFBFF" font-size="22" font-weight="900">Berlin Sec Crew</text>
+        </g>
+        <!-- Faint roster rows -->
+        <g transform="translate(20,180)">
+          <rect width="324" height="50" rx="16" fill="#102234"/>
+          <rect y="58" width="324" height="50" rx="16" fill="#102234"/>
+          <rect y="116" width="324" height="50" rx="16" fill="#102234"/>
+          <rect y="174" width="324" height="50" rx="16" fill="#102234"/>
+        </g>
+      </g>
+    </g>
+
+    <!-- Scrim -->
+    <rect x="24" y="28" width="412" height="894" fill="#000" fill-opacity="0.55"/>
+
+    <!-- AlertDialog -->
+    <g transform="translate(50,260)">
+      <rect width="360" height="424" rx="22" fill="url(#dialogGrad)" stroke="#152639"/>
+      <!-- Title -->
+      <text x="24" y="42" fill="#EAFBFF" font-size="17" font-weight="800">Change role for Lina Marek</text>
+
+      <!-- Body -->
+      <g transform="translate(24,60)">
+        <text x="0" y="20" fill="#A3BDCA" font-size="12">Currently: <tspan fill="#12EAD8" font-weight="700">Admin</tspan>. The Rust core broadcasts a</text>
+        <text x="0" y="38" fill="#A3BDCA" font-size="12">signed <tspan font-family="ui-monospace, SFMono-Regular, monospace" fill="#EAFBFF">RoleChange</tspan> so other members converge</text>
+        <text x="0" y="56" fill="#A3BDCA" font-size="12">on the new view.</text>
+      </g>
+
+      <!-- Role rows -->
+      <g transform="translate(20,150)" font-family="Inter, system-ui">
+        <!-- Admin (current, disabled) -->
+        <g>
+          <rect width="320" height="44" rx="12" fill="#102234" fill-opacity="0.6"/>
+          <text x="16" y="28" fill="#A3BDCA" font-size="14" font-weight="600">Admin</text>
+          <text x="304" y="28" text-anchor="end" fill="#A3BDCA" font-size="11" font-style="italic">current</text>
+        </g>
+        <!-- Moderator -->
+        <g transform="translate(0,52)">
+          <rect width="320" height="44" rx="12" fill="#102234"/>
+          <text x="16" y="28" fill="#12EAD8" font-size="14" font-weight="700">Moderator</text>
+          <path d="M298 22 l8 6 l-8 6" stroke="#12EAD8" stroke-width="1.6" fill="none"/>
+        </g>
+        <!-- Member -->
+        <g transform="translate(0,104)">
+          <rect width="320" height="44" rx="12" fill="#102234"/>
+          <text x="16" y="28" fill="#12EAD8" font-size="14" font-weight="700">Member</text>
+          <path d="M298 22 l8 6 l-8 6" stroke="#12EAD8" stroke-width="1.6" fill="none"/>
+        </g>
+        <!-- Observer -->
+        <g transform="translate(0,156)">
+          <rect width="320" height="44" rx="12" fill="#102234"/>
+          <text x="16" y="28" fill="#12EAD8" font-size="14" font-weight="700">Observer</text>
+          <path d="M298 22 l8 6 l-8 6" stroke="#12EAD8" stroke-width="1.6" fill="none"/>
+        </g>
+      </g>
+
+      <!-- Cancel button -->
+      <g transform="translate(252,376)">
+        <text x="0" y="16" fill="#A3BDCA" font-size="13" font-weight="700">Cancel</text>
+      </g>
+    </g>
+
+    <!-- Status bar peeking through -->
+    <g font-size="11" fill="#EAFBFF" opacity="0.85">
+      <text x="44" y="50" font-weight="600">21:48</text>
+    </g>
+    <circle cx="230" cy="46" r="7" fill="#000"/>
+
+    <!-- Home indicator -->
+    <rect x="170" y="900" width="120" height="4" rx="2" fill="#A3BDCA" fill-opacity="0.6"/>
+    <rect x="24" y="28" width="412" height="894" rx="42" fill="url(#screenGlare)" pointer-events="none"/>
+  </g>
+</svg>

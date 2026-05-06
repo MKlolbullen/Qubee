@@ -17,12 +17,12 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType};
 use qubee_crypto::groups::group_message::{decrypt_group_message, encrypt_group_message};
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
-use qubee_crypto::storage::secure_keystore::SecureKeyStore;
+use qubee_crypto::storage::secure_keystore::SecureKeystore;
 
 fn bench_encrypt(c: &mut Criterion) {
     let tmp = tempfile::TempDir::new().unwrap();
     let ks_path = tmp.path().join("bench_enc.db");
-    let ks = SecureKeyStore::new(&ks_path).unwrap();
+    let ks = SecureKeystore::new(&ks_path).unwrap();
     let mut gm = GroupManager::new(ks).unwrap();
     let kp = IdentityKeyPair::generate().unwrap();
     let group_id = gm
@@ -56,7 +56,7 @@ fn bench_encrypt(c: &mut Criterion) {
 fn bench_decrypt(c: &mut Criterion) {
     let tmp = tempfile::TempDir::new().unwrap();
     let ks_path = tmp.path().join("bench_dec.db");
-    let ks = SecureKeyStore::new(&ks_path).unwrap();
+    let ks = SecureKeystore::new(&ks_path).unwrap();
     let mut gm = GroupManager::new(ks).unwrap();
     let kp = IdentityKeyPair::generate().unwrap();
     let group_id = gm

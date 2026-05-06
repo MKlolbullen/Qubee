@@ -914,3 +914,116 @@ fn state_sync_response_addressed_to_someone_else_is_ignored() {
         "Carol must silently drop a response addressed to Bob",
     );
 }
+
+#[test]
+fn lagging_member_resyncs_after_missing_key_rotation() {
+    use qubee_crypto::groups::group_handshake::{sign_request_state_sync, GroupHandshake};
+    use qubee_crypto::groups::handshake_handlers::{
+        process_request_state_sync, process_state_sync_response,
+    };
+
+    // Alice + Bob in a group. Alice rotates the group key locally
+    // *without* delivering the rotation to Bob (simulates Bob being
+    // offline through the KeyRotation broadcast). Bob comes back
+    // online and asks for a state sync; the responder should bundle
+    // the current group key wrapped under Bob's Kyber pub. After
+    // applying the response, Bob's local view is realigned AND he
+    // can decrypt fresh messages encrypted with the new key.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invitation = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invitation.invitation_code,
+        invitation.inviter_name,
+    );
+
+    // Pre-rotation key, captured for the post-resync sanity check.
+    let pre_rotation_key = alice_gm.export_group_key(&group_id).unwrap();
+    assert_eq!(
+        bob_gm.export_group_key(&group_id).unwrap(),
+        pre_rotation_key,
+        "precondition: Bob shares the original key after handshake",
+    );
+
+    // Alice rotates locally without telling Bob. The rotation
+    // returns a recipients list (Bob would be in it in a real
+    // deployment), but we deliberately don't apply the
+    // KeyRotation on Bob's side — that's the offline-window we're
+    // simulating.
+    let _ = alice_gm
+        .rotate_group_key_after_removal(group_id, alice_id)
+        .unwrap();
+    let post_rotation_key = alice_gm.export_group_key(&group_id).unwrap();
+    assert_ne!(
+        post_rotation_key, pre_rotation_key,
+        "precondition: rotation actually changed Alice's key",
+    );
+    assert_eq!(
+        bob_gm.export_group_key(&group_id).unwrap(),
+        pre_rotation_key,
+        "precondition: Bob still has the pre-rotation key",
+    );
+
+    // Bob asks for a state sync.
+    let request_body = bob_gm
+        .build_state_sync_request(group_id, bob_kp.identity_id())
+        .unwrap();
+    let (req_body, req_sig) = match sign_request_state_sync(&bob_kp, request_body).unwrap() {
+        GroupHandshake::RequestStateSync { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    let (resp_body, resp_sig) =
+        process_request_state_sync(&alice_gm, &alice_kp, &req_body, &req_sig)
+            .unwrap()
+            .unwrap();
+
+    // Response must include a wrapped key (Bob's kyber_pub was set
+    // at handshake time, so the responder has what it needs).
+    assert!(
+        resp_body.wrapped_group_key.is_some(),
+        "responder should bundle the current group key when requester has a kyber_pub",
+    );
+
+    // Bob applies the response. After this, Bob's local key
+    // matches Alice's post-rotation key.
+    let applied = process_state_sync_response(
+        &mut bob_gm,
+        bob_kp.identity_id(),
+        &resp_body,
+        &resp_sig,
+    )
+    .expect("Bob applies the response without error");
+    assert!(applied, "Bob should accept a response addressed to him");
+
+    let bob_post_resync = bob_gm.export_group_key(&group_id).unwrap();
+    assert_eq!(
+        bob_post_resync, post_rotation_key,
+        "Bob must have the post-rotation key after the resync delivers it",
+    );
+
+    // End-to-end sanity: Alice sends a message under the new key;
+    // Bob decrypts. Without the key delivery, decrypt would have
+    // bounced (different keys on either side).
+    let payload = b"hello after rotation".as_slice();
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, payload).unwrap();
+    let decrypted = decrypt_group_message(&bob_gm, &wire)
+        .expect("Bob must decrypt Alice's post-rotation message after resync");
+    assert_eq!(decrypted.plaintext, payload);
+}

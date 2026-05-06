@@ -86,6 +86,12 @@ class ChatViewModel @Inject constructor(
                     else -> "Unverified"
                 },
             )
+            // Load our own fingerprint once so the verify dialog can
+            // render it as a QR for the peer to scan. Best-effort —
+            // null on JNI miss / pre-onboarding state, dialog hides
+            // the my-QR section in that case.
+            val myFp = runCatching { qubeeManager.getMyFingerprint() }.getOrNull()
+
             _uiState.value = _uiState.value.copy(
                 contactName = name,
                 details = initialDetails,
@@ -94,6 +100,7 @@ class ChatViewModel @Inject constructor(
                 } else {
                     ConversationSecurityState.Unverified
                 },
+                myFingerprint = myFp,
             )
 
             messageRepository
@@ -527,6 +534,12 @@ data class ChatUiState(
     /// etc.) — the dialog renders the fingerprint half but hides
     /// the SAS section in that case.
     val pendingSas: String? = null,
+    /// The locally-active identity's own fingerprint, in the
+    /// `"AABB CCDD EEFF GGHH"` shape. Loaded once at
+    /// `ChatViewModel.init` time. Rendered as a QR code in the
+    /// verify dialog so the peer can scan it and verify *us*. Null
+    /// until onboarding completes / the JNI getter resolves.
+    val myFingerprint: String? = null,
 )
 
 data class ConversationDetailsUi(

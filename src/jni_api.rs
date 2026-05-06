@@ -1882,3 +1882,30 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
         result.unwrap_or(std::ptr::null_mut())
     })
 }
+
+/// Return the locally-active identity's fingerprint as a string in
+/// the canonical `"AABB CCDD EEFF GGHH"` shape — same value as
+/// `IdentityKey::fingerprint()` over our own public key. Lets the
+/// Android verify UI render the local user's self-fingerprint as
+/// a QR code for the peer to scan; closes the missing direction
+/// of the OOB compare ceremony (`nativeComputeFingerprint` covers
+/// the peer's fingerprint side, this covers ours).
+///
+/// Returns `null` if onboarding hasn't completed yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyFingerprint(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let java_str = env
+                .new_string(identity.public_key().fingerprint())
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}

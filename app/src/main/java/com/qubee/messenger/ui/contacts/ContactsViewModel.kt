@@ -56,6 +56,7 @@ class ContactsViewModel @Inject constructor(
             isVerified = trustLevel == TrustLevel.VERIFIED,
             isOnline = isOnline,
             initials = initials,
+            lastSeenEpochMillis = lastSeen,
         )
     }
 }
@@ -72,4 +73,8 @@ data class ContactSummaryUi(
     val isVerified: Boolean,
     val isOnline: Boolean,
     val initials: String,
+    /// Epoch milliseconds. Null for contacts that have never been
+    /// observed online — we default to "Last seen offline" in the
+    /// row subtitle in that case.
+    val lastSeenEpochMillis: Long?,
 )

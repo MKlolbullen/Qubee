@@ -165,6 +165,30 @@ class QubeeManager @Inject constructor(
         }
 
     /**
+     * Return the locally-active identity's own fingerprint, formatted
+     * as `"AABB CCDD EEFF GGHH"`. Used by the verify dialog to render
+     * the local user's self-fingerprint as a QR code so the peer can
+     * scan it — closes the "what does the peer scan to verify *me*"
+     * direction of the OOB compare ceremony.
+     *
+     * Returns null if onboarding hasn't completed yet (no active
+     * identity in the keystore).
+     */
+    suspend fun getMyFingerprint(): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeGetMyFingerprint()
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust my-fingerprint JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust my-fingerprint computation failed")
+                null
+            }
+        }
+
+    /**
      * Read the `sender_id` field out of a `GroupMessageEnvelope`
      * wire envelope without decrypting. The signed body carries
      * this in the clear (authenticated, not confidential), so we
@@ -322,6 +346,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeComputeFingerprint(identityKey: ByteArray): String?
     private external fun nativeInspectEnvelopeSender(wire: ByteArray): String?
     private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
+    private external fun nativeGetMyFingerprint(): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

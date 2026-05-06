@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.foundation.Image
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
@@ -21,6 +23,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import com.qubee.messenger.util.QrUtils
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -59,6 +64,7 @@ import androidx.compose.ui.unit.dp
 fun VerifyContactDialog(
     contactName: String,
     localFingerprint: String,
+    myFingerprint: String?,
     sasCode: String?,
     onConfirmFingerprint: (expected: String) -> Unit,
     onConfirmSasMatch: () -> Unit,
@@ -124,6 +130,34 @@ fun VerifyContactDialog(
                     Text("Scan QR instead")
                 }
 
+                if (myFingerprint != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Divider()
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Let peer scan you",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "Show this QR to the contact's device. Their verify " +
+                            "dialog scans it to confirm your identity at the same time " +
+                            "you're confirming theirs.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    SelfFingerprintQr(myFingerprint)
+                    Text(
+                        text = myFingerprint,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
+                        textAlign = TextAlign.Center,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+
                 if (sasCode != null) {
                     Spacer(Modifier.height(4.dp))
                     Divider()
@@ -175,4 +209,44 @@ fun VerifyContactDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
+}
+
+/**
+ * Render the local user's fingerprint as a QR code using the
+ * existing [com.qubee.messenger.util.QrUtils.encodeAsBitmap]
+ * helper. Cached via `remember(fingerprint)` so the encode runs
+ * once per dialog open, not on every recomposition.
+ *
+ * The QR is bordered + padded inside a high-contrast white
+ * background so a scanner has a clean target. Failure to encode
+ * (oversized payload — won't happen for an 8-byte fingerprint —
+ * or memory pressure) renders the textual fingerprint as a
+ * fallback below; the textual version is always rendered by the
+ * caller anyway, so the fallback is implicit.
+ */
+@Composable
+private fun SelfFingerprintQr(fingerprint: String) {
+    val bitmap = remember(fingerprint) {
+        QrUtils.encodeAsBitmap(fingerprint, sizePx = 480)
+    }
+    if (bitmap != null) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = Color.White,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "Your verification QR code",
+                    modifier = Modifier.size(180.dp),
+                )
+            }
+        }
+    }
 }

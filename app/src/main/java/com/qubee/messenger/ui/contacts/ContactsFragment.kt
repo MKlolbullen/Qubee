@@ -229,9 +229,38 @@ private fun ContactRow(contact: ContactSummaryUi, onClick: () -> Unit) {
                 }
             }
             Spacer(Modifier.height(2.dp))
-            QubeeMutedText(
-                text = if (contact.isOnline) "Online" else "Last seen offline",
-            )
+            QubeeMutedText(text = subtitleFor(contact))
+        }
+    }
+}
+
+/**
+ * Build the row subtitle from online status + relative time on
+ * `lastSeenEpochMillis`. Buckets are coarse on purpose — this is
+ * an at-a-glance hint, not a clock.
+ *
+ *  * online → "Online"
+ *  * `lastSeen == null` → "Last seen offline" (no timestamp ever
+ *    recorded; usually means we've never received a packet from
+ *    this peer since pairing).
+ *  * within 1 minute → "Last seen just now"
+ *  * within 1 hour → "Last seen Xm ago"
+ *  * within 1 day → "Last seen Xh ago"
+ *  * within 7 days → "Last seen Xd ago"
+ *  * older → "Last seen on YYYY-MM-DD"
+ */
+private fun subtitleFor(contact: ContactSummaryUi): String {
+    if (contact.isOnline) return "Online"
+    val ts = contact.lastSeenEpochMillis ?: return "Last seen offline"
+    val deltaSeconds = ((System.currentTimeMillis() - ts) / 1000).coerceAtLeast(0)
+    return when {
+        deltaSeconds < 60 -> "Last seen just now"
+        deltaSeconds < 60 * 60 -> "Last seen ${deltaSeconds / 60}m ago"
+        deltaSeconds < 24 * 60 * 60 -> "Last seen ${deltaSeconds / 3600}h ago"
+        deltaSeconds < 7 * 24 * 60 * 60 -> "Last seen ${deltaSeconds / 86_400}d ago"
+        else -> {
+            val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+            "Last seen on ${fmt.format(java.util.Date(ts))}"
         }
     }
 }

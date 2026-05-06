@@ -75,13 +75,18 @@ fun GroupDetailsSheet(
     onLoadMembers: () -> Unit,
     onAddMember: () -> Unit,
     onRemoveMember: (memberIdHex: String) -> Unit,
+    onPromoteMember: (memberIdHex: String, newRole: String) -> Unit,
     onLeaveGroup: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val canManage = members.orEmpty()
+    val myRole = members.orEmpty()
         .firstOrNull { myIdentityIdHex != null && it.identityIdHex == myIdentityIdHex }
         ?.role
-        ?.let { it == "Owner" || it == "Admin" } == true
+    val canManage = myRole?.let { it == "Owner" || it == "Admin" } == true
+    // Promote / demote is strictly owner-only Rust-side
+    // (`GroupManager::promote_member` checks `promoter.role == Owner`),
+    // so the UI gate is stricter than `canManage`.
+    val isOwner = myRole == "Owner"
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var confirmLeave by remember { mutableStateOf(false) }
 
@@ -127,7 +132,9 @@ fun GroupDetailsSheet(
                     members = members,
                     myIdentityIdHex = myIdentityIdHex,
                     canManage = canManage,
+                    canPromote = isOwner,
                     onRemoveMember = onRemoveMember,
+                    onPromoteMember = onPromoteMember,
                 )
             }
 
@@ -203,25 +210,34 @@ private fun MemberList(
     members: List<GroupMemberInfo>,
     myIdentityIdHex: String?,
     canManage: Boolean,
+    canPromote: Boolean,
     onRemoveMember: (String) -> Unit,
+    onPromoteMember: (memberIdHex: String, newRole: String) -> Unit,
 ) {
     var pendingRemove by remember { mutableStateOf<GroupMemberInfo?>(null) }
+    var pendingPromote by remember { mutableStateOf<GroupMemberInfo?>(null) }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         items(members, key = { it.identityIdHex }) { member ->
             val isSelf = myIdentityIdHex != null && member.identityIdHex == myIdentityIdHex
+            // Owner row never shows the role-picker — transferring
+            // ownership needs its own confirmed flow that this batch
+            // doesn't ship.
+            val isMemberOwner = member.role == "Owner"
             MemberRow(
                 member = member,
                 isSelf = isSelf,
                 canRemove = canManage && !isSelf && member.isActive,
+                canPromote = canPromote && !isSelf && member.isActive && !isMemberOwner,
                 onRequestRemove = { pendingRemove = member },
+                onRequestPromote = { pendingPromote = member },
             )
         }
     }
-    val target = pendingRemove
-    if (target != null) {
+    val removeTarget = pendingRemove
+    if (removeTarget != null) {
         AlertDialog(
             onDismissRequest = { pendingRemove = null },
-            title = { Text("Remove ${target.displayName.ifBlank { "this member" }}?") },
+            title = { Text("Remove ${removeTarget.displayName.ifBlank { "this member" }}?") },
             text = {
                 Text(
                     "The Rust core will rotate the group key and the removed member loses access to new messages. They keep their copy of past traffic up to the rotation point.",
@@ -230,7 +246,7 @@ private fun MemberList(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    onRemoveMember(target.identityIdHex)
+                    onRemoveMember(removeTarget.identityIdHex)
                     pendingRemove = null
                 }) { Text("Remove", color = QubeePalette.Cyan) }
             },
@@ -239,14 +255,79 @@ private fun MemberList(
             },
         )
     }
+    val promoteTarget = pendingPromote
+    if (promoteTarget != null) {
+        RolePickerDialog(
+            member = promoteTarget,
+            onDismiss = { pendingPromote = null },
+            onPick = { newRole ->
+                onPromoteMember(promoteTarget.identityIdHex, newRole)
+                pendingPromote = null
+            },
+        )
+    }
 }
+
+/**
+ * Owner-only role picker. Lists the four assignable roles (`Owner`
+ * is excluded — transferring ownership has its own flow that this
+ * batch doesn't ship). Greys out the row matching the member's
+ * current role.
+ *
+ * Strings here must match the small fixed vocabulary the JNI
+ * accepts (`Admin` / `Moderator` / `Member` / `Observer`); see
+ * `Java_com_qubee_messenger_crypto_QubeeManager_nativePromoteMember`
+ * in `src/jni_api.rs` for the canonical list.
+ */
+@Composable
+private fun RolePickerDialog(
+    member: GroupMemberInfo,
+    onDismiss: () -> Unit,
+    onPick: (newRole: String) -> Unit,
+) {
+    val roles = listOf("Admin", "Moderator", "Member", "Observer")
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Change role for ${member.displayName.ifBlank { "this member" }}") },
+        text = {
+            Column {
+                QubeeMutedText(
+                    text = "Currently: ${member.role}. The Rust core broadcasts a signed RoleChange so other members converge on the new view.",
+                )
+                Spacer(Modifier.height(12.dp))
+                roles.forEach { role ->
+                    val isCurrent = role == member.role
+                    TextButton(
+                        onClick = { if (!isCurrent) onPick(role) },
+                        enabled = !isCurrent,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = if (isCurrent) "$role (current)" else role,
+                            color = if (isCurrent) QubeeMutedColor else QubeePalette.Cyan,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+private val QubeeMutedColor: androidx.compose.ui.graphics.Color
+    get() = QubeePalette.Text.copy(alpha = 0.45f)
 
 @Composable
 private fun MemberRow(
     member: GroupMemberInfo,
     isSelf: Boolean,
     canRemove: Boolean,
+    canPromote: Boolean,
     onRequestRemove: () -> Unit,
+    onRequestPromote: () -> Unit,
 ) {
     val initials = member.displayName
         .split(' ', '\t', '\n')
@@ -306,9 +387,19 @@ private fun MemberRow(
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                 )
             }
-        } else if (canRemove) {
-            TextButton(onClick = onRequestRemove) {
-                Text("Remove", color = QubeePalette.Cyan)
+        } else {
+            // Right-edge actions for non-self rows. Owner / admin
+            // can remove; owner alone can change role. Both can be
+            // visible on the same row when the viewer is the owner.
+            if (canPromote) {
+                TextButton(onClick = onRequestPromote) {
+                    Text("Role", color = QubeePalette.Cyan)
+                }
+            }
+            if (canRemove) {
+                TextButton(onClick = onRequestRemove) {
+                    Text("Remove", color = QubeePalette.Cyan)
+                }
             }
         }
     }

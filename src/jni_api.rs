@@ -17,8 +17,10 @@ use crate::identity::identity_key::{IdentityKey, IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_request_join, GroupHandshake, KeyRotationBody, RequestJoinBody,
+    generate_ephemeral_kyber, sign_request_join, sign_role_change, GroupHandshake,
+    KeyRotationBody, RequestJoinBody,
 };
+use crate::groups::group_permissions::Role;
 use crate::groups::group_message::{
     decrypt_group_message, encrypt_group_message, GroupMessageEnvelope,
 };
@@ -684,6 +686,106 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
 
         ok_or_null(env, result)
     })
+}
+
+/// Promote (or demote) a member of a group we own to a new role
+/// and broadcast a signed `RoleChange` so other members converge on
+/// the same membership view. Owner-only Rust-side; non-owner callers
+/// get an `Err` from `GroupManager::promote_member` which surfaces
+/// here as a null return.
+///
+/// `new_role` accepts a small fixed vocabulary — `"Owner"`, `"Admin"`,
+/// `"Moderator"`, `"Member"`, `"Observer"` — case-insensitive, with
+/// any other value rejected. We deliberately don't expose `Custom(_)`
+/// over the JNI: the wire frame supports it, but there's no UI for
+/// minting one yet, and silently round-tripping arbitrary strings
+/// would let bugs in the client side leak through.
+///
+/// Returns JSON `{group_id_hex, member_id_hex, new_role,
+/// new_version, network_published}` on success.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePromoteMember(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    member_id_hex: JString,
+    new_role: JString,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let member_id_hex: String = match env.get_string(&member_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let new_role: String = match env.get_string(&new_role) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+            let member_id = IdentityId::from(parse_hex32(Some(member_id_hex.as_str()))?);
+            let role = match new_role.to_ascii_lowercase().as_str() {
+                "owner" => Role::Owner,
+                "admin" => Role::Admin,
+                "moderator" => Role::Moderator,
+                "member" => Role::Member,
+                "observer" => Role::Observer,
+                other => return Err(anyhow::anyhow!("unknown role: {other}")),
+            };
+
+            let signed = {
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                let body = gm.promote_member(group_id, identity.identity_id(), member_id, role.clone())?;
+                sign_role_change(identity.as_ref(), body)?
+            };
+
+            let (new_version, role_str) = match &signed {
+                GroupHandshake::RoleChange { body, .. } => (
+                    body.new_version,
+                    role_to_str(&body.new_role).to_string(),
+                ),
+                _ => (0u64, new_role.clone()),
+            };
+
+            let topic = group_topic(&hex::encode(group_id.as_ref()));
+            let wire = signed.to_wire()?;
+            let published = publish_to_topic(topic, wire);
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "member_id_hex": hex::encode(member_id.as_ref()),
+                "new_role": role_str,
+                "new_version": new_version,
+                "network_published": published,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Render a `Role` back to the canonical wire string used by
+/// `nativePromoteMember` and `nativeListGroupMembers`. The roundtrip
+/// stays in lock-step with the small vocabulary the JNI accepts so
+/// the UI always sees the same set of strings.
+fn role_to_str(role: &Role) -> &'static str {
+    match role {
+        Role::Owner => "Owner",
+        Role::Admin => "Admin",
+        Role::Moderator => "Moderator",
+        Role::Member => "Member",
+        Role::Observer => "Observer",
+        Role::Custom(_) => "Custom",
+    }
 }
 
 /// Record that the local user accepted a `qubee://invite/...` link
@@ -1975,14 +2077,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
                 .members
                 .values()
                 .map(|m| {
-                    let role_label = match &m.role {
-                        crate::groups::group_permissions::Role::Owner => "Owner",
-                        crate::groups::group_permissions::Role::Admin => "Admin",
-                        crate::groups::group_permissions::Role::Moderator => "Moderator",
-                        crate::groups::group_permissions::Role::Member => "Member",
-                        crate::groups::group_permissions::Role::Observer => "Observer",
-                        crate::groups::group_permissions::Role::Custom(_) => "Custom",
-                    };
+                    let role_label = role_to_str(&m.role);
                     let is_active = matches!(
                         m.member_status,
                         crate::groups::group_manager::MemberStatus::Active,

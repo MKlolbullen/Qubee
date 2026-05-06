@@ -96,6 +96,24 @@ class GroupRepository @Inject constructor(
     ): String? = qubeeManager.removeMember(groupIdHex, memberIdHex, reason)
 
     /**
+     * Promote (or demote) a member to a new role. Owner-only Rust-
+     * side; non-owner callers get a null return. `newRole` must be
+     * one of `Owner`, `Admin`, `Moderator`, `Member`, `Observer`
+     * (case-insensitive Rust-side); anything else is rejected.
+     *
+     * Returns the JSON envelope from `nativePromoteMember`
+     * unchanged for now — callers that just need success/failure
+     * can `!= null` it; the structured shape (new_version,
+     * network_published) lands when there's a UI surface that
+     * wants those details.
+     */
+    suspend fun promoteMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        newRole: String,
+    ): String? = qubeeManager.promoteMember(groupIdHex, memberIdHex, newRole)
+
+    /**
      * List the active + removed members of a group from the Rust
      * core's local view. Returns null if the group isn't yet known
      * locally (e.g., the user accepted an invite but the handshake

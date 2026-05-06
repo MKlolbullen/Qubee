@@ -297,6 +297,31 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Promote (or demote) a member of a group we own to a new role.
+     * `newRole` must be one of `Owner`, `Admin`, `Moderator`,
+     * `Member`, `Observer` (case-insensitive Rust-side; the native
+     * code rejects anything else). Returns the JSON envelope from
+     * `nativePromoteMember` on success, null if the JNI call failed
+     * (not owner, member not found, role string unknown, …).
+     */
+    suspend fun promoteMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        newRole: String,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativePromoteMember(groupIdHex, memberIdHex, newRole)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust promote-member JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust promote-member failed")
+            null
+        }
+    }
+
+    /**
      * List the active members of a group, as returned by the Rust
      * core. JSON shape is an array of
      * `{identity_id_hex, display_name, role, is_active, joined_at}`
@@ -411,6 +436,11 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         memberIdHex: String,
         reason: String,
+    ): String?
+    private external fun nativePromoteMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        newRole: String,
     ): String?
     private external fun nativeSendGroupMessage(
         groupIdHex: String,

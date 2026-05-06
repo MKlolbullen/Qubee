@@ -582,6 +582,38 @@ class ChatViewModel @Inject constructor(
     }
 
     /**
+     * Promote (or demote) a member to a new role. Owner-only Rust-
+     * side; non-owner callers see a "Failed to update role" notice
+     * via the null-mapped JNI return.
+     *
+     * Caller passes one of the small fixed vocabulary the JNI
+     * accepts — `"Admin"`, `"Moderator"`, `"Member"`, `"Observer"`
+     * (case-insensitive). Owner is excluded from the UI: rotating
+     * ownership requires its own confirmed transfer flow, which
+     * this batch doesn't ship.
+     *
+     * On success the Rust core publishes a signed `RoleChange`
+     * frame so other members converge on the same membership view;
+     * we follow up with `loadGroupMembers` so the local roster row
+     * picks up the new role label without waiting for a sheet
+     * dismiss-and-reopen.
+     */
+    fun promoteMember(memberIdHex: String, newRole: String) {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val ok = runCatching {
+                groupRepository.promoteMember(conversationId, memberIdHex, newRole)
+            }.getOrNull() != null
+            if (ok) {
+                _events.emit(ChatUiEvent.Notice("Role updated to $newRole"))
+                loadGroupMembers()
+            } else {
+                _events.emit(ChatUiEvent.Notice("Failed to update role (owner only?)"))
+            }
+        }
+    }
+
+    /**
      * Leave the current group. Routes through the existing
      * `removeMember` JNI export — the Rust side accepts
      * "remove yourself" the same way it accepts an owner removing

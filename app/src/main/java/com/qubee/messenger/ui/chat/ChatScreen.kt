@@ -191,6 +191,7 @@ fun ChatScreen(
                     onLoadMembers = viewModel::loadGroupMembers,
                     onAddMember = viewModel::addMember,
                     onRemoveMember = viewModel::removeMember,
+                    onPromoteMember = viewModel::promoteMember,
                     onLeaveGroup = viewModel::leaveGroup,
                     onDismiss = { showDetails = false },
                 )

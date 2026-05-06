@@ -212,6 +212,7 @@ private fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
 private fun MyIdentityPanel(viewModel: SettingsViewModel) {
     val identity by viewModel.identity.collectAsState()
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     QubeePanel {
         QubeeStatusPill("YOUR IDENTITY")
@@ -257,17 +258,50 @@ private fun MyIdentityPanel(viewModel: SettingsViewModel) {
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                 )
                 Spacer(Modifier.height(10.dp))
-                QubeeSecondaryButton(
-                    text = "Copy link",
-                    onClick = {
-                        clipboard.setText(
-                            androidx.compose.ui.text.AnnotatedString(shareLink),
-                        )
-                    },
-                )
+                androidx.compose.foundation.layout.Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    QubeeSecondaryButton(
+                        text = "Copy link",
+                        onClick = {
+                            clipboard.setText(
+                                androidx.compose.ui.text.AnnotatedString(shareLink),
+                            )
+                        },
+                        modifier = Modifier.weight(1f),
+                    )
+                    QubeeSecondaryButton(
+                        text = "Share…",
+                        onClick = { startShareIntent(context, shareLink) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
         }
     }
+}
+
+/**
+ * Open the system share sheet with the share link as plain text.
+ * Used by the "Share…" button on the My identity panel — saves
+ * the user a copy-paste round-trip when they want to send the
+ * invite via another messaging app.
+ *
+ * `Intent.ACTION_SEND` with `text/plain` MIME is the standard
+ * Android pattern; the system chooser presents every app that
+ * registered for plain-text share intents (Messages, Email,
+ * Slack, etc.). The chooser title is fixed to "Share Qubee
+ * identity" so users see what they're sharing in the chooser
+ * header.
+ */
+private fun startShareIntent(context: android.content.Context, link: String) {
+    val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(android.content.Intent.EXTRA_TEXT, link)
+    }
+    val chooser = android.content.Intent.createChooser(sendIntent, "Share Qubee identity")
+    chooser.flags = chooser.flags or android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+    runCatching { context.startActivity(chooser) }
 }
 
 @Composable

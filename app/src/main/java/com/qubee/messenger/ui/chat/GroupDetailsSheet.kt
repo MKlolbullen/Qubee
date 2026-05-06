@@ -73,9 +73,15 @@ fun GroupDetailsSheet(
     members: List<GroupMemberInfo>?,
     myIdentityIdHex: String?,
     onLoadMembers: () -> Unit,
+    onAddMember: () -> Unit,
+    onRemoveMember: (memberIdHex: String) -> Unit,
     onLeaveGroup: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val canManage = members.orEmpty()
+        .firstOrNull { myIdentityIdHex != null && it.identityIdHex == myIdentityIdHex }
+        ?.role
+        ?.let { it == "Owner" || it == "Admin" } == true
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var confirmLeave by remember { mutableStateOf(false) }
 
@@ -101,12 +107,28 @@ fun GroupDetailsSheet(
             )
             Spacer(Modifier.height(4.dp))
             QubeeMutedText("Member roster, fetched live from the Rust core.")
+
+            if (canManage) {
+                Spacer(Modifier.height(14.dp))
+                OutlinedButton(
+                    onClick = onAddMember,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Add member", color = QubeePalette.Cyan)
+                }
+            }
+
             Spacer(Modifier.height(16.dp))
 
             when {
                 members == null -> LoadingMembers()
                 members.isEmpty() -> EmptyMembers()
-                else -> MemberList(members, myIdentityIdHex)
+                else -> MemberList(
+                    members = members,
+                    myIdentityIdHex = myIdentityIdHex,
+                    canManage = canManage,
+                    onRemoveMember = onRemoveMember,
+                )
             }
 
             Spacer(Modifier.height(20.dp))
@@ -177,16 +199,55 @@ private fun EmptyMembers() {
 }
 
 @Composable
-private fun MemberList(members: List<GroupMemberInfo>, myIdentityIdHex: String?) {
+private fun MemberList(
+    members: List<GroupMemberInfo>,
+    myIdentityIdHex: String?,
+    canManage: Boolean,
+    onRemoveMember: (String) -> Unit,
+) {
+    var pendingRemove by remember { mutableStateOf<GroupMemberInfo?>(null) }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         items(members, key = { it.identityIdHex }) { member ->
-            MemberRow(member, isSelf = myIdentityIdHex != null && member.identityIdHex == myIdentityIdHex)
+            val isSelf = myIdentityIdHex != null && member.identityIdHex == myIdentityIdHex
+            MemberRow(
+                member = member,
+                isSelf = isSelf,
+                canRemove = canManage && !isSelf && member.isActive,
+                onRequestRemove = { pendingRemove = member },
+            )
         }
+    }
+    val target = pendingRemove
+    if (target != null) {
+        AlertDialog(
+            onDismissRequest = { pendingRemove = null },
+            title = { Text("Remove ${target.displayName.ifBlank { "this member" }}?") },
+            text = {
+                Text(
+                    "The Rust core will rotate the group key and the removed member loses access to new messages. They keep their copy of past traffic up to the rotation point.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onRemoveMember(target.identityIdHex)
+                    pendingRemove = null
+                }) { Text("Remove", color = QubeePalette.Cyan) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRemove = null }) { Text("Cancel") }
+            },
+        )
     }
 }
 
 @Composable
-private fun MemberRow(member: GroupMemberInfo, isSelf: Boolean) {
+private fun MemberRow(
+    member: GroupMemberInfo,
+    isSelf: Boolean,
+    canRemove: Boolean,
+    onRequestRemove: () -> Unit,
+) {
     val initials = member.displayName
         .split(' ', '\t', '\n')
         .mapNotNull { it.firstOrNull()?.toString()?.uppercase() }
@@ -244,6 +305,10 @@ private fun MemberRow(member: GroupMemberInfo, isSelf: Boolean) {
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                 )
+            }
+        } else if (canRemove) {
+            TextButton(onClick = onRequestRemove) {
+                Text("Remove", color = QubeePalette.Cyan)
             }
         }
     }

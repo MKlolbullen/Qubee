@@ -517,6 +517,71 @@ class ChatViewModel @Inject constructor(
     }
 
     /**
+     * Mint a fresh invite link for the current group and emit a
+     * `ShareLink` event so the host launches the system share
+     * sheet. Owner-only Rust-side; non-owner callers see a
+     * "Failed to mint invite" notice (the JNI call returns null,
+     * which we map to the same UX as a transient JNI failure).
+     *
+     * Default TTL is 24h via `groupRepository.createInvite`'s
+     * `expiresAtSeconds` parameter — passing -1 here would mean
+     * "no expiry" but that's not the right default for a
+     * member-add gesture on a live chat. Hardcoded to 24h for
+     * now; configurable in a follow-up.
+     */
+    fun addMember() {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val expiresAt = System.currentTimeMillis() / 1000L + 24L * 60L * 60L
+            val invite = runCatching {
+                groupRepository.createInvite(
+                    groupIdHex = conversationId,
+                    expiresAtSeconds = expiresAt,
+                    maxUses = 1,
+                )
+            }.getOrNull()
+            val link = invite?.link
+            if (link == null) {
+                _events.emit(ChatUiEvent.Notice("Failed to mint invite (owner only?)"))
+                return@launch
+            }
+            _events.emit(
+                ChatUiEvent.ShareLink(
+                    link = link,
+                    title = "Share Qubee group invite",
+                ),
+            )
+        }
+    }
+
+    /**
+     * Remove a member from the current group. Owner / Admin only
+     * Rust-side; callers without permission see "Failed to remove
+     * member" via the null-mapped JNI return.
+     *
+     * The Rust core publishes a `KeyRotation` after a successful
+     * removal so the remaining members converge on a fresh group
+     * key the kicked member can no longer decrypt with — the
+     * removed member stays subscribed to the gossipsub topic but
+     * sees only the encrypted bytes from this point.
+     */
+    fun removeMember(memberIdHex: String) {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val ok = runCatching {
+                groupRepository.removeMember(conversationId, memberIdHex, "removed by admin")
+            }.getOrNull() != null
+            if (ok) {
+                _events.emit(ChatUiEvent.Notice("Member removed"))
+                // Refresh roster so the UI drops the row.
+                loadGroupMembers()
+            } else {
+                _events.emit(ChatUiEvent.Notice("Failed to remove member"))
+            }
+        }
+    }
+
+    /**
      * Leave the current group. Routes through the existing
      * `removeMember` JNI export — the Rust side accepts
      * "remove yourself" the same way it accepts an owner removing
@@ -664,6 +729,12 @@ enum class UiMessageType { TEXT, IMAGE, FILE, AUDIO }
 
 sealed class ChatUiEvent {
     data class Notice(val message: String) : ChatUiEvent()
+    /// Asks the host (ChatFragment / ChatScreen) to launch the
+    /// system share sheet with the given text. Used by the
+    /// "Add member" action — fresh group invite link is minted
+    /// in the ViewModel, but the share-intent has to be fired
+    /// from a Context the Composable owns.
+    data class ShareLink(val link: String, val title: String) : ChatUiEvent()
 }
 
 private fun MessageType.toUiType(): UiMessageType = when (this) {

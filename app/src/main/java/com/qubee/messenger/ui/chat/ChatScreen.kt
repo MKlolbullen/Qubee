@@ -110,6 +110,22 @@ fun ChatScreen(
             viewModel.events.collect { event ->
                 when (event) {
                     is ChatUiEvent.Notice -> snackbarHostState.showSnackbar(event.message)
+                    is ChatUiEvent.ShareLink -> {
+                        // Launch the system share sheet with the
+                        // fresh invite link as plain text. Wrapped
+                        // in runCatching for the (rare) zero-share-
+                        // targets case; same pattern as Settings's
+                        // identity-share button.
+                        runCatching {
+                            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(android.content.Intent.EXTRA_TEXT, event.link)
+                            }
+                            val chooser = android.content.Intent.createChooser(intent, event.title)
+                            chooser.flags = chooser.flags or android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                            context.startActivity(chooser)
+                        }
+                    }
                 }
             }
         }
@@ -173,6 +189,8 @@ fun ChatScreen(
                     members = uiState.groupMembers,
                     myIdentityIdHex = uiState.myIdentityIdHex,
                     onLoadMembers = viewModel::loadGroupMembers,
+                    onAddMember = viewModel::addMember,
+                    onRemoveMember = viewModel::removeMember,
                     onLeaveGroup = viewModel::leaveGroup,
                     onDismiss = { showDetails = false },
                 )

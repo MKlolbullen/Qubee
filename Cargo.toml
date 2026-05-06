@@ -114,3 +114,25 @@ _typecheck_jni = []
 
 [dev-dependencies]
 tempfile = "3.10"
+# Property-based round-trip tests for canonical wire encoders.
+# Counter-balances `tests/wire_stability.rs`'s pinned vectors with
+# randomized inputs, catching encode/decode asymmetries that a single
+# fixed example wouldn't cover.
+proptest = "1.4"
+# Microbenchmarks for the hot paths (Kyber KEM, ML-DSA-44 sign/verify,
+# ChaCha20-Poly1305 group encrypt/decrypt). `cargo bench --no-run` is
+# wired into CI as a smoke test; full runs land baseline numbers in
+# `docs/perf/baseline.md`.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name = "kyber_kem"
+harness = false
+
+[[bench]]
+name = "mldsa_sign_verify"
+harness = false
+
+[[bench]]
+name = "group_encrypt_decrypt"
+harness = false

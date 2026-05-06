@@ -236,3 +236,136 @@ fn canonical_payload_uses_explicit_length_prefixes_not_bincode() {
     // accidental re-encoding (base64, etc.) would break this.
     assert!(canonical.windows(kyber_pub.len()).any(|w| w == kyber_pub));
 }
+
+// ---------------------------------------------------------------------
+// Property-based round-trip tests.
+//
+// The pinned vectors above catch byte-level layout regressions for one
+// fixed input per type. The properties below run the same encode→decode
+// loop across many randomized inputs to surface input shapes that the
+// fixed vectors don't cover (long invitation_codes, NUL bytes inside
+// display names, max-size groups, etc.).
+//
+// Cases are capped at 64 — Kyber-768 pubkeys are 1184 bytes and the
+// default 256-case run blows CI runtime; 64 cases is enough to surface
+// any obvious encode/decode asymmetry while keeping the bench tight.
+// ---------------------------------------------------------------------
+
+use proptest::prelude::*;
+use qubee_crypto::groups::group_handshake::{
+    sign_request_join, sign_role_change, GroupHandshake,
+};
+use qubee_crypto::groups::group_message::GroupMessageEnvelope;
+
+fn config_64() -> ProptestConfig {
+    ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    }
+}
+
+proptest! {
+    #![proptest_config(config_64())]
+
+    /// Round-trip a `GroupMessageEnvelope` through `to_wire` /
+    /// `from_wire` for arbitrary plaintext-shaped inputs. Catches any
+    /// length-prefix asymmetry that the pinned single-vector test
+    /// can't surface.
+    #[test]
+    fn group_message_envelope_round_trips(
+        group_seed in any::<[u8; 32]>(),
+        sender_seed in any::<[u8; 32]>(),
+        generation in 0u64..=1_000_000,
+        aead_payload in proptest::collection::vec(any::<u8>(), 0..1024),
+        timestamp in 0u64..=4_000_000_000,
+    ) {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let body = GroupMessageBody {
+            group_id: GroupId::from_bytes(group_seed),
+            sender_id: IdentityId::from(sender_seed),
+            generation,
+            aead_payload,
+            timestamp,
+        };
+        let payload = canonical_group_message(&body);
+        let signature = kp.sign(&payload).unwrap();
+        let envelope = GroupMessageEnvelope { body: body.clone(), signature };
+        let wire = envelope.to_wire().expect("to_wire");
+        let decoded = GroupMessageEnvelope::from_wire(&wire)
+            .expect("from_wire on freshly-encoded envelope must succeed");
+        prop_assert_eq!(decoded.body.group_id, body.group_id);
+        prop_assert_eq!(decoded.body.sender_id, body.sender_id);
+        prop_assert_eq!(decoded.body.generation, body.generation);
+        prop_assert_eq!(decoded.body.aead_payload, body.aead_payload);
+        prop_assert_eq!(decoded.body.timestamp, body.timestamp);
+    }
+
+    /// Round-trip a signed `RequestJoin` handshake for arbitrary
+    /// invitation codes and joiner display names. The signed
+    /// `GroupHandshake::to_wire` / `from_wire` path goes through
+    /// bincode, so this surfaces any field-ordering or option-encoding
+    /// asymmetries.
+    #[test]
+    fn signed_request_join_round_trips(
+        group_seed in any::<[u8; 32]>(),
+        invitation_code in "[A-Za-z0-9_-]{0,32}",
+        joiner_display_name in "[\\PC]{0,64}",
+    ) {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let (kyber_pub, _) = generate_ephemeral_kyber();
+        let body = RequestJoinBody {
+            group_id: GroupId::from_bytes(group_seed),
+            invitation_code: invitation_code.clone(),
+            joiner_public_key: kp.public_key(),
+            joiner_display_name: joiner_display_name.clone(),
+            joiner_kyber_pub: kyber_pub.clone(),
+        };
+        let signed = sign_request_join(&kp, body).unwrap();
+        let wire = signed.to_wire().expect("handshake to_wire");
+        let decoded = GroupHandshake::from_wire(&wire)
+            .expect("handshake from_wire on freshly-encoded request");
+        match decoded {
+            GroupHandshake::RequestJoin { body, .. } => {
+                prop_assert_eq!(body.group_id.as_ref(), &group_seed[..]);
+                prop_assert_eq!(body.invitation_code, invitation_code);
+                prop_assert_eq!(body.joiner_display_name, joiner_display_name);
+                prop_assert_eq!(body.joiner_kyber_pub, kyber_pub);
+            }
+            other => prop_assert!(false, "expected RequestJoin variant, got {:?}", other),
+        }
+    }
+
+    /// Round-trip a signed `RoleChange` for arbitrary versions and
+    /// timestamps. RoleChange is the smallest signed handshake variant;
+    /// good canary for the bincode encode path.
+    #[test]
+    fn signed_role_change_round_trips(
+        group_seed in any::<[u8; 32]>(),
+        promoter_seed in any::<[u8; 32]>(),
+        member_seed in any::<[u8; 32]>(),
+        new_version in 1u64..=1_000_000,
+        timestamp in 0u64..=4_000_000_000,
+    ) {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let body = RoleChangeBody {
+            group_id: GroupId::from_bytes(group_seed),
+            promoter_id: IdentityId::from(promoter_seed),
+            member_id: IdentityId::from(member_seed),
+            new_role: Role::Admin,
+            new_version,
+            timestamp,
+        };
+        let signed = sign_role_change(&kp, body).unwrap();
+        let wire = signed.to_wire().expect("handshake to_wire");
+        let decoded = GroupHandshake::from_wire(&wire)
+            .expect("handshake from_wire on freshly-encoded role-change");
+        match decoded {
+            GroupHandshake::RoleChange { body, .. } => {
+                prop_assert_eq!(body.group_id.as_ref(), &group_seed[..]);
+                prop_assert_eq!(body.new_version, new_version);
+                prop_assert_eq!(body.timestamp, timestamp);
+            }
+            other => prop_assert!(false, "expected RoleChange variant, got {:?}", other),
+        }
+    }
+}

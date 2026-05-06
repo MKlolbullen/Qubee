@@ -1909,3 +1909,71 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyF
         result.unwrap_or(std::ptr::null_mut())
     })
 }
+
+/// Return the active members of a group as a JSON array. Each entry
+/// is `{identity_id_hex, display_name, role, is_active, joined_at}`.
+/// Used by the Android Group Details sheet to render the member
+/// list — the Rust side is the source of truth (the Kotlin
+/// `Conversation.participants` field is a hint, not authoritative).
+///
+/// Returns:
+///   * the JSON array on success,
+///   * `[]` if the group exists but has no active members (shouldn't
+///     happen — the owner is always an active member — but matches
+///     the empty-state UI gracefully),
+///   * `null` if the group isn't in the local view (legacy enrolment,
+///     bad input). The caller treats null as "couldn't load".
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGroupMembers(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let raw: String = env
+                .get_string(&group_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid group_id_hex: {e}"))?
+                .into();
+            let group_id = GroupId::from_bytes(parse_hex32(Some(raw.as_str()))?);
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let group = gm
+                .get_group(&group_id)
+                .ok_or_else(|| anyhow::anyhow!("group not in local view"))?;
+            let members: Vec<serde_json::Value> = group
+                .members
+                .values()
+                .map(|m| {
+                    let role_label = match &m.role {
+                        crate::groups::group_permissions::Role::Owner => "Owner",
+                        crate::groups::group_permissions::Role::Admin => "Admin",
+                        crate::groups::group_permissions::Role::Moderator => "Moderator",
+                        crate::groups::group_permissions::Role::Member => "Member",
+                        crate::groups::group_permissions::Role::Observer => "Observer",
+                        crate::groups::group_permissions::Role::Custom(_) => "Custom",
+                    };
+                    let is_active = matches!(
+                        m.member_status,
+                        crate::groups::group_manager::MemberStatus::Active,
+                    );
+                    serde_json::json!({
+                        "identity_id_hex": hex::encode(m.identity_id.as_ref() as &[u8]),
+                        "display_name": m.display_name,
+                        "role": role_label,
+                        "is_active": is_active,
+                        "joined_at": m.joined_at,
+                    })
+                })
+                .collect();
+            let payload = serde_json::Value::Array(members).to_string();
+            let java_str = env
+                .new_string(payload)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}

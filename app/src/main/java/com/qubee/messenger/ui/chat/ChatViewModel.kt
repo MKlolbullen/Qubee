@@ -44,6 +44,7 @@ class ChatViewModel @Inject constructor(
     private val messageRepository: MessageRepository,
     private val contactRepository: ContactRepository,
     private val conversationRepository: ConversationRepository,
+    private val groupRepository: com.qubee.messenger.data.repository.GroupRepository,
     private val qubeeManager: QubeeManager,
 ) : ViewModel() {
 
@@ -68,8 +69,18 @@ class ChatViewModel @Inject constructor(
             // so subsequent sendMessage calls have a target to write
             // to, then start streaming messages.
             conversationId = conversationRepository.getOrCreateConversationId(contactId)
+            val conversation = conversationRepository.getConversationById(conversationId)
+            // For groups the row's `name` is authoritative (set by
+            // GroupInviteViewModel at create / accept). For 1:1 the
+            // row's `name` is empty, so we fall back to the
+            // contact's display name and then to a hex prefix.
+            val isGroup =
+                conversation?.type == com.qubee.messenger.data.model.ConversationType.GROUP
             val contact = contactRepository.getContactById(contactId)
-            val name = contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
+            val name = when {
+                isGroup -> conversation?.name?.takeIf { it.isNotBlank() } ?: "Group"
+                else -> contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
+            }
 
             // Honour persisted trust state: a contact whose
             // `trustLevel` is `TrustLevel.VERIFIED` (set by a
@@ -101,6 +112,7 @@ class ChatViewModel @Inject constructor(
                     ConversationSecurityState.Unverified
                 },
                 myFingerprint = myFp,
+                isGroup = isGroup,
             )
 
             messageRepository
@@ -483,6 +495,25 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Load the current group's member roster from the Rust core.
+     * Called when the user opens the Group Details sheet — keeps
+     * the call lazy so the JNI round-trip only happens when
+     * actually needed.
+     *
+     * On null (group not yet known to the Rust core, e.g. invite
+     * accepted but JoinAccepted handshake hasn't landed yet) we
+     * surface an empty list, which the UI renders as an explicit
+     * "no members yet" state rather than an indefinite spinner.
+     */
+    fun loadGroupMembers() {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val members = groupRepository.listGroupMembers(conversationId) ?: emptyList()
+            _uiState.value = _uiState.value.copy(groupMembers = members)
+        }
+    }
+
     fun clearChat() {
         if (conversationId.isEmpty()) return
         viewModelScope.launch {
@@ -540,6 +571,17 @@ data class ChatUiState(
     /// verify dialog so the peer can scan it and verify *us*. Null
     /// until onboarding completes / the JNI getter resolves.
     val myFingerprint: String? = null,
+    /// True when the current conversation row is a group rather than
+    /// a 1:1 chat. Read at `init` time from `Conversation.type` and
+    /// then static for the lifetime of the screen — switching from
+    /// DIRECT to GROUP would require a fresh navigation.
+    val isGroup: Boolean = false,
+    /// Lazily-loaded roster shown in the Group Details sheet.
+    /// Populated by `loadGroupMembers()` when the user opens the
+    /// sheet; `null` means "not loaded yet" (the UI shows a
+    /// spinner), an empty list means "Rust core has no group at
+    /// this id" (the UI shows the empty-state copy).
+    val groupMembers: List<com.qubee.messenger.groups.GroupMemberInfo>? = null,
 )
 
 data class ConversationDetailsUi(

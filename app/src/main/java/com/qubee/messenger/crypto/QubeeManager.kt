@@ -296,6 +296,29 @@ class QubeeManager @Inject constructor(
         nativeRemoveMember(groupIdHex, memberIdHex, reason)
     }
 
+    /**
+     * List the active members of a group, as returned by the Rust
+     * core. JSON shape is an array of
+     * `{identity_id_hex, display_name, role, is_active, joined_at}`
+     * — see `Java_com_qubee_messenger_crypto_QubeeManager_nativeListGroupMembers`
+     * in `src/jni_api.rs`. Returns null if the group isn't in the
+     * local Rust view (e.g., the user accepted an invite but the
+     * JoinAccepted handshake hasn't landed yet, so the Rust core
+     * still doesn't know about the group).
+     */
+    suspend fun listGroupMembers(groupIdHex: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeListGroupMembers(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust list-group-members JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust list-group-members failed")
+            null
+        }
+    }
+
     suspend fun sendGroupMessage(
         groupIdHex: String,
         plaintext: ByteArray,
@@ -347,6 +370,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeInspectEnvelopeSender(wire: ByteArray): String?
     private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
     private external fun nativeGetMyFingerprint(): String?
+    private external fun nativeListGroupMembers(groupIdHex: String): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

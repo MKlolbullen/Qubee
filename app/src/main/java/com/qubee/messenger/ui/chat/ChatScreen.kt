@@ -163,24 +163,37 @@ fun ChatScreen(
         }
 
         if (showDetails) {
-            ConversationDetailsSheet(
-                contactName = uiState.contactName,
-                securityState = uiState.securityState,
-                details = uiState.details,
-                onDismiss = { showDetails = false },
-                onVerifyClick = {
-                    // Close the details sheet first so the dialog
-                    // doesn't stack on top of it.
-                    showDetails = false
-                    viewModel.requestContactVerification()
-                },
-                onTimerClick = viewModel::changeDisappearingTimer,
-                onClearChatClick = {
-                    showDetails = false
-                    viewModel.clearChat()
-                },
-                onResetSessionClick = viewModel::resetSecureSession,
-            )
+            // Branch on conversation type. The 1:1 sheet is built
+            // around fingerprint-verification + disappearing-timer
+            // controls that don't really apply to groups; for
+            // groups we surface the member roster instead.
+            if (uiState.isGroup) {
+                GroupDetailsSheet(
+                    groupName = uiState.contactName,
+                    members = uiState.groupMembers,
+                    onLoadMembers = viewModel::loadGroupMembers,
+                    onDismiss = { showDetails = false },
+                )
+            } else {
+                ConversationDetailsSheet(
+                    contactName = uiState.contactName,
+                    securityState = uiState.securityState,
+                    details = uiState.details,
+                    onDismiss = { showDetails = false },
+                    onVerifyClick = {
+                        // Close the details sheet first so the dialog
+                        // doesn't stack on top of it.
+                        showDetails = false
+                        viewModel.requestContactVerification()
+                    },
+                    onTimerClick = viewModel::changeDisappearingTimer,
+                    onClearChatClick = {
+                        showDetails = false
+                        viewModel.clearChat()
+                    },
+                    onResetSessionClick = viewModel::resetSecureSession,
+                )
+            }
         }
 
         if (uiState.pendingVerification) {

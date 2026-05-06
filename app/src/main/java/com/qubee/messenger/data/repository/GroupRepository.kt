@@ -1,5 +1,7 @@
 package com.qubee.messenger.data.repository
 
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.groups.AcceptInviteResult
 import com.qubee.messenger.groups.BuildInviteResponse
@@ -7,6 +9,7 @@ import com.qubee.messenger.groups.CreatedGroup
 import com.qubee.messenger.groups.CreatedInvite
 import com.qubee.messenger.groups.GroupInvite
 import com.qubee.messenger.groups.GroupInviteRequest
+import com.qubee.messenger.groups.GroupMemberInfo
 import com.qubee.messenger.groups.QUBEE_MAX_GROUP_MEMBERS
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -67,6 +70,23 @@ class GroupRepository @Inject constructor(
         withContext(Dispatchers.IO) {
             val json = qubeeManager.createGroup(name, description) ?: return@withContext null
             CreatedGroup.fromJson(json)
+        }
+
+    /**
+     * List the active + removed members of a group from the Rust
+     * core's local view. Returns null if the group isn't yet known
+     * locally (e.g., the user accepted an invite but the handshake
+     * confirmation hasn't landed). Callers render a "loading" or
+     * "not yet" state in that case.
+     */
+    suspend fun listGroupMembers(groupIdHex: String): List<GroupMemberInfo>? =
+        withContext(Dispatchers.IO) {
+            val json = qubeeManager.listGroupMembers(groupIdHex) ?: return@withContext null
+            runCatching {
+                val gson = Gson()
+                val type = object : TypeToken<List<GroupMemberInfo>>() {}.type
+                gson.fromJson<List<GroupMemberInfo>>(json, type) ?: emptyList()
+            }.getOrNull()
         }
 
     /**

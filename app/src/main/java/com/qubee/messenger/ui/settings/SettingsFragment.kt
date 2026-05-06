@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -113,6 +115,10 @@ private fun SettingsContent(
 
                 Spacer(Modifier.height(26.dp))
 
+                MyIdentityPanel(viewModel)
+
+                Spacer(Modifier.height(20.dp))
+
                 QubeePanel {
                     QubeeStatusPill("KEY MATERIAL")
                     Spacer(Modifier.height(14.dp))
@@ -187,4 +193,106 @@ private fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
             disabledContentColor = QubeePalette.MutedText,
         ),
     ) { Text("Destroy local identity", fontWeight = FontWeight.Bold) }
+}
+
+/**
+ * Identity-display panel: shows the local user's display name,
+ * canonical fingerprint, and `qubee://identity/<token>` invite
+ * link as both text and QR. Lets the user share their identity
+ * with new contacts after onboarding without retracing through
+ * the OnboardingScreen.
+ *
+ * `viewModel.identity` is loaded once at VM init via
+ * `qubeeManager.loadOnboardingBundle()` + `IdentityBundle.fromJson`.
+ * A null bundle (pre-onboarding state, JSON parse failure)
+ * collapses the panel to a muted "Identity not yet generated"
+ * placeholder so the rest of Settings still renders.
+ */
+@Composable
+private fun MyIdentityPanel(viewModel: SettingsViewModel) {
+    val identity by viewModel.identity.collectAsState()
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+
+    QubeePanel {
+        QubeeStatusPill("YOUR IDENTITY")
+        Spacer(Modifier.height(14.dp))
+        val bundle = identity
+        if (bundle == null) {
+            Text(
+                "Identity not yet generated",
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleLarge,
+            )
+            Spacer(Modifier.height(6.dp))
+            QubeeMutedText(
+                "Onboarding hasn't completed on this device yet. Once it has, your share link and fingerprint show up here.",
+            )
+        } else {
+            Text(
+                bundle.displayName.ifBlank { "Anonymous" },
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(4.dp))
+            QubeeMutedText("Fingerprint")
+            Text(
+                bundle.fingerprint.ifBlank { "Not available" },
+                color = QubeePalette.Text,
+                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+
+            val shareLink = bundle.shareLink
+            if (!shareLink.isNullOrBlank()) {
+                Spacer(Modifier.height(16.dp))
+                QubeeMutedText("Share link")
+                ShareLinkQr(shareLink)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    shareLink,
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(10.dp))
+                QubeeSecondaryButton(
+                    text = "Copy link",
+                    onClick = {
+                        clipboard.setText(
+                            androidx.compose.ui.text.AnnotatedString(shareLink),
+                        )
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShareLinkQr(link: String) {
+    val bitmap = remember(link) {
+        com.qubee.messenger.util.QrUtils.encodeAsBitmap(link, sizePx = 540)
+    }
+    if (bitmap != null) {
+        androidx.compose.material3.Surface(
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+            color = androidx.compose.ui.graphics.Color.White,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            androidx.compose.foundation.layout.Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                contentAlignment = androidx.compose.ui.Alignment.Center,
+            ) {
+                androidx.compose.foundation.Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "Your identity share link as a QR code",
+                    modifier = Modifier.size(220.dp),
+                )
+            }
+        }
+    }
 }

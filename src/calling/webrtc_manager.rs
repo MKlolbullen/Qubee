@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -152,7 +152,7 @@ impl WebRTCManager {
     /// Create a new WebRTC manager
     pub async fn new(config: WebRTCConfig) -> Result<Self> {
         let media_devices = MediaDevicesManager::new().await?;
-        
+
         Ok(WebRTCManager {
             peer_connections: Arc::new(RwLock::new(HashMap::new())),
             config,
@@ -160,7 +160,7 @@ impl WebRTCManager {
             ice_candidates: Arc::new(RwLock::new(HashMap::new())),
         })
     }
-    
+
     /// Create a new peer connection
     pub async fn create_peer_connection(
         &self,
@@ -168,33 +168,33 @@ impl WebRTCManager {
         participant: IdentityId,
         media_key: MediaKey,
     ) -> Result<()> {
-        let peer_connection = PeerConnection::new(
-            self.config.clone(),
-            media_key,
-            call_id,
-            participant,
-        ).await?;
-        
+        let peer_connection =
+            PeerConnection::new(self.config.clone(), media_key, call_id, participant).await?;
+
         let mut connections = self.peer_connections.write().await;
         connections.insert((call_id, participant), peer_connection);
-        
+
         Ok(())
     }
-    
+
     /// Close a peer connection
-    pub async fn close_peer_connection(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
+    pub async fn close_peer_connection(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+    ) -> Result<()> {
         let mut connections = self.peer_connections.write().await;
         if let Some(mut connection) = connections.remove(&(call_id, participant)) {
             connection.close().await?;
         }
-        
+
         // Clean up ICE candidates
         let mut ice_candidates = self.ice_candidates.write().await;
         ice_candidates.remove(&(call_id, participant));
-        
+
         Ok(())
     }
-    
+
     /// Set audio enabled/disabled for a participant
     pub async fn set_audio_enabled(
         &self,
@@ -208,7 +208,7 @@ impl WebRTCManager {
         }
         Ok(())
     }
-    
+
     /// Set video enabled/disabled for a participant
     pub async fn set_video_enabled(
         &self,
@@ -222,25 +222,33 @@ impl WebRTCManager {
         }
         Ok(())
     }
-    
+
     /// Start screen capture for a participant
-    pub async fn start_screen_capture(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
+    pub async fn start_screen_capture(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+    ) -> Result<()> {
         let connections = self.peer_connections.read().await;
         if let Some(connection) = connections.get(&(call_id, participant)) {
             connection.start_screen_capture().await?;
         }
         Ok(())
     }
-    
+
     /// Stop screen capture for a participant
-    pub async fn stop_screen_capture(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
+    pub async fn stop_screen_capture(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+    ) -> Result<()> {
         let connections = self.peer_connections.read().await;
         if let Some(connection) = connections.get(&(call_id, participant)) {
             connection.stop_screen_capture().await?;
         }
         Ok(())
     }
-    
+
     /// Get media statistics for a connection
     pub async fn get_media_stats(
         &self,
@@ -254,7 +262,7 @@ impl WebRTCManager {
             Err(anyhow::anyhow!("Peer connection not found"))
         }
     }
-    
+
     /// Add ICE candidate
     pub async fn add_ice_candidate(
         &self,
@@ -275,13 +283,9 @@ impl WebRTCManager {
         }
         Ok(())
     }
-    
+
     /// Create offer for initiating connection
-    pub async fn create_offer(
-        &self,
-        call_id: CallId,
-        participant: IdentityId,
-    ) -> Result<String> {
+    pub async fn create_offer(&self, call_id: CallId, participant: IdentityId) -> Result<String> {
         let connections = self.peer_connections.read().await;
         if let Some(connection) = connections.get(&(call_id, participant)) {
             connection.create_offer().await
@@ -289,7 +293,7 @@ impl WebRTCManager {
             Err(anyhow::anyhow!("Peer connection not found"))
         }
     }
-    
+
     /// Create answer for responding to offer
     pub async fn create_answer(
         &self,
@@ -304,7 +308,7 @@ impl WebRTCManager {
             Err(anyhow::anyhow!("Peer connection not found"))
         }
     }
-    
+
     /// Set remote description
     pub async fn set_remote_description(
         &self,
@@ -315,7 +319,7 @@ impl WebRTCManager {
         let connections = self.peer_connections.read().await;
         if let Some(connection) = connections.get(&(call_id, participant)) {
             connection.set_remote_description(description).await?;
-            
+
             // Add any cached ICE candidates
             let mut ice_candidates = self.ice_candidates.write().await;
             if let Some(candidates) = ice_candidates.remove(&(call_id, participant)) {
@@ -326,17 +330,17 @@ impl WebRTCManager {
         }
         Ok(())
     }
-    
+
     /// Get available media devices
     pub async fn get_media_devices(&self) -> Result<Vec<MediaDevice>> {
         self.media_devices.get_devices().await
     }
-    
+
     /// Set current media devices
     pub async fn set_media_devices(&mut self, devices: CurrentDevices) -> Result<()> {
         self.media_devices.set_current_devices(devices).await
     }
-    
+
     /// Get supported codecs
     pub fn get_supported_codecs(&self) -> Vec<CodecConfig> {
         vec![
@@ -390,7 +394,7 @@ impl WebRTCManager {
             },
         ]
     }
-    
+
     /// Configure bandwidth limits
     pub async fn set_bandwidth_limit(
         &self,
@@ -404,7 +408,7 @@ impl WebRTCManager {
         }
         Ok(())
     }
-    
+
     /// Enable/disable noise suppression
     pub async fn set_noise_suppression(
         &self,
@@ -418,7 +422,7 @@ impl WebRTCManager {
         }
         Ok(())
     }
-    
+
     /// Enable/disable echo cancellation
     pub async fn set_echo_cancellation(
         &self,
@@ -447,64 +451,58 @@ impl MediaDevicesManager {
                 audio_output: None,
             },
         };
-        
+
         manager.refresh_devices().await?;
         Ok(manager)
     }
-    
+
     /// Refresh the list of available devices
     pub async fn refresh_devices(&mut self) -> Result<()> {
         // This would interface with the actual media device APIs
         // For now, we'll create some mock devices
-        
-        self.audio_inputs = vec![
-            MediaDevice {
-                id: "default_audio_input".to_string(),
-                name: "Default Microphone".to_string(),
-                device_type: MediaDeviceType::AudioInput,
-                is_default: true,
-                capabilities: DeviceCapabilities {
-                    audio_sample_rates: vec![8000, 16000, 44100, 48000],
-                    video_resolutions: Vec::new(),
-                    video_frame_rates: Vec::new(),
-                    audio_codecs: vec!["opus".to_string(), "PCMU".to_string()],
-                    video_codecs: Vec::new(),
-                },
+
+        self.audio_inputs = vec![MediaDevice {
+            id: "default_audio_input".to_string(),
+            name: "Default Microphone".to_string(),
+            device_type: MediaDeviceType::AudioInput,
+            is_default: true,
+            capabilities: DeviceCapabilities {
+                audio_sample_rates: vec![8000, 16000, 44100, 48000],
+                video_resolutions: Vec::new(),
+                video_frame_rates: Vec::new(),
+                audio_codecs: vec!["opus".to_string(), "PCMU".to_string()],
+                video_codecs: Vec::new(),
             },
-        ];
-        
-        self.video_inputs = vec![
-            MediaDevice {
-                id: "default_video_input".to_string(),
-                name: "Default Camera".to_string(),
-                device_type: MediaDeviceType::VideoInput,
-                is_default: true,
-                capabilities: DeviceCapabilities {
-                    audio_sample_rates: Vec::new(),
-                    video_resolutions: vec![(640, 480), (1280, 720), (1920, 1080)],
-                    video_frame_rates: vec![15, 30, 60],
-                    audio_codecs: Vec::new(),
-                    video_codecs: vec!["VP8".to_string(), "VP9".to_string(), "H264".to_string()],
-                },
+        }];
+
+        self.video_inputs = vec![MediaDevice {
+            id: "default_video_input".to_string(),
+            name: "Default Camera".to_string(),
+            device_type: MediaDeviceType::VideoInput,
+            is_default: true,
+            capabilities: DeviceCapabilities {
+                audio_sample_rates: Vec::new(),
+                video_resolutions: vec![(640, 480), (1280, 720), (1920, 1080)],
+                video_frame_rates: vec![15, 30, 60],
+                audio_codecs: Vec::new(),
+                video_codecs: vec!["VP8".to_string(), "VP9".to_string(), "H264".to_string()],
             },
-        ];
-        
-        self.audio_outputs = vec![
-            MediaDevice {
-                id: "default_audio_output".to_string(),
-                name: "Default Speaker".to_string(),
-                device_type: MediaDeviceType::AudioOutput,
-                is_default: true,
-                capabilities: DeviceCapabilities {
-                    audio_sample_rates: vec![8000, 16000, 44100, 48000],
-                    video_resolutions: Vec::new(),
-                    video_frame_rates: Vec::new(),
-                    audio_codecs: vec!["opus".to_string(), "PCMU".to_string()],
-                    video_codecs: Vec::new(),
-                },
+        }];
+
+        self.audio_outputs = vec![MediaDevice {
+            id: "default_audio_output".to_string(),
+            name: "Default Speaker".to_string(),
+            device_type: MediaDeviceType::AudioOutput,
+            is_default: true,
+            capabilities: DeviceCapabilities {
+                audio_sample_rates: vec![8000, 16000, 44100, 48000],
+                video_resolutions: Vec::new(),
+                video_frame_rates: Vec::new(),
+                audio_codecs: vec!["opus".to_string(), "PCMU".to_string()],
+                video_codecs: Vec::new(),
             },
-        ];
-        
+        }];
+
         // Set defaults if not already set
         if self.current_devices.audio_input.is_none() {
             self.current_devices.audio_input = Some("default_audio_input".to_string());
@@ -515,10 +513,10 @@ impl MediaDevicesManager {
         if self.current_devices.audio_output.is_none() {
             self.current_devices.audio_output = Some("default_audio_output".to_string());
         }
-        
+
         Ok(())
     }
-    
+
     /// Get all available devices
     pub async fn get_devices(&self) -> Result<Vec<MediaDevice>> {
         let mut devices = Vec::new();
@@ -527,9 +525,12 @@ impl MediaDevicesManager {
         devices.extend(self.audio_outputs.clone());
         Ok(devices)
     }
-    
+
     /// Get devices by type
-    pub async fn get_devices_by_type(&self, device_type: MediaDeviceType) -> Result<Vec<MediaDevice>> {
+    pub async fn get_devices_by_type(
+        &self,
+        device_type: MediaDeviceType,
+    ) -> Result<Vec<MediaDevice>> {
         let devices = match device_type {
             MediaDeviceType::AudioInput => self.audio_inputs.clone(),
             MediaDeviceType::VideoInput => self.video_inputs.clone(),
@@ -537,7 +538,7 @@ impl MediaDevicesManager {
         };
         Ok(devices)
     }
-    
+
     /// Set current devices
     pub async fn set_current_devices(&mut self, devices: CurrentDevices) -> Result<()> {
         // Validate device IDs exist
@@ -546,23 +547,23 @@ impl MediaDevicesManager {
                 return Err(anyhow::anyhow!("Invalid audio input device ID"));
             }
         }
-        
+
         if let Some(ref video_input) = devices.video_input {
             if !self.video_inputs.iter().any(|d| d.id == *video_input) {
                 return Err(anyhow::anyhow!("Invalid video input device ID"));
             }
         }
-        
+
         if let Some(ref audio_output) = devices.audio_output {
             if !self.audio_outputs.iter().any(|d| d.id == *audio_output) {
                 return Err(anyhow::anyhow!("Invalid audio output device ID"));
             }
         }
-        
+
         self.current_devices = devices;
         Ok(())
     }
-    
+
     /// Get current devices
     pub fn get_current_devices(&self) -> &CurrentDevices {
         &self.current_devices

@@ -16,9 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use blake3::Hasher;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use pqcrypto_mldsa::mldsa44::{self};
-use pqcrypto_traits::sign::{
-    DetachedSignature as _, PublicKey as _, SecretKey as _,
-};
+use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroize;
@@ -355,12 +353,9 @@ impl IdentityKey {
             .classical_public
             .verify(&message, &signature.classical_signature)
             .is_ok();
-        let pq_valid = mldsa44::verify_detached_signature(
-            &signature.pq_signature,
-            &message,
-            &self.pq_public,
-        )
-        .is_ok();
+        let pq_valid =
+            mldsa44::verify_detached_signature(&signature.pq_signature, &message, &self.pq_public)
+                .is_ok();
         Ok(classical_valid && pq_valid)
     }
 
@@ -480,9 +475,8 @@ impl<'de> Deserialize<'de> for HybridSignature {
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(&wire.classical_signature);
         let classical_signature = Signature::from_bytes(&sig_bytes);
-        let pq_signature =
-            mldsa44::DetachedSignature::from_bytes(&wire.pq_signature)
-                .map_err(serde::de::Error::custom)?;
+        let pq_signature = mldsa44::DetachedSignature::from_bytes(&wire.pq_signature)
+            .map_err(serde::de::Error::custom)?;
         Ok(HybridSignature {
             classical_signature,
             pq_signature,

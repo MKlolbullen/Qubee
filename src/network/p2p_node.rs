@@ -5,7 +5,9 @@
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identity::Keypair, kad, mdns, noise,
+    gossipsub,
+    identity::Keypair,
+    kad, mdns, noise,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm,
 };
@@ -195,12 +197,7 @@ impl P2PNode {
     /// behaviour events into [`NodeEvent`] messages for Kotlin.
     pub async fn run(mut self, event_sender: mpsc::Sender<NodeEvent>) {
         let chat_topic = gossipsub::IdentTopic::new(GLOBAL_TOPIC);
-        if let Err(e) = self
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&chat_topic)
-        {
+        if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&chat_topic) {
             eprintln!("Failed to subscribe to topic: {e:?}");
         }
 

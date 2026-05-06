@@ -1,16 +1,16 @@
-use anyhow::{Result, Context};
-use secrecy::ExposeSecret;
-use rand::rngs::OsRng;
-use rand::RngCore;
-use serde::{Serialize, Deserialize};
+use crate::ephemeral_keys::{verify_and_pin_ephemeral_key, EphemeralKeyStore};
+use crate::{HybridRatchet, PQ_REKEY_PERIOD};
+use anyhow::{Context, Result};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+use pqcrypto_dilithium::dilithium2;
+use rand::rngs::OsRng;
+use rand::Rng;
+use rand::RngCore;
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, Duration};
-use rand::Rng;
-use pqcrypto_dilithium::dilithium2;
-use crate::{HybridRatchet, PQ_REKEY_PERIOD};
-use crate::ephemeral_keys::{EphemeralKeyStore, verify_and_pin_ephemeral_key};
 
 const CHUNK_SIZE: usize = 65536;
 
@@ -35,7 +35,7 @@ pub async fn send_file(
     file_id: u64,
     enable_cover: bool,
     dummy_freq_secs: Option<u64>,
-    identity_sk: &dilithium2::SecretKey
+    identity_sk: &dilithium2::SecretKey,
 ) -> Result<()> {
     let mut file = File::open(file_path).await.context("failed to open file")?;
     let mut buffer = vec![0u8; CHUNK_SIZE];
@@ -52,11 +52,24 @@ pub async fn send_file(
             loop {
                 let jitter = rand::thread_rng().gen_range(0..5);
                 sleep(Duration::from_secs(freq + jitter)).await;
-                if let Ok(dummy_chunk) = encrypt_chunk(&mut dummy_r, &dummy_peer_pk, file_id, seq, b"", true, false, &dummy_sk) {
+                if let Ok(dummy_chunk) = encrypt_chunk(
+                    &mut dummy_r,
+                    &dummy_peer_pk,
+                    file_id,
+                    seq,
+                    b"",
+                    true,
+                    false,
+                    &dummy_sk,
+                ) {
                     let data = bincode::serialize(&dummy_chunk).unwrap();
                     let len = (data.len() as u32).to_be_bytes();
-                    if dummy_writer.write_all(&len).await.is_err() { break; }
-                    if dummy_writer.write_all(&data).await.is_err() { break; }
+                    if dummy_writer.write_all(&len).await.is_err() {
+                        break;
+                    }
+                    if dummy_writer.write_all(&data).await.is_err() {
+                        break;
+                    }
                     println!("Sent dummy file chunk seq {}", seq);
                 }
                 seq = seq.wrapping_add(1);
@@ -66,11 +79,22 @@ pub async fn send_file(
 
     loop {
         let n = file.read(&mut buffer).await.context("file read error")?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
 
         hasher.update(&buffer[..n]);
 
-        let chunk = encrypt_chunk(r, peer_pq_pk, file_id, seq, &buffer[..n], false, false, identity_sk)?;
+        let chunk = encrypt_chunk(
+            r,
+            peer_pq_pk,
+            file_id,
+            seq,
+            &buffer[..n],
+            false,
+            false,
+            identity_sk,
+        )?;
         let data = bincode::serialize(&chunk).context("chunk serialization failed")?;
         let len = (data.len() as u32).to_be_bytes();
         writer.write_all(&len).await?;
@@ -81,7 +105,16 @@ pub async fn send_file(
 
     let hash_output = hasher.finalize();
     let hash_bytes = hash_output.as_bytes();
-    let hash_chunk = encrypt_chunk(r, peer_pq_pk, file_id, seq, hash_bytes, false, true, identity_sk)?;
+    let hash_chunk = encrypt_chunk(
+        r,
+        peer_pq_pk,
+        file_id,
+        seq,
+        hash_bytes,
+        false,
+        true,
+        identity_sk,
+    )?;
     let data = bincode::serialize(&hash_chunk).context("hash chunk serialization failed")?;
     let len = (data.len() as u32).to_be_bytes();
     writer.write_all(&len).await?;
@@ -96,21 +129,31 @@ pub async fn receive_file(
     output_path: &str,
     expected_file_id: u64,
     sender_id: &str,
-    ephemeral_store: EphemeralKeyStore
+    ephemeral_store: EphemeralKeyStore,
 ) -> Result<()> {
-    let mut file = File::create(output_path).await.context("failed to create output file")?;
+    let mut file = File::create(output_path)
+        .await
+        .context("failed to create output file")?;
     let mut hasher = blake3::Hasher::new();
 
     loop {
         let mut len_buf = [0u8; 4];
-        if reader.read_exact(&mut len_buf).await.is_err() { break; }
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
 
         let chunk_len = u32::from_be_bytes(len_buf) as usize;
         let mut chunk_buf = vec![0u8; chunk_len];
-        reader.read_exact(&mut chunk_buf).await.context("chunk read failed")?;
+        reader
+            .read_exact(&mut chunk_buf)
+            .await
+            .context("chunk read failed")?;
 
-        let chunk: FileChunk = bincode::deserialize(&chunk_buf).context("chunk deserialize failed")?;
-        if chunk.file_id != expected_file_id { continue; }
+        let chunk: FileChunk =
+            bincode::deserialize(&chunk_buf).context("chunk deserialize failed")?;
+        if chunk.file_id != expected_file_id {
+            continue;
+        }
 
         if let Some(ct) = &chunk.pq_ct {
             r.pq_decaps(ct)?;
@@ -118,7 +161,8 @@ pub async fn receive_file(
 
         let root = r.derive_root_key();
         let cipher = ChaCha20Poly1305::new(Key::from_slice(root.expose_secret()));
-        let decrypted = cipher.decrypt(Nonce::from_slice(&chunk.nonce), &chunk.ciphertext)
+        let decrypted = cipher
+            .decrypt(Nonce::from_slice(&chunk.nonce), &chunk.ciphertext)
             .context("chunk decrypt failed")?;
 
         let ephemeral_pk = dilithium2::PublicKey::from_bytes(&chunk.ephemeral_pk)?;
@@ -146,7 +190,9 @@ pub async fn receive_file(
         }
 
         hasher.update(&decrypted);
-        file.write_all(&decrypted).await.context("file write error")?;
+        file.write_all(&decrypted)
+            .await
+            .context("file write error")?;
     }
 
     Ok(())
@@ -160,22 +206,25 @@ fn encrypt_chunk(
     plaintext: &[u8],
     is_dummy: bool,
     is_hash: bool,
-    identity_sk: &dilithium2::SecretKey
+    identity_sk: &dilithium2::SecretKey,
 ) -> Result<FileChunk> {
     r.send_ctr = r.send_ctr.wrapping_add(1);
     let pq_ct = if r.send_ctr % PQ_REKEY_PERIOD == 0 {
         Some(r.pq_reencap(peer_pq_pk)?)
-    } else { None };
+    } else {
+        None
+    };
 
     let ephemeral_sk = dilithium2::keypair().0;
-    let ephemeral_pk = dilithium2::keypair().1.0.to_vec();
+    let ephemeral_pk = dilithium2::keypair().1 .0.to_vec();
 
     let root = r.derive_root_key();
     let cipher = ChaCha20Poly1305::new(Key::from_slice(root.expose_secret()));
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
 
-    let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), plaintext)
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
         .context("chunk encryption failed")?;
 
     let signature = dilithium2::sign(&ciphertext, &ephemeral_sk).0.to_vec();

@@ -118,9 +118,7 @@ impl ContactManager {
     /// Convenience method to retrieve a contact's display name. If
     /// the contact is unknown `None` is returned.
     pub async fn get_display_name(&self, identity_id: &IdentityId) -> Option<String> {
-        self.get_contact(identity_id)
-            .await
-            .map(|c| c.display_name)
+        self.get_contact(identity_id).await.map(|c| c.display_name)
     }
 
     /// Load contacts from the secure keystore into the in‑memory map.

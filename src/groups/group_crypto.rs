@@ -58,9 +58,7 @@ impl GroupCrypto {
     /// on success.
     pub fn create_group_key(&mut self, group_id: GroupId) -> Result<()> {
         let key_bytes = secure_rng::random::array::<32>()?;
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let group_key = GroupKey {
             key: SecretBox::new(Box::new(key_bytes)),
             created_at,
@@ -73,15 +71,9 @@ impl GroupCrypto {
     /// with a newly generated one. Returns a `GroupKeyRotation`
     /// describing the change.
     pub fn rotate_group_key(&mut self, group_id: GroupId) -> Result<GroupKeyRotation> {
-        let old_created_at = self
-            .keys
-            .get(&group_id)
-            .map(|k| k.created_at)
-            .unwrap_or(0);
+        let old_created_at = self.keys.get(&group_id).map(|k| k.created_at).unwrap_or(0);
         let new_key_bytes = secure_rng::random::array::<32>()?;
-        let new_created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let new_created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let group_key = GroupKey {
             key: SecretBox::new(Box::new(new_key_bytes)),
             created_at: new_created_at,
@@ -116,9 +108,7 @@ impl GroupCrypto {
     /// member. Callers should immediately KEM-wrap the result and not
     /// hold onto the plaintext.
     pub fn export_group_key(&self, group_id: &GroupId) -> Option<[u8; 32]> {
-        self.keys
-            .get(group_id)
-            .map(|k| *k.key.expose_secret())
+        self.keys.get(group_id).map(|k| *k.key.expose_secret())
     }
 
     /// Retrieve the current key for a group, if any.

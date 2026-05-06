@@ -167,22 +167,22 @@ pub struct CallSettings {
 /// Video quality settings
 #[derive(Clone, Serialize, Deserialize)]
 pub enum VideoQuality {
-    Low,      // 240p
-    Medium,   // 480p
-    High,     // 720p
-    HD,       // 1080p
-    UHD,      // 4K
-    Auto,     // Adaptive based on connection
+    Low,    // 240p
+    Medium, // 480p
+    High,   // 720p
+    HD,     // 1080p
+    UHD,    // 4K
+    Auto,   // Adaptive based on connection
 }
 
 /// Audio quality settings
 #[derive(Clone, Serialize, Deserialize)]
 pub enum AudioQuality {
-    Low,      // 8kHz, mono
-    Medium,   // 16kHz, mono
-    High,     // 48kHz, stereo
-    Studio,   // 96kHz, stereo
-    Auto,     // Adaptive based on connection
+    Low,    // 8kHz, mono
+    Medium, // 16kHz, mono
+    High,   // 48kHz, stereo
+    Studio, // 96kHz, stereo
+    Auto,   // Adaptive based on connection
 }
 
 /// Call quality statistics
@@ -237,10 +237,7 @@ pub enum CallEvent {
         quality: ConnectionQuality,
     },
     /// Call error occurred
-    CallError {
-        call_id: CallId,
-        error: String,
-    },
+    CallError { call_id: CallId, error: String },
 }
 
 /// Call manager configuration
@@ -275,12 +272,12 @@ impl CallManager {
             enable_dtls: true,
             enable_srtp: true,
         };
-        
+
         let webrtc_manager = WebRTCManager::new(webrtc_config).await?;
         let media_encryption = MediaEncryption::new()?;
         let signaling_server = Arc::new(SignalingServer::new().await?);
         let contact_manager = Arc::new(ContactManager::new());
-        
+
         Ok(CallManager {
             calls: Arc::new(RwLock::new(HashMap::new())),
             webrtc_manager,
@@ -291,7 +288,7 @@ impl CallManager {
             contact_manager,
         })
     }
-    
+
     /// Initiate a new call
     pub async fn initiate_call(
         &self,
@@ -302,33 +299,32 @@ impl CallManager {
         settings: CallSettings,
     ) -> Result<CallId> {
         let call_id = self.generate_call_id()?;
-        
+
         // Validate participants
         if participants.is_empty() {
             return Err(anyhow::anyhow!("No participants specified"));
         }
-        
+
         if let Some(max_participants) = settings.max_participants {
             if participants.len() > max_participants {
                 return Err(anyhow::anyhow!("Too many participants"));
             }
         }
-        
+
         // Check concurrent call limit
         let calls = self.calls.read().await;
-        let active_calls = calls.values()
+        let active_calls = calls
+            .values()
             .filter(|call| matches!(call.state, CallState::Active | CallState::Ringing))
             .count();
-        
+
         if active_calls >= self.config.max_concurrent_calls {
             return Err(anyhow::anyhow!("Maximum concurrent calls reached"));
         }
         drop(calls);
-        
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
         // Create call participants
         let mut call_participants = HashMap::new();
         for participant_id in participants {
@@ -342,12 +338,15 @@ impl CallManager {
                 joined_at: None,
                 left_at: None,
                 is_muted: settings.auto_mute_on_join,
-                is_video_enabled: matches!(call_type, CallType::VideoCall | CallType::GroupVideoCall),
+                is_video_enabled: matches!(
+                    call_type,
+                    CallType::VideoCall | CallType::GroupVideoCall
+                ),
                 is_screen_sharing: false,
             };
             call_participants.insert(participant_id, participant);
         }
-        
+
         let call = Call {
             id: call_id,
             call_type,
@@ -361,306 +360,340 @@ impl CallManager {
             settings,
             quality_stats: CallQualityStats::default(),
         };
-        
+
         // Store the call
         let mut calls = self.calls.write().await;
         calls.insert(call_id, call);
         drop(calls);
-        
+
         // Send invitations to participants
         self.send_call_invitations(call_id).await?;
-        
+
         // Update call state to ringing
         self.update_call_state(call_id, CallState::Ringing).await?;
-        
+
         // Start ring timeout
         self.start_ring_timeout(call_id).await;
-        
+
         Ok(call_id)
     }
-    
+
     /// Accept an incoming call
     pub async fn accept_call(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
         let mut calls = self.calls.write().await;
-        let call = calls.get_mut(&call_id)
+        let call = calls
+            .get_mut(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         if !call.participants.contains_key(&participant) {
             return Err(anyhow::anyhow!("Participant not invited to call"));
         }
-        
+
         if call.state != CallState::Ringing {
             return Err(anyhow::anyhow!("Call is not in ringing state"));
         }
-        
+
         // Update participant state
         if let Some(participant_info) = call.participants.get_mut(&participant) {
             participant_info.participant_state = ParticipantState::Connecting;
-            participant_info.joined_at = Some(SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs());
+            participant_info.joined_at =
+                Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
         }
-        
+
         // If this is the first participant to accept, start the call
-        let connecting_participants = call.participants.values()
+        let connecting_participants = call
+            .participants
+            .values()
             .filter(|p| p.participant_state == ParticipantState::Connecting)
             .count();
-        
+
         if connecting_participants == 1 && call.state == CallState::Ringing {
             call.state = CallState::Active;
-            call.started_at = Some(SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs());
+            call.started_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
         }
-        
+
         drop(calls);
-        
+
         // Establish WebRTC connection
         self.establish_peer_connection(call_id, participant).await?;
-        
+
         // Send event
-        self.event_sender.send(CallEvent::ParticipantJoined {
-            call_id,
-            participant,
-        }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-        
+        self.event_sender
+            .send(CallEvent::ParticipantJoined {
+                call_id,
+                participant,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
         Ok(())
     }
-    
+
     /// Reject an incoming call
     pub async fn reject_call(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
         let mut calls = self.calls.write().await;
-        let call = calls.get_mut(&call_id)
+        let call = calls
+            .get_mut(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         if !call.participants.contains_key(&participant) {
             return Err(anyhow::anyhow!("Participant not invited to call"));
         }
-        
+
         // Update participant state
         if let Some(participant_info) = call.participants.get_mut(&participant) {
             participant_info.participant_state = ParticipantState::Left;
-            participant_info.left_at = Some(SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs());
+            participant_info.left_at =
+                Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
         }
-        
+
         // Check if all participants have rejected
-        let active_participants = call.participants.values()
-            .filter(|p| matches!(p.participant_state, ParticipantState::Invited | ParticipantState::Connecting | ParticipantState::Connected))
+        let active_participants = call
+            .participants
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.participant_state,
+                    ParticipantState::Invited
+                        | ParticipantState::Connecting
+                        | ParticipantState::Connected
+                )
+            })
             .count();
-        
+
         if active_participants == 0 {
             call.state = CallState::Rejected;
-            call.ended_at = Some(SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs());
+            call.ended_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
         }
-        
+
         drop(calls);
-        
+
         // Send event
-        self.event_sender.send(CallEvent::ParticipantLeft {
-            call_id,
-            participant,
-            reason: "Rejected".to_string(),
-        }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-        
+        self.event_sender
+            .send(CallEvent::ParticipantLeft {
+                call_id,
+                participant,
+                reason: "Rejected".to_string(),
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
         Ok(())
     }
-    
+
     /// End a call
     pub async fn end_call(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
         let mut calls = self.calls.write().await;
-        let call = calls.get_mut(&call_id)
+        let call = calls
+            .get_mut(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         // If initiator ends the call, end for everyone
         if participant == call.initiator {
             call.state = CallState::Ended;
-            call.ended_at = Some(SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs());
-            
+            call.ended_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+
             // Update all participants
             for participant_info in call.participants.values_mut() {
                 if participant_info.participant_state == ParticipantState::Connected {
                     participant_info.participant_state = ParticipantState::Left;
-                    participant_info.left_at = Some(SystemTime::now()
-                        .duration_since(UNIX_EPOCH)?
-                        .as_secs());
+                    participant_info.left_at =
+                        Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
                 }
             }
         } else {
             // Individual participant leaves
             if let Some(participant_info) = call.participants.get_mut(&participant) {
                 participant_info.participant_state = ParticipantState::Left;
-                participant_info.left_at = Some(SystemTime::now()
-                    .duration_since(UNIX_EPOCH)?
-                    .as_secs());
+                participant_info.left_at =
+                    Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
             }
-            
+
             // Check if any participants remain
-            let active_participants = call.participants.values()
+            let active_participants = call
+                .participants
+                .values()
                 .filter(|p| p.participant_state == ParticipantState::Connected)
                 .count();
-            
+
             if active_participants <= 1 {
                 call.state = CallState::Ended;
-                call.ended_at = Some(SystemTime::now()
-                    .duration_since(UNIX_EPOCH)?
-                    .as_secs());
+                call.ended_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
             }
         }
-        
+
         drop(calls);
-        
+
         // Close peer connections
         self.close_peer_connection(call_id, participant).await?;
-        
+
         // Send event
-        self.event_sender.send(CallEvent::ParticipantLeft {
-            call_id,
-            participant,
-            reason: "Left call".to_string(),
-        }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-        
+        self.event_sender
+            .send(CallEvent::ParticipantLeft {
+                call_id,
+                participant,
+                reason: "Left call".to_string(),
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
         Ok(())
     }
-    
+
     /// Toggle mute for a participant
     pub async fn toggle_mute(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
         let mut calls = self.calls.write().await;
-        let call = calls.get_mut(&call_id)
+        let call = calls
+            .get_mut(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         if let Some(participant_info) = call.participants.get_mut(&participant) {
             participant_info.is_muted = !participant_info.is_muted;
             participant_info.media_state.audio_enabled = !participant_info.is_muted;
-            
+
             let new_state = participant_info.media_state.clone();
             drop(calls);
-            
+
             // Update WebRTC audio track
-            self.webrtc_manager.set_audio_enabled(call_id, participant, !participant_info.is_muted).await?;
-            
+            self.webrtc_manager
+                .set_audio_enabled(call_id, participant, !participant_info.is_muted)
+                .await?;
+
             // Send event
-            self.event_sender.send(CallEvent::MediaStateChanged {
-                call_id,
-                participant,
-                media_state: new_state,
-            }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-            
+            self.event_sender
+                .send(CallEvent::MediaStateChanged {
+                    call_id,
+                    participant,
+                    media_state: new_state,
+                })
+                .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
             Ok(participant_info.is_muted)
         } else {
             Err(anyhow::anyhow!("Participant not found in call"))
         }
     }
-    
+
     /// Toggle video for a participant
     pub async fn toggle_video(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
         let mut calls = self.calls.write().await;
-        let call = calls.get_mut(&call_id)
+        let call = calls
+            .get_mut(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         if let Some(participant_info) = call.participants.get_mut(&participant) {
             participant_info.is_video_enabled = !participant_info.is_video_enabled;
             participant_info.media_state.video_enabled = participant_info.is_video_enabled;
-            
+
             let new_state = participant_info.media_state.clone();
             drop(calls);
-            
+
             // Update WebRTC video track
-            self.webrtc_manager.set_video_enabled(call_id, participant, participant_info.is_video_enabled).await?;
-            
+            self.webrtc_manager
+                .set_video_enabled(call_id, participant, participant_info.is_video_enabled)
+                .await?;
+
             // Send event
-            self.event_sender.send(CallEvent::MediaStateChanged {
-                call_id,
-                participant,
-                media_state: new_state,
-            }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-            
+            self.event_sender
+                .send(CallEvent::MediaStateChanged {
+                    call_id,
+                    participant,
+                    media_state: new_state,
+                })
+                .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
             Ok(participant_info.is_video_enabled)
         } else {
             Err(anyhow::anyhow!("Participant not found in call"))
         }
     }
-    
+
     /// Start screen sharing
     pub async fn start_screen_share(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
         let mut calls = self.calls.write().await;
-        let call = calls.get_mut(&call_id)
+        let call = calls
+            .get_mut(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         if let Some(participant_info) = call.participants.get_mut(&participant) {
             participant_info.is_screen_sharing = true;
             participant_info.media_state.screen_share_enabled = true;
-            
+
             let new_state = participant_info.media_state.clone();
             drop(calls);
-            
+
             // Start screen capture
-            self.webrtc_manager.start_screen_capture(call_id, participant).await?;
-            
+            self.webrtc_manager
+                .start_screen_capture(call_id, participant)
+                .await?;
+
             // Send event
-            self.event_sender.send(CallEvent::MediaStateChanged {
-                call_id,
-                participant,
-                media_state: new_state,
-            }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-            
+            self.event_sender
+                .send(CallEvent::MediaStateChanged {
+                    call_id,
+                    participant,
+                    media_state: new_state,
+                })
+                .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
             Ok(())
         } else {
             Err(anyhow::anyhow!("Participant not found in call"))
         }
     }
-    
+
     /// Get call information
     pub async fn get_call(&self, call_id: CallId) -> Option<Call> {
         let calls = self.calls.read().await;
         calls.get(&call_id).cloned()
     }
-    
+
     /// Get all active calls
     pub async fn get_active_calls(&self) -> Vec<Call> {
         let calls = self.calls.read().await;
-        calls.values()
+        calls
+            .values()
             .filter(|call| matches!(call.state, CallState::Active | CallState::Ringing))
             .cloned()
             .collect()
     }
-    
+
     /// Update call quality statistics
-    pub async fn update_quality_stats(&self, call_id: CallId, participant: IdentityId, quality: ConnectionQuality) -> Result<()> {
+    pub async fn update_quality_stats(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        quality: ConnectionQuality,
+    ) -> Result<()> {
         let mut calls = self.calls.write().await;
         if let Some(call) = calls.get_mut(&call_id) {
             if let Some(participant_info) = call.participants.get_mut(&participant) {
                 participant_info.connection_quality = quality.clone();
-                
+
                 // Send event
-                self.event_sender.send(CallEvent::QualityChanged {
-                    call_id,
-                    participant,
-                    quality,
-                }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+                self.event_sender
+                    .send(CallEvent::QualityChanged {
+                        call_id,
+                        participant,
+                        quality,
+                    })
+                    .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
             }
         }
         Ok(())
     }
-    
+
     /// Generate a unique call ID
     fn generate_call_id(&self) -> Result<CallId> {
         let mut bytes = [0u8; 16];
         getrandom::getrandom(&mut bytes)?;
         Ok(CallId(bytes))
     }
-    
+
     /// Send call invitations to participants
     async fn send_call_invitations(&self, call_id: CallId) -> Result<()> {
         let calls = self.calls.read().await;
-        let call = calls.get(&call_id)
+        let call = calls
+            .get(&call_id)
             .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
-        
+
         for participant_id in call.participants.keys() {
             if *participant_id != call.initiator {
                 let message = SignalingMessage::CallInvitation {
@@ -669,56 +702,64 @@ impl CallManager {
                     call_type: call.call_type.clone(),
                     settings: call.settings.clone(),
                 };
-                
-                self.signaling_server.send_message(*participant_id, message).await?;
-                
+
+                self.signaling_server
+                    .send_message(*participant_id, message)
+                    .await?;
+
                 // Send event
-                self.event_sender.send(CallEvent::IncomingCall {
-                    call_id,
-                    caller: call.initiator,
-                    call_type: call.call_type.clone(),
-                }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+                self.event_sender
+                    .send(CallEvent::IncomingCall {
+                        call_id,
+                        caller: call.initiator,
+                        call_type: call.call_type.clone(),
+                    })
+                    .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Update call state
     async fn update_call_state(&self, call_id: CallId, new_state: CallState) -> Result<()> {
         let mut calls = self.calls.write().await;
         if let Some(call) = calls.get_mut(&call_id) {
             let old_state = call.state.clone();
             call.state = new_state.clone();
-            
+
             // Send event
-            self.event_sender.send(CallEvent::CallStateChanged {
-                call_id,
-                old_state,
-                new_state,
-            }).map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+            self.event_sender
+                .send(CallEvent::CallStateChanged {
+                    call_id,
+                    old_state,
+                    new_state,
+                })
+                .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
         }
         Ok(())
     }
-    
+
     /// Start ring timeout
     async fn start_ring_timeout(&self, call_id: CallId) {
         let calls = self.calls.clone();
         let timeout = self.config.ring_timeout;
         let event_sender = self.event_sender.clone();
-        
+
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            
+
             let mut calls = calls.write().await;
             if let Some(call) = calls.get_mut(&call_id) {
                 if call.state == CallState::Ringing {
                     call.state = CallState::TimedOut;
-                    call.ended_at = Some(SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs());
-                    
+                    call.ended_at = Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    );
+
                     let _ = event_sender.send(CallEvent::CallStateChanged {
                         call_id,
                         old_state: CallState::Ringing,
@@ -728,24 +769,34 @@ impl CallManager {
             }
         });
     }
-    
+
     /// Establish peer connection for a participant
-    async fn establish_peer_connection(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
+    async fn establish_peer_connection(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+    ) -> Result<()> {
         // Generate media encryption key
-        let media_key = self.media_encryption.generate_media_key(call_id, participant)?;
-        
+        let media_key = self
+            .media_encryption
+            .generate_media_key(call_id, participant)?;
+
         // Create WebRTC peer connection
-        self.webrtc_manager.create_peer_connection(call_id, participant, media_key).await?;
-        
+        self.webrtc_manager
+            .create_peer_connection(call_id, participant, media_key)
+            .await?;
+
         Ok(())
     }
-    
+
     /// Close peer connection for a participant
     async fn close_peer_connection(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
-        self.webrtc_manager.close_peer_connection(call_id, participant).await?;
+        self.webrtc_manager
+            .close_peer_connection(call_id, participant)
+            .await?;
         Ok(())
     }
-    
+
     /// Get identity key for a participant (placeholder)
     async fn get_identity_key(&self, participant: IdentityId) -> Result<IdentityKey> {
         // Try to look up the contact first. If none exists we fall back
@@ -762,7 +813,7 @@ impl CallManager {
         let pair = IdentityKeyPair::generate()?;
         Ok(pair.public_key())
     }
-    
+
     /// Get display name for a participant (placeholder)
     async fn get_display_name(&self, participant: IdentityId) -> Result<String> {
         if let Some(name) = self.contact_manager.get_display_name(&participant).await {
@@ -868,25 +919,33 @@ impl std::fmt::Debug for CallId {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    
+
     #[tokio::test]
     async fn test_call_creation() {
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
         let config = CallManagerConfig::default();
-        let call_manager = CallManager::new(config, event_sender).await.expect("Should create call manager");
-        
+        let call_manager = CallManager::new(config, event_sender)
+            .await
+            .expect("Should create call manager");
+
         let initiator = IdentityId::from([1u8; 32]);
         let participants = vec![IdentityId::from([2u8; 32])];
-        
-        let call_id = call_manager.initiate_call(
-            initiator,
-            participants,
-            CallType::VoiceCall,
-            None,
-            CallSettings::default(),
-        ).await.expect("Should initiate call");
-        
-        let call = call_manager.get_call(call_id).await.expect("Should find call");
+
+        let call_id = call_manager
+            .initiate_call(
+                initiator,
+                participants,
+                CallType::VoiceCall,
+                None,
+                CallSettings::default(),
+            )
+            .await
+            .expect("Should initiate call");
+
+        let call = call_manager
+            .get_call(call_id)
+            .await
+            .expect("Should find call");
         assert_eq!(call.call_type, CallType::VoiceCall);
         assert_eq!(call.initiator, initiator);
         assert_eq!(call.participants.len(), 1);

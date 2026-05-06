@@ -2100,3 +2100,71 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
         result.unwrap_or(std::ptr::null_mut())
     })
 }
+
+/// List every group the active identity is a member of, from the
+/// Rust core's local view. Used on fresh-install / cold-launch to
+/// hydrate the Conversation table when the Kotlin DB is empty but
+/// the Rust state (recovered from `nativeInitialize`) isn't.
+///
+/// JSON shape: array of
+/// `{group_id_hex, name, member_count, my_role, last_updated,
+/// version}`. `my_role` mirrors the small fixed vocabulary used by
+/// `nativeListGroupMembers` / `nativePromoteMember`.
+///
+/// Returns:
+///  * a (possibly empty) JSON array on success — including when
+///    the active identity is in no groups.
+///  * `null` if no active identity has been loaded yet (caller
+///    treats this as "wait until onboarding finishes").
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGroups(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let my_id = identity.identity_id();
+
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+
+            let groups: Vec<serde_json::Value> = gm
+                .get_member_groups(&my_id)
+                .into_iter()
+                .map(|group| {
+                    let my_role = group
+                        .members
+                        .get(&my_id)
+                        .map(|m| role_to_str(&m.role))
+                        .unwrap_or("Member");
+                    let active_count = group
+                        .members
+                        .values()
+                        .filter(|m| matches!(
+                            m.member_status,
+                            crate::groups::group_manager::MemberStatus::Active,
+                        ))
+                        .count();
+                    serde_json::json!({
+                        "group_id_hex": hex::encode(group.id.as_ref() as &[u8]),
+                        "name": group.name,
+                        "member_count": active_count,
+                        "my_role": my_role,
+                        "last_updated": group.last_updated,
+                        "version": group.version,
+                    })
+                })
+                .collect();
+            let payload = serde_json::Value::Array(groups).to_string();
+            let java_str = env
+                .new_string(payload)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}

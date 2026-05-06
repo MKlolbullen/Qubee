@@ -10,6 +10,7 @@ import com.qubee.messenger.groups.CreatedInvite
 import com.qubee.messenger.groups.GroupInvite
 import com.qubee.messenger.groups.GroupInviteRequest
 import com.qubee.messenger.groups.GroupMemberInfo
+import com.qubee.messenger.groups.GroupSummary
 import com.qubee.messenger.groups.QUBEE_MAX_GROUP_MEMBERS
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -112,6 +113,19 @@ class GroupRepository @Inject constructor(
         memberIdHex: String,
         newRole: String,
     ): String? = qubeeManager.promoteMember(groupIdHex, memberIdHex, newRole)
+
+    /**
+     * Snapshot every group the active identity belongs to from the
+     * Rust core's local view. Used at app cold-start to hydrate the
+     * SQLCipher Conversation table when it's empty (fresh install /
+     * after a wipe) but the Rust core has groups recovered from
+     * `nativeInitialize`. Returns an empty list on any failure —
+     * the caller treats "no groups" and "couldn't load" identically.
+     */
+    suspend fun listGroups(): List<GroupSummary> = withContext(Dispatchers.IO) {
+        val json = qubeeManager.listGroups() ?: return@withContext emptyList()
+        GroupSummary.listFromJson(json)
+    }
 
     /**
      * List the active + removed members of a group from the Rust

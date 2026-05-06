@@ -363,6 +363,28 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    /**
+     * List every group the active identity belongs to from the
+     * Rust core's local view. Returns the JSON array as-is — see
+     * `com.qubee.messenger.groups.GroupSummary.listFromJson` for
+     * the structured shape. Returns null if the JNI call rejected
+     * the request (no active identity, group manager not
+     * initialised). An empty array is a valid success — the user
+     * is in zero groups.
+     */
+    suspend fun listGroups(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeListGroups()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust list-groups JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust list-groups failed")
+            null
+        }
+    }
+
     suspend fun sendGroupMessage(
         groupIdHex: String,
         plaintext: ByteArray,
@@ -415,6 +437,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
     private external fun nativeGetMyFingerprint(): String?
     private external fun nativeListGroupMembers(groupIdHex: String): String?
+    private external fun nativeListGroups(): String?
     private external fun nativeGetMyIdentityIdHex(): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?

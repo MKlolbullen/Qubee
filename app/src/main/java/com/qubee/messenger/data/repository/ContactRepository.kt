@@ -73,6 +73,19 @@ class ContactRepository @Inject constructor(
         contactDao.updateBlockedStatus(contactId, true)
     }
 
+    /// Counterpart to [blockContact] — flips `Contact.isBlocked` back
+    /// to `false`. The contact reappears on the active address-book
+    /// list and inbound from them stops being suppressed.
+    suspend fun unblockContact(contactId: String) {
+        contactDao.updateBlockedStatus(contactId, false)
+    }
+
+    /// Stream of contacts the local user has blocked. Surfaced on
+    /// the Contacts tab as a separate "Blocked" section so the user
+    /// can unblock without spelunking through Settings.
+    fun getBlockedContactsFlow(): kotlinx.coroutines.flow.Flow<List<Contact>> =
+        contactDao.getBlockedContacts()
+
     suspend fun deleteContact(contactId: String) {
         contactDao.deleteContactById(contactId)
     }

@@ -7,23 +7,23 @@ import com.qubee.messenger.data.model.ContactWithLastMessage
 import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.database.dao.ContactDao
 import com.qubee.messenger.data.repository.database.dao.CryptoKeyDao
+import com.qubee.messenger.identity.IdentityBundle
 import com.qubee.messenger.security.TrustStatePolicy
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
-// Real Room-backed implementation — rev-3 priority 6.
-//
-// Cryptographic helpers (`addContactFromInviteLink`, `verifyIdentityKey`,
-// `generateSAS`) still return placeholder values because the matching
-// JNI surface on `QubeeManager` is being reconnected in parallel
-// (see `crypto/QubeeManager.kt` and `EncryptedPayloads.kt`). The
-// rest persists through the DAO.
+// Real Room-backed implementation. Crypto-backed surfaces
+// (addContactFromInviteLink, verifyIdentityKey, generateSAS) route
+// through QubeeManager's JNI bridge; private key material never
+// leaves Rust.
 @Singleton
 class ContactRepository @Inject constructor(
     private val contactDao: ContactDao,
     @Suppress("unused") private val cryptoKeyDao: CryptoKeyDao,
-    @Suppress("unused") private val qubeeManager: QubeeManager,
+    private val qubeeManager: QubeeManager,
 ) {
 
     fun getAllContactsFlow(): Flow<List<Contact>> = contactDao.getAllContacts()
@@ -34,14 +34,7 @@ class ContactRepository @Inject constructor(
     fun getContactsWithLastMessage(): Flow<List<ContactWithLastMessage>> =
         contactDao.getContactsWithLastMessage()
 
-    suspend fun getAllContacts(): List<Contact> {
-        // No suspend `getAllContactsList` on the DAO — we just take
-        // a single snapshot of the Flow's current value via the
-        // `first()` operator. Avoiding it here for now since the
-        // call sites that need a one-shot are rare; refactor when
-        // they appear.
-        return emptyList()
-    }
+    suspend fun getAllContacts(): List<Contact> = contactDao.getAllContacts().first()
 
     suspend fun getContactById(contactId: String): Contact? =
         contactDao.getContactById(contactId)
@@ -150,25 +143,100 @@ class ContactRepository @Inject constructor(
         contactDao.insertContact(contact)
     }
 
-    // ---- Crypto-backed surfaces — still placeholder ---------------
+    // ---- Crypto-backed surfaces -----------------------------------
 
+    /**
+     * Verify a `qubee://identity/...` share link's hybrid signature
+     * via the Rust core, decode the resulting identity bundle, and
+     * persist it as a new (or updated) contact. Returns the upserted
+     * `Contact` on success, or `null` if the link is malformed,
+     * tampered, or the JNI surface is unavailable.
+     *
+     * The first-time observation goes through `TrustStatePolicy` to
+     * establish a non-verified trust baseline; the user must complete
+     * the OOB ceremony separately to bump to `TrustLevel.VERIFIED`.
+     */
     suspend fun addContactFromInviteLink(link: String): Contact? {
-        // TODO(rev-4): wire to QubeeManager.verifyOnboardingLink
-        // (already exists on the JNI surface) → parse identity →
-        // contactDao.insertContact. Stub returns null so callers
-        // see "could not parse" rather than crashing.
-        return null
+        val json = qubeeManager.verifyOnboardingLink(link) ?: return null
+        val bundle = IdentityBundle.fromJson(json) ?: return null
+
+        val now = System.currentTimeMillis()
+        val identityKey = runCatching { hexToBytes(bundle.identityIdHex) }.getOrNull()
+        val existing = contactDao.getContactByIdentityId(bundle.identityIdHex)
+
+        val contact = if (existing != null) {
+            existing.copy(
+                displayName = bundle.displayName.ifBlank { existing.displayName },
+                identityKey = identityKey ?: existing.identityKey,
+                updatedAt = now,
+            )
+        } else {
+            Contact(
+                id = UUID.randomUUID().toString(),
+                identityId = bundle.identityIdHex,
+                displayName = bundle.displayName,
+                identityKey = identityKey,
+                trustLevel = TrustLevel.UNKNOWN,
+                verificationStatus = ContactVerificationStatus.UNVERIFIED,
+                createdAt = now,
+                updatedAt = now,
+            )
+        }
+        contactDao.insertContact(contact)
+        return contact
     }
 
-    suspend fun verifyIdentityKey(contactId: String, key: ByteArray): Boolean {
-        // TODO(rev-4): cross-check via QubeeManager + persist trust
-        // bump. Returning false is the safe stub: nothing claims
-        // verification it didn't actually do.
-        return false
+    /**
+     * Verify a peer's `IdentityKey` against a verification payload via
+     * the Rust core's hybrid Ed25519 + ML-DSA-44 check. On success,
+     * stamp the contact's trust state through `TrustStatePolicy`
+     * (which is the choke point that downgrades a previously-verified
+     * contact whose key changed).
+     */
+    suspend fun verifyIdentityKey(
+        contactId: String,
+        key: ByteArray,
+        verificationData: ByteArray = ByteArray(0),
+    ): Boolean {
+        val ok = qubeeManager.verifyIdentityKey(contactId, key, verificationData)
+        if (!ok) return false
+        val existing = contactDao.getContactById(contactId) ?: return false
+        val now = System.currentTimeMillis()
+        val withKey = TrustStatePolicy.applyObservedIdentityKey(
+            contact = existing,
+            observedIdentityKey = key,
+            nowMillis = now,
+        )
+        val verified = withKey.copy(
+            trustLevel = TrustLevel.VERIFIED,
+            verificationStatus = ContactVerificationStatus.VERIFIED,
+            updatedAt = now,
+        )
+        contactDao.updateContact(verified)
+        return true
     }
 
+    /**
+     * Compute the Short Authentication String for a contact by routing
+     * their stored `identityKey` through `QubeeManager.generateSASForContact`.
+     * Returns the empty string when the contact is unknown, has no
+     * stored identity key, or the JNI call fails.
+     */
     suspend fun generateSAS(contactId: String): String {
-        // TODO(rev-4): SAS gesture lands in the OOB/SAS batch.
-        return ""
+        val contact = contactDao.getContactById(contactId) ?: return ""
+        val peerKey = contact.identityKey ?: return ""
+        return qubeeManager.generateSASForContact(peerKey).orEmpty()
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        require(hex.length % 2 == 0) { "odd-length hex: ${hex.length}" }
+        val out = ByteArray(hex.length / 2)
+        for (i in out.indices) {
+            val hi = Character.digit(hex[2 * i], 16)
+            val lo = Character.digit(hex[2 * i + 1], 16)
+            require(hi >= 0 && lo >= 0) { "non-hex char at index ${2 * i}" }
+            out[i] = ((hi shl 4) or lo).toByte()
+        }
+        return out
     }
 }

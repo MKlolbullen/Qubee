@@ -24,20 +24,12 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 import javax.inject.Inject
 
-// Real chat surface ViewModel — rev-3 priority 7. Wires
-// `MessageRepository` (Flow<List<MessageWithSender>>) and
-// `ContactRepository` into the surface that `ChatScreen.kt`
-// consumes (`uiState.details`, `uiState.securityState`,
-// `events`, plus the action methods `requestSecureCall`,
-// `requestContactVerification`, `changeDisappearingTimer`,
-// `resetSecureSession`, `clearChat`).
-//
-// The actual message-pipeline JNI surface (`encryptMessage` /
-// `decryptMessage`) is being reconnected in parallel — see
-// `crypto/QubeeManager.kt` and the comment block in
-// `src/jni_api.rs`. Until that lands, `sendMessage` writes a
-// `MessageStatus.SENDING` row through the repository and surfaces
-// a `ChatUiEvent.Notice` rather than calling into the Rust core.
+// Real chat surface ViewModel. Wires `MessageRepository`
+// (Flow<List<MessageWithSender>>) and `ContactRepository` into the
+// surface that `ChatScreen.kt` consumes (`uiState.details`,
+// `uiState.securityState`, `events`, plus the action methods
+// `requestSecureCall`, `requestContactVerification`,
+// `changeDisappearingTimer`, `resetSecureSession`, `clearChat`).
 @HiltViewModel
 class ChatViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
@@ -61,6 +53,11 @@ class ChatViewModel @Inject constructor(
     val events: SharedFlow<ChatUiEvent> = _events.asSharedFlow()
 
     private var conversationId: String = ""
+
+    // Resolved at init time from `QubeeManager.getMyIdentityId()`. Null
+    // until onboarding completes; sendMessage falls back to the
+    // contact id in that window so the row still persists.
+    private var selfSenderId: String? = null
 
     init {
         viewModelScope.launch {
@@ -91,6 +88,7 @@ class ChatViewModel @Inject constructor(
             // null on JNI miss / pre-onboarding state, dialog hides
             // the my-QR section in that case.
             val myFp = runCatching { qubeeManager.getMyFingerprint() }.getOrNull()
+            selfSenderId = runCatching { qubeeManager.getMyIdentityId() }.getOrNull()
 
             _uiState.value = _uiState.value.copy(
                 contactName = name,
@@ -122,7 +120,7 @@ class ChatViewModel @Inject constructor(
             val message = Message(
                 id = UUID.randomUUID().toString(),
                 conversationId = conversationId,
-                senderId = SELF_SENDER_ID,
+                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
                 content = payload,
                 contentType = MessageType.TEXT,
                 timestamp = now,
@@ -178,7 +176,7 @@ class ChatViewModel @Inject constructor(
             val msg = Message(
                 id = UUID.randomUUID().toString(),
                 conversationId = conversationId,
-                senderId = SELF_SENDER_ID,
+                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
                 content = "",
                 contentType = MessageType.FILE,
                 timestamp = now,
@@ -202,7 +200,7 @@ class ChatViewModel @Inject constructor(
             val msg = Message(
                 id = UUID.randomUUID().toString(),
                 conversationId = conversationId,
-                senderId = SELF_SENDER_ID,
+                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
                 content = "",
                 contentType = MessageType.IMAGE,
                 timestamp = now,
@@ -225,7 +223,7 @@ class ChatViewModel @Inject constructor(
             val msg = Message(
                 id = UUID.randomUUID().toString(),
                 conversationId = conversationId,
-                senderId = SELF_SENDER_ID,
+                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
                 content = "",
                 contentType = MessageType.AUDIO,
                 timestamp = now,
@@ -508,11 +506,12 @@ class ChatViewModel @Inject constructor(
     }
 
     private companion object {
-        // TODO(rev-4): replace with the local user's IdentityId once
-        // QubeeManager exposes a stable accessor for it (the
-        // onboarding bundle plumbs it but doesn't surface it as a
-        // dedicated JNI getter yet).
-        const val SELF_SENDER_ID: String = "self"
+        // Used only when the JNI accessor for `getMyIdentityId()`
+        // returns null (pre-onboarding state, JNI link miss). In
+        // steady-state, every persisted message carries the locally-
+        // resolved 64-char hex identity id — same shape as
+        // `nativeInspectEnvelopeSender` returns for inbound rows.
+        const val SELF_SENDER_ID_FALLBACK: String = "self"
     }
 }
 

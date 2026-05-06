@@ -2,6 +2,9 @@ package com.qubee.messenger.ui.groups
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.qubee.messenger.data.model.Conversation
+import com.qubee.messenger.data.model.ConversationType
+import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.GroupRepository
 import com.qubee.messenger.groups.AcceptInviteResult
 import com.qubee.messenger.groups.GroupInvite
@@ -24,6 +27,7 @@ import kotlinx.coroutines.launch
 @HiltViewModel
 class GroupInviteViewModel @Inject constructor(
     private val groupRepository: GroupRepository,
+    private val conversationRepository: ConversationRepository,
 ) : ViewModel() {
 
     val maxMembers: Int = groupRepository.maxMembers
@@ -56,6 +60,17 @@ class GroupInviteViewModel @Inject constructor(
             }
             val expiresAt = ttlSeconds?.let { System.currentTimeMillis() / 1000L + it } ?: -1L
             val invite = groupRepository.createInvite(created.groupIdHex, expiresAt, maxUses = -1)
+            // Persist the new group as a Conversation row so it
+            // appears immediately in the user's inbox alongside
+            // their direct chats. Without this, a freshly-created
+            // group only existed in the Rust core; users had to
+            // wait for the first inbound message from a peer who
+            // joined to see anything in their conversation list.
+            persistGroupConversation(
+                groupIdHex = created.groupIdHex,
+                groupName = created.name,
+                participantHexIds = listOf(created.ownerIdHex),
+            )
             _state.value = if (invite != null) {
                 _state.value.copy(
                     isWorking = false,
@@ -139,6 +154,17 @@ class GroupInviteViewModel @Inject constructor(
             _state.value = _state.value.copy(isWorking = true, error = null)
             val accepted = groupRepository.acceptInvite(link)
             _state.value = if (accepted != null) {
+                // Same rationale as createGroupAndInvite: persist a
+                // Conversation row so the group appears in the user's
+                // inbox right after they tap Accept. The Rust handshake
+                // (RequestJoin → JoinAccepted) lands asynchronously;
+                // by the time it does, the row already exists and the
+                // first inbound message just adds to it.
+                persistGroupConversation(
+                    groupIdHex = accepted.groupIdHex,
+                    groupName = accepted.groupName,
+                    participantHexIds = listOf(accepted.inviterIdHex),
+                )
                 _state.value.copy(
                     isWorking = false,
                     accepted = true,
@@ -151,6 +177,34 @@ class GroupInviteViewModel @Inject constructor(
                 )
             }
         }
+    }
+
+    /**
+     * Upsert a Conversation row for a group so it shows up in the
+     * inbox. Idempotent — `insertConversation`'s OnConflictStrategy
+     * is REPLACE, so a re-create / re-accept doesn't duplicate the
+     * row but does refresh the name + participants snapshot.
+     *
+     * `participantHexIds` is a starter set the UI uses to pick a
+     * preview avatar / count; the authoritative member list lives
+     * Rust-side and arrives via `MemberAdded` broadcasts.
+     */
+    private suspend fun persistGroupConversation(
+        groupIdHex: String,
+        groupName: String,
+        participantHexIds: List<String>,
+    ) {
+        val now = System.currentTimeMillis()
+        conversationRepository.upsertConversation(
+            Conversation(
+                id = groupIdHex,
+                type = ConversationType.GROUP,
+                name = groupName,
+                participants = participantHexIds,
+                createdAt = now,
+                updatedAt = now,
+            ),
+        )
     }
 
     fun clearScanned() {

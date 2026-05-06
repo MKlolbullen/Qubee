@@ -37,6 +37,12 @@ enum class TrustLevel {
     MAXIMUM,
     TOFU,
     VERIFIED,
+    /// A previously verified contact presented a different identity
+    /// key. This is not automatically "compromised" — users can
+    /// legitimately rotate/reset identities — but it must never be
+    /// displayed as VERIFIED / PQ READY until the new identity is
+    /// explicitly re-verified.
+    KEY_CHANGED,
     COMPROMISED,
 }
 

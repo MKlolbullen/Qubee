@@ -494,9 +494,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
 
             // Subscribe to this group's gossipsub topic so we receive
             // RequestJoin frames from peers who scan an invite.
-            // Best-effort: if the network thread isn't up yet, we'll
-            // re-subscribe on next bootstrap (TODO once we persist a
-            // group→subscribed mapping).
+            // Best-effort: if the network thread isn't up yet,
+            // `resubscribe_known_groups()` picks it up on the next
+            // bootstrap because `gm.create_group` already persisted
+            // the group through `store_group_securely`.
             let _ = subscribe_topic(group_topic(&hex::encode(group_id.as_ref())));
 
             Ok(json!({
@@ -2023,6 +2024,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyF
 /// Returns null if onboarding hasn't completed yet.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityIdHex(
+/// Return the locally-active identity's `IdentityId` as a 64-character
+/// lowercase hex string — same shape as `nativeInspectEnvelopeSender`
+/// returns for inbound envelopes, so persisted `Message.senderId` rows
+/// stay interoperable across send and receive paths. Distinct from
+/// `nativeGetMyFingerprint`: the fingerprint is the 8-byte BLAKE3
+/// truncation used for OOB comparison; this is the full 32-byte
+/// identifier used as the canonical sender id on the wire.
+///
+/// Returns `null` if onboarding hasn't completed yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityId(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -2162,6 +2174,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
             let payload = serde_json::Value::Array(groups).to_string();
             let java_str = env
                 .new_string(payload)
+            let id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
+            let java_str = env
+                .new_string(id_hex)
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
             Ok(java_str.into_raw())
         })();

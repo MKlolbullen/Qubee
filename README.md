@@ -238,39 +238,54 @@ every PR (`.github/workflows/ci.yml`).
 
 Already shipped (cleaned out of the list below):
 * OOB compare gesture — fingerprint typed-input + SAS visual-compare
-  in `VerifyContactDialog`. Persistence flips
+  + QR-scan-from-peer in `VerifyContactDialog`. Persistence flips
   `Contact.trustLevel = VERIFIED` so a restart honours the
-  ceremony.
+  ceremony. The dialog's "Scan QR instead" button launches the
+  embedded ZXing scanner via `QrScannerActivity` and feeds the
+  scanned text back through `confirmContactVerification`.
 * `docs/two-device-walkthrough.md`.
 * Android data layer — `data.model.*` are real Room entities,
   `ContactRepository` / `MessageRepository` / `ConversationRepository`
   are DAO-backed, `data/repository/database/QubeeDatabase.kt` opens
-  through SQLCipher's `SupportOpenHelperFactory`, `di/DatabaseModule.kt`
-  wires Hilt providers. `MessageService` decrypts inbound P2P
-  packets and writes through the message store.
+  through SQLCipher's `SupportOpenHelperFactory` keyed off an
+  Android Keystore-derived passphrase (`SqlCipherKeyProvider`),
+  `di/DatabaseModule.kt` wires Hilt providers. `MessageService`
+  decrypts inbound P2P packets and writes through the message store.
 * PeerId ↔ Contact mapping (libp2p `PeerId` ↔ Qubee `IdentityId`)
   with two population paths: handshake-time
   `NetworkCallback.onPeerLinked(peerId, identityIdHex)` and
   receive-path TOFU via `nativeInspectEnvelopeSender`.
+* Snapshot resync after extended offline — `StateSyncResponse` now
+  carries the current group key wrapped under the requester's Kyber
+  pubkey, so a member who missed both a `MemberAdded` and a
+  `KeyRotation` while offline can re-converge in one round trip
+  (test: `lagging_member_resyncs_after_missing_key_rotation`).
+* `ContactRepository` crypto-backed surfaces (`addContactFromInviteLink`,
+  `verifyIdentityKey`, `generateSAS`) wired through `QubeeManager`'s
+  JNI bridge; `nativeGetMyIdentityId` exposes the local 64-char hex
+  id so persisted `Message.senderId` rows match what
+  `nativeInspectEnvelopeSender` returns for inbound traffic.
+* Real SQLCipher passphrase derivation via Android Keystore
+  (`security/SqlCipherKeyProvider.kt`); legacy hardcoded-passphrase
+  databases are wiped on first run after upgrade.
+* `SECURITY.md` (responsible disclosure), threat model in
+  `docs/security/`, fuzz target plan in `docs/security/fuzzing.md`,
+  perf baseline in `docs/perf/baseline.md`, criterion benchmarks
+  for the crypto hot paths, proptest round-trip cases in
+  `tests/wire_stability.rs`.
 
 Pre-alpha → alpha (still open):
-* QR-scan flavor of `VerifyContactDialog` (today's dialog accepts
-  typed input only; CameraX surface around the same
-  `confirmContactVerification(scanned)` call is roughly 100 lines
-  of Compose).
 * Android instrumented tests (`app/src/androidTest/`) covering
   `nativeStartNetwork` on a real device + a Compose UI test for
   create-group → invite-QR → scan-QR. Blocked here on emulator
   access; the test surface is documented in
   `docs/two-device-walkthrough.md` and the JNI side is
   type-checked on the host CI via `cargo build --features
-  _typecheck_jni`.
-* Snapshot resync after extended offline. The rev-4 P1
-  `RequestStateSync` / `StateSyncResponse` pair recovers members
-  + version, but a member who *also* missed a `KeyRotation` in
-  between still bounces on the strict generation gate. Fix
-  candidate: extend `StateSyncResponse` to include the current
-  group key wrapped to the requester's Kyber pubkey.
+  _typecheck_jni`. A first instrumented test for
+  `SqlCipherKeyProvider` is already checked in at
+  `app/src/androidTest/java/com/qubee/messenger/security/SqlCipherKeyProviderTest.kt`
+  and runs on a real device once the emulator-access blocker
+  resolves.
 * Port the legacy modules (`hybrid_ratchet`, `secure_message`,
   `file_transfer`, `audio`, `sas`, `oob_secrets`) to the current
   dependency versions — currently feature-gated behind `legacy`

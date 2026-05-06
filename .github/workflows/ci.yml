@@ -66,6 +66,14 @@ jobs:
       - name: cargo build --features _typecheck_jni
         run: cargo build --features _typecheck_jni
 
+      # Compile-only smoke test for benches. Doesn't run them (the
+      # full criterion suite would dominate CI runtime); guarantees
+      # the bench surface stays compatible with whatever crypto-crate
+      # API changes land. Baseline numbers live in
+      # docs/perf/baseline.md and are recorded locally.
+      - name: cargo bench --no-run
+        run: cargo bench --no-run
+
   rust-audit:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest

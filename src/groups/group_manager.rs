@@ -1581,10 +1581,63 @@ mod tests {
         ).expect("Should join group");
         
         assert_eq!(joined_group_id, group_id);
-        
+
         let group = group_manager.get_group(&group_id).expect("Should find group");
         assert_eq!(group.members.len(), 2);
         assert!(group.members.contains_key(&joiner_id));
+    }
+
+    /// Restart-preserves-membership: the create-group → drop-manager →
+    /// reopen-from-disk path must rehydrate `member_groups` so
+    /// `resubscribe_known_groups()` re-subscribes the same gossipsub
+    /// topics on next bootstrap. Closes the legacy comment at
+    /// `jni_api.rs:496` that read "TODO once we persist a
+    /// group→subscribed mapping" — the persistence has been
+    /// in place via `store_group_securely` + `load_groups_from_storage`,
+    /// this test pins it down so a future refactor can't silently
+    /// regress it.
+    #[test]
+    fn restart_reloads_member_groups_for_creator() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let keystore_path = temp_dir.path().join("group_keystore.db");
+
+        let creator_keypair = IdentityKeyPair::generate().expect("keypair");
+        let creator_key = creator_keypair.public_key();
+        let creator_id = creator_key.identity_id;
+
+        let group_id = {
+            let keystore = SecureKeystore::new(&keystore_path).expect("keystore open");
+            let mut gm = GroupManager::new(keystore).expect("gm");
+            gm.create_group(
+                creator_id,
+                creator_key.clone(),
+                "Persisted Group".to_string(),
+                "Restart resilience".to_string(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("create_group")
+            // gm + keystore drop here, flushing to disk via SecureKeyStore::Drop.
+        };
+
+        // Reopen from the same on-disk path — same flow as the real
+        // bootstrap (`nativeInitialize` → `load_groups_from_storage`).
+        let keystore = SecureKeystore::new(&keystore_path).expect("keystore reopen");
+        let mut gm = GroupManager::new(keystore).expect("gm reopen");
+        gm.load_groups_from_storage().expect("load_groups_from_storage");
+
+        let groups = gm.get_member_groups(&creator_id);
+        assert_eq!(
+            groups.len(),
+            1,
+            "creator should still appear as a member after restart",
+        );
+        assert_eq!(groups[0].id, group_id);
+        assert_eq!(groups[0].name, "Persisted Group");
+        assert!(
+            groups[0].members.contains_key(&creator_id),
+            "rehydrated group must include the creator",
+        );
     }
 }
 

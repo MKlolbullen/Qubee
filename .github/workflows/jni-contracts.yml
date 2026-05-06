@@ -1,0 +1,40 @@
+name: JNI Contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  jni-contracts:
+    name: Kotlin ↔ Rust JNI contract
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check JNI symbol contract
+        run: bash scripts/check_jni_contracts.sh
+
+      - name: Audit message/file bridge contract
+        run: bash scripts/audit_message_file_bridge.sh
+
+      - name: Typecheck Rust JNI surface
+        run: |
+          if grep -q '^_typecheck_jni = ' Cargo.toml; then
+            cargo build --features _typecheck_jni
+          else
+            echo 'Cargo feature _typecheck_jni not declared; running regular cargo check instead.'
+            cargo check
+          fi
+
+      - name: Run Rust tests
+        run: cargo test

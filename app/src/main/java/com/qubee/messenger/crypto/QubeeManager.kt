@@ -189,6 +189,32 @@ class QubeeManager @Inject constructor(
         }
 
     /**
+     * Return the locally-active identity's `IdentityId` as a 64-char
+     * lowercase hex string — same shape that
+     * [inspectEnvelopeSender] returns for inbound envelopes, so
+     * persisted `Message.senderId` rows stay interoperable across
+     * send and receive paths. Distinct from [getMyFingerprint]:
+     * the fingerprint is the 8-byte BLAKE3 truncation used for OOB
+     * comparison; this is the full 32-byte id used as the canonical
+     * sender id on the wire.
+     *
+     * Returns null if onboarding hasn't completed yet.
+     */
+    suspend fun getMyIdentityId(): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeGetMyIdentityId()
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust my-identity-id JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust my-identity-id retrieval failed")
+                null
+            }
+        }
+
+    /**
      * Read the `sender_id` field out of a `GroupMessageEnvelope`
      * wire envelope without decrypting. The signed body carries
      * this in the clear (authenticated, not confidential), so we
@@ -439,6 +465,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeListGroupMembers(groupIdHex: String): String?
     private external fun nativeListGroups(): String?
     private external fun nativeGetMyIdentityIdHex(): String?
+    private external fun nativeGetMyIdentityId(): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

@@ -15,14 +15,22 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,10 +71,13 @@ import com.qubee.messenger.ui.theme.QubeeStatusPill
 fun GroupDetailsSheet(
     groupName: String,
     members: List<GroupMemberInfo>?,
+    myIdentityIdHex: String?,
     onLoadMembers: () -> Unit,
+    onLeaveGroup: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var confirmLeave by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { onLoadMembers() }
 
@@ -95,9 +106,40 @@ fun GroupDetailsSheet(
             when {
                 members == null -> LoadingMembers()
                 members.isEmpty() -> EmptyMembers()
-                else -> MemberList(members)
+                else -> MemberList(members, myIdentityIdHex)
+            }
+
+            Spacer(Modifier.height(20.dp))
+            OutlinedButton(
+                onClick = { confirmLeave = true },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Leave group", color = QubeePalette.Cyan)
             }
         }
+    }
+
+    if (confirmLeave) {
+        AlertDialog(
+            onDismissRequest = { confirmLeave = false },
+            title = { Text("Leave $groupName?") },
+            text = {
+                Text(
+                    "You'll stop receiving messages and the remaining members will rotate the group key. The conversation stays in your inbox so you can scroll back through history, but you can't post or decrypt new messages.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmLeave = false
+                    onLeaveGroup()
+                    onDismiss()
+                }) { Text("Leave", color = QubeePalette.Cyan) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmLeave = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 
@@ -135,16 +177,16 @@ private fun EmptyMembers() {
 }
 
 @Composable
-private fun MemberList(members: List<GroupMemberInfo>) {
+private fun MemberList(members: List<GroupMemberInfo>, myIdentityIdHex: String?) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         items(members, key = { it.identityIdHex }) { member ->
-            MemberRow(member)
+            MemberRow(member, isSelf = myIdentityIdHex != null && member.identityIdHex == myIdentityIdHex)
         }
     }
 }
 
 @Composable
-private fun MemberRow(member: GroupMemberInfo) {
+private fun MemberRow(member: GroupMemberInfo, isSelf: Boolean) {
     val initials = member.displayName
         .split(' ', '\t', '\n')
         .mapNotNull { it.firstOrNull()?.toString()?.uppercase() }
@@ -188,6 +230,21 @@ private fun MemberRow(member: GroupMemberInfo) {
             QubeeMutedText(
                 text = if (member.isActive) member.role else "${member.role} · removed",
             )
+        }
+        if (isSelf) {
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = QubeePalette.Cyan.copy(alpha = 0.18f),
+                modifier = Modifier.padding(start = 8.dp),
+            ) {
+                Text(
+                    "You",
+                    color = QubeePalette.Cyan,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+            }
         }
     }
 }

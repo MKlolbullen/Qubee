@@ -306,6 +306,25 @@ class QubeeManager @Inject constructor(
      * JoinAccepted handshake hasn't landed yet, so the Rust core
      * still doesn't know about the group).
      */
+    /**
+     * The locally-active identity's `IdentityId` as a 64-char hex
+     * string. Used to flag "this row is you" in the Group Details
+     * member list and to pass our own id into `removeMember` for
+     * the "Leave group" action.
+     */
+    suspend fun getMyIdentityIdHex(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeGetMyIdentityIdHex()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust my-identity-id JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust my-identity-id failed")
+            null
+        }
+    }
+
     suspend fun listGroupMembers(groupIdHex: String): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         try {
@@ -371,6 +390,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
     private external fun nativeGetMyFingerprint(): String?
     private external fun nativeListGroupMembers(groupIdHex: String): String?
+    private external fun nativeGetMyIdentityIdHex(): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
     private external fun nativeLoadOnboardingBundle(): String?

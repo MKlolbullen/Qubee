@@ -1910,6 +1910,34 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyF
     })
 }
 
+/// Return the locally-active identity's `IdentityId` as a 64-char
+/// hex string. Used by the Android Group Details sheet to flag
+/// "this row is you" on the member list and to wire the
+/// "Leave group" action (which needs to pass our own id into
+/// `nativeRemoveMember`). Distinct from `nativeGetMyFingerprint`
+/// — fingerprint is a hash for OOB compare, identity_id is the
+/// raw 32-byte address used everywhere on the wire.
+///
+/// Returns null if onboarding hasn't completed yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityIdHex(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let hex_id = hex::encode(identity.identity_id().as_ref() as &[u8]);
+            let java_str = env
+                .new_string(hex_id)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Return the active members of a group as a JSON array. Each entry
 /// is `{identity_id_hex, display_name, role, is_active, joined_at}`.
 /// Used by the Android Group Details sheet to render the member

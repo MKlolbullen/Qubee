@@ -171,7 +171,9 @@ fun ChatScreen(
                 GroupDetailsSheet(
                     groupName = uiState.contactName,
                     members = uiState.groupMembers,
+                    myIdentityIdHex = uiState.myIdentityIdHex,
                     onLoadMembers = viewModel::loadGroupMembers,
+                    onLeaveGroup = viewModel::leaveGroup,
                     onDismiss = { showDetails = false },
                 )
             } else {

@@ -102,6 +102,7 @@ class ChatViewModel @Inject constructor(
             // null on JNI miss / pre-onboarding state, dialog hides
             // the my-QR section in that case.
             val myFp = runCatching { qubeeManager.getMyFingerprint() }.getOrNull()
+            val myId = runCatching { qubeeManager.getMyIdentityIdHex() }.getOrNull()
 
             _uiState.value = _uiState.value.copy(
                 contactName = name,
@@ -112,6 +113,7 @@ class ChatViewModel @Inject constructor(
                     ConversationSecurityState.Unverified
                 },
                 myFingerprint = myFp,
+                myIdentityIdHex = myId,
                 isGroup = isGroup,
             )
 
@@ -514,6 +516,40 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Leave the current group. Routes through the existing
+     * `removeMember` JNI export — the Rust side accepts
+     * "remove yourself" the same way it accepts an owner removing
+     * someone else, just with `member_id = self_id`. Triggers a
+     * local key rotation so the user no longer holds the
+     * post-rotation key; remaining members get a `KeyRotation`
+     * broadcast and converge on the fresh key.
+     *
+     * The local Conversation row stays in place after a leave —
+     * the user can still scroll back through the message history
+     * even though they can no longer post or decrypt new
+     * messages. A future "archive after leave" follow-up would
+     * collapse the row from the active inbox.
+     */
+    fun leaveGroup() {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        val myId = _uiState.value.myIdentityIdHex
+        if (myId.isNullOrBlank()) {
+            notice("Cannot leave: local identity not loaded")
+            return
+        }
+        viewModelScope.launch {
+            val ok = runCatching {
+                groupRepository.removeMember(conversationId, myId, "leaving")
+            }.getOrNull() != null
+            if (ok) {
+                _events.emit(ChatUiEvent.Notice("You left the group"))
+            } else {
+                _events.emit(ChatUiEvent.Notice("Failed to leave group"))
+            }
+        }
+    }
+
     fun clearChat() {
         if (conversationId.isEmpty()) return
         viewModelScope.launch {
@@ -582,6 +618,11 @@ data class ChatUiState(
     /// spinner), an empty list means "Rust core has no group at
     /// this id" (the UI shows the empty-state copy).
     val groupMembers: List<com.qubee.messenger.groups.GroupMemberInfo>? = null,
+    /// The locally-active identity id, hex-encoded. Loaded once at
+    /// init alongside `myFingerprint`. The Group Details sheet
+    /// matches this against `GroupMemberInfo.identityIdHex` to put
+    /// a "You" badge on the row representing the local user.
+    val myIdentityIdHex: String? = null,
 )
 
 data class ConversationDetailsUi(

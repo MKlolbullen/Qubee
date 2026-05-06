@@ -73,6 +73,29 @@ class GroupRepository @Inject constructor(
         }
 
     /**
+     * The locally-active identity's `IdentityId` as a 64-char hex
+     * string. Cached after first successful read. Used by the Group
+     * Details sheet's "you" badge and the "Leave group" action.
+     */
+    suspend fun myIdentityIdHex(): String? = qubeeManager.getMyIdentityIdHex()
+
+    /**
+     * Remove a member (or yourself, for "Leave group") from a
+     * group. Owner-only Rust-side; non-owner callers get a JNI
+     * error which surfaces here as a null return.
+     *
+     * Returns the JSON envelope from `nativeRemoveMember`
+     * unchanged for now — callers that just need success/failure
+     * can `!= null` it; the structured shape lands when there's a
+     * UI surface that uses the rotation details.
+     */
+    suspend fun removeMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        reason: String = "",
+    ): String? = qubeeManager.removeMember(groupIdHex, memberIdHex, reason)
+
+    /**
      * List the active + removed members of a group from the Rust
      * core's local view. Returns null if the group isn't yet known
      * locally (e.g., the user accepted an invite but the handshake

@@ -181,6 +181,92 @@ class MessageService : Service(), NetworkCallback {
     }
 
     /**
+     * Persist a group message that the Rust core has already
+     * verified (sender is an active member, hybrid signature
+     * passes, generation counter matches) and AEAD-decrypted.
+     *
+     * The Conversation row is keyed directly by `groupIdHex` —
+     * matches what `ConversationRepository.hydrateFromRustGroups`
+     * inserts on cold start and what
+     * `GroupInviteViewModel.persistGroupConversation` writes on
+     * create / accept. If no row exists yet (e.g., a state-sync
+     * landed a group we don't know about because hydration hasn't
+     * run), we conservatively *insert* a placeholder row so the
+     * inbound message has somewhere to land — better than
+     * dropping the decrypted plaintext on the floor.
+     *
+     * Sender mapping mirrors the direct path: try
+     * `getContactByIdentityId(senderIdHex)` for a friendly display
+     * name, fall back to the raw hex senderId so the row is at
+     * least decryptable in the UI ("Unknown 4f7e…").
+     *
+     * Best-effort throughout — a failure anywhere logs and drops
+     * the message rather than crashing the foreground service.
+     */
+    override fun onGroupMessageReceived(
+        groupIdHex: String,
+        senderIdHex: String,
+        plaintext: ByteArray,
+        timestampSeconds: Long,
+    ) {
+        Timber.d(
+            "Group message received: group=%s sender=%s (%d bytes)",
+            groupIdHex,
+            senderIdHex,
+            plaintext.size,
+        )
+        serviceScope.launch {
+            try {
+                val existing = conversationRepository.getConversationById(groupIdHex)
+                if (existing == null) {
+                    // Hydration hasn't caught up yet (or this is a
+                    // group we just got state-sync'd into). Mint a
+                    // placeholder row so the message lands; the
+                    // next hydration pass will refresh `name` if
+                    // it's blank.
+                    conversationRepository.upsertConversation(
+                        com.qubee.messenger.data.model.Conversation(
+                            id = groupIdHex,
+                            type = com.qubee.messenger.data.model.ConversationType.GROUP,
+                            name = "",
+                            participants = emptyList(),
+                            createdAt = System.currentTimeMillis(),
+                            updatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+                val matched = contactRepository.getContactByIdentityId(senderIdHex)
+                val resolvedSenderId = matched?.id ?: senderIdHex
+                val msg = Message(
+                    id = UUID.randomUUID().toString(),
+                    conversationId = groupIdHex,
+                    senderId = resolvedSenderId,
+                    content = plaintext.toString(Charsets.UTF_8),
+                    contentType = MessageType.TEXT,
+                    timestamp = timestampSeconds * 1_000L,
+                    status = MessageStatus.DELIVERED,
+                    isFromMe = false,
+                )
+                messageRepository.saveMessage(msg)
+                if (matched != null) {
+                    contactRepository.updateOnlineStatus(
+                        matched.id,
+                        true,
+                        System.currentTimeMillis(),
+                    )
+                }
+            } catch (e: Exception) {
+                Timber.e(
+                    e,
+                    "Failed to persist group message: group=%s sender=%s",
+                    groupIdHex,
+                    senderIdHex,
+                )
+            }
+        }
+    }
+
+    /**
      * Inspect the wire envelope to extract the signed sender
      * `IdentityId`, look up the matching Contact, and stamp its
      * `peerId` with the libp2p sender id. Returns the linked

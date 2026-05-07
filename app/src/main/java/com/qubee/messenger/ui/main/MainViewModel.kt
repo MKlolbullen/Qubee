@@ -3,6 +3,8 @@ package com.qubee.messenger.ui.main
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.repository.ConversationRepository
+import com.qubee.messenger.data.repository.GroupRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,6 +24,8 @@ import javax.inject.Inject
 @HiltViewModel
 class MainViewModel @Inject constructor(
     private val qubeeManager: QubeeManager,
+    private val groupRepository: GroupRepository,
+    private val conversationRepository: ConversationRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MainUiState())
@@ -42,6 +46,22 @@ class MainViewModel @Inject constructor(
                 if (!ok) throw IllegalStateException("Failed to initialize cryptographic system")
                 _uiState.value = _uiState.value.copy(isLoading = false, isInitialized = true)
                 Timber.d("App initialization completed successfully")
+
+                // Cold-start hydration: if the Rust core has groups
+                // we don't have Conversation rows for (fresh install
+                // / post-wipe), fold them in so the inbox isn't
+                // empty while the underlying state is intact. No-op
+                // when the Conversation table already mirrors the
+                // Rust view.
+                runCatching {
+                    val groups = groupRepository.listGroups()
+                    if (groups.isNotEmpty()) {
+                        val inserted = conversationRepository.hydrateFromRustGroups(groups)
+                        if (inserted > 0) {
+                            Timber.d("Hydrated $inserted group(s) from the Rust core")
+                        }
+                    }
+                }.onFailure { Timber.w(it, "Group hydration failed") }
             } catch (e: Exception) {
                 Timber.e(e, "Failed to initialize app")
                 _uiState.value = _uiState.value.copy(

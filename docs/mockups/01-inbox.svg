@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 950" width="460" height="950" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
+  <!-- Galaxy S25 Ultra mock-up: Inbox / Conversations -->
+  <defs>
+    <linearGradient id="frameGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a22"/>
+      <stop offset="1" stop-color="#050507"/>
+    </linearGradient>
+    <linearGradient id="screenGlare" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#12EAD8" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#12EAD8" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="screenClip">
+      <rect x="24" y="28" width="412" height="894" rx="42"/>
+    </clipPath>
+  </defs>
+
+  <!-- Phone body -->
+  <rect x="6" y="10" width="448" height="930" rx="56" fill="url(#frameGloss)"/>
+  <rect x="10" y="14" width="440" height="922" rx="54" fill="#0c0c10" stroke="#23232b" stroke-width="0.7"/>
+  <!-- Side button hints -->
+  <rect x="3" y="220" width="4" height="80" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="180" width="4" height="60" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="260" width="4" height="100" rx="2" fill="#1a1a22"/>
+  <!-- Screen -->
+  <rect x="24" y="28" width="412" height="894" rx="42" fill="#040C16"/>
+
+  <g clip-path="url(#screenClip)">
+    <!-- Background ambient glow -->
+    <circle cx="80" cy="100" r="180" fill="url(#cyanGlow)"/>
+    <circle cx="380" cy="800" r="160" fill="url(#cyanGlow)" opacity="0.6"/>
+
+    <!-- Status bar -->
+    <g font-size="11" fill="#EAFBFF">
+      <text x="44" y="50" font-weight="600">21:47</text>
+      <!-- Right cluster: signal, wifi, battery -->
+      <g transform="translate(370,40)">
+        <rect x="0" y="6" width="2" height="4" fill="#EAFBFF"/>
+        <rect x="3" y="4" width="2" height="6" fill="#EAFBFF"/>
+        <rect x="6" y="2" width="2" height="8" fill="#EAFBFF"/>
+        <rect x="9" y="0" width="2" height="10" fill="#EAFBFF"/>
+        <path d="M16 8 q4 -5 10 0" stroke="#EAFBFF" fill="none" stroke-width="1.3"/>
+        <path d="M18 6 q3 -3 6 0" stroke="#EAFBFF" fill="none" stroke-width="1.3"/>
+        <circle cx="21" cy="9" r="0.9" fill="#EAFBFF"/>
+        <rect x="32" y="2" width="22" height="9" rx="2" fill="none" stroke="#EAFBFF" stroke-width="1"/>
+        <rect x="34" y="4" width="15" height="5" fill="#12EAD8"/>
+        <rect x="54" y="5" width="2" height="3" fill="#EAFBFF"/>
+        <text x="58" y="9" font-size="10" fill="#EAFBFF">87%</text>
+      </g>
+    </g>
+    <!-- Camera punch hole -->
+    <circle cx="230" cy="46" r="7" fill="#000"/>
+
+    <!-- App header -->
+    <g transform="translate(24,86)">
+      <text x="0" y="0" fill="#12EAD8" font-size="11" letter-spacing="3" font-weight="700">QUBEE</text>
+      <text x="0" y="34" fill="#EAFBFF" font-size="28" font-weight="800">Inbox</text>
+      <text x="0" y="56" fill="#A3BDCA" font-size="12">5 conversations · synced via libp2p</text>
+      <!-- Cog (settings) icon -->
+      <g transform="translate(330,8)" stroke="#EAFBFF" stroke-width="1.5" fill="none">
+        <circle cx="14" cy="14" r="4"/>
+        <path d="M14 2 v3 M14 23 v3 M2 14 h3 M23 14 h3 M5 5 l2 2 M21 21 l2 2 M5 23 l2 -2 M21 7 l2 -2"/>
+      </g>
+    </g>
+
+    <!-- Search field -->
+    <g transform="translate(24,166)">
+      <rect width="364" height="42" rx="14" fill="#0a1726" fill-opacity="0.9" stroke="#152639"/>
+      <circle cx="20" cy="21" r="6" fill="none" stroke="#A3BDCA" stroke-width="1.4"/>
+      <line x1="25" y1="26" x2="30" y2="31" stroke="#A3BDCA" stroke-width="1.4"/>
+      <text x="40" y="26" fill="#A3BDCA" font-size="13">Search people or groups…</text>
+    </g>
+
+    <!-- Conversation list -->
+    <g transform="translate(20,222)">
+      <!-- Card 1: Group with unread -->
+      <g transform="translate(0,0)">
+        <rect width="372" height="76" rx="20" fill="#102234" fill-opacity="0.94"/>
+        <rect width="372" height="76" rx="20" fill="none" stroke="#12EAD8" stroke-opacity="0.18"/>
+        <circle cx="38" cy="38" r="22" fill="#12EAD8" fill-opacity="0.18"/>
+        <text x="38" y="44" text-anchor="middle" fill="#EAFBFF" font-size="14" font-weight="700">BS</text>
+        <!-- Group glyph: small overlap -->
+        <circle cx="52" cy="22" r="7" fill="#0a1726" stroke="#12EAD8" stroke-width="1.2"/>
+        <path d="M48 24 a4 3 0 1 0 8 0" fill="none" stroke="#12EAD8" stroke-width="1.1"/>
+        <text x="74" y="34" fill="#EAFBFF" font-size="14.5" font-weight="700">Berlin Sec Crew</text>
+        <text x="74" y="54" fill="#A3BDCA" font-size="12">Lina · rotated key after Bo left</text>
+        <text x="350" y="30" text-anchor="end" fill="#A3BDCA" font-size="10">12m</text>
+        <!-- Unread chip -->
+        <rect x="332" y="46" width="22" height="18" rx="9" fill="#12EAD8"/>
+        <text x="343" y="59" text-anchor="middle" fill="#040C16" font-size="11" font-weight="800">3</text>
+      </g>
+
+      <!-- Card 2: Verified DM -->
+      <g transform="translate(0,86)">
+        <rect width="372" height="76" rx="20" fill="#102234" fill-opacity="0.9"/>
+        <circle cx="38" cy="38" r="22" fill="#0E5F59"/>
+        <text x="38" y="44" text-anchor="middle" fill="#EAFBFF" font-size="14" font-weight="700">MV</text>
+        <!-- Verified shield -->
+        <path d="M52 22 l6 -2 l6 2 v6 q0 5 -6 8 q-6 -3 -6 -8 z" fill="#12EAD8"/>
+        <path d="M55 27 l3 3 l5 -5" stroke="#040C16" stroke-width="1.6" fill="none"/>
+        <text x="74" y="34" fill="#EAFBFF" font-size="14.5" font-weight="700">Marie Vasquez</text>
+        <text x="74" y="54" fill="#A3BDCA" font-size="12">see you sat</text>
+        <text x="350" y="30" text-anchor="end" fill="#A3BDCA" font-size="10">1h</text>
+      </g>
+
+      <!-- Card 3: Group, my last message -->
+      <g transform="translate(0,172)">
+        <rect width="372" height="76" rx="20" fill="#102234" fill-opacity="0.9"/>
+        <circle cx="38" cy="38" r="22" fill="#12EAD8" fill-opacity="0.18"/>
+        <text x="38" y="44" text-anchor="middle" fill="#EAFBFF" font-size="14" font-weight="700">OR</text>
+        <circle cx="52" cy="22" r="7" fill="#0a1726" stroke="#12EAD8" stroke-width="1.2"/>
+        <path d="M48 24 a4 3 0 1 0 8 0" fill="none" stroke="#12EAD8" stroke-width="1.1"/>
+        <text x="74" y="34" fill="#EAFBFF" font-size="14.5" font-weight="700">ops-relay</text>
+        <text x="74" y="54" fill="#A3BDCA" font-size="12">you · shipped a073268</text>
+        <text x="350" y="30" text-anchor="end" fill="#A3BDCA" font-size="10">4h</text>
+        <!-- Sent check -->
+        <path d="M340 49 l3 3 l6 -7" stroke="#12EAD8" stroke-width="1.6" fill="none"/>
+      </g>
+
+      <!-- Card 4: DM -->
+      <g transform="translate(0,258)">
+        <rect width="372" height="76" rx="20" fill="#102234" fill-opacity="0.9"/>
+        <circle cx="38" cy="38" r="22" fill="#102234" stroke="#12EAD8" stroke-opacity="0.4"/>
+        <text x="38" y="44" text-anchor="middle" fill="#EAFBFF" font-size="14" font-weight="700">KY</text>
+        <text x="74" y="34" fill="#EAFBFF" font-size="14.5" font-weight="700">Karim Yıldız</text>
+        <text x="74" y="54" fill="#A3BDCA" font-size="12">invite please</text>
+        <text x="350" y="30" text-anchor="end" fill="#A3BDCA" font-size="10">9h</text>
+      </g>
+
+      <!-- Card 5: Empty group -->
+      <g transform="translate(0,344)">
+        <rect width="372" height="76" rx="20" fill="#102234" fill-opacity="0.7"/>
+        <circle cx="38" cy="38" r="22" fill="#12EAD8" fill-opacity="0.12"/>
+        <text x="38" y="44" text-anchor="middle" fill="#A3BDCA" font-size="14" font-weight="700">FT</text>
+        <circle cx="52" cy="22" r="7" fill="#0a1726" stroke="#12EAD8" stroke-width="1.2"/>
+        <path d="M48 24 a4 3 0 1 0 8 0" fill="none" stroke="#12EAD8" stroke-width="1.1"/>
+        <text x="74" y="34" fill="#EAFBFF" font-size="14.5" font-weight="700">field-test-3</text>
+        <text x="74" y="54" fill="#A3BDCA" font-size="12" font-style="italic">No messages yet · 2 members</text>
+        <text x="350" y="30" text-anchor="end" fill="#A3BDCA" font-size="10">just now</text>
+      </g>
+    </g>
+
+    <!-- FAB: New conversation -->
+    <g transform="translate(330,756)">
+      <circle cx="34" cy="34" r="34" fill="#12EAD8"/>
+      <circle cx="34" cy="34" r="34" fill="url(#screenGlare)"/>
+      <line x1="34" y1="22" x2="34" y2="46" stroke="#040C16" stroke-width="3" stroke-linecap="round"/>
+      <line x1="22" y1="34" x2="46" y2="34" stroke="#040C16" stroke-width="3" stroke-linecap="round"/>
+    </g>
+
+    <!-- Bottom navigation -->
+    <g transform="translate(0,840)">
+      <rect x="24" y="0" width="412" height="64" rx="22" fill="#0a1726" fill-opacity="0.92" stroke="#152639"/>
+      <!-- Inbox (selected) -->
+      <g transform="translate(82,18)">
+        <rect x="-22" y="-2" width="68" height="32" rx="16" fill="#12EAD8" fill-opacity="0.18"/>
+        <path d="M0 18 v-12 a4 4 0 0 1 4 -4 h16 a4 4 0 0 1 4 4 v12" stroke="#12EAD8" stroke-width="1.6" fill="none"/>
+        <path d="M0 14 h6 l3 4 h6 l3 -4 h6" stroke="#12EAD8" stroke-width="1.6" fill="none"/>
+      </g>
+      <text x="116" y="44" fill="#12EAD8" font-size="11" font-weight="700">Inbox</text>
+      <!-- Contacts -->
+      <g transform="translate(220,18)" stroke="#A3BDCA" stroke-width="1.6" fill="none">
+        <circle cx="10" cy="6" r="4"/>
+        <path d="M2 22 q8 -10 16 0"/>
+      </g>
+      <text x="232" y="56" text-anchor="middle" fill="#A3BDCA" font-size="10">Contacts</text>
+      <!-- Settings -->
+      <g transform="translate(330,18)" stroke="#A3BDCA" stroke-width="1.6" fill="none">
+        <circle cx="10" cy="10" r="4"/>
+        <path d="M10 0 v3 M10 17 v3 M0 10 h3 M17 10 h3 M3 3 l2 2 M15 15 l2 2 M3 17 l2 -2 M15 5 l2 -2"/>
+      </g>
+      <text x="340" y="56" text-anchor="middle" fill="#A3BDCA" font-size="10">Settings</text>
+    </g>
+
+    <!-- Home indicator -->
+    <rect x="170" y="900" width="120" height="4" rx="2" fill="#A3BDCA" fill-opacity="0.6"/>
+
+    <!-- Screen glare overlay -->
+    <rect x="24" y="28" width="412" height="894" rx="42" fill="url(#screenGlare)" pointer-events="none"/>
+  </g>
+</svg>

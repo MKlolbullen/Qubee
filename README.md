@@ -4,6 +4,9 @@
 > Built with **Android (Kotlin + Compose)** and **Rust** for maximum security and performance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml)
+[![Android](https://github.com/MKlolbullen/Qubee/actions/workflows/android-smoke.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/android-smoke.yml)
+[![Release](https://img.shields.io/github/v/release/MKlolbullen/Qubee?include_prereleases&label=release)](https://github.com/MKlolbullen/Qubee/releases)
 ![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)
 ![Status](https://img.shields.io/badge/status-pre--alpha-red)
 
@@ -70,6 +73,9 @@ all live.
 The releases are signed by the maintainer's release key
 (fingerprint published in `SECURITY.md`). Signature failures on
 install mean the APK has been tampered with — do not proceed.
+
+Maintainers cutting a new release: see `RELEASE.md` for the
+keystore / GitHub Secrets / tag-push procedure.
 
 Pre-alpha caveats apply (see `SECURITY.md`): no Play Store yet,
 no migrations between minor versions (DB resets), no instrumented

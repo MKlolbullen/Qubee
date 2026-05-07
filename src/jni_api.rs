@@ -207,7 +207,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
         Ok(())
     });
     if result.is_err() {
-        eprintln!("Rust: nativeInitialize failed");
+        tracing::error!("nativeInitialize failed");
         return 0;
     }
     1
@@ -326,7 +326,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         node.run(tx_event).await;
                     },
                     Err(e) => {
-                        eprintln!("Rust: Failed to start P2P node: {}", e);
+                        tracing::error!(error = %e, "Failed to start P2P node");
                     }
                 }
             });
@@ -359,12 +359,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
             match commander.try_send(cmd) {
                 Ok(_) => 1,
                 Err(e) => {
-                    eprintln!("Rust: Failed to send P2P command: {}", e);
+                    tracing::warn!(error = %e, "Failed to send P2P command");
                     0
                 }
             }
         } else {
-            eprintln!("Rust: P2P Commander not initialized");
+            tracing::warn!("P2P Commander not initialized");
             0
         }
     })
@@ -389,7 +389,7 @@ fn handle_inbound_group_message(envelope: GroupMessageEnvelope) {
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("Rust: group message dropped: {e:#}");
+        tracing::warn!(error = ?e, "group message dropped");
     }
 }
 
@@ -864,7 +864,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
 
             // Best-effort network publication.
             let network_published = publish_request_join(&payload).unwrap_or_else(|e| {
-                eprintln!("Rust: publish_request_join failed: {e:#}");
+                tracing::warn!(error = ?e, "publish_request_join failed");
                 false
             });
 
@@ -1033,7 +1033,7 @@ fn active_display_name() -> anyhow::Result<String> {
 fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
     let extracted_identity = extract_peer_identity_hex(&frame);
     if let Err(e) = process_handshake(frame) {
-        eprintln!("Rust: handshake rejected: {e:#}");
+        tracing::info!(error = ?e, "handshake rejected");
         return;
     }
     if let Some(identity_hex) = extracted_identity {
@@ -1115,9 +1115,10 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             if let Some(mut secret) = take_pending_kyber_secret(&body.invitation_code) {
                 secret.zeroize();
             }
-            eprintln!(
-                "Rust: invite to group {} rejected: {}",
-                body.group_id, body.reason
+            tracing::info!(
+                group_id = %body.group_id,
+                reason = %body.reason,
+                "invite to group rejected",
             );
         }
         GroupHandshake::KeyRotation { body, signature } => {
@@ -1401,7 +1402,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
             let p = path.join(name);
             if let Err(e) = std::fs::remove_file(&p) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("Rust: reset failed to delete {p:?}: {e}");
+                    tracing::warn!(path = ?p, error = %e, "reset failed to delete file");
                 }
             }
         }
@@ -1433,7 +1434,7 @@ fn ok_or_null(env: JNIEnv, result: anyhow::Result<serde_json::Value>) -> jstring
     match result {
         Ok(v) => json_to_jstring(env, v),
         Err(e) => {
-            eprintln!("Rust: JNI op failed: {:#}", e);
+            tracing::warn!(error = ?e, "JNI op failed");
             std::ptr::null_mut()
         }
     }
@@ -1518,7 +1519,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
                 // No-identity is the *expected* state on first launch —
                 // treat it as null rather than a hard error so the
                 // Kotlin caller can branch cleanly.
-                eprintln!("Rust: nativeLoadOnboardingBundle: {e:#}");
+                tracing::warn!(error = ?e, "nativeLoadOnboardingBundle failed");
                 std::ptr::null_mut()
             }
         }

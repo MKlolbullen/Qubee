@@ -75,7 +75,41 @@ lazy_static! {
     // Ephemeral Kyber-768 secrets the joiner generated when sending a
     // RequestJoin, indexed by invitation_code. Lives only in process
     // memory and gets zeroised + dropped on JoinAccepted/JoinRejected.
-    static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, Vec<u8>>> = Mutex::new(HashMap::new());
+    //
+    // Each entry carries the time it was inserted; `prune_pending_kems`
+    // evicts (and zeroises) entries older than `PENDING_JOIN_KEM_TTL`
+    // so a lost JoinAccepted/JoinRejected reply doesn't keep the
+    // joiner's ephemeral secret resident indefinitely.
+    static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, (Vec<u8>, std::time::SystemTime)>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Maximum lifetime of an entry in [`PENDING_JOIN_KEMS`]. Beyond this
+/// the inviter's reply is presumed lost; the joiner re-attempts the
+/// handshake from scratch and we drop the stale ephemeral. 10 minutes
+/// is loose enough for a slow inviter on a flaky network and tight
+/// enough that an undelivered reply doesn't pin secret material in
+/// memory across a multi-hour app lifetime.
+const PENDING_JOIN_KEM_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Evict + zeroise pending Kyber secrets older than [`PENDING_JOIN_KEM_TTL`].
+/// Must be called while holding the `PENDING_JOIN_KEMS` mutex.
+fn prune_pending_kems(
+    pending: &mut HashMap<String, (Vec<u8>, std::time::SystemTime)>,
+) {
+    let now = std::time::SystemTime::now();
+    pending.retain(|_code, (secret, inserted_at)| {
+        match now.duration_since(*inserted_at) {
+            Ok(age) if age >= PENDING_JOIN_KEM_TTL => {
+                secret.zeroize();
+                false
+            }
+            // duration_since returns Err iff `inserted_at` is in the
+            // future (clock skew). Treat that as "still fresh" rather
+            // than dropping the entry.
+            _ => true,
+        }
+    });
 }
 
 /// Catch panics from a JNI body that returns a `Default`-able value
@@ -252,7 +286,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let id_keys = libp2p::identity::Keypair::generate_ed25519();
-                println!("Rust: Starting P2P Node: {}", libp2p::PeerId::from(id_keys.public()));
+                tracing::info!(
+                    peer_id = %libp2p::PeerId::from(id_keys.public()),
+                    "Starting P2P Node",
+                );
 
                 let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32); 
                 let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32); 
@@ -866,11 +903,15 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
     let (kyber_pub, kyber_secret) = generate_ephemeral_kyber();
     {
         let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+        prune_pending_kems(&mut pending);
         // If a previous attempt for this invitation_code is still
         // pending its reply, drop it — the new attempt invalidates the
         // old ephemeral.
-        if let Some(mut prev) = pending.insert(payload.invitation_code.clone(), kyber_secret) {
-            prev.zeroize();
+        let now = std::time::SystemTime::now();
+        if let Some((mut prev_secret, _)) =
+            pending.insert(payload.invitation_code.clone(), (kyber_secret, now))
+        {
+            prev_secret.zeroize();
         }
     }
 
@@ -895,8 +936,14 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
 
 /// Pop the cached Kyber secret for an invitation, returning ownership
 /// to the caller. The caller is responsible for zeroising once done.
+///
+/// Also prunes any other entries that have outlived
+/// [`PENDING_JOIN_KEM_TTL`] — TTL eviction piggybacks on every
+/// take/insert so we never need a background thread.
 fn take_pending_kyber_secret(invitation_code: &str) -> Option<Vec<u8>> {
-    PENDING_JOIN_KEMS.lock().unwrap().remove(invitation_code)
+    let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+    prune_pending_kems(&mut pending);
+    pending.remove(invitation_code).map(|(secret, _)| secret)
 }
 
 /// Re-subscribe the network layer to every group topic the local user
@@ -1326,7 +1373,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
         *ACTIVE_IDENTITY.lock().unwrap() = None;
         *KEYSTORE.lock().unwrap() = None;
         *GROUP_MANAGER.lock().unwrap() = None;
-        PENDING_JOIN_KEMS.lock().unwrap().clear();
+        {
+            // Zeroise every cached ephemeral before dropping the map.
+            // Vec::clear() runs Drop on the inner Vec<u8> but doesn't
+            // overwrite its contents — explicit zeroize is what
+            // actually erases the bytes.
+            let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+            for (_, (secret, _)) in pending.iter_mut() {
+                secret.zeroize();
+            }
+            pending.clear();
+        }
         *INITIALIZED.lock().unwrap() = false;
 
         // SecureKeyStore stores its data file at <path>.db and the
@@ -2014,37 +2071,47 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyF
 }
 
 /// Return the locally-active identity's `IdentityId` as a 64-char
-/// hex string. Used by the Android Group Details sheet to flag
-/// "this row is you" on the member list and to wire the
-/// "Leave group" action (which needs to pass our own id into
-/// `nativeRemoveMember`). Distinct from `nativeGetMyFingerprint`
-/// — fingerprint is a hash for OOB compare, identity_id is the
-/// raw 32-byte address used everywhere on the wire.
+/// lowercase hex string. Used by the Android Group Details sheet
+/// to flag "this row is you" on the member list, to wire the
+/// "Leave group" action (which passes our own id into
+/// `nativeRemoveMember`), and as the canonical sender id baked
+/// into persisted `Message.senderId` rows so send + receive paths
+/// stay interoperable. Distinct from `nativeGetMyFingerprint` —
+/// fingerprint is the 8-byte BLAKE3 truncation used for OOB
+/// compare; this is the full 32-byte address used on the wire.
 ///
-/// Returns null if onboarding hasn't completed yet.
-#[no_mangle]
-pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityIdHex(
-/// Return the locally-active identity's `IdentityId` as a 64-character
-/// lowercase hex string — same shape as `nativeInspectEnvelopeSender`
-/// returns for inbound envelopes, so persisted `Message.senderId` rows
-/// stay interoperable across send and receive paths. Distinct from
-/// `nativeGetMyFingerprint`: the fingerprint is the 8-byte BLAKE3
-/// truncation used for OOB comparison; this is the full 32-byte
-/// identifier used as the canonical sender id on the wire.
+/// Two exports with identical bodies on purpose:
+///   * `nativeGetMyIdentityIdHex` — historical name used by the
+///     Group UX surface; kept stable so old Kotlin call sites
+///     keep linking.
+///   * `nativeGetMyIdentityId` — newer alias used by `ChatViewModel`
+///     when stamping outbound `Message.senderId`. Same return.
 ///
 /// Returns `null` if onboarding hasn't completed yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityIdHex(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    my_identity_id_hex_impl(env)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityId(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    my_identity_id_hex_impl(env)
+}
+
+fn my_identity_id_hex_impl(env: JNIEnv) -> jstring {
     jni_catch_jstring(|| {
         let result: anyhow::Result<jstring> = (|| {
             let identity = active_identity()?
                 .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
-            let hex_id = hex::encode(identity.identity_id().as_ref() as &[u8]);
+            let id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
             let java_str = env
-                .new_string(hex_id)
+                .new_string(id_hex)
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
             Ok(java_str.into_raw())
         })();
@@ -2174,9 +2241,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
             let payload = serde_json::Value::Array(groups).to_string();
             let java_str = env
                 .new_string(payload)
-            let id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
-            let java_str = env
-                .new_string(id_hex)
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
             Ok(java_str.into_raw())
         })();

@@ -5,6 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.qubee.messenger.data.model.Contact
 import com.qubee.messenger.data.model.Conversation
 import com.qubee.messenger.data.model.CryptoKey
@@ -80,8 +81,48 @@ abstract class QubeeDatabase : RoomDatabase() {
                 // Pre-alpha: hard reset on schema change. Real
                 // migrations are post-alpha.
                 .fallbackToDestructiveMigration()
+                // Canary: SQLCipher v4 defaults (cipher_compatibility = 4,
+                // cipher_page_size = 4096, HMAC-SHA512, 256k KDF iter)
+                // are what we rely on for the threat model. If a future
+                // sqlcipher-android upgrade silently shifts them we want
+                // to crash loudly on first DB open rather than silently
+                // continue with weaker settings.
+                .addCallback(SqlCipherDefaultsCanary)
                 .build()
         }
+
+        private object SqlCipherDefaultsCanary : Callback() {
+            override fun onOpen(db: SupportSQLiteDatabase) {
+                super.onOpen(db)
+                val compat = readIntPragma(db, "cipher_compatibility")
+                val pageSize = readIntPragma(db, "cipher_page_size")
+                if (compat != EXPECTED_CIPHER_COMPAT || pageSize != EXPECTED_PAGE_SIZE) {
+                    // Throw to abort startup. The Hilt-provided database
+                    // singleton will fail; the calling layer surfaces
+                    // the failure to the user. Continuing under
+                    // unexpected SQLCipher params would be silently
+                    // weaker.
+                    error(
+                        "Unexpected SQLCipher params: cipher_compatibility=$compat" +
+                            " (want $EXPECTED_CIPHER_COMPAT), cipher_page_size=$pageSize" +
+                            " (want $EXPECTED_PAGE_SIZE)",
+                    )
+                }
+                Timber.d(
+                    "SQLCipher params OK: compat=%d page_size=%d",
+                    compat,
+                    pageSize,
+                )
+            }
+
+            private fun readIntPragma(db: SupportSQLiteDatabase, name: String): Int =
+                db.query("PRAGMA $name").use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getInt(0) else -1
+                }
+        }
+
+        private const val EXPECTED_CIPHER_COMPAT = 4
+        private const val EXPECTED_PAGE_SIZE = 4096
 
         /**
          * If the database file at [DATABASE_NAME] was written under

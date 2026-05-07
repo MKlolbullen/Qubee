@@ -156,11 +156,23 @@ class SqlCipherKeyProvider(private val context: Context) {
             .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
             .setKeySize(MASTER_KEY_SIZE_BITS)
             .setRandomizedEncryptionRequired(true)
-            // Headless service contexts need this to be false. The
-            // Keystore-bound master key is still hardware-backed on
-            // most modern devices (StrongBox or TEE); user-auth
-            // gating would block MessageService from decrypting on
-            // boot before the user unlocks.
+            // Trade-off: `setUserAuthenticationRequired(false)` lets
+            // the headless `MessageService` decrypt the local DB on
+            // boot, before the user unlocks the device — which is
+            // what allows inbound messages to land in the Room store
+            // while the screen is still locked. The downside is that
+            // the master key is *only* protected by hardware-backed
+            // key custody (StrongBox / TEE) plus system-level access
+            // controls; it is not gated behind a biometric / PIN
+            // prompt at every DB open.
+            //
+            // For the alpha threat model (a researcher / developer
+            // installing the APK on their own device, where attackers
+            // are remote network adversaries rather than a co-located
+            // attacker with the unlocked phone in hand) this is the
+            // right default. A future "lock-on-screen-off" mode that
+            // re-encrypts the in-memory DB key behind biometric
+            // unlock is tracked as v0.2+ work.
             .setUserAuthenticationRequired(false)
             .build()
         generator.init(spec)

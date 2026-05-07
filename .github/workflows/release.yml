@@ -1,0 +1,193 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Allow manual dispatch from the Actions tab so a maintainer can
+  # rebuild a release without re-tagging (e.g. to swap in a new
+  # signing key).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0-alpha)'
+        required: true
+        type: string
+
+permissions:
+  contents: write  # needed to upload release assets
+
+concurrency:
+  # One release build at a time per ref. Cancel in-flight runs when
+  # a new push lands on the same tag (rare, but happens during a
+  # signing-key debug cycle).
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + sign + release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building release for tag=$tag (versionName=$version)"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for `git rev-list --count`
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Compute monotonic versionCode
+        id: vcode
+        run: |
+          # Per-tag versionCode = number of commits leading to this
+          # tag. Monotonic per branch; survives squash-merges; lets
+          # Android's package manager accept every release as an
+          # upgrade over its predecessor.
+          code=$(git rev-list --count HEAD)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "versionCode=$code"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-android-release
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          local-cache: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version ^3
+
+      - name: Build Rust shared libraries (4 ABIs)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          chmod +x ./build_rust.sh
+          ./build_rust.sh
+          # Sanity: every ABI directory must contain libqubee_crypto.so
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            so="app/src/main/jniLibs/$abi/libqubee_crypto.so"
+            if [ ! -f "$so" ]; then
+              echo "::error::Missing $so after build_rust.sh"
+              exit 1
+            fi
+            echo "$so $(stat -c%s $so) bytes"
+          done
+
+      - name: Decode release keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$RELEASE_KEYSTORE_BASE64" ]; then
+            echo "::error::RELEASE_KEYSTORE_BASE64 secret is not set; cannot sign release. Configure it in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/qubee-release.jks"
+          echo "RELEASE_KEYSTORE_FILE=$RUNNER_TEMP/qubee-release.jks" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        env:
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease \
+            -PqubeeVersionName='${{ steps.tag.outputs.version }}' \
+            -PqubeeVersionCode='${{ steps.vcode.outputs.code }}' \
+            --no-daemon --stacktrace
+
+      - name: Locate APK + verify signature
+        id: apk
+        run: |
+          src=$(find app/build/outputs/apk/release -name '*.apk' | head -n1)
+          if [ -z "$src" ]; then
+            echo "::error::No APK in app/build/outputs/apk/release"
+            exit 1
+          fi
+          dst="qubee-${{ steps.tag.outputs.version }}.apk"
+          cp "$src" "$dst"
+          echo "path=$dst" >> "$GITHUB_OUTPUT"
+          echo "Built APK: $dst ($(stat -c%s $dst) bytes)"
+          # Verify signature scheme
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BUILD_TOOLS/apksigner" verify --verbose "$dst" || {
+            echo "::error::apksigner verify failed"
+            exit 1
+          }
+
+      - name: Compute SHA256 + collect mapping
+        id: shasum
+        run: |
+          sha256sum "${{ steps.apk.outputs.path }}" \
+            | tee "${{ steps.apk.outputs.path }}.sha256"
+          mapping=app/build/outputs/mapping/release/mapping.txt
+          if [ -f "$mapping" ]; then
+            cp "$mapping" "qubee-${{ steps.tag.outputs.version }}-mapping.txt"
+            echo "mapping=qubee-${{ steps.tag.outputs.version }}-mapping.txt" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          # Pull the section for this version from CHANGELOG.md.
+          # Falls back to the tag name if we can't find a matching
+          # section (defensive — the workflow should never block on
+          # missing release notes).
+          version='${{ steps.tag.outputs.version }}'
+          out="release-notes.md"
+          if grep -q "^## \[$version\]" CHANGELOG.md; then
+            awk -v v="$version" '
+              $0 ~ "^## \\[" v "\\]" { found=1; print; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > "$out"
+          else
+            printf "Release %s.\n" "$version" > "$out"
+          fi
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.path }}
+          # Only mark as prerelease when the tag has a `-` suffix
+          # (semver pre-release), e.g. `v0.1.0-alpha`. Stable tags
+          # (e.g. `v1.0.0`) ship as full releases.
+          prerelease: ${{ contains(steps.tag.outputs.version, '-') }}
+          files: |
+            ${{ steps.apk.outputs.path }}
+            ${{ steps.apk.outputs.path }}.sha256
+            ${{ steps.shasum.outputs.mapping }}
+          fail_on_unmatched_files: false

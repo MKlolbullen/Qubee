@@ -10,6 +10,18 @@ plugins {
     id 'app.cash.paparazzi'
 }
 
+// Release signing pulls every credential from env vars so the
+// CI workflow at .github/workflows/release.yml can decode the
+// keystore from a GH Secret into RUNNER_TEMP and point us at
+// it. Local debug builds + unsigned local releases continue to
+// work without any of these set; only assembleRelease + a fully
+// populated environment produces a signed APK.
+def releaseKeystoreFile = System.getenv('RELEASE_KEYSTORE_FILE')
+def releaseKeystorePassword = System.getenv('RELEASE_KEYSTORE_PASSWORD')
+def releaseKeyAlias = System.getenv('RELEASE_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('RELEASE_KEY_PASSWORD')
+def hasReleaseSigning = releaseKeystoreFile && file(releaseKeystoreFile).exists()
+
 android {
     namespace 'com.qubee.messenger'
     compileSdk 34
@@ -18,8 +30,16 @@ android {
         applicationId 'com.qubee.messenger'
         minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        // versionName / versionCode default to a "0.1.0-alpha" pre-release
+        // label. Override from the release workflow with
+        //   ./gradlew assembleRelease \
+        //     -PqubeeVersionName=$tag -PqubeeVersionCode=$code
+        // where `code` is the monotonic git rev-list count
+        // (so every tag gets a unique increasing versionCode that
+        // Android's per-package version comparator accepts as an
+        // upgrade).
+        versionName project.findProperty('qubeeVersionName') ?: '0.1.0-alpha'
+        versionCode (project.findProperty('qubeeVersionCode') ?: '100').toInteger()
 
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
@@ -33,10 +53,33 @@ android {
         main.jniLibs.srcDirs = ['src/main/jniLibs']
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseKeystoreFile)
+                storePassword releaseKeystorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                // v2 + v3 schemes are required for sideload install on
+                // modern Android (v1-only is rejected on API 30+
+                // depending on the manifest's `extractNativeLibs`).
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Only attach the signingConfig when the env wired it
+            // up. Unsigned local release builds remain installable
+            // via `adb install` for emulator smoke testing.
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
         }
         debug {
             minifyEnabled false

@@ -93,6 +93,10 @@ class ContactsFragment : Fragment() {
                 onDeleteContact = viewModel::deleteContact,
                 onBlockContact = viewModel::blockContact,
                 onUnblockContact = viewModel::unblockContact,
+                onVerifyContact = { summary ->
+                    com.qubee.messenger.ui.contacts.verification.ContactVerificationActivity
+                        .launch(requireActivity(), summary.identityIdHex)
+                },
             )
         }
     }
@@ -106,6 +110,7 @@ private fun ContactsScreen(
     onDeleteContact: (String) -> Unit,
     onBlockContact: (String) -> Unit,
     onUnblockContact: (String) -> Unit,
+    onVerifyContact: (ContactSummaryUi) -> Unit,
 ) {
     QubeeTheme {
         QubeeScreen {
@@ -128,6 +133,7 @@ private fun ContactsScreen(
                         onDeleteContact = onDeleteContact,
                         onBlockContact = onBlockContact,
                         onUnblockContact = onUnblockContact,
+                        onVerifyContact = onVerifyContact,
                     )
                 }
             }
@@ -143,6 +149,7 @@ private fun ContactsBody(
     onDeleteContact: (String) -> Unit,
     onBlockContact: (String) -> Unit,
     onUnblockContact: (String) -> Unit,
+    onVerifyContact: (ContactSummaryUi) -> Unit,
 ) {
     var pendingDelete by remember { mutableStateOf<ContactSummaryUi?>(null) }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -153,6 +160,7 @@ private fun ContactsBody(
                     onClick = { onContactClick(contact) },
                     onRequestDelete = { pendingDelete = contact },
                     onBlock = { onBlockContact(contact.contactId) },
+                    onVerify = { onVerifyContact(contact) },
                 )
             }
         }
@@ -315,6 +323,7 @@ private fun ContactRow(
     onClick: () -> Unit,
     onRequestDelete: () -> Unit,
     onBlock: () -> Unit,
+    onVerify: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
@@ -360,6 +369,13 @@ private fun ContactRow(
                 expanded = menuOpen,
                 onDismissRequest = { menuOpen = false },
             ) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(if (contact.isVerified) "Re-verify" else "Verify") },
+                    onClick = {
+                        menuOpen = false
+                        onVerify()
+                    },
+                )
                 androidx.compose.material3.DropdownMenuItem(
                     text = { Text("Block") },
                     onClick = {

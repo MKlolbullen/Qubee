@@ -12,9 +12,16 @@ believe instead of seeing real behavior.
 
 ## Prerequisites
 
-* Two devices running the same APK build (or the same APK on two
-  emulators). Building: `./build_rust.sh && ./gradlew
-  installDebug`.
+* Two devices running Qubee. Easiest path is to download the
+  signed APK from the latest GitHub Release and `adb install` it on
+  both — see `RELEASE.md` for the build / release pipeline. If
+  you're building from source for development,
+  `./build_rust.sh && ./gradlew installDebug` works too. Mixing a
+  release-signed install on one device with a debug-built install
+  on the other is fine — invite signatures use the user's
+  per-install identity key, not the APK signing cert. The only
+  caveat is that `adb install` over an existing install with a
+  different signing cert needs `adb uninstall` first.
 * Both devices on the same local network so libp2p mDNS / loopback
   TCP can find each other. mDNS-only deployments also work as long
   as the network doesn't suppress multicast (most home Wi-Fi
@@ -136,7 +143,19 @@ different identity in the QR scan; the handshake would succeed
 because the MITM signs everything correctly with their own key.
 The OOB ceremony is what closes that gap.
 
-The dialog accepts **two** routes that arrive at the same
+There are two entry-points to the same ceremony:
+
+* **In-chat:** open the chat with the contact, tap the details
+  arrow, then `Verify`. Renders the same widget as an
+  `AlertDialog` over the chat.
+* **Standalone:** from the Contacts tab, long-press the contact
+  and tap `Verify` (or `Re-verify` if the row already shows the
+  cyan check). Launches `ContactVerificationActivity`, which
+  hosts the same widget as a full-screen Scaffold — preferred
+  when both devices are co-located and you want a larger QR for
+  scanning.
+
+Both surfaces accept **two** routes that arrive at the same
 end-state:
 
 ### 4a. Fingerprint compare
@@ -207,19 +226,37 @@ likely culprit.
 
 ## What's deferred
 
-* **QR-scan flavor of the verify dialog.** Today the SAS / hash
-  is only typed-input. CameraX integration (similar to the
-  invite-link scanner) calling `confirmContactVerification(scanned)`
-  is the natural follow-up — a roughly 100-line Compose surface,
-  no protocol changes.
 * **Delivery confirmation.** Status = `SENT` today means
   "encrypted bytes left this device", not "peer ack'd". A real
   ack roundtrip is post-alpha.
-* **Group chat (>2 members).** All the primitives exist (groups,
-  invites, member-added broadcasts, key rotation). The UX flow to
-  invite multiple peers from a single chat is the gap.
 * **Voice / video calling.** Post-alpha; gated behind the
   Rust `calling` feature flag and an unbuilt `webrtc` integration.
+* **Ownership transfer.** A group's owner is the original creator
+  forever; promote/demote can move other members between Admin /
+  Moderator / Member / Observer but cannot transfer Owner. Tracked
+  for v0.2.x.
+* **Schema migrations.** `fallbackToDestructiveMigration` resets
+  the local DB on every minor-version bump until v0.2.0 commits to
+  schema stability.
+
+## What's already shipped
+
+(Items previously listed as deferred that have since landed —
+useful when running the walkthrough against an older build.)
+
+* **QR-scan flavor of the verify dialog** — landed in the in-chat
+  `VerifyContactDialog` and in the new `VerifyContactScreen` that
+  `ContactVerificationActivity` hosts (long-press a contact →
+  Verify). Both routes feed the scanned text into the same
+  `verifyIdentityKey` JNI path as a typed value.
+* **Group chat (>2 members)** — full UX shipped: create a group
+  from contact selection, mint invites, accept invites via QR /
+  paste, member roster in `GroupDetailsSheet`, Add member /
+  Remove / Role picker (owner-only), Leave group, cold-start
+  hydration so groups survive an app restart.
+* **OOB SAS gesture** — the symmetric SAS code shows on both
+  ends of the verify screen; tapping "Codes match" persists
+  `TrustLevel.VERIFIED` without a bridge round-trip.
 
 ## Troubleshooting
 

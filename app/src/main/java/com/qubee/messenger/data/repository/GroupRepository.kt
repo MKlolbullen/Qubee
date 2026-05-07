@@ -115,6 +115,20 @@ class GroupRepository @Inject constructor(
     ): String? = qubeeManager.promoteMember(groupIdHex, memberIdHex, newRole)
 
     /**
+     * Owner-only ownership transfer. Atomically promotes the
+     * target to `Owner` and demotes the active identity (donor)
+     * to `Admin`. Owner-only Rust-side; non-owner callers get a
+     * null return.
+     *
+     * Group key isn't rotated — the donor stays in the group as
+     * Admin and keeps full read access. Only the role bits move.
+     */
+    suspend fun transferOwnership(
+        groupIdHex: String,
+        newOwnerIdHex: String,
+    ): String? = qubeeManager.transferOwnership(groupIdHex, newOwnerIdHex)
+
+    /**
      * Snapshot every group the active identity belongs to from the
      * Rust core's local view. Used at app cold-start to hydrate the
      * SQLCipher Conversation table when it's empty (fresh install /

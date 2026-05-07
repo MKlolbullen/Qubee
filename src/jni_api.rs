@@ -17,8 +17,8 @@ use crate::identity::identity_key::{IdentityKey, IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_request_join, sign_role_change, GroupHandshake,
-    KeyRotationBody, RequestJoinBody,
+    generate_ephemeral_kyber, sign_ownership_transfer, sign_request_join, sign_role_change,
+    GroupHandshake, KeyRotationBody, RequestJoinBody,
 };
 use crate::groups::group_permissions::Role;
 use crate::groups::group_message::{
@@ -811,6 +811,76 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePromot
     })
 }
 
+/// Owner-only ownership transfer. Atomically promotes
+/// `new_owner_id_hex` to `Owner` and demotes the donor (active
+/// identity) to `Admin`. Mirrors the rev-2 5c `RoleChange` path
+/// but uses a single signed wire frame so the swap arrives
+/// atomically — receivers never see two owners or zero owners.
+///
+/// Owner-only Rust-side; non-owner callers get an `Err` from
+/// `GroupManager::transfer_ownership`, which surfaces here as a
+/// null return.
+///
+/// Returns JSON `{group_id_hex, donor_id_hex, new_owner_id_hex,
+/// new_version, network_published}` on success.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeTransferOwnership(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    new_owner_id_hex: JString,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let new_owner_id_hex: String = match env.get_string(&new_owner_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+            let new_owner_id =
+                IdentityId::from(parse_hex32(Some(new_owner_id_hex.as_str()))?);
+
+            let signed = {
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                let body = gm.transfer_ownership(
+                    group_id,
+                    identity.identity_id(),
+                    new_owner_id,
+                )?;
+                sign_ownership_transfer(identity.as_ref(), body)?
+            };
+
+            let new_version = match &signed {
+                GroupHandshake::OwnershipTransfer { body, .. } => body.new_version,
+                _ => 0u64,
+            };
+            let topic = group_topic(&hex::encode(group_id.as_ref()));
+            let wire = signed.to_wire()?;
+            let published = publish_to_topic(topic, wire);
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "donor_id_hex": hex::encode(identity.identity_id().as_ref() as &[u8]),
+                "new_owner_id_hex": hex::encode(new_owner_id.as_ref() as &[u8]),
+                "new_version": new_version,
+                "network_published": published,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
 /// Render a `Role` back to the canonical wire string used by
 /// `nativePromoteMember` and `nativeListGroupMembers`. The roundtrip
 /// stays in lock-step with the small vocabulary the JNI accepts so
@@ -1054,6 +1124,7 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
         GroupHandshake::KeyRotation { body, .. } => body.rotator_id,
         GroupHandshake::MemberAdded { body, .. } => body.adder_id,
         GroupHandshake::RoleChange { body, .. } => body.promoter_id,
+        GroupHandshake::OwnershipTransfer { body, .. } => body.donor_id,
         GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
         GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
         GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
@@ -1142,6 +1213,15 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             crate::groups::handshake_handlers::process_role_change(gm, &body, &signature)?;
+        }
+        GroupHandshake::OwnershipTransfer { body, signature } => {
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            crate::groups::handshake_handlers::process_ownership_transfer(
+                gm, &body, &signature,
+            )?;
         }
         GroupHandshake::RequestStateSync { body, signature } => {
             // Responder side. Build + sign a snapshot reply and

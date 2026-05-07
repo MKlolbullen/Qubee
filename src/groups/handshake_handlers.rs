@@ -344,6 +344,36 @@ pub fn process_role_change(
     )
 }
 
+/// Existing-member handler for donor-broadcast `OwnershipTransfer`.
+/// Verifies the broadcast was signed by the local view's current
+/// owner of the group, then applies the atomic Owner ↔ Admin swap.
+pub fn process_ownership_transfer(
+    gm: &mut GroupManager,
+    body: &crate::groups::group_handshake::OwnershipTransferBody,
+    signature: &HybridSignature,
+) -> Result<()> {
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("OwnershipTransfer for unknown group"))?;
+    let donor = group
+        .members
+        .get(&body.donor_id)
+        .ok_or_else(|| anyhow!("OwnershipTransfer donor is not a current member"))?;
+    if donor.role != Role::Owner {
+        return Err(anyhow!("OwnershipTransfer donor is not the owner"));
+    }
+    let donor_key = donor.identity_key.clone();
+    if !crate::groups::group_handshake::verify_ownership_transfer(body, signature, &donor_key)? {
+        return Err(anyhow!("OwnershipTransfer signature failed"));
+    }
+    gm.apply_ownership_transfer(
+        body.group_id,
+        body.donor_id,
+        body.new_owner_id,
+        body.new_version,
+    )
+}
+
 /// Responder-side handler for `RequestStateSync`. Confirms the
 /// requester is still an active member of the local view, verifies
 /// the request signature, and builds a signed `StateSyncResponse`

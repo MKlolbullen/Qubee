@@ -612,6 +612,37 @@ class ChatViewModel @Inject constructor(
     }
 
     /**
+     * Owner-only ownership transfer. Atomically promotes the
+     * target member to `Owner` and demotes the local user (donor)
+     * to `Admin`. The group key isn't rotated; the donor keeps
+     * full read access as Admin.
+     *
+     * Owner-only Rust-side; non-owner callers see "Failed to
+     * transfer ownership" via the null-mapped JNI return. The
+     * caller (the role-picker dialog) is responsible for the
+     * confirmation prompt — once this method fires, the transfer
+     * is irreversible from this side.
+     */
+    fun transferOwnership(memberIdHex: String) {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val ok = runCatching {
+                groupRepository.transferOwnership(conversationId, memberIdHex)
+            }.getOrNull() != null
+            if (ok) {
+                _events.emit(ChatUiEvent.Notice("Ownership transferred"))
+                loadGroupMembers()
+            } else {
+                _events.emit(
+                    ChatUiEvent.Notice(
+                        "Failed to transfer ownership (owner only, target must be active member)",
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
      * Leave the current group. Routes through the existing
      * `removeMember` JNI export — the Rust side accepts
      * "remove yourself" the same way it accepts an owner removing

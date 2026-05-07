@@ -348,6 +348,31 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Owner-only ownership transfer. Atomically promotes
+     * `newOwnerIdHex` to `Owner` and demotes the active identity
+     * (the donor) to `Admin` in one signed wire frame. Returns the
+     * JSON envelope from `nativeTransferOwnership` on success, null
+     * if the JNI call rejected the request (donor isn't the
+     * current Owner, target isn't an active member, transferring
+     * to self, …).
+     */
+    suspend fun transferOwnership(
+        groupIdHex: String,
+        newOwnerIdHex: String,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeTransferOwnership(groupIdHex, newOwnerIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust transfer-ownership JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust transfer-ownership failed")
+            null
+        }
+    }
+
+    /**
      * List the active members of a group, as returned by the Rust
      * core. JSON shape is an array of
      * `{identity_id_hex, display_name, role, is_active, joined_at}`
@@ -491,6 +516,10 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         memberIdHex: String,
         newRole: String,
+    ): String?
+    private external fun nativeTransferOwnership(
+        groupIdHex: String,
+        newOwnerIdHex: String,
     ): String?
     private external fun nativeSendGroupMessage(
         groupIdHex: String,

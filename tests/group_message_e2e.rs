@@ -1027,3 +1027,189 @@ fn lagging_member_resyncs_after_missing_key_rotation() {
         .expect("Bob must decrypt Alice's post-rotation message after resync");
     assert_eq!(decrypted.plaintext, payload);
 }
+
+// ---------------------------------------------------------------------
+// 5d — transfer_ownership + OwnershipTransfer wire frame
+// ---------------------------------------------------------------------
+
+#[test]
+fn owner_can_transfer_ownership_to_existing_admin() {
+    use qubee_crypto::groups::group_handshake::{sign_ownership_transfer, GroupHandshake};
+    use qubee_crypto::groups::group_permissions::Role;
+    use qubee_crypto::groups::handshake_handlers::process_ownership_transfer;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Alice transfers ownership to Bob.
+    let body = alice_gm
+        .transfer_ownership(group_id, alice_id, bob_kp.identity_id())
+        .expect("owner may transfer ownership to an active member");
+    let signed = sign_ownership_transfer(&alice_kp, body.clone()).unwrap();
+    let (ot_body, ot_sig) = match signed {
+        GroupHandshake::OwnershipTransfer { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Alice's local view already reflects the swap.
+    let group = alice_gm.get_group(&group_id).unwrap();
+    assert_eq!(group.members.get(&alice_id).unwrap().role, Role::Admin);
+    assert_eq!(group.members.get(&bob_kp.identity_id()).unwrap().role, Role::Owner);
+
+    // Bob applies the broadcast and converges.
+    process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig)
+        .expect("Bob applies the ownership transfer");
+    let bob_group = bob_gm.get_group(&group_id).unwrap();
+    assert_eq!(bob_group.members.get(&alice_id).unwrap().role, Role::Admin);
+    assert_eq!(
+        bob_group.members.get(&bob_kp.identity_id()).unwrap().role,
+        Role::Owner,
+    );
+    assert_eq!(
+        bob_group.version,
+        alice_gm.get_group(&group_id).unwrap().version,
+        "post-transfer version must agree across devices",
+    );
+
+    // Group key is unchanged; encrypted round-trip still works.
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"after transfer").unwrap();
+    let decrypted =
+        decrypt_group_message(&bob_gm, &wire).expect("post-transfer decryption works");
+    assert_eq!(decrypted.plaintext, b"after transfer");
+}
+
+#[test]
+fn non_owner_cannot_transfer_ownership() {
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Bob is a Member; tries to transfer ownership to Alice. Must fail
+    // with the owner-only gate before any local mutation happens.
+    let before_alice_role = bob_gm
+        .get_group(&group_id)
+        .unwrap()
+        .members
+        .get(&alice_id)
+        .unwrap()
+        .role
+        .clone();
+    let result = bob_gm.transfer_ownership(group_id, bob_kp.identity_id(), alice_id);
+    assert!(
+        result.is_err(),
+        "non-owner must not be able to transfer ownership",
+    );
+    let after_alice_role = bob_gm
+        .get_group(&group_id)
+        .unwrap()
+        .members
+        .get(&alice_id)
+        .unwrap()
+        .role
+        .clone();
+    assert_eq!(
+        before_alice_role, after_alice_role,
+        "failed transfer must not mutate local view",
+    );
+}
+
+#[test]
+fn ownership_transfer_replays_idempotently() {
+    use qubee_crypto::groups::group_handshake::{sign_ownership_transfer, GroupHandshake};
+    use qubee_crypto::groups::group_permissions::Role;
+    use qubee_crypto::groups::handshake_handlers::process_ownership_transfer;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    let body = alice_gm
+        .transfer_ownership(group_id, alice_id, bob_kp.identity_id())
+        .unwrap();
+    let signed = sign_ownership_transfer(&alice_kp, body.clone()).unwrap();
+    let (ot_body, ot_sig) = match signed {
+        GroupHandshake::OwnershipTransfer { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Bob applies the transfer once...
+    process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig).expect("first apply ok");
+
+    // ...then replays. Donor is no longer Owner in Bob's view, so the
+    // re-application must Err — which is what protects against a
+    // forged "transfer back" signed under the now-Admin's key.
+    let replay = process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig);
+    assert!(
+        replay.is_err(),
+        "replaying an already-applied transfer must Err (donor isn't Owner anymore)",
+    );
+
+    // State is unchanged: bob is still Owner, alice still Admin.
+    let bob_group = bob_gm.get_group(&group_id).unwrap();
+    assert_eq!(bob_group.members.get(&alice_id).unwrap().role, Role::Admin);
+    assert_eq!(
+        bob_group.members.get(&bob_kp.identity_id()).unwrap().role,
+        Role::Owner,
+    );
+}

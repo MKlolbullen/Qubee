@@ -262,6 +262,30 @@ pub struct RoleChangeBody {
     pub timestamp: u64,
 }
 
+/// Body of an `OwnershipTransfer` payload. The current `Owner`
+/// (`donor_id`) hands the role to an existing member (`new_owner_id`)
+/// and becomes `Admin`. Both role swaps are applied atomically by
+/// receivers — there is never a wire-observable instant with two
+/// owners or zero owners.
+///
+/// `new_version` carries the post-transfer `group.version`, mirroring
+/// `RoleChangeBody`. The strict generation gate in
+/// `decrypt_group_message` needs receivers to track the donor's view.
+///
+/// The new_owner must already be an active group member at the donor's
+/// view; transferring to a non-member or a removed member is rejected
+/// at sign time. Recipients re-verify this against their own local
+/// view, so a concurrent removal that strands the transfer arrives
+/// as a no-op (handler returns Err and the signed frame is dropped).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnershipTransferBody {
+    pub group_id: GroupId,
+    pub donor_id: IdentityId,
+    pub new_owner_id: IdentityId,
+    pub new_version: u64,
+    pub timestamp: u64,
+}
+
 /// Body of a `RequestStateSync` payload. A member who's been offline
 /// through one or more `MemberAdded` / `RoleChange` broadcasts uses
 /// this to ask any current member of the group for the latest
@@ -356,6 +380,10 @@ pub enum GroupHandshake {
         body: StateSyncResponseBody,
         signature: HybridSignature,
     },
+    OwnershipTransfer {
+        body: OwnershipTransferBody,
+        signature: HybridSignature,
+    },
 }
 
 impl GroupHandshake {
@@ -402,6 +430,7 @@ const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
 const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
+const OWNERSHIP_TRANSFER_TAG: &[u8] = b"qubee_handshake_ownership_transfer_v1";
 const REQUEST_STATE_SYNC_TAG: &[u8] = b"qubee_handshake_request_state_sync_v1";
 // _v2: the body grew an `Option<WrappedGroupKey>` for KeyRotation
 // re-send (extends the rev-4 P1 resync flow to also recover the
@@ -535,6 +564,22 @@ pub fn canonical_role_change(body: &RoleChangeBody) -> Result<Vec<u8>> {
     out.extend_from_slice(body.member_id.as_ref());
     out.push(0u8);
     out.extend_from_slice(&bincode::serialize(&body.new_role)?);
+    out.push(0u8);
+    out.extend_from_slice(&body.new_version.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    Ok(out)
+}
+
+pub fn canonical_ownership_transfer(body: &OwnershipTransferBody) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(160);
+    out.extend_from_slice(OWNERSHIP_TRANSFER_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.donor_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.new_owner_id.as_ref());
     out.push(0u8);
     out.extend_from_slice(&body.new_version.to_le_bytes());
     out.push(0u8);
@@ -708,6 +753,31 @@ pub fn sign_role_change(
     let payload = canonical_role_change(&body)?;
     let signature = keypair.sign(&payload)?;
     Ok(GroupHandshake::RoleChange { body, signature })
+}
+
+/// Sign an `OwnershipTransfer` payload with the donor's keypair.
+/// Donor must be the current `Owner`; the API in `GroupManager`
+/// enforces that gate before producing the body.
+pub fn sign_ownership_transfer(
+    keypair: &IdentityKeyPair,
+    body: OwnershipTransferBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_ownership_transfer(&body)?;
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::OwnershipTransfer { body, signature })
+}
+
+/// Verify an `OwnershipTransfer` against the stated donor's
+/// `IdentityKey`. The handler is responsible for confirming the
+/// donor was the group's `Owner` at signing time; this only
+/// verifies cryptographic authorship and freshness.
+pub fn verify_ownership_transfer(
+    body: &OwnershipTransferBody,
+    signature: &HybridSignature,
+    expected_donor: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_ownership_transfer(body)?;
+    expected_donor.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
 }
 
 /// Sign a `RequestStateSync` payload with the requester's keypair.

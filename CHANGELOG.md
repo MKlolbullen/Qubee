@@ -9,7 +9,28 @@ between minor versions.
 
 ## [Unreleased]
 
-(empty)
+### Added
+
+- **Ownership transfer** — owner-only atomic role swap that
+  promotes an existing active member to `Owner` and demotes the
+  current owner to `Admin` in a single signed wire frame
+  (`qubee_handshake_ownership_transfer_v1`). Surfaced from the
+  Group Details role picker via a "Transfer ownership →" entry
+  with its own confirmation dialog. JNI export
+  `nativeTransferOwnership(group_id_hex, new_owner_id_hex)`,
+  Kotlin wrapper `GroupRepository.transferOwnership`, ViewModel
+  action `ChatViewModel.transferOwnership`. Group key isn't
+  rotated; the donor keeps full read access as Admin. Receivers
+  re-check that the donor was the current Owner at apply time,
+  so a forged "transfer back" signed under the now-Admin's key
+  is rejected.
+
+### Changed
+
+- `eprintln!` / `println!` debug log lines in `src/jni_api.rs`
+  + `src/groups/handshake_handlers.rs` converted to structured
+  `tracing` calls (error / warn / info by signal class). The
+  one secret-leak-risk line dropped its `{e:#}` interpolation.
 
 ## [0.1.0-alpha] — 2026-05
 

@@ -231,10 +231,6 @@ likely culprit.
   ack roundtrip is post-alpha.
 * **Voice / video calling.** Post-alpha; gated behind the
   Rust `calling` feature flag and an unbuilt `webrtc` integration.
-* **Ownership transfer.** A group's owner is the original creator
-  forever; promote/demote can move other members between Admin /
-  Moderator / Member / Observer but cannot transfer Owner. Tracked
-  for v0.2.x.
 * **Schema migrations.** `fallbackToDestructiveMigration` resets
   the local DB on every minor-version bump until v0.2.0 commits to
   schema stability.
@@ -257,6 +253,12 @@ useful when running the walkthrough against an older build.)
 * **OOB SAS gesture** — the symmetric SAS code shows on both
   ends of the verify screen; tapping "Codes match" persists
   `TrustLevel.VERIFIED` without a bridge round-trip.
+* **Ownership transfer** — owners can hand the role to an
+  existing active member via the Group Details role picker's
+  "Transfer ownership →" entry; the swap is atomic (donor →
+  Admin, target → Owner) via a signed
+  `qubee_handshake_ownership_transfer_v1` wire frame, no group
+  key rotation needed.
 
 ## Troubleshooting
 

@@ -97,15 +97,24 @@ why.
 These are known and are not vulnerabilities — they're the shape of
 the pre-alpha:
 
-- The Android `QubeeDatabase` SQLCipher passphrase is hardcoded in
-  current `main`. This is being replaced with a Keystore-derived key
-  in the next release; see `app/src/main/java/com/qubee/messenger/data/repository/database/QubeeDatabase.kt`
-  and the project plan for "Real SQLCipher passphrase derivation".
+- The Android Keystore master key that wraps the SQLCipher
+  passphrase is configured with `setUserAuthenticationRequired(false)`,
+  meaning the local DB decrypts on boot before the user unlocks the
+  device. Trade-off explicitly documented in
+  `app/src/main/java/com/qubee/messenger/security/SqlCipherKeyProvider.kt`;
+  enables headless `MessageService` operation at the cost of no
+  per-DB-open biometric/PIN gate. A "lock-on-screen-off" mode is
+  v0.2+ work.
 - `MessageStatus.SENT` means "encrypted bytes left this device", not
   "the peer acked". A real ack roundtrip is post-alpha.
-- Snapshot resync after extended offline still bounces a member who
-  missed a `KeyRotation` while offline. The
-  `RequestStateSync` / `StateSyncResponse` extension is in flight.
+- Local DB migrations are `fallbackToDestructiveMigration` on every
+  schema bump until v0.2.0 ships the first stable schema. Pre-alpha
+  data is not expected to survive minor-version upgrades; the README
+  says so.
+- The legacy modules listed below (`hybrid_ratchet`, etc.) are
+  feature-gated and not built in default releases. They contain known
+  pre-NIST-standardisation crypto and are tracked for removal /
+  rewrite, not fixes in place.
 
 ## Disclosure policy
 

@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 950" width="460" height="950" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
+  <!-- Galaxy S25 Ultra mock-up: GroupDetailsSheet (owner POV, sheet ~62% height) -->
+  <defs>
+    <linearGradient id="frameGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a22"/>
+      <stop offset="1" stop-color="#050507"/>
+    </linearGradient>
+    <linearGradient id="screenGlare" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#12EAD8" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#12EAD8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheetGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0a1726"/>
+      <stop offset="1" stop-color="#091624"/>
+    </linearGradient>
+    <clipPath id="screenClip">
+      <rect x="24" y="28" width="412" height="894" rx="42"/>
+    </clipPath>
+  </defs>
+
+  <!-- Phone body -->
+  <rect x="6" y="10" width="448" height="930" rx="56" fill="url(#frameGloss)"/>
+  <rect x="10" y="14" width="440" height="922" rx="54" fill="#0c0c10" stroke="#23232b" stroke-width="0.7"/>
+  <rect x="3" y="220" width="4" height="80" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="180" width="4" height="60" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="260" width="4" height="100" rx="2" fill="#1a1a22"/>
+  <rect x="24" y="28" width="412" height="894" rx="42" fill="#040C16"/>
+
+  <g clip-path="url(#screenClip)">
+    <!-- Background: dimmed chat behind the sheet -->
+    <circle cx="80" cy="80" r="160" fill="url(#cyanGlow)"/>
+    <g opacity="0.35">
+      <g font-size="11" fill="#EAFBFF">
+        <text x="44" y="50" font-weight="600">21:48</text>
+      </g>
+      <circle cx="230" cy="46" r="7" fill="#000"/>
+      <!-- Faint chat above the sheet -->
+      <g transform="translate(34,160)">
+        <rect width="180" height="36" rx="14" fill="#102234"/>
+        <rect y="46" width="120" height="28" rx="14" fill="#102234"/>
+        <rect x="190" y="92" width="170" height="36" rx="14" fill="#0E5F59"/>
+        <rect width="220" height="32" rx="14" y="138" fill="#102234"/>
+        <rect x="180" y="178" width="180" height="34" rx="14" fill="#0E5F59"/>
+      </g>
+    </g>
+    <!-- Scrim over chat -->
+    <rect x="24" y="28" width="412" height="894" fill="#000" fill-opacity="0.55"/>
+
+    <!-- Bottom sheet (slides up from bottom) -->
+    <g transform="translate(24,310)">
+      <rect width="412" height="612" rx="28" fill="url(#sheetGrad)" stroke="#152639"/>
+      <!-- Drag handle -->
+      <rect x="186" y="10" width="40" height="4" rx="2" fill="#A3BDCA" fill-opacity="0.55"/>
+
+      <g transform="translate(22,30)">
+        <!-- Status pill -->
+        <rect width="124" height="22" rx="11" fill="#12EAD8" fill-opacity="0.18"/>
+        <text x="62" y="15" text-anchor="middle" fill="#12EAD8" font-size="10" font-weight="800" letter-spacing="2">GROUP DETAILS</text>
+
+        <text x="0" y="58" fill="#EAFBFF" font-size="26" font-weight="900">Berlin Sec Crew</text>
+        <text x="0" y="80" fill="#A3BDCA" font-size="12">Member roster, fetched live from the Rust core.</text>
+
+        <!-- Add member outlined button (owner can manage) -->
+        <g transform="translate(0,98)">
+          <rect width="368" height="44" rx="14" fill="none" stroke="#12EAD8" stroke-width="1.4"/>
+          <g transform="translate(132,15)" stroke="#12EAD8" stroke-width="1.7" fill="none" stroke-linecap="round">
+            <line x1="0" y1="7" x2="14" y2="7"/>
+            <line x1="7" y1="0" x2="7" y2="14"/>
+          </g>
+          <text x="156" y="29" fill="#12EAD8" font-size="13.5" font-weight="700">Add member</text>
+        </g>
+
+        <!-- Member rows -->
+        <g transform="translate(0,156)">
+          <!-- Owner (You) -->
+          <g>
+            <rect width="368" height="58" rx="16" fill="#102234"/>
+            <circle cx="29" cy="29" r="19" fill="#12EAD8" fill-opacity="0.22"/>
+            <text x="29" y="34" text-anchor="middle" fill="#EAFBFF" font-size="12.5" font-weight="700">AP</text>
+            <text x="60" y="26" fill="#EAFBFF" font-size="14" font-weight="700">Aisha Petrov</text>
+            <text x="60" y="44" fill="#A3BDCA" font-size="11">Owner</text>
+            <!-- You badge -->
+            <rect x="320" y="20" width="40" height="20" rx="6" fill="#12EAD8" fill-opacity="0.18"/>
+            <text x="340" y="34" text-anchor="middle" fill="#12EAD8" font-size="10" font-weight="800">YOU</text>
+          </g>
+          <!-- Admin Lina (Owner-viewer can promote + remove) -->
+          <g transform="translate(0,68)">
+            <rect width="368" height="58" rx="16" fill="#102234"/>
+            <circle cx="29" cy="29" r="19" fill="#0E5F59"/>
+            <text x="29" y="34" text-anchor="middle" fill="#EAFBFF" font-size="12.5" font-weight="700">LM</text>
+            <text x="60" y="26" fill="#EAFBFF" font-size="14" font-weight="700">Lina Marek</text>
+            <text x="60" y="44" fill="#A3BDCA" font-size="11">Admin</text>
+            <!-- Role + Remove -->
+            <text x="266" y="34" fill="#12EAD8" font-size="12" font-weight="700">Role</text>
+            <text x="316" y="34" fill="#12EAD8" font-size="12" font-weight="700">Remove</text>
+          </g>
+          <!-- Bo (removed, greyed) -->
+          <g transform="translate(0,136)" opacity="0.55">
+            <rect width="368" height="58" rx="16" fill="#102234"/>
+            <circle cx="29" cy="29" r="19" fill="#102234" stroke="#A3BDCA" stroke-opacity="0.4"/>
+            <text x="29" y="34" text-anchor="middle" fill="#A3BDCA" font-size="12.5" font-weight="700">BL</text>
+            <text x="60" y="26" fill="#EAFBFF" font-size="14" font-weight="700">Bo Liu</text>
+            <text x="60" y="44" fill="#A3BDCA" font-size="11">Member · removed</text>
+          </g>
+          <!-- Klaus -->
+          <g transform="translate(0,204)">
+            <rect width="368" height="58" rx="16" fill="#102234"/>
+            <circle cx="29" cy="29" r="19" fill="#102234" stroke="#12EAD8" stroke-opacity="0.4"/>
+            <text x="29" y="34" text-anchor="middle" fill="#EAFBFF" font-size="12.5" font-weight="700">KF</text>
+            <text x="60" y="26" fill="#EAFBFF" font-size="14" font-weight="700">Klaus Frank</text>
+            <text x="60" y="44" fill="#A3BDCA" font-size="11">Member</text>
+            <text x="266" y="34" fill="#12EAD8" font-size="12" font-weight="700">Role</text>
+            <text x="316" y="34" fill="#12EAD8" font-size="12" font-weight="700">Remove</text>
+          </g>
+          <!-- Mira -->
+          <g transform="translate(0,272)">
+            <rect width="368" height="58" rx="16" fill="#102234"/>
+            <circle cx="29" cy="29" r="19" fill="#102234" stroke="#12EAD8" stroke-opacity="0.4"/>
+            <text x="29" y="34" text-anchor="middle" fill="#EAFBFF" font-size="12.5" font-weight="700">MO</text>
+            <text x="60" y="26" fill="#EAFBFF" font-size="14" font-weight="700">Mira O.</text>
+            <text x="60" y="44" fill="#A3BDCA" font-size="11">Moderator</text>
+            <text x="266" y="34" fill="#12EAD8" font-size="12" font-weight="700">Role</text>
+            <text x="316" y="34" fill="#12EAD8" font-size="12" font-weight="700">Remove</text>
+          </g>
+        </g>
+
+        <!-- Leave group at bottom -->
+        <g transform="translate(0,500)">
+          <rect width="368" height="44" rx="14" fill="none" stroke="#FF5C7A" stroke-width="1.4"/>
+          <text x="184" y="29" text-anchor="middle" fill="#FF5C7A" font-size="13.5" font-weight="700">Leave group</text>
+        </g>
+      </g>
+    </g>
+
+    <!-- Home indicator -->
+    <rect x="170" y="900" width="120" height="4" rx="2" fill="#A3BDCA" fill-opacity="0.6"/>
+    <rect x="24" y="28" width="412" height="894" rx="42" fill="url(#screenGlare)" pointer-events="none"/>
+  </g>
+</svg>

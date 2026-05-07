@@ -56,6 +56,26 @@ via JNI.
 * **P2P:** `libp2p 0.55`.
 * **Toolchain:** Rust 1.86 (pinned in `rust-toolchain.toml`).
 
+## Installing
+
+Pre-built signed APKs ship on every git tag — see the
+[Releases page](https://github.com/MKlolbullen/qubee/releases) for
+the latest. Pick `qubee-<version>.apk`, verify the SHA256 against
+the matching `.sha256` asset, and sideload via your file manager
+or `adb install qubee-<version>.apk`. The first launch walks you
+through onboarding (creates a local identity + paired Keystore
+master key); after that the inbox / contacts / settings tabs are
+all live.
+
+The releases are signed by the maintainer's release key
+(fingerprint published in `SECURITY.md`). Signature failures on
+install mean the APK has been tampered with — do not proceed.
+
+Pre-alpha caveats apply (see `SECURITY.md`): no Play Store yet,
+no migrations between minor versions (DB resets), no instrumented
+tests on real hardware in CI. Read the threat model before
+trusting it for anything that matters.
+
 ## Setup & build
 
 ### Prerequisites

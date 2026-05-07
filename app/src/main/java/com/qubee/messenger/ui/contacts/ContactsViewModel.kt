@@ -8,7 +8,7 @@ import com.qubee.messenger.data.repository.ContactRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -29,13 +29,15 @@ class ContactsViewModel @Inject constructor(
     private val contactRepository: ContactRepository,
 ) : ViewModel() {
 
-    val uiState: StateFlow<ContactsUiState> = contactRepository
-        .getAllContactsFlow()
-        .map { contacts ->
-            ContactsUiState(
-                contacts = contacts.map { it.toSummary() },
-            )
-        }
+    val uiState: StateFlow<ContactsUiState> = combine(
+        contactRepository.getAllContactsFlow(),
+        contactRepository.getBlockedContactsFlow(),
+    ) { active, blocked ->
+        ContactsUiState(
+            contacts = active.map { it.toSummary() },
+            blocked = blocked.map { it.toSummary() },
+        )
+    }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5_000L),
@@ -66,6 +68,17 @@ class ContactsViewModel @Inject constructor(
         }
     }
 
+    /// Counterpart to [blockContact]. Called from the "Blocked"
+    /// section's Unblock button on the Contacts tab. The blocked
+    /// list flow updates atomically — the row disappears from
+    /// "Blocked" and reappears on the active list on the same
+    /// emission.
+    fun unblockContact(contactId: String) {
+        viewModelScope.launch {
+            contactRepository.unblockContact(contactId)
+        }
+    }
+
     private fun Contact.toSummary(): ContactSummaryUi {
         val name = displayName.ifBlank { identityId.take(8) }
         val initials = name
@@ -89,6 +102,7 @@ class ContactsViewModel @Inject constructor(
 data class ContactsUiState(
     val isLoading: Boolean = false,
     val contacts: List<ContactSummaryUi> = emptyList(),
+    val blocked: List<ContactSummaryUi> = emptyList(),
 )
 
 data class ContactSummaryUi(

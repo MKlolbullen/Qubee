@@ -92,6 +92,11 @@ class ContactsFragment : Fragment() {
                 },
                 onDeleteContact = viewModel::deleteContact,
                 onBlockContact = viewModel::blockContact,
+                onUnblockContact = viewModel::unblockContact,
+                onVerifyContact = { summary ->
+                    com.qubee.messenger.ui.contacts.verification.ContactVerificationActivity
+                        .launch(requireActivity(), summary.identityIdHex)
+                },
             )
         }
     }
@@ -104,6 +109,8 @@ private fun ContactsScreen(
     onAddContactClick: () -> Unit,
     onDeleteContact: (String) -> Unit,
     onBlockContact: (String) -> Unit,
+    onUnblockContact: (String) -> Unit,
+    onVerifyContact: (ContactSummaryUi) -> Unit,
 ) {
     QubeeTheme {
         QubeeScreen {
@@ -117,15 +124,105 @@ private fun ContactsScreen(
 
                 when {
                     state.isLoading -> LoadingContacts()
-                    state.contacts.isEmpty() -> EmptyContacts(onAddContactClick = onAddContactClick)
-                    else -> ContactList(
-                        contacts = state.contacts,
+                    state.contacts.isEmpty() && state.blocked.isEmpty() ->
+                        EmptyContacts(onAddContactClick = onAddContactClick)
+                    else -> ContactsBody(
+                        active = state.contacts,
+                        blocked = state.blocked,
                         onContactClick = onContactClick,
                         onDeleteContact = onDeleteContact,
                         onBlockContact = onBlockContact,
+                        onUnblockContact = onUnblockContact,
+                        onVerifyContact = onVerifyContact,
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ContactsBody(
+    active: List<ContactSummaryUi>,
+    blocked: List<ContactSummaryUi>,
+    onContactClick: (ContactSummaryUi) -> Unit,
+    onDeleteContact: (String) -> Unit,
+    onBlockContact: (String) -> Unit,
+    onUnblockContact: (String) -> Unit,
+    onVerifyContact: (ContactSummaryUi) -> Unit,
+) {
+    var pendingDelete by remember { mutableStateOf<ContactSummaryUi?>(null) }
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (active.isNotEmpty()) {
+            items(active, key = { "active-${it.contactId}" }) { contact ->
+                ContactRow(
+                    contact = contact,
+                    onClick = { onContactClick(contact) },
+                    onRequestDelete = { pendingDelete = contact },
+                    onBlock = { onBlockContact(contact.contactId) },
+                    onVerify = { onVerifyContact(contact) },
+                )
+            }
+        }
+        if (blocked.isNotEmpty()) {
+            item(key = "blocked-header") {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Blocked",
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            items(blocked, key = { "blocked-${it.contactId}" }) { contact ->
+                BlockedContactRow(
+                    contact = contact,
+                    onUnblock = { onUnblockContact(contact.contactId) },
+                )
+            }
+        }
+    }
+    val target = pendingDelete
+    if (target != null) {
+        ConfirmDeleteContactDialog(
+            contactName = target.displayName,
+            onConfirm = {
+                onDeleteContact(target.contactId)
+                pendingDelete = null
+            },
+            onDismiss = { pendingDelete = null },
+        )
+    }
+}
+
+@Composable
+private fun BlockedContactRow(
+    contact: ContactSummaryUi,
+    onUnblock: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(QubeePalette.Panel.copy(alpha = 0.55f))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Avatar(initials = contact.initials, isOnline = false)
+        Spacer(Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = contact.displayName,
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            QubeeMutedText("Blocked — inbound is suppressed")
+        }
+        androidx.compose.material3.TextButton(onClick = onUnblock) {
+            Text("Unblock", color = QubeePalette.Cyan)
         }
     }
 }
@@ -192,37 +289,6 @@ private fun EmptyContacts(onAddContactClick: () -> Unit) {
 }
 
 @Composable
-private fun ContactList(
-    contacts: List<ContactSummaryUi>,
-    onContactClick: (ContactSummaryUi) -> Unit,
-    onDeleteContact: (String) -> Unit,
-    onBlockContact: (String) -> Unit,
-) {
-    var pendingDelete by remember { mutableStateOf<ContactSummaryUi?>(null) }
-    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        items(contacts, key = { it.contactId }) { contact ->
-            ContactRow(
-                contact = contact,
-                onClick = { onContactClick(contact) },
-                onRequestDelete = { pendingDelete = contact },
-                onBlock = { onBlockContact(contact.contactId) },
-            )
-        }
-    }
-    val target = pendingDelete
-    if (target != null) {
-        ConfirmDeleteContactDialog(
-            contactName = target.displayName,
-            onConfirm = {
-                onDeleteContact(target.contactId)
-                pendingDelete = null
-            },
-            onDismiss = { pendingDelete = null },
-        )
-    }
-}
-
-@Composable
 private fun ConfirmDeleteContactDialog(
     contactName: String,
     onConfirm: () -> Unit,
@@ -257,6 +323,7 @@ private fun ContactRow(
     onClick: () -> Unit,
     onRequestDelete: () -> Unit,
     onBlock: () -> Unit,
+    onVerify: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
@@ -302,6 +369,13 @@ private fun ContactRow(
                 expanded = menuOpen,
                 onDismissRequest = { menuOpen = false },
             ) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(if (contact.isVerified) "Re-verify" else "Verify") },
+                    onClick = {
+                        menuOpen = false
+                        onVerify()
+                    },
+                )
                 androidx.compose.material3.DropdownMenuItem(
                     text = { Text("Block") },
                     onClick = {

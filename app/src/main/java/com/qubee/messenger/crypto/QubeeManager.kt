@@ -322,6 +322,95 @@ class QubeeManager @Inject constructor(
         nativeRemoveMember(groupIdHex, memberIdHex, reason)
     }
 
+    /**
+     * Promote (or demote) a member of a group we own to a new role.
+     * `newRole` must be one of `Owner`, `Admin`, `Moderator`,
+     * `Member`, `Observer` (case-insensitive Rust-side; the native
+     * code rejects anything else). Returns the JSON envelope from
+     * `nativePromoteMember` on success, null if the JNI call failed
+     * (not owner, member not found, role string unknown, …).
+     */
+    suspend fun promoteMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        newRole: String,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativePromoteMember(groupIdHex, memberIdHex, newRole)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust promote-member JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust promote-member failed")
+            null
+        }
+    }
+
+    /**
+     * List the active members of a group, as returned by the Rust
+     * core. JSON shape is an array of
+     * `{identity_id_hex, display_name, role, is_active, joined_at}`
+     * — see `Java_com_qubee_messenger_crypto_QubeeManager_nativeListGroupMembers`
+     * in `src/jni_api.rs`. Returns null if the group isn't in the
+     * local Rust view (e.g., the user accepted an invite but the
+     * JoinAccepted handshake hasn't landed yet, so the Rust core
+     * still doesn't know about the group).
+     */
+    /**
+     * The locally-active identity's `IdentityId` as a 64-char hex
+     * string. Used to flag "this row is you" in the Group Details
+     * member list and to pass our own id into `removeMember` for
+     * the "Leave group" action.
+     */
+    suspend fun getMyIdentityIdHex(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeGetMyIdentityIdHex()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust my-identity-id JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust my-identity-id failed")
+            null
+        }
+    }
+
+    suspend fun listGroupMembers(groupIdHex: String): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeListGroupMembers(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust list-group-members JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust list-group-members failed")
+            null
+        }
+    }
+
+    /**
+     * List every group the active identity belongs to from the
+     * Rust core's local view. Returns the JSON array as-is — see
+     * `com.qubee.messenger.groups.GroupSummary.listFromJson` for
+     * the structured shape. Returns null if the JNI call rejected
+     * the request (no active identity, group manager not
+     * initialised). An empty array is a valid success — the user
+     * is in zero groups.
+     */
+    suspend fun listGroups(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeListGroups()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust list-groups JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust list-groups failed")
+            null
+        }
+    }
+
     suspend fun sendGroupMessage(
         groupIdHex: String,
         plaintext: ByteArray,
@@ -373,6 +462,9 @@ class QubeeManager @Inject constructor(
     private external fun nativeInspectEnvelopeSender(wire: ByteArray): String?
     private external fun nativeGenerateSASForContact(peerIdentityKey: ByteArray): String?
     private external fun nativeGetMyFingerprint(): String?
+    private external fun nativeListGroupMembers(groupIdHex: String): String?
+    private external fun nativeListGroups(): String?
+    private external fun nativeGetMyIdentityIdHex(): String?
     private external fun nativeGetMyIdentityId(): String?
 
     private external fun nativeCreateOnboardingBundle(displayName: String, userId: String): String?
@@ -394,6 +486,11 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         memberIdHex: String,
         reason: String,
+    ): String?
+    private external fun nativePromoteMember(
+        groupIdHex: String,
+        memberIdHex: String,
+        newRole: String,
     ): String?
     private external fun nativeSendGroupMessage(
         groupIdHex: String,

@@ -13,7 +13,8 @@ use tokio::runtime::Runtime;
 
 // Core modules
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_request_join, GroupHandshake, KeyRotationBody, RequestJoinBody,
+    generate_ephemeral_kyber, sign_request_join, sign_role_change, GroupHandshake,
+    KeyRotationBody, RequestJoinBody,
 };
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_manager::{
@@ -73,7 +74,41 @@ lazy_static! {
     // Ephemeral Kyber-768 secrets the joiner generated when sending a
     // RequestJoin, indexed by invitation_code. Lives only in process
     // memory and gets zeroised + dropped on JoinAccepted/JoinRejected.
-    static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, Vec<u8>>> = Mutex::new(HashMap::new());
+    //
+    // Each entry carries the time it was inserted; `prune_pending_kems`
+    // evicts (and zeroises) entries older than `PENDING_JOIN_KEM_TTL`
+    // so a lost JoinAccepted/JoinRejected reply doesn't keep the
+    // joiner's ephemeral secret resident indefinitely.
+    static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, (Vec<u8>, std::time::SystemTime)>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Maximum lifetime of an entry in [`PENDING_JOIN_KEMS`]. Beyond this
+/// the inviter's reply is presumed lost; the joiner re-attempts the
+/// handshake from scratch and we drop the stale ephemeral. 10 minutes
+/// is loose enough for a slow inviter on a flaky network and tight
+/// enough that an undelivered reply doesn't pin secret material in
+/// memory across a multi-hour app lifetime.
+const PENDING_JOIN_KEM_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Evict + zeroise pending Kyber secrets older than [`PENDING_JOIN_KEM_TTL`].
+/// Must be called while holding the `PENDING_JOIN_KEMS` mutex.
+fn prune_pending_kems(
+    pending: &mut HashMap<String, (Vec<u8>, std::time::SystemTime)>,
+) {
+    let now = std::time::SystemTime::now();
+    pending.retain(|_code, (secret, inserted_at)| {
+        match now.duration_since(*inserted_at) {
+            Ok(age) if age >= PENDING_JOIN_KEM_TTL => {
+                secret.zeroize();
+                false
+            }
+            // duration_since returns Err iff `inserted_at` is in the
+            // future (clock skew). Treat that as "still fresh" rather
+            // than dropping the entry.
+            _ => true,
+        }
+    });
 }
 
 /// Catch panics from a JNI body that returns a `Default`-able value
@@ -249,9 +284,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let id_keys = libp2p::identity::Keypair::generate_ed25519();
-                println!(
-                    "Rust: Starting P2P Node: {}",
-                    libp2p::PeerId::from(id_keys.public())
+                tracing::info!(
+                    peer_id = %libp2p::PeerId::from(id_keys.public()),
+                    "Starting P2P Node",
                 );
 
                 let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
@@ -687,6 +722,106 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
     })
 }
 
+/// Promote (or demote) a member of a group we own to a new role
+/// and broadcast a signed `RoleChange` so other members converge on
+/// the same membership view. Owner-only Rust-side; non-owner callers
+/// get an `Err` from `GroupManager::promote_member` which surfaces
+/// here as a null return.
+///
+/// `new_role` accepts a small fixed vocabulary — `"Owner"`, `"Admin"`,
+/// `"Moderator"`, `"Member"`, `"Observer"` — case-insensitive, with
+/// any other value rejected. We deliberately don't expose `Custom(_)`
+/// over the JNI: the wire frame supports it, but there's no UI for
+/// minting one yet, and silently round-tripping arbitrary strings
+/// would let bugs in the client side leak through.
+///
+/// Returns JSON `{group_id_hex, member_id_hex, new_role,
+/// new_version, network_published}` on success.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePromoteMember(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    member_id_hex: JString,
+    new_role: JString,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let member_id_hex: String = match env.get_string(&member_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let new_role: String = match env.get_string(&new_role) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+            let member_id = IdentityId::from(parse_hex32(Some(member_id_hex.as_str()))?);
+            let role = match new_role.to_ascii_lowercase().as_str() {
+                "owner" => Role::Owner,
+                "admin" => Role::Admin,
+                "moderator" => Role::Moderator,
+                "member" => Role::Member,
+                "observer" => Role::Observer,
+                other => return Err(anyhow::anyhow!("unknown role: {other}")),
+            };
+
+            let signed = {
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                let body = gm.promote_member(group_id, identity.identity_id(), member_id, role.clone())?;
+                sign_role_change(identity.as_ref(), body)?
+            };
+
+            let (new_version, role_str) = match &signed {
+                GroupHandshake::RoleChange { body, .. } => (
+                    body.new_version,
+                    role_to_str(&body.new_role).to_string(),
+                ),
+                _ => (0u64, new_role.clone()),
+            };
+
+            let topic = group_topic(&hex::encode(group_id.as_ref()));
+            let wire = signed.to_wire()?;
+            let published = publish_to_topic(topic, wire);
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "member_id_hex": hex::encode(member_id.as_ref()),
+                "new_role": role_str,
+                "new_version": new_version,
+                "network_published": published,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Render a `Role` back to the canonical wire string used by
+/// `nativePromoteMember` and `nativeListGroupMembers`. The roundtrip
+/// stays in lock-step with the small vocabulary the JNI accepts so
+/// the UI always sees the same set of strings.
+fn role_to_str(role: &Role) -> &'static str {
+    match role {
+        Role::Owner => "Owner",
+        Role::Admin => "Admin",
+        Role::Moderator => "Moderator",
+        Role::Member => "Member",
+        Role::Observer => "Observer",
+        Role::Custom(_) => "Custom",
+    }
+}
+
 /// Record that the local user accepted a `qubee://invite/...` link
 /// and (best-effort) publish a signed `RequestJoin` over the
 /// gossipsub global topic so the inviter's device can enrol us.
@@ -764,11 +899,15 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
     let (kyber_pub, kyber_secret) = generate_ephemeral_kyber();
     {
         let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+        prune_pending_kems(&mut pending);
         // If a previous attempt for this invitation_code is still
         // pending its reply, drop it — the new attempt invalidates the
         // old ephemeral.
-        if let Some(mut prev) = pending.insert(payload.invitation_code.clone(), kyber_secret) {
-            prev.zeroize();
+        let now = std::time::SystemTime::now();
+        if let Some((mut prev_secret, _)) =
+            pending.insert(payload.invitation_code.clone(), (kyber_secret, now))
+        {
+            prev_secret.zeroize();
         }
     }
 
@@ -793,8 +932,14 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
 
 /// Pop the cached Kyber secret for an invitation, returning ownership
 /// to the caller. The caller is responsible for zeroising once done.
+///
+/// Also prunes any other entries that have outlived
+/// [`PENDING_JOIN_KEM_TTL`] — TTL eviction piggybacks on every
+/// take/insert so we never need a background thread.
 fn take_pending_kyber_secret(invitation_code: &str) -> Option<Vec<u8>> {
-    PENDING_JOIN_KEMS.lock().unwrap().remove(invitation_code)
+    let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+    prune_pending_kems(&mut pending);
+    pending.remove(invitation_code).map(|(secret, _)| secret)
 }
 
 /// Re-subscribe the network layer to every group topic the local user
@@ -1227,7 +1372,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
         *ACTIVE_IDENTITY.lock().unwrap() = None;
         *KEYSTORE.lock().unwrap() = None;
         *GROUP_MANAGER.lock().unwrap() = None;
-        PENDING_JOIN_KEMS.lock().unwrap().clear();
+        {
+            // Zeroise every cached ephemeral before dropping the map.
+            // Vec::clear() runs Drop on the inner Vec<u8> but doesn't
+            // overwrite its contents — explicit zeroize is what
+            // actually erases the bytes.
+            let mut pending = PENDING_JOIN_KEMS.lock().unwrap();
+            for (_, (secret, _)) in pending.iter_mut() {
+                secret.zeroize();
+            }
+            pending.clear();
+        }
         *INITIALIZED.lock().unwrap() = false;
 
         // SecureKeyStore stores its data file at <path>.db and the
@@ -1924,20 +2079,41 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyF
     })
 }
 
-/// Return the locally-active identity's `IdentityId` as a 64-character
-/// lowercase hex string — same shape as `nativeInspectEnvelopeSender`
-/// returns for inbound envelopes, so persisted `Message.senderId` rows
-/// stay interoperable across send and receive paths. Distinct from
-/// `nativeGetMyFingerprint`: the fingerprint is the 8-byte BLAKE3
-/// truncation used for OOB comparison; this is the full 32-byte
-/// identifier used as the canonical sender id on the wire.
+/// Return the locally-active identity's `IdentityId` as a 64-char
+/// lowercase hex string. Used by the Android Group Details sheet
+/// to flag "this row is you" on the member list, to wire the
+/// "Leave group" action (which passes our own id into
+/// `nativeRemoveMember`), and as the canonical sender id baked
+/// into persisted `Message.senderId` rows so send + receive paths
+/// stay interoperable. Distinct from `nativeGetMyFingerprint` —
+/// fingerprint is the 8-byte BLAKE3 truncation used for OOB
+/// compare; this is the full 32-byte address used on the wire.
+///
+/// Two exports with identical bodies on purpose:
+///   * `nativeGetMyIdentityIdHex` — historical name used by the
+///     Group UX surface; kept stable so old Kotlin call sites
+///     keep linking.
+///   * `nativeGetMyIdentityId` — newer alias used by `ChatViewModel`
+///     when stamping outbound `Message.senderId`. Same return.
 ///
 /// Returns `null` if onboarding hasn't completed yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityIdHex(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    my_identity_id_hex_impl(env)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyIdentityId(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    my_identity_id_hex_impl(env)
+}
+
+fn my_identity_id_hex_impl(env: JNIEnv) -> jstring {
     jni_catch_jstring(|| {
         let result: anyhow::Result<jstring> = (|| {
             let identity =
@@ -1945,6 +2121,135 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyI
             let id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
             let java_str = env
                 .new_string(id_hex)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Return the active members of a group as a JSON array. Each entry
+/// is `{identity_id_hex, display_name, role, is_active, joined_at}`.
+/// Used by the Android Group Details sheet to render the member
+/// list — the Rust side is the source of truth (the Kotlin
+/// `Conversation.participants` field is a hint, not authoritative).
+///
+/// Returns:
+///   * the JSON array on success,
+///   * `[]` if the group exists but has no active members (shouldn't
+///     happen — the owner is always an active member — but matches
+///     the empty-state UI gracefully),
+///   * `null` if the group isn't in the local view (legacy enrolment,
+///     bad input). The caller treats null as "couldn't load".
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGroupMembers(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let raw: String = env
+                .get_string(&group_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid group_id_hex: {e}"))?
+                .into();
+            let group_id = GroupId::from_bytes(parse_hex32(Some(raw.as_str()))?);
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let group = gm
+                .get_group(&group_id)
+                .ok_or_else(|| anyhow::anyhow!("group not in local view"))?;
+            let members: Vec<serde_json::Value> = group
+                .members
+                .values()
+                .map(|m| {
+                    let role_label = role_to_str(&m.role);
+                    let is_active = matches!(
+                        m.member_status,
+                        crate::groups::group_manager::MemberStatus::Active,
+                    );
+                    serde_json::json!({
+                        "identity_id_hex": hex::encode(m.identity_id.as_ref() as &[u8]),
+                        "display_name": m.display_name,
+                        "role": role_label,
+                        "is_active": is_active,
+                        "joined_at": m.joined_at,
+                    })
+                })
+                .collect();
+            let payload = serde_json::Value::Array(members).to_string();
+            let java_str = env
+                .new_string(payload)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// List every group the active identity is a member of, from the
+/// Rust core's local view. Used on fresh-install / cold-launch to
+/// hydrate the Conversation table when the Kotlin DB is empty but
+/// the Rust state (recovered from `nativeInitialize`) isn't.
+///
+/// JSON shape: array of
+/// `{group_id_hex, name, member_count, my_role, last_updated,
+/// version}`. `my_role` mirrors the small fixed vocabulary used by
+/// `nativeListGroupMembers` / `nativePromoteMember`.
+///
+/// Returns:
+///  * a (possibly empty) JSON array on success — including when
+///    the active identity is in no groups.
+///  * `null` if no active identity has been loaded yet (caller
+///    treats this as "wait until onboarding finishes").
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGroups(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let my_id = identity.identity_id();
+
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+
+            let groups: Vec<serde_json::Value> = gm
+                .get_member_groups(&my_id)
+                .into_iter()
+                .map(|group| {
+                    let my_role = group
+                        .members
+                        .get(&my_id)
+                        .map(|m| role_to_str(&m.role))
+                        .unwrap_or("Member");
+                    let active_count = group
+                        .members
+                        .values()
+                        .filter(|m| matches!(
+                            m.member_status,
+                            crate::groups::group_manager::MemberStatus::Active,
+                        ))
+                        .count();
+                    serde_json::json!({
+                        "group_id_hex": hex::encode(group.id.as_ref() as &[u8]),
+                        "name": group.name,
+                        "member_count": active_count,
+                        "my_role": my_role,
+                        "last_updated": group.last_updated,
+                        "version": group.version,
+                    })
+                })
+                .collect();
+            let payload = serde_json::Value::Array(groups).to_string();
+            let java_str = env
+                .new_string(payload)
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
             Ok(java_str.into_raw())
         })();

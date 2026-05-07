@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.repository.PreferenceRepository
+import com.qubee.messenger.identity.IdentityBundle
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +27,30 @@ class SettingsViewModel @Inject constructor(
 
     private val _state = MutableStateFlow<SettingsResetState>(SettingsResetState.Idle)
     val state: StateFlow<SettingsResetState> = _state.asStateFlow()
+
+    private val _identity = MutableStateFlow<IdentityBundle?>(null)
+    val identity: StateFlow<IdentityBundle?> = _identity.asStateFlow()
+
+    init {
+        loadIdentity()
+    }
+
+    /// Pull the active onboarding bundle (display name, fingerprint,
+    /// `qubee://identity/<token>` share link) so the Settings UI can
+    /// expose it. Best-effort: a missing / unparseable bundle leaves
+    /// the Identity panel in an empty state but doesn't break the
+    /// rest of Settings.
+    private fun loadIdentity() {
+        viewModelScope.launch {
+            val raw = try {
+                qubeeManager.loadOnboardingBundle()
+            } catch (e: Exception) {
+                Timber.e(e, "loadOnboardingBundle threw")
+                null
+            }
+            _identity.value = IdentityBundle.fromJson(raw)
+        }
+    }
 
     fun resetIdentity() {
         viewModelScope.launch {

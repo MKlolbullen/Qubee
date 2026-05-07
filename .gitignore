@@ -32,3 +32,12 @@ Thumbs.db
 
 # Paparazzi failures (regenerate on next CI run)
 app/build/paparazzi/failures/
+
+# Release signing — keystore + base64-encoded copy must NEVER be
+# committed. The release workflow decodes RELEASE_KEYSTORE_BASE64
+# (a GitHub Secret) into RUNNER_TEMP at job time; locally you'd
+# generate qubee-release.jks once and keep it outside the repo.
+*.jks
+*.jks.b64
+*.keystore
+keystore.properties

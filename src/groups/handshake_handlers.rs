@@ -258,8 +258,12 @@ pub fn process_join_accepted(
     // even after a process restart. Errors here only mean the joiner
     // won't be able to receive rotations — they'd need to rejoin —
     // but the join itself has already landed, so we don't unwind.
-    if let Err(e) = gm.store_my_kyber_secret(body.group_id, joiner_kyber_secret) {
-        eprintln!("warning: persisting joiner Kyber secret failed: {e:#}");
+    if let Err(_e) = gm.store_my_kyber_secret(body.group_id, joiner_kyber_secret) {
+        // Deliberately do NOT interpolate the error: the underlying
+        // failure mode is keystore persistence, and any diagnostic
+        // detail from `e:#` could leak metadata about the secret's
+        // shape (size, encoding) that we'd rather not have in logs.
+        tracing::warn!("persisting joiner ephemeral secret failed");
     }
     Ok(())
 }

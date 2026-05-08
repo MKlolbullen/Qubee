@@ -83,10 +83,6 @@ why.
   unlocked screen. The threat model assumes a locked device; an
   attacker with full physical access has already won (see
   `docs/security/threat-model.md` once published).
-- Bugs in the `legacy` feature-gated modules (`hybrid_ratchet`,
-  `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
-  These are documented as broken in `docs/build-status.md`; they're
-  not built by default and not part of any release.
 - Bugs in the `calling` feature (WebRTC). It's gated, not yet ported
   to webrtc 0.14, and not built by default.
 - Phishing / social-engineering of the OOB verification gesture. We

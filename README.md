@@ -133,7 +133,9 @@ Qubee/
 │   ├── onboarding/               # Onboarding bundles + invite-link
 │   │                             # parsing
 │   ├── storage/                  # SecureKeyStore (encrypted)
-│   ├── security/                 # secure_memory, secure_rng
+│   ├── security/                 # secure_rng (CSPRNG with entropy mix-in)
+│   ├── crypto/                   # EnhancedHybridRatchet + DoubleRatchet
+│   ├── media_devices/            # Video device registry (JNI-fed)
 │   ├── jni_api.rs                # JNI bridge (Android-only)
 │   └── lib.rs                    # Module wiring + feature gates
 ├── tests/                        # Rust integration tests
@@ -306,11 +308,6 @@ Pre-alpha → alpha (still open):
   `app/src/androidTest/java/com/qubee/messenger/security/SqlCipherKeyProviderTest.kt`
   and runs on a real device once the emulator-access blocker
   resolves.
-* Port the legacy modules (`hybrid_ratchet`, `secure_message`,
-  `file_transfer`, `audio`, `sas`, `oob_secrets`) to the current
-  dependency versions — currently feature-gated behind `legacy`
-  and documented as broken in `docs/build-status.md`.
-
 Post-alpha:
 * Real delivery confirmation (today `MessageStatus.SENT` only
   means "encrypted bytes left this device"; needs an ack

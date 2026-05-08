@@ -3232,7 +3232,6 @@ dependencies = [
  "hkdf",
  "jni",
  "lazy_static",
- "libc",
  "libp2p",
  "log",
  "percent-encoding",

@@ -100,13 +100,6 @@ crc32fast = "1.4"
 url = "2.5"
 percent-encoding = "2.3"
 
-[target.'cfg(unix)'.dependencies]
-# Required by src/security/secure_memory.rs for mlock/munlock and by
-# the entropy mixer in secure_rng.rs. Was previously called from
-# `unsafe { libc::... }` blocks without ever being declared, which is
-# why the crate had been failing to resolve.
-libc = "0.2"
-
 [features]
 default = []
 # Pull in the WebRTC stack and the in-progress `calling` module. It
@@ -114,11 +107,6 @@ default = []
 # version of webrtc-rs and several files reference types that have
 # moved. Enabling this is for active development, not for users.
 calling = ["dep:webrtc", "dep:cpal"]
-# Compile the legacy prototype modules (`hybrid_ratchet`,
-# `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
-# They reference dependency APIs that have since drifted; enabling
-# this is for porting work, not for downstream consumers.
-legacy = []
 # Compile `jni_api.rs` on the host so the JNI surface can be type-
 # checked without an Android target installed. Off by default — the
 # Android JNI build picks the module up via `cfg(target_os = "android")`.

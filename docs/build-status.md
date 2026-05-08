@@ -34,14 +34,18 @@ test result: ok. 8 passed; 0 failed; 0 ignored
 
 The verification pass started at 162 errors. Steps:
 
-1. **Feature-gated the legacy modules** behind `#[cfg(feature =
-   "legacy")]`: `audio`, `hybrid_ratchet`, `secure_message`,
-   `file_transfer`, `signal_protocol`, `sas`, `oob_secrets`,
-   `secure_memory`. They reference dependency APIs that have since
-   drifted; nothing on the JNI surface uses them. Compile them when
-   you're ready to port: `cargo check --features legacy`. (Today
-   that's still a 100+ error fix-up project — the gating is
-   protective, not a green light.)
+1. **Removed the legacy modules** entirely: `audio`,
+   `hybrid_ratchet`, `secure_message`, `file_transfer`,
+   `signal_protocol`, `sas`, `oob_secrets`, `secure_memory`. They
+   referenced dependency APIs that had drifted (legacy
+   `secrecy::Secret`, `pqcrypto-kyber`, `double_ratchet`); nothing
+   on the JNI surface used them. Earlier rounds gated them behind
+   `--features legacy` for porting work — that work never
+   materialised, and the orphaned modules outlived their usefulness.
+   The active group flow lives in `src/groups/` and uses the
+   sender-keys forward-secret primitive in `src/groups/sender_keys.rs`;
+   pairwise direct-message ratcheting (when wired) uses
+   `src/crypto/double_ratchet.rs`.
 2. **Upgraded `secrecy 0.8` → `0.10`** and switched
    `Secret<NonCopyType>` to `SecretBox<NonCopyType>` everywhere it
    appeared: `identity/identity_key.rs`, `groups/group_crypto.rs`,
@@ -127,9 +131,6 @@ git commit -m "Add Paparazzi baselines"
 
 ## Recommended next steps
 
-* (q-tail) Port the legacy modules behind `--features legacy` once
-  there's an actual consumer. Today's gating is honest; the modules
-  have ~100 errors waiting and aren't worth fixing speculatively.
 * (s-cont) Run Paparazzi on a real machine to commit the baseline
   PNGs. With the SDK present and the wrapper jar already in the
   repo, this is one command on a dev box.

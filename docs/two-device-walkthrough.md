@@ -226,14 +226,8 @@ likely culprit.
 
 ## What's deferred
 
-* **Delivery confirmation.** Status = `SENT` today means
-  "encrypted bytes left this device", not "peer ack'd". A real
-  ack roundtrip is post-alpha.
 * **Voice / video calling.** Post-alpha; gated behind the
   Rust `calling` feature flag and an unbuilt `webrtc` integration.
-* **Schema migrations.** `fallbackToDestructiveMigration` resets
-  the local DB on every minor-version bump until v0.2.0 commits to
-  schema stability.
 
 ## What's already shipped
 
@@ -259,6 +253,17 @@ useful when running the walkthrough against an older build.)
   Admin, target → Owner) via a signed
   `qubee_handshake_ownership_transfer_v1` wire frame, no group
   key rotation needed.
+* **Delivery confirmation** — every successful decrypt fires a
+  signed `MessageAck` back on the group's gossipsub topic; the
+  sender's local Message row flips from `SENT` to `DELIVERED`
+  on first ack arrival and tracks per-recipient delivery in
+  `deliveredAckers` for "delivered to N of M" hints. No bridge
+  round-trip on the receiver side; the auto-ack runs Rust-side
+  inside `handle_inbound_group_message`.
+* **Schema migrations** — v2→v3 migration in
+  `Migrations.kt` adds the `wireId` / `deliveredAckers` columns
+  without wiping the inbox. Future bumps follow the same
+  pattern; the destructive fallback stays as a safety net.
 
 ## Troubleshooting
 

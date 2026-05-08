@@ -24,6 +24,26 @@ between minor versions.
   re-check that the donor was the current Owner at apply time,
   so a forged "transfer back" signed under the now-Admin's key
   is rejected.
+- **Delivery confirmation** — every successful
+  `decrypt_group_message` auto-fires a signed
+  `qubee_handshake_message_ack_v1` frame with a 16-byte BLAKE3
+  message id; senders look up the row by `Message.wireId` and
+  flip status `SENT → DELIVERED` on first ack arrival. Receivers
+  dedupe by `(message_id, acker_id)`. Acks for unknown ids and
+  acks from non-members are silently dropped.
+- **Android instrumented tests** — emulator-based CI workflow
+  (`.github/workflows/instrumented-tests.yml`) running on PRs to
+  `main` and push to `main`. First DAO test
+  (`MessageDaoInstrumentedTest`) validates the wireId lookup +
+  deliveredAckers persistence path. First migration test
+  (`MigrationsInstrumentedTest`) validates that v2→v3 preserves
+  existing message rows.
+- **Schema migrations** — real `MIGRATION_2_3` in
+  `Migrations.kt` adds `wireId` + `deliveredAckers` columns to
+  the existing `messages` table without dropping data.
+  `fallbackToDestructiveMigration` retained as a safety net for
+  unknown version pairs. `exportSchema = true` so future
+  migrations can be schema-validated by `MigrationTestHelper`.
 
 ### Changed
 

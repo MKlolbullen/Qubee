@@ -32,10 +32,12 @@ import timber.log.Timber
     //     group-message id, used to look up the row when an
     //     `onMessageAcked` callback arrives) and `deliveredAckers`
     //     (JSON-encoded list of acker `IdentityId` hex values).
-    // fallbackToDestructiveMigration recreates the DB on the bump;
-    // pre-alpha data isn't yet meant to survive schema changes.
+    // exportSchema = true generates JSON snapshots into
+    // `app/schemas/<version>.json` so MigrationTestHelper can
+    // validate `Migrations.kt` actually moves the schema between
+    // versions correctly.
     version = 3,
-    exportSchema = false,
+    exportSchema = true,
 )
 @TypeConverters(Converters::class)
 abstract class QubeeDatabase : RoomDatabase() {
@@ -82,8 +84,14 @@ abstract class QubeeDatabase : RoomDatabase() {
                 DATABASE_NAME,
             )
                 .openHelperFactory(factory)
-                // Pre-alpha: hard reset on schema change. Real
-                // migrations are post-alpha.
+                // Real migrations land in `Migrations.kt` as
+                // schema bumps happen. The destructive fallback
+                // stays as a safety net: any version pair
+                // [ALL_MIGRATIONS] doesn't cover (e.g. someone
+                // installed a debug build, force-set
+                // `version = 99`, then back to current) hard-
+                // resets rather than corrupting the schema.
+                .addMigrations(*ALL_MIGRATIONS)
                 .fallbackToDestructiveMigration()
                 // Canary: SQLCipher v4 defaults (cipher_compatibility = 4,
                 // cipher_page_size = 4096, HMAC-SHA512, 256k KDF iter)

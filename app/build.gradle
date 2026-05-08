@@ -30,6 +30,17 @@ android {
         applicationId 'com.qubee.messenger'
         minSdk 24
         targetSdk 34
+
+        // Room schema snapshots — required for MigrationTestHelper
+        // to validate that `Migrations.kt` actually transitions the
+        // schema correctly. Snapshots are committed under
+        // `app/schemas/com.qubee.messenger.data.repository.database.QubeeDatabase/`
+        // and reviewed in PRs alongside any `version` bump.
+        kapt {
+            arguments {
+                arg('room.schemaLocation', "$projectDir/schemas")
+            }
+        }
         // versionName / versionCode default to a "0.1.0-alpha" pre-release
         // label. Override from the release workflow with
         //   ./gradlew assembleRelease \
@@ -51,6 +62,9 @@ android {
     sourceSets {
         // Rust .so libraries built by build_rust.sh / cargo-ndk land here.
         main.jniLibs.srcDirs = ['src/main/jniLibs']
+        // Surface Room schema snapshots to androidTest so
+        // MigrationTestHelper can find them at run time.
+        androidTest.assets.srcDirs += files("$projectDir/schemas")
     }
 
     signingConfigs {

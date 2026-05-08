@@ -23,12 +23,13 @@ use qubee_crypto::groups::handshake_handlers::{
     HandshakeOutcome,
 };
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
-use qubee_crypto::storage::secure_keystore::SecureKeyStore;
+use qubee_crypto::storage::secure_keystore::{install_test_password, SecureKeyStore};
 use tempfile::TempDir;
 
 /// Convenience: spin up an `IdentityKeyPair` and a `GroupManager`
 /// backed by a fresh temp-dir keystore.
 fn fresh_device(label: &str) -> (TempDir, IdentityKeyPair, GroupManager) {
+    install_test_password();
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join(format!("{label}.db"));
     let ks = SecureKeyStore::new(&path).expect("keystore");

@@ -30,7 +30,7 @@ use qubee_crypto::identity::identity_key::IdentityKeyPair;
 use qubee_crypto::network::p2p_node::{
     group_topic as build_group_topic, NodeEvent, P2PCommand, P2PNode, P2PNodeConfig,
 };
-use qubee_crypto::storage::secure_keystore::SecureKeyStore;
+use qubee_crypto::storage::secure_keystore::{install_test_password, SecureKeyStore};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -122,6 +122,7 @@ where
 /// temp-dir keystore. Mirrors the helper in `group_handshake_e2e.rs`
 /// so the two test files stay parallel.
 fn fresh_app_state(label: &str) -> (TempDir, IdentityKeyPair, GroupManager) {
+    install_test_password();
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join(format!("{label}.db"));
     let ks = SecureKeyStore::new(&path).expect("keystore");

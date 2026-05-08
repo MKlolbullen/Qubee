@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, SecretBox};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
@@ -9,7 +9,49 @@ use blake3::Hasher;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::sync::{OnceLock, RwLock};
 use crate::security::secure_rng;
+
+/// Process-wide override for the master-key password. Set this from
+/// the embedding application (e.g. via the JNI bridge after pulling a
+/// passphrase out of Android Keystore) before opening the first
+/// keystore. Takes precedence over the `QUBEE_KEYSTORE_PASSWORD`
+/// environment variable.
+static MASTER_PASSWORD: OnceLock<RwLock<Option<SecretString>>> = OnceLock::new();
+
+fn master_password_slot() -> &'static RwLock<Option<SecretString>> {
+    MASTER_PASSWORD.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the master-key password the keystore will use to derive its
+/// file-encryption key. Subsequent calls overwrite the previous value;
+/// the previous `SecretString` is dropped and zeroised.
+pub fn set_master_password(password: SecretString) {
+    let mut slot = master_password_slot().write().expect("master password lock poisoned");
+    *slot = Some(password);
+}
+
+/// Clear any password installed via `set_master_password`. Mainly
+/// useful in tests that want to assert the fail-closed behaviour.
+pub fn clear_master_password() {
+    let mut slot = master_password_slot().write().expect("master password lock poisoned");
+    *slot = None;
+}
+
+/// Install a fixed test passphrase, idempotently. Integration tests
+/// and benchmarks should call this before opening a keystore — they
+/// run against the library compiled without `cfg(test)`, so the
+/// in-crate `cfg(test)` fallback in `get_user_password` doesn't fire
+/// for them.
+///
+/// Production code must not call this.
+pub fn install_test_password() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        set_master_password(SecretString::from("qubee-keystore-test-password"));
+    });
+}
 
 /// Secure key storage with encryption and integrity protection.
 ///
@@ -314,11 +356,50 @@ impl SecureKeyStore {
         Ok(())
     }
     
+    /// Resolve the password used to derive the master-key file encryption
+    /// key. Resolution order, highest precedence first:
+    ///
+    /// 1. Programmatic override installed via `set_master_password`. The
+    ///    embedder is expected to source this from a real secret store
+    ///    (Android Keystore, the system keyring, a user PIN, ...).
+    /// 2. The `QUBEE_KEYSTORE_PASSWORD` environment variable, useful for
+    ///    headless/server deployments where step 1 isn't wired in yet.
+    /// 3. In `cfg(test)` builds, a fixed test passphrase so the unit
+    ///    and integration tests can drive the keystore without the
+    ///    test author having to plumb a password through.
+    ///
+    /// If none of those apply, the call fails closed. The previous
+    /// behaviour silently fell back to the literal string
+    /// `"default_password"`, which left the on-disk master key
+    /// effectively unencrypted on any system where neither the env
+    /// var nor the override had been set.
     fn get_user_password() -> Result<String> {
-        // In a real implementation, this would prompt the user or use platform keyring
-        // For now, we'll use a simple environment variable
-        std::env::var("QUBEE_KEYSTORE_PASSWORD")
-            .or_else(|_| Ok("default_password".to_string()))
+        if let Some(secret) = master_password_slot()
+            .read()
+            .expect("master password lock poisoned")
+            .as_ref()
+        {
+            return Ok(secret.expose_secret().to_string());
+        }
+
+        if let Ok(env_password) = std::env::var("QUBEE_KEYSTORE_PASSWORD") {
+            return Ok(env_password);
+        }
+
+        #[cfg(test)]
+        {
+            return Ok("qubee-keystore-test-password".to_string());
+        }
+
+        #[cfg(not(test))]
+        {
+            anyhow::bail!(
+                "no keystore password configured: install one via \
+                 secure_keystore::set_master_password(...) or set the \
+                 QUBEE_KEYSTORE_PASSWORD environment variable before \
+                 opening the keystore"
+            );
+        }
     }
     
     fn derive_key_from_password(password: &str) -> Result<[u8; 32]> {

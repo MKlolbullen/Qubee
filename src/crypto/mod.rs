@@ -5,5 +5,7 @@
 //! self-contained pieces that get composed into either.
 
 pub mod enhanced_ratchet;
+pub mod double_ratchet;
 
 pub use enhanced_ratchet::{EnhancedHybridRatchet, RatchetRole};
+pub use double_ratchet::DoubleRatchet;

@@ -1246,8 +1246,7 @@ mod tests {
         // the wire. Encrypt several frames and confirm a's
         // current_dh_pub bytes never show up in the encrypted
         // headers' raw representation.
-        let (mut a, mut b, _) = pair();
-        let _ = b; // drop unused warning
+        let (mut a, _b, _) = pair();
         let pub_bytes = a.current_dh_pub().as_bytes().to_vec();
         for _ in 0..5 {
             let w = a.encrypt(b"x", b"").unwrap();

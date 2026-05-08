@@ -893,7 +893,7 @@ fn state_sync_response_addressed_to_someone_else_is_ignored() {
     let invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,

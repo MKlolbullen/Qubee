@@ -10,6 +10,7 @@ pub mod storage;
 pub mod security;
 pub mod media_devices;
 pub mod crypto;
+pub mod sessions;
 
 // WebRTC-backed calling. Behind a feature flag because the in-tree
 // implementation hasn't been ported to webrtc 0.14 yet — see

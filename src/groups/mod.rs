@@ -1,5 +1,6 @@
 pub mod group_manager;
 pub mod group_crypto;
+pub mod sender_keys;
 pub mod group_permissions;
 pub mod group_events;
 pub mod group_invite;

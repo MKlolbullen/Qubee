@@ -146,7 +146,8 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use pqcrypto_mlkem::mlkem768;
 use pqcrypto_traits::kem::{
-    Ciphertext as _, SecretKey as KyberSecretKeyTrait, SharedSecret as _,
+    Ciphertext as _, PublicKey as KyberPublicKeyTrait, SecretKey as KyberSecretKeyTrait,
+    SharedSecret as _,
 };
 use rand::thread_rng;
 use secrecy::{ExposeSecret, SecretBox};
@@ -241,6 +242,16 @@ impl ChainKey {
             .map_err(|e| anyhow::anyhow!("hkdf expand (kyber-mix): {e}"))?;
         self.0 = SecretBox::new(Box::new(next));
         Ok(())
+    }
+
+    /// Internal-only: copy out the chain key bytes for the
+    /// keystore persistence path. Sibling to `duplicate` —
+    /// exposes the secret in cleartext, which is acceptable here
+    /// because the caller (`State::persist`) immediately hands
+    /// the bytes to `bincode::serialize`, and the bincode buffer
+    /// goes through the `SecureKeyStore` which encrypts at rest.
+    fn bytes(&self) -> [u8; KEY_LEN] {
+        *self.0.expose_secret()
     }
 }
 
@@ -966,6 +977,153 @@ impl DoubleRatchet {
         self.state.dh_self_pub
     }
 
+    /// Serialize the entire ratchet state to bytes for keystore
+    /// persistence. Round-trips through [`DoubleRatchet::restore`].
+    /// Wire format is bincode of a `Persisted` struct whose
+    /// field set is the contract.
+    ///
+    /// Cleartext key material crosses the boundary here — the
+    /// caller is expected to encrypt the resulting bytes before
+    /// landing them on disk (which is what
+    /// `SecureKeyStore::store_key` does).
+    pub fn persist(&self) -> Result<Vec<u8>> {
+        let mut skipped_entries: Vec<PersistedSkipEntry> =
+            Vec::with_capacity(self.skipped.len());
+        for (sk, key) in &self.skipped {
+            let bytes: [u8; KEY_LEN] = **key;
+            skipped_entries.push(PersistedSkipEntry {
+                dh_peer: sk.dh_peer,
+                counter: sk.counter,
+                msg_key: bytes,
+            });
+        }
+        // Sort so the bincode output is deterministic across
+        // serialisations of equivalent state — useful for tests
+        // and for keystore content-addressing if we ever wire it.
+        skipped_entries.sort_by(|a, b| {
+            a.dh_peer
+                .cmp(&b.dh_peer)
+                .then_with(|| a.counter.cmp(&b.counter))
+        });
+
+        let kyber = self.kyber.as_ref().map(|ks| {
+            let pq_pub = ks.config.peer_pub.as_bytes().to_vec();
+            let own_pub = ks.config.own_keypair.public.as_bytes().to_vec();
+            let own_secret = ks.config.own_keypair.secret_bytes.clone();
+            PersistedKyber {
+                peer_pub: pq_pub,
+                own_pub,
+                own_secret,
+            }
+        });
+
+        let persisted = Persisted {
+            root_key: *self.state.root_key.expose_secret(),
+            dh_self_priv: self.state.dh_self_priv.to_bytes(),
+            dh_self_pub: *self.state.dh_self_pub.as_bytes(),
+            dh_peer: self.state.dh_peer.map(|p| *p.as_bytes()),
+            send_chain: self.state.send_chain.as_ref().map(ChainKey::bytes),
+            recv_chain: self.state.recv_chain.as_ref().map(ChainKey::bytes),
+            send_counter: self.state.send_counter,
+            recv_counter: self.state.recv_counter,
+            prev_send_counter: self.state.prev_send_counter,
+            pending_kyber_send: self.state.pending_kyber_send,
+            hks: self
+                .state
+                .hks
+                .as_ref()
+                .map(|s| *s.expose_secret()),
+            hkr: self
+                .state
+                .hkr
+                .as_ref()
+                .map(|s| *s.expose_secret()),
+            nhks: *self.state.nhks.expose_secret(),
+            nhkr: *self.state.nhkr.expose_secret(),
+            skipped: skipped_entries,
+            kyber,
+        };
+        bincode::serialize(&persisted)
+            .map_err(|e| anyhow::anyhow!("double ratchet serialize: {e}"))
+    }
+
+    /// Restore a ratchet from bytes produced by
+    /// [`DoubleRatchet::persist`]. Validates the stash size cap
+    /// up-front so a tampered keystore blob can't drive memory
+    /// usage; rejects malformed Kyber bytes outright.
+    pub fn restore(bytes: &[u8]) -> Result<Self> {
+        let p: Persisted = bincode::deserialize(bytes)
+            .map_err(|e| anyhow::anyhow!("double ratchet deserialize: {e}"))?;
+
+        if p.skipped.len() > MAX_SKIPPED_STASH {
+            return Err(anyhow::anyhow!(
+                "persisted stash size {} exceeds MAX_SKIPPED_STASH {}",
+                p.skipped.len(),
+                MAX_SKIPPED_STASH
+            ));
+        }
+
+        let mut skipped: HashMap<SkipKey, Zeroizing<[u8; KEY_LEN]>> =
+            HashMap::with_capacity(p.skipped.len());
+        for entry in p.skipped {
+            skipped.insert(
+                SkipKey {
+                    dh_peer: entry.dh_peer,
+                    counter: entry.counter,
+                },
+                Zeroizing::new(entry.msg_key),
+            );
+        }
+
+        let kyber = match p.kyber {
+            Some(pk) => {
+                let peer_pub = mlkem768::PublicKey::from_bytes(&pk.peer_pub).map_err(|e| {
+                    anyhow::anyhow!("invalid persisted peer kyber pub: {e}")
+                })?;
+                let own_pub = mlkem768::PublicKey::from_bytes(&pk.own_pub).map_err(|e| {
+                    anyhow::anyhow!("invalid persisted own kyber pub: {e}")
+                })?;
+                // Validate own secret bytes parse correctly so a
+                // corrupted keystore blob fails fast rather than
+                // failing at first decap.
+                let _ = mlkem768::SecretKey::from_bytes(&pk.own_secret).map_err(|e| {
+                    anyhow::anyhow!("invalid persisted own kyber secret: {e}")
+                })?;
+                Some(KyberState {
+                    config: KyberConfig {
+                        peer_pub,
+                        own_keypair: KyberKeypair {
+                            public: own_pub,
+                            secret_bytes: pk.own_secret,
+                        },
+                    },
+                })
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            state: State {
+                root_key: SecretBox::new(Box::new(p.root_key)),
+                dh_self_priv: StaticSecret::from(p.dh_self_priv),
+                dh_self_pub: PublicKey::from(p.dh_self_pub),
+                dh_peer: p.dh_peer.map(PublicKey::from),
+                send_chain: p.send_chain.map(ChainKey::from_bytes),
+                recv_chain: p.recv_chain.map(ChainKey::from_bytes),
+                send_counter: p.send_counter,
+                recv_counter: p.recv_counter,
+                prev_send_counter: p.prev_send_counter,
+                pending_kyber_send: p.pending_kyber_send,
+                hks: p.hks.map(|b| SecretBox::new(Box::new(b))),
+                hkr: p.hkr.map(|b| SecretBox::new(Box::new(b))),
+                nhks: SecretBox::new(Box::new(p.nhks)),
+                nhkr: SecretBox::new(Box::new(p.nhkr)),
+            },
+            skipped,
+            kyber,
+        })
+    }
+
     fn stash_message_key(&mut self, k: SkipKey, v: Zeroizing<[u8; KEY_LEN]>) {
         if self.skipped.len() >= MAX_SKIPPED_STASH {
             // Evict the smallest-counter entry. Cross-epoch ties
@@ -978,6 +1136,50 @@ impl DoubleRatchet {
         }
         self.skipped.insert(k, v);
     }
+}
+
+/// On-disk representation of a [`DoubleRatchet`]. All fields are
+/// wire-friendly types (raw byte arrays, primitives, `Vec<u8>`)
+/// so bincode round-trips cleanly. Layout is the persistence
+/// contract — adding new fields means bumping a version
+/// somewhere, not silently changing the in-place struct.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Persisted {
+    root_key: [u8; KEY_LEN],
+    dh_self_priv: [u8; KEY_LEN],
+    dh_self_pub: [u8; KEY_LEN],
+    dh_peer: Option<[u8; KEY_LEN]>,
+    send_chain: Option<[u8; KEY_LEN]>,
+    recv_chain: Option<[u8; KEY_LEN]>,
+    send_counter: u32,
+    recv_counter: u32,
+    prev_send_counter: u32,
+    pending_kyber_send: bool,
+    hks: Option<[u8; KEY_LEN]>,
+    hkr: Option<[u8; KEY_LEN]>,
+    nhks: [u8; KEY_LEN],
+    nhkr: [u8; KEY_LEN],
+    skipped: Vec<PersistedSkipEntry>,
+    kyber: Option<PersistedKyber>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedSkipEntry {
+    dh_peer: [u8; KEY_LEN],
+    counter: u32,
+    msg_key: [u8; KEY_LEN],
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedKyber {
+    /// ML-KEM-768 public key bytes (1184).
+    peer_pub: Vec<u8>,
+    /// Our ML-KEM-768 public key bytes (1184) — kept alongside
+    /// the secret so [`KyberKeypair`] can be reconstructed
+    /// without re-deriving from the secret.
+    own_pub: Vec<u8>,
+    /// Our ML-KEM-768 secret key bytes (2400).
+    own_secret: Vec<u8>,
 }
 
 /// Signal-style `KDF_RK_HE`: derives `(new_root, chain_seed,
@@ -1286,6 +1488,125 @@ mod tests {
         // two peers.
         let final_a_w = a.encrypt(b"final", b"").unwrap();
         assert_eq!(b.decrypt(&final_a_w, b"").unwrap(), b"final");
+    }
+
+    #[test]
+    fn persist_restore_round_trip_x25519_only() {
+        let (mut a, mut b, _) = pair();
+
+        // Drive a few round-trips so both peers have non-trivial
+        // chain state, header keys promoted past initials, and
+        // counters > 0.
+        for i in 0..3 {
+            let m = format!("a{i}");
+            let w = a.encrypt(m.as_bytes(), b"").unwrap();
+            assert_eq!(b.decrypt(&w, b"").unwrap(), m.as_bytes());
+            let m = format!("b{i}");
+            let w = b.encrypt(m.as_bytes(), b"").unwrap();
+            assert_eq!(a.decrypt(&w, b"").unwrap(), m.as_bytes());
+        }
+
+        // Snapshot + restore both sides.
+        let a_bytes = a.persist().unwrap();
+        let b_bytes = b.persist().unwrap();
+        let mut a = DoubleRatchet::restore(&a_bytes).unwrap();
+        let mut b = DoubleRatchet::restore(&b_bytes).unwrap();
+
+        // Continue the conversation — all of:
+        //  * counters resume from where they were
+        //  * header keys still match (HKs/HKr/NHKs/NHKr all roundtripped)
+        //  * chain keys still match (send/recv chain keys roundtripped)
+        //  * DH state still matches (so no spurious DH ratchet step
+        //    fires on the next message)
+        // are required for these decrypts to succeed.
+        let w = a.encrypt(b"after-restore from a", b"").unwrap();
+        assert_eq!(b.decrypt(&w, b"").unwrap(), b"after-restore from a");
+        let w = b.encrypt(b"after-restore from b", b"").unwrap();
+        assert_eq!(a.decrypt(&w, b"").unwrap(), b"after-restore from b");
+    }
+
+    #[test]
+    fn persist_restore_preserves_skip_stash() {
+        let (mut a, mut b, _) = pair();
+
+        // Send three frames, deliver out of order so b's stash
+        // holds two entries.
+        let w0 = a.encrypt(b"m0", b"").unwrap();
+        let w1 = a.encrypt(b"m1", b"").unwrap();
+        let w2 = a.encrypt(b"m2", b"").unwrap();
+        assert_eq!(b.decrypt(&w2, b"").unwrap(), b"m2");
+        assert_eq!(b.skipped_stash_len(), 2);
+
+        // Persist + restore b.
+        let b_bytes = b.persist().unwrap();
+        let mut b = DoubleRatchet::restore(&b_bytes).unwrap();
+        assert_eq!(b.skipped_stash_len(), 2);
+
+        // Late deliveries decrypt cleanly via the restored stash.
+        assert_eq!(b.decrypt(&w0, b"").unwrap(), b"m0");
+        assert_eq!(b.decrypt(&w1, b"").unwrap(), b"m1");
+        assert_eq!(b.skipped_stash_len(), 0);
+    }
+
+    #[test]
+    fn persist_restore_round_trip_hybrid() {
+        let (mut a, mut b, _) = hybrid_pair();
+        // Drive direction changes so kyber re-encap fires both ways.
+        for i in 0..3 {
+            let m = format!("a{i}");
+            let w = a.encrypt(m.as_bytes(), b"").unwrap();
+            assert_eq!(b.decrypt(&w, b"").unwrap(), m.as_bytes());
+            let m = format!("b{i}");
+            let w = b.encrypt(m.as_bytes(), b"").unwrap();
+            assert_eq!(a.decrypt(&w, b"").unwrap(), m.as_bytes());
+        }
+        // Snapshot + restore.
+        let a_bytes = a.persist().unwrap();
+        let b_bytes = b.persist().unwrap();
+        let mut a = DoubleRatchet::restore(&a_bytes).unwrap();
+        let mut b = DoubleRatchet::restore(&b_bytes).unwrap();
+        // Continue — including a kyber-re-encap-bearing frame
+        // (b's first send after restore is on a fresh send chain
+        // post-DH-ratchet, so kyber fires).
+        let w = a.encrypt(b"after-restore", b"").unwrap();
+        assert_eq!(b.decrypt(&w, b"").unwrap(), b"after-restore");
+        let w = b.encrypt(b"after-restore-reply", b"").unwrap();
+        assert_eq!(a.decrypt(&w, b"").unwrap(), b"after-restore-reply");
+    }
+
+    #[test]
+    fn restore_rejects_oversized_stash() {
+        // Hand-craft a Persisted with too many stash entries.
+        // Defends against keystore corruption / malicious blob.
+        let mut over: Vec<PersistedSkipEntry> =
+            Vec::with_capacity(MAX_SKIPPED_STASH + 1);
+        for i in 0..(MAX_SKIPPED_STASH + 1) {
+            over.push(PersistedSkipEntry {
+                dh_peer: [0u8; KEY_LEN],
+                counter: i as u32,
+                msg_key: [0u8; KEY_LEN],
+            });
+        }
+        let p = Persisted {
+            root_key: [0u8; KEY_LEN],
+            dh_self_priv: [0u8; KEY_LEN],
+            dh_self_pub: [0u8; KEY_LEN],
+            dh_peer: None,
+            send_chain: None,
+            recv_chain: None,
+            send_counter: 0,
+            recv_counter: 0,
+            prev_send_counter: 0,
+            pending_kyber_send: false,
+            hks: None,
+            hkr: None,
+            nhks: [0u8; KEY_LEN],
+            nhkr: [0u8; KEY_LEN],
+            skipped: over,
+            kyber: None,
+        };
+        let bytes = bincode::serialize(&p).unwrap();
+        assert!(DoubleRatchet::restore(&bytes).is_err());
     }
 
     #[test]

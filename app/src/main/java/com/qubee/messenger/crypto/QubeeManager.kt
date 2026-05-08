@@ -590,6 +590,73 @@ class QubeeManager @Inject constructor(
         nativeListAcceptedInvites()
     }
 
+    // ----------------------------------------------------------------------
+    // 1:1 DM session surface
+    //
+    // Pairwise Double Ratchet sessions, persisted into the same
+    // keystore as the active identity. The handshake that produces
+    // `rootKey` and the peer's `peerInitialDhPub` lives outside this
+    // class today (see Roadmap → "X3DH-style pairwise handshake"
+    // in README.md); the four methods below are the wire layer
+    // once those bytes have been negotiated.
+    // ----------------------------------------------------------------------
+
+    /**
+     * Open a new initiator-side DM session against [peerIdHex].
+     * `rootKey` and `peerInitialDhPub` come from a pairwise
+     * handshake (X3DH-style) that's done out-of-band of this class.
+     * Returns true on success, false on any failure (already-open
+     * session, malformed inputs, keystore unavailable).
+     */
+    suspend fun openDmInitiatorSession(
+        peerIdHex: String,
+        rootKey: ByteArray,
+        peerInitialDhPub: ByteArray,
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        nativeOpenDmInitiatorSession(peerIdHex, rootKey, peerInitialDhPub)
+    }
+
+    /**
+     * Open a new responder-side DM session against [peerIdHex].
+     * `ownInitialDhPriv` is the X25519 private key whose public was
+     * advertised in our own prekey bundle.
+     */
+    suspend fun openDmResponderSession(
+        peerIdHex: String,
+        rootKey: ByteArray,
+        ownInitialDhPriv: ByteArray,
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        nativeOpenDmResponderSession(peerIdHex, rootKey, ownInitialDhPriv)
+    }
+
+    /** True if a DM session is open for [peerIdHex]. */
+    suspend fun hasDmSession(peerIdHex: String): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        nativeHasDmSession(peerIdHex)
+    }
+
+    /** Encrypt a plaintext message to [peerIdHex] and return the wire frame. */
+    suspend fun encryptDm(peerIdHex: String, plaintext: ByteArray): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            nativeEncryptDm(peerIdHex, plaintext)
+        }
+
+    /** Decrypt a wire frame received from [peerIdHex]. */
+    suspend fun decryptDm(peerIdHex: String, wire: ByteArray): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            nativeDecryptDm(peerIdHex, wire)
+        }
+
+    /** Drop a session from memory and the keystore. */
+    suspend fun dropDmSession(peerIdHex: String): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        nativeDropDmSession(peerIdHex)
+    }
+
     private external fun nativeSetKeystorePassword(password: String): Boolean
     private external fun nativeRegisterVideoInputs(devicesJson: String): Boolean
     private external fun nativeInitialize(dataDir: String): Boolean
@@ -643,6 +710,25 @@ class QubeeManager @Inject constructor(
         plaintext: ByteArray,
     ): String?
     private external fun nativeResetIdentity(dataDir: String): Boolean
+
+    // 1:1 DM session JNI surface — implemented in
+    // src/jni_api.rs alongside the corresponding `nativeOpenDm…`
+    // / `nativeEncryptDm` / `nativeDecryptDm` exports. Wire format
+    // is documented in src/crypto/double_ratchet.rs.
+    private external fun nativeOpenDmInitiatorSession(
+        peerIdHex: String,
+        rootKey: ByteArray,
+        peerInitialDhPub: ByteArray,
+    ): Boolean
+    private external fun nativeOpenDmResponderSession(
+        peerIdHex: String,
+        rootKey: ByteArray,
+        ownInitialDhPriv: ByteArray,
+    ): Boolean
+    private external fun nativeHasDmSession(peerIdHex: String): Boolean
+    private external fun nativeEncryptDm(peerIdHex: String, plaintext: ByteArray): ByteArray?
+    private external fun nativeDecryptDm(peerIdHex: String, wire: ByteArray): ByteArray?
+    private external fun nativeDropDmSession(peerIdHex: String): Boolean
 
     external fun nativeCleanup()
 

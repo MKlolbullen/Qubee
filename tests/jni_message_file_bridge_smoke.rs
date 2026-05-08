@@ -207,6 +207,12 @@ fn android_jni_message_file_symbols_are_present() {
         "nativeDecryptFile",
         "nativeSetKeystorePassword",
         "nativeRegisterVideoInputs",
+        "nativeOpenDmInitiatorSession",
+        "nativeOpenDmResponderSession",
+        "nativeHasDmSession",
+        "nativeEncryptDm",
+        "nativeDecryptDm",
+        "nativeDropDmSession",
     ] {
         assert!(
             kotlin.contains(&format!("external fun {symbol}")),

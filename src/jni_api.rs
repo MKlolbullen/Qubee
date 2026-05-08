@@ -32,6 +32,7 @@ use crate::groups::handshake_handlers::{
     HandshakeOutcome,
 };
 use crate::media_devices::{parse_video_inputs_json, set_video_inputs};
+use crate::sessions::SessionManager;
 use crate::storage::secure_keystore::{
     set_master_password, KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
 };
@@ -74,6 +75,14 @@ lazy_static! {
     // keep group state separate from the identity record so the two
     // can be reset independently (e.g. "wipe my groups but keep me").
     static ref GROUP_MANAGER: Mutex<Option<GroupManager>> = Mutex::new(None);
+
+    // 1:1 DM SessionManager — pairwise Double Ratchet sessions per
+    // peer IdentityId. State (chain keys, header keys, skipped-key
+    // stash, optional Kyber config) is persisted into the identity
+    // keystore on every encrypt/decrypt step and restored from disk
+    // on `nativeInitialize` so peers can resume conversations
+    // across process restart.
+    static ref SESSION_MANAGER: Mutex<SessionManager> = Mutex::new(SessionManager::new());
 
     // Ephemeral Kyber-768 secrets the joiner generated when sending a
     // RequestJoin, indexed by invitation_code. Lives only in process
@@ -294,6 +303,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
         // succeed without the caller having to do anything special, and
         // primes the in-memory cache for subsequent signing.
         let _ = load_identity_from_keystore();
+
+        // Restore any persisted DM sessions from the identity
+        // keystore. Lives alongside the identity record (rather
+        // than the groups keystore) because sessions are
+        // pairwise — they belong to *me* talking to peers, not to
+        // any specific group's lifetime.
+        {
+            let mut ks = KEYSTORE.lock().unwrap();
+            if let Some(ks) = ks.as_mut() {
+                let mut sm = SESSION_MANAGER.lock().unwrap();
+                let _ = sm.load_from_keystore(ks);
+            }
+        }
 
         *init = true;
         Ok(())
@@ -1425,6 +1447,244 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListAc
     })
 }
 
+// ---------------------------------------------------------------------------
+// 1:1 DM session surface
+//
+// Sessions are looked up / managed by peer IdentityId hex string.
+// All four entry points require the keystore to be initialised
+// (i.e. `nativeInitialize` has run); without that there's no place
+// to persist chain state and the session would silently desync on
+// process restart. Returns 0 / null on any failure so the Kotlin
+// side can surface as a generic "couldn't open session" without
+// each call site duplicating the error mapping.
+// ---------------------------------------------------------------------------
+
+fn parse_identity_id_hex(env: &mut JNIEnv, id_hex: JString) -> anyhow::Result<IdentityId> {
+    let s: String = env
+        .get_string(&id_hex)
+        .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+        .into();
+    let bytes = parse_hex32(Some(s.as_str()))?;
+    Ok(IdentityId::from(bytes))
+}
+
+/// Open a new initiator-side DM session against `peer_id_hex`.
+/// Caller has done the X3DH-style handshake out-of-band and
+/// produced the 32-byte `root_key` plus the peer's published
+/// initial DH public key (32 bytes).
+///
+/// Returns 1 on success, 0 on any failure (already-open session,
+/// malformed inputs, keystore unavailable, etc.).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOpenDmInitiatorSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    root_key: JByteArray,
+    peer_initial_dh_pub: JByteArray,
+) -> jboolean {
+    let result = jni_catch_or(|| -> anyhow::Result<()> {
+        let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
+        let root_bytes = env
+            .convert_byte_array(&root_key)
+            .map_err(|e| anyhow::anyhow!("invalid root_key: {e}"))?;
+        if root_bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "root_key must be 32 bytes; got {}", root_bytes.len()
+            ));
+        }
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&root_bytes);
+
+        let dh_bytes = env
+            .convert_byte_array(&peer_initial_dh_pub)
+            .map_err(|e| anyhow::anyhow!("invalid peer_initial_dh_pub: {e}"))?;
+        if dh_bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "peer_initial_dh_pub must be 32 bytes; got {}", dh_bytes.len()
+            ));
+        }
+        let mut dh_arr = [0u8; 32];
+        dh_arr.copy_from_slice(&dh_bytes);
+        let peer_dh = x25519_dalek::PublicKey::from(dh_arr);
+
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        let mut sm = SESSION_MANAGER.lock().unwrap();
+        sm.establish_initiator_persistent(ks, peer_id, &root_arr, peer_dh)?;
+        Ok(())
+    });
+    if result.is_err() {
+        eprintln!("Rust: nativeOpenDmInitiatorSession failed");
+        return 0;
+    }
+    1
+}
+
+/// Open a new responder-side DM session. `own_initial_dh_priv`
+/// is the 32-byte X25519 private key whose public was advertised
+/// in our own prekey bundle (i.e. what the peer initiator has
+/// already DH'd against).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOpenDmResponderSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    root_key: JByteArray,
+    own_initial_dh_priv: JByteArray,
+) -> jboolean {
+    let result = jni_catch_or(|| -> anyhow::Result<()> {
+        let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
+        let root_bytes = env
+            .convert_byte_array(&root_key)
+            .map_err(|e| anyhow::anyhow!("invalid root_key: {e}"))?;
+        if root_bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "root_key must be 32 bytes; got {}", root_bytes.len()
+            ));
+        }
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&root_bytes);
+
+        let priv_bytes = env
+            .convert_byte_array(&own_initial_dh_priv)
+            .map_err(|e| anyhow::anyhow!("invalid own_initial_dh_priv: {e}"))?;
+        if priv_bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "own_initial_dh_priv must be 32 bytes; got {}", priv_bytes.len()
+            ));
+        }
+        let mut priv_arr = [0u8; 32];
+        priv_arr.copy_from_slice(&priv_bytes);
+        let own_dh = x25519_dalek::StaticSecret::from(priv_arr);
+
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        let mut sm = SESSION_MANAGER.lock().unwrap();
+        sm.establish_responder_persistent(ks, peer_id, &root_arr, own_dh)?;
+        Ok(())
+    });
+    if result.is_err() {
+        eprintln!("Rust: nativeOpenDmResponderSession failed");
+        return 0;
+    }
+    1
+}
+
+/// Encrypt a plaintext message to `peer_id_hex` against the
+/// open DM session. Wire bytes go back to Kotlin as a `byte[]`.
+/// Returns null on any failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptDm(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    plaintext: JByteArray,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
+            let pt = env
+                .convert_byte_array(&plaintext)
+                .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?;
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let mut sm = SESSION_MANAGER.lock().unwrap();
+            // AAD: peer id binds the AEAD ciphertext to the
+            // intended recipient, defending against a substitution
+            // attack that re-routes a frame to a different session.
+            let wire = sm.encrypt_persistent(ks, &peer_id, &pt, peer_id.as_ref())?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Decrypt a wire frame from `peer_id_hex` against the open DM
+/// session. Returns the plaintext bytes, or null on any failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptDm(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    wire: JByteArray,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
+            let wire_bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let mut sm = SESSION_MANAGER.lock().unwrap();
+            let pt =
+                sm.decrypt_persistent(ks, &peer_id, &wire_bytes, peer_id.as_ref())?;
+            let arr = env
+                .byte_array_from_slice(&pt)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Drop a DM session from memory and the keystore. Returns 1 if
+/// anything was deleted in either place, 0 otherwise.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDropDmSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+) -> jboolean {
+    let result = jni_catch_or(|| -> anyhow::Result<bool> {
+        let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        let mut sm = SESSION_MANAGER.lock().unwrap();
+        sm.drop_session_persistent(ks, &peer_id)
+    });
+    match result {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
+/// True if a DM session exists for `peer_id_hex` (either in
+/// memory after a `nativeOpen…` or persisted from a previous
+/// process). Lets the Kotlin side decide between "send via
+/// nativeEncryptDm" and "kick off a handshake first" without
+/// having to round-trip a probe encrypt.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHasDmSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+) -> jboolean {
+    let result = jni_catch_or(|| -> anyhow::Result<bool> {
+        let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
+        let sm = SESSION_MANAGER.lock().unwrap();
+        Ok(sm.has_session(&peer_id))
+    });
+    match result {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanup(
     _env: JNIEnv,
@@ -1433,6 +1693,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCleanu
     *ACTIVE_IDENTITY.lock().unwrap() = None;
     *KEYSTORE.lock().unwrap() = None;
     *GROUP_MANAGER.lock().unwrap() = None;
+    *SESSION_MANAGER.lock().unwrap() = SessionManager::new();
     *INITIALIZED.lock().unwrap() = false;
 }
 

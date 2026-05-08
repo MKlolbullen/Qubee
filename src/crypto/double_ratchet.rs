@@ -26,18 +26,21 @@
 //! # Wire format
 //!
 //! ```text
-//! +-----------------+--------------+----------+--------------+--------------------+
-//! | sender DH pub   | prev_n (u32) | n (u32)  | nonce (12B)  | AEAD ct + tag      |
-//! | 32 B            | BE           | BE       |              |                    |
-//! +-----------------+--------------+----------+--------------+--------------------+
+//! +---------------+--------+--------+----------+--------------+-------+--------------+
+//! | sender DH pub | prev_n | n      | kyb_len  | optional     | nonce | AEAD ct+tag  |
+//! | 32 B          | u32 BE | u32 BE | u16 BE   | kyber ct     | 12 B  |              |
+//! +---------------+--------+--------+----------+--------------+-------+--------------+
 //! ```
 //!
 //! `n` is the sender's counter inside the current DH epoch.
 //! `prev_n` is the number of messages they sent in the *previous*
 //! epoch — so the receiver knows how many keys to skip+stash from
-//! the old recv chain when they detect the DH change. The whole
-//! header is fed to ChaCha20-Poly1305 as AAD; tampering with any
-//! field invalidates the AEAD tag.
+//! the old recv chain when they detect the DH change.
+//! `kyb_len` is 0 in X25519-only mode and on most hybrid frames;
+//! when non-zero it's the byte length of the trailing ML-KEM
+//! ciphertext (1088 for ML-KEM-768). The whole header (including
+//! the kyber ciphertext when present) is fed to ChaCha20-Poly1305
+//! as AAD; tampering with any field invalidates the AEAD tag.
 //!
 //! # Threat model and known limits
 //!
@@ -56,10 +59,35 @@
 //!   back to `self`. A forged frame that names a fresh DH header
 //!   would otherwise advance the ratchet permanently and lose the
 //!   legitimate sender; the snapshot pattern prevents that.
-//! * **Not implemented**: per-message DH ratchet (we ratchet per
-//!   *epoch*, where an epoch starts on receipt of a new peer DH —
-//!   matches Signal's actual cadence, not the colloquial
-//!   "per-message"). ML-KEM re-encap layer (b2). Header encryption.
+//! * **Not implemented**: header encryption (Signal HEHE mode).
+//!   Per-message DH ratchet (we ratchet per *epoch* — every
+//!   direction change — matching Signal's actual cadence, not
+//!   the colloquial "per-message").
+//!
+//! # ML-KEM re-encap (hybrid mode)
+//!
+//! Opt-in via [`DoubleRatchet::initiator_hybrid`] /
+//! [`DoubleRatchet::responder_hybrid`] with a [`KyberConfig`]. Each
+//! peer holds a static ML-KEM-768 keypair plus the peer's public.
+//!
+//! **Cadence**: re-encap fires on the first outgoing frame after
+//! every DH ratchet step (initiator construction; responder's
+//! first frame after receiving; either side's first frame after
+//! a peer-initiated DH change). This is the same cadence as the
+//! DH ratchet itself — each direction change carries a fresh
+//! Kyber ciphertext that mixes into the new send chain. We
+//! deliberately **don't** re-encap on a per-message counter
+//! cadence: that would break under out-of-order delivery (a
+//! kyber-bearing frame stashed for later can't be replayed
+//! because the chain at that counter has moved on without the
+//! kyber input). Aligning to DH-ratchet boundaries keeps kyber
+//! on first-of-epoch frames, where in-order delivery is implicit.
+//!
+//! Threat model addition: a future adversary who breaks X25519
+//! (e.g. CRQC) can recover the DH ratchet halves but not the
+//! ML-KEM contributions, so any chain key that's been re-encapped
+//! at least once stays opaque to them. Forward secrecy is
+//! unchanged.
 
 use anyhow::{Context, Result};
 use chacha20poly1305::{
@@ -67,6 +95,10 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
+use pqcrypto_mlkem::mlkem768;
+use pqcrypto_traits::kem::{
+    Ciphertext as _, SecretKey as KyberSecretKeyTrait, SharedSecret as _,
+};
 use rand::thread_rng;
 use secrecy::{ExposeSecret, SecretBox};
 use sha2::Sha256;
@@ -78,9 +110,16 @@ use crate::security::secure_rng;
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-const HEADER_LEN: usize = 32 + 4 + 4;
+/// Fixed-size header prefix: dh_pub(32) + prev_n(4) + n(4) +
+/// kyber_ct_len(2). The optional kyber ciphertext follows
+/// immediately after the prefix.
+const HEADER_PREFIX_LEN: usize = 32 + 4 + 4 + 2;
 const TAG_LEN: usize = 16;
-const MIN_FRAME_LEN: usize = HEADER_LEN + NONCE_LEN + TAG_LEN;
+/// Minimum well-formed frame: header prefix (no kyber ct) + nonce
+/// + AEAD tag. Empty plaintext is permitted.
+const MIN_FRAME_LEN: usize = HEADER_PREFIX_LEN + NONCE_LEN + TAG_LEN;
+/// ML-KEM-768 ciphertext length, fixed by the algorithm.
+const MLKEM768_CT_LEN: usize = 1088;
 
 /// Cap on per-frame skip inside a single DH epoch's recv chain.
 /// Same intent as the chain ratchet's MAX_SKIP — bounds attacker-
@@ -99,6 +138,12 @@ pub const MAX_SKIPPED_STASH: usize = 4096;
 const INFO_RK: &[u8] = b"qubee/dr/v1/rk";
 const INFO_CHAIN_NEXT: &[u8] = b"qubee/dr/v1/chain/next";
 const INFO_MESSAGE: &[u8] = b"qubee/dr/v1/chain/msg";
+/// HKDF tag for the Kyber-mix step: chain_key' =
+/// HKDF(salt = kyber_ss, ikm = chain_key, info = INFO_KYBER_MIX).
+/// Salt being the post-quantum half ensures both inputs are
+/// required to reconstruct chain_key' — even an X25519-only
+/// adversary who knows chain_key can't predict chain_key'.
+const INFO_KYBER_MIX: &[u8] = b"qubee/dr/v1/chain/kyber-mix";
 
 struct ChainKey(SecretBox<[u8; KEY_LEN]>);
 
@@ -128,6 +173,70 @@ impl ChainKey {
     fn duplicate(&self) -> Self {
         Self(SecretBox::new(Box::new(*self.0.expose_secret())))
     }
+
+    /// Stir an external 32-byte secret into the chain key. Used
+    /// by the ML-KEM re-encap path: the post-quantum shared
+    /// secret becomes the HKDF salt and the current chain key the
+    /// IKM, so reconstructing the new chain requires both inputs.
+    fn mix_in(&mut self, additional_secret: &[u8]) -> Result<()> {
+        let current = self.0.expose_secret();
+        let mut next = [0u8; KEY_LEN];
+        Hkdf::<Sha256>::new(Some(additional_secret), current)
+            .expand(INFO_KYBER_MIX, &mut next)
+            .map_err(|e| anyhow::anyhow!("hkdf expand (kyber-mix): {e}"))?;
+        self.0 = SecretBox::new(Box::new(next));
+        Ok(())
+    }
+}
+
+/// Static ML-KEM-768 keypair plus a cached public-half copy. The
+/// secret is held as raw bytes because pqcrypto_mlkem's
+/// `SecretKey` is neither `Clone` nor zeroize-on-drop in the way
+/// the snapshot pattern needs; a `Vec<u8>` is straightforward to
+/// snapshot and is wiped via `Zeroizing` everywhere it crosses
+/// process memory.
+#[derive(Clone)]
+pub struct KyberKeypair {
+    public: mlkem768::PublicKey,
+    /// ML-KEM-768 secret key bytes (2400 bytes per FIPS 203).
+    secret_bytes: Vec<u8>,
+}
+
+impl KyberKeypair {
+    /// Generate a fresh keypair via the underlying KEM.
+    pub fn generate() -> Self {
+        let (public, secret) = mlkem768::keypair();
+        Self {
+            public,
+            secret_bytes: secret.as_bytes().to_vec(),
+        }
+    }
+
+    /// The public half — what the *peer* needs to encapsulate
+    /// against this keypair.
+    pub fn public(&self) -> mlkem768::PublicKey {
+        self.public
+    }
+}
+
+/// Configuration for hybrid (ML-KEM-augmented) mode. The cadence
+/// is fixed (one re-encap per DH ratchet step on each direction)
+/// so there's no `period` knob — see the module-level docs for
+/// why per-counter cadence breaks under out-of-order delivery.
+pub struct KyberConfig {
+    /// Peer's ML-KEM public key — what we encapsulate against
+    /// when we send a re-encap frame.
+    pub peer_pub: mlkem768::PublicKey,
+    /// Our keypair — used to decapsulate the peer's incoming
+    /// re-encap ciphertexts.
+    pub own_keypair: KyberKeypair,
+}
+
+/// Hybrid-mode bookkeeping. Lives on `DoubleRatchet` rather than
+/// on `State` because the only mutable bit (`pending_send`) is
+/// part of the snapshotable State (see there).
+struct KyberState {
+    config: KyberConfig,
 }
 
 /// Mutable state of a [`DoubleRatchet`]. Lifted into its own struct
@@ -144,6 +253,11 @@ struct State {
     send_counter: u32,
     recv_counter: u32,
     prev_send_counter: u32,
+    /// Hybrid-mode flag: set true whenever a fresh send chain
+    /// has been derived (initiator construction, or after a DH
+    /// ratchet step in `decrypt`). Cleared by `encrypt` after
+    /// firing a Kyber re-encap. Always false in non-hybrid mode.
+    pending_kyber_send: bool,
 }
 
 impl State {
@@ -162,6 +276,7 @@ impl State {
             send_counter: self.send_counter,
             recv_counter: self.recv_counter,
             prev_send_counter: self.prev_send_counter,
+            pending_kyber_send: self.pending_kyber_send,
         }
     }
 }
@@ -175,11 +290,13 @@ struct SkipKey {
     counter: u32,
 }
 
-/// Hybrid Double Ratchet (X25519 DH ratchet + chain ratchet).
-/// See the module-level docs for the threat model.
+/// Hybrid Double Ratchet (X25519 DH ratchet + chain ratchet,
+/// optionally augmented with ML-KEM-768 re-encap for post-quantum
+/// PCS). See the module-level docs for the threat model.
 pub struct DoubleRatchet {
     state: State,
     skipped: HashMap<SkipKey, Zeroizing<[u8; KEY_LEN]>>,
+    kyber: Option<KyberState>,
 }
 
 impl DoubleRatchet {
@@ -189,10 +306,34 @@ impl DoubleRatchet {
     /// Generates the initiator's first ratchet keypair and seeds
     /// the send chain by running DH against the peer's pub.
     pub fn initiator(root_key: &[u8; KEY_LEN], peer_initial_dh_pub: PublicKey) -> Result<Self> {
+        Self::initiator_inner(root_key, peer_initial_dh_pub, None)
+    }
+
+    /// Hybrid-mode initiator. Same semantics as [`initiator`],
+    /// plus periodic ML-KEM-768 re-encap as configured.
+    pub fn initiator_hybrid(
+        root_key: &[u8; KEY_LEN],
+        peer_initial_dh_pub: PublicKey,
+        kyber: KyberConfig,
+    ) -> Result<Self> {
+        Self::initiator_inner(root_key, peer_initial_dh_pub, Some(kyber))
+    }
+
+    fn initiator_inner(
+        root_key: &[u8; KEY_LEN],
+        peer_initial_dh_pub: PublicKey,
+        kyber: Option<KyberConfig>,
+    ) -> Result<Self> {
         let dh_self_priv = StaticSecret::random_from_rng(thread_rng());
         let dh_self_pub = PublicKey::from(&dh_self_priv);
         let shared = dh_self_priv.diffie_hellman(&peer_initial_dh_pub);
         let (new_root, send_chain_key) = kdf_rk(root_key, shared.as_bytes())?;
+
+        // Hybrid mode: the initiator has just derived a fresh send
+        // chain via DH ratchet, so the next encrypt should fire a
+        // Kyber re-encap and mix the result into that chain before
+        // the first message goes out.
+        let pending_kyber_send = kyber.is_some();
 
         Ok(Self {
             state: State {
@@ -205,8 +346,10 @@ impl DoubleRatchet {
                 send_counter: 0,
                 recv_counter: 0,
                 prev_send_counter: 0,
+                pending_kyber_send,
             },
             skipped: HashMap::new(),
+            kyber: kyber.map(|config| KyberState { config }),
         })
     }
 
@@ -217,6 +360,24 @@ impl DoubleRatchet {
     /// Send chain isn't ready until the first incoming message
     /// triggers a DH ratchet step.
     pub fn responder(root_key: &[u8; KEY_LEN], own_initial_keypair: StaticSecret) -> Result<Self> {
+        Self::responder_inner(root_key, own_initial_keypair, None)
+    }
+
+    /// Hybrid-mode responder. Same semantics as [`responder`],
+    /// plus periodic ML-KEM-768 re-encap as configured.
+    pub fn responder_hybrid(
+        root_key: &[u8; KEY_LEN],
+        own_initial_keypair: StaticSecret,
+        kyber: KyberConfig,
+    ) -> Result<Self> {
+        Self::responder_inner(root_key, own_initial_keypair, Some(kyber))
+    }
+
+    fn responder_inner(
+        root_key: &[u8; KEY_LEN],
+        own_initial_keypair: StaticSecret,
+        kyber: Option<KyberConfig>,
+    ) -> Result<Self> {
         let dh_self_pub = PublicKey::from(&own_initial_keypair);
         Ok(Self {
             state: State {
@@ -229,18 +390,49 @@ impl DoubleRatchet {
                 send_counter: 0,
                 recv_counter: 0,
                 prev_send_counter: 0,
+                // Responder has no send chain yet; pending flag
+                // gets set inside `decrypt` after the DH ratchet
+                // step that produces one.
+                pending_kyber_send: false,
             },
             skipped: HashMap::new(),
+            kyber: kyber.map(|config| KyberState { config }),
         })
     }
 
-    /// Encrypt a message in the current epoch.
+    /// Encrypt a message in the current epoch. In hybrid mode,
+    /// fires an ML-KEM re-encap on the first outgoing frame after
+    /// every DH ratchet step and includes the resulting
+    /// ciphertext in the header.
     ///
     /// Errors if called on the responder before they've received
     /// the initiator's first message — the responder has no send
     /// chain until the first incoming frame triggers the DH
     /// ratchet step that derives one.
     pub fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        // Hybrid-mode re-encap: stir a fresh ML-KEM shared secret
+        // into the send chain *before* deriving this message's
+        // key, so the post-quantum entropy lands on the message
+        // we're about to send. Fires only on the first frame
+        // after a fresh send chain (initiator construction or
+        // post-DH-ratchet-step on receive).
+        let kyber_ct_bytes: Vec<u8> = if self.state.pending_kyber_send {
+            let kyber = self.kyber.as_ref().expect(
+                "pending_kyber_send true ⇒ hybrid mode (config invariant)",
+            );
+            let send_chain = self.state.send_chain.as_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no send chain: responder must receive the first message before re-encap"
+                )
+            })?;
+            let (shared_secret, ct) = mlkem768::encapsulate(&kyber.config.peer_pub);
+            send_chain.mix_in(shared_secret.as_bytes())?;
+            self.state.pending_kyber_send = false;
+            ct.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+
         let send_chain = self
             .state
             .send_chain
@@ -252,10 +444,18 @@ impl DoubleRatchet {
         let msg_key = send_chain.step()?;
         let nonce_bytes = secure_rng::random::array::<NONCE_LEN>()?;
 
-        let mut header = Vec::with_capacity(HEADER_LEN);
+        // Bound check: ML-KEM ct length must fit a u16. Always
+        // true for ML-KEM-768 (1088 bytes) but defends against a
+        // future algorithm bump that doesn't.
+        let kyber_ct_len = u16::try_from(kyber_ct_bytes.len())
+            .map_err(|_| anyhow::anyhow!("kyber ct length exceeds u16"))?;
+
+        let mut header = Vec::with_capacity(HEADER_PREFIX_LEN + kyber_ct_bytes.len());
         header.extend_from_slice(self.state.dh_self_pub.as_bytes());
         header.extend_from_slice(&self.state.prev_send_counter.to_be_bytes());
         header.extend_from_slice(&counter.to_be_bytes());
+        header.extend_from_slice(&kyber_ct_len.to_be_bytes());
+        header.extend_from_slice(&kyber_ct_bytes);
 
         let bound_aad = bind_aad(&header, aad);
 
@@ -271,7 +471,7 @@ impl DoubleRatchet {
             .checked_add(1)
             .context("send counter overflow — re-handshake required")?;
 
-        let mut wire = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ct.len());
+        let mut wire = Vec::with_capacity(header.len() + NONCE_LEN + ct.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&nonce_bytes);
         wire.extend_from_slice(&ct);
@@ -301,21 +501,43 @@ impl DoubleRatchet {
             return Err(anyhow::anyhow!("wire frame too short: {} bytes", wire.len()));
         }
 
-        let header = &wire[..HEADER_LEN];
-        let header_dh_bytes: [u8; KEY_LEN] = header[..32].try_into().expect("len");
+        let prefix = &wire[..HEADER_PREFIX_LEN];
+        let header_dh_bytes: [u8; KEY_LEN] = prefix[..32].try_into().expect("len");
         let header_dh = PublicKey::from(header_dh_bytes);
-        let prev_n = u32::from_be_bytes(header[32..36].try_into().expect("len"));
-        let counter = u32::from_be_bytes(header[36..40].try_into().expect("len"));
+        let prev_n = u32::from_be_bytes(prefix[32..36].try_into().expect("len"));
+        let counter = u32::from_be_bytes(prefix[36..40].try_into().expect("len"));
+        let kyber_ct_len = u16::from_be_bytes(prefix[40..42].try_into().expect("len")) as usize;
 
-        let nonce = Nonce::from_slice(&wire[HEADER_LEN..HEADER_LEN + NONCE_LEN]);
-        let ct = &wire[HEADER_LEN + NONCE_LEN..];
+        let header_total_len = HEADER_PREFIX_LEN + kyber_ct_len;
+        if wire.len() < header_total_len + NONCE_LEN + TAG_LEN {
+            return Err(anyhow::anyhow!(
+                "wire frame too short for declared kyber_ct_len={kyber_ct_len}: {} bytes",
+                wire.len(),
+            ));
+        }
+        let kyber_ct_bytes = &wire[HEADER_PREFIX_LEN..header_total_len];
 
+        let nonce = Nonce::from_slice(&wire[header_total_len..header_total_len + NONCE_LEN]);
+        let ct = &wire[header_total_len + NONCE_LEN..];
+
+        // Header for AAD purposes covers everything before the
+        // nonce — including the optional kyber ciphertext, so a
+        // downgrade-or-tamper attack on `kyber_ct_len` breaks AEAD.
+        let header = &wire[..header_total_len];
         let bound_aad = bind_aad(header, aad);
 
-        // Stash hit path: cheap, no state mutation. On AEAD failure
-        // we put the key back so a clean retry isn't locked out.
+        // Stash hit path: cheap, no state mutation. Stashed keys
+        // are by definition pre-derived, so a kyber_ct on a
+        // stash-hit frame is meaningless — reject it as a
+        // mis-routed frame rather than silently ignoring.
         let stash_lookup = SkipKey { dh_peer: header_dh_bytes, counter };
         if let Some(key) = self.skipped.remove(&stash_lookup) {
+            if kyber_ct_len > 0 {
+                self.skipped.insert(stash_lookup, key);
+                return Err(anyhow::anyhow!(
+                    "kyber_ct present on a stash-hit frame; expected only on fresh-epoch frames"
+                ));
+            }
             let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).expect("32-byte key");
             return match cipher.decrypt(nonce, Payload { msg: ct, aad: &bound_aad }) {
                 Ok(pt) => Ok(pt),
@@ -335,6 +557,35 @@ impl DoubleRatchet {
             None => true,
             Some(prev) => prev.as_bytes() != &header_dh_bytes,
         };
+
+        // Validate hybrid-mode invariants: kyber_ct is present iff
+        // (we're hybrid AND this frame triggers a DH ratchet step).
+        // Catches downgrade attempts and protocol confusion before
+        // we touch any chain state.
+        let hybrid = self.kyber.is_some();
+        match (kyber_ct_len, triggers_dh, hybrid) {
+            (0, true, true) => {
+                return Err(anyhow::anyhow!(
+                    "fresh-epoch frame missing kyber_ct (peer in non-hybrid mode? downgrade?)"
+                ));
+            }
+            (n, false, _) if n > 0 => {
+                return Err(anyhow::anyhow!(
+                    "kyber_ct on non-epoch-boundary frame: {n} bytes"
+                ));
+            }
+            (n, _, false) if n > 0 => {
+                return Err(anyhow::anyhow!(
+                    "kyber_ct from peer but local config is non-hybrid: {n} bytes"
+                ));
+            }
+            (n, _, true) if n > 0 && n != MLKEM768_CT_LEN => {
+                return Err(anyhow::anyhow!(
+                    "wrong kyber ct length {n}; expected {MLKEM768_CT_LEN}"
+                ));
+            }
+            _ => {}
+        }
 
         if triggers_dh {
             // Skip + stash any remaining keys in the old recv
@@ -374,13 +625,36 @@ impl DoubleRatchet {
                 shared_recv.as_bytes(),
             )?;
             working.root_key = SecretBox::new(Box::new(new_root));
-            working.recv_chain = Some(ChainKey::from_bytes(recv_chain_key));
+            let mut new_recv_chain = ChainKey::from_bytes(recv_chain_key);
+
+            // Hybrid mode: decapsulate the peer's kyber ciphertext
+            // with our own ML-KEM secret key and stir the shared
+            // secret into the freshly-derived recv chain. AEAD
+            // failure on the message that follows rolls this back
+            // along with everything else (working state isn't
+            // committed).
+            if kyber_ct_len > 0 {
+                let kyber = self.kyber.as_ref().expect(
+                    "kyber_ct_len > 0 already validated to imply hybrid mode",
+                );
+                let ct = mlkem768::Ciphertext::from_bytes(kyber_ct_bytes).map_err(|e| {
+                    anyhow::anyhow!("invalid ML-KEM ciphertext: {e}")
+                })?;
+                let sk = mlkem768::SecretKey::from_bytes(&kyber.config.own_keypair.secret_bytes)
+                    .map_err(|e| anyhow::anyhow!("invalid stored ML-KEM sk: {e}"))?;
+                let shared = mlkem768::decapsulate(&ct, &sk);
+                new_recv_chain.mix_in(shared.as_bytes())?;
+            }
+
+            working.recv_chain = Some(new_recv_chain);
             working.dh_peer = Some(header_dh);
             working.recv_counter = 0;
 
             // Generate fresh send keypair and DH against the same
             // header_dh → new root + send chain. The send keypair
             // is what we'll publish in our next outgoing header.
+            // pending_kyber_send=true so the next encrypt fires
+            // its own re-encap into this newly-derived send chain.
             let new_priv = StaticSecret::random_from_rng(thread_rng());
             let new_pub = PublicKey::from(&new_priv);
             let shared_send = new_priv.diffie_hellman(&header_dh);
@@ -394,6 +668,7 @@ impl DoubleRatchet {
             working.send_chain = Some(ChainKey::from_bytes(send_chain_key));
             working.prev_send_counter = working.send_counter;
             working.send_counter = 0;
+            working.pending_kyber_send = hybrid;
         }
 
         // Now in the current epoch: skip + step recv chain to
@@ -695,5 +970,194 @@ mod tests {
         let (_a, mut b, _) = pair();
         let too_short = vec![0u8; MIN_FRAME_LEN - 1];
         assert!(b.decrypt(&too_short, b"").is_err());
+    }
+
+    /// Hybrid-mode pair: same as `pair` but both peers wired with
+    /// ML-KEM-768 keypairs and each others' publics.
+    fn hybrid_pair() -> (DoubleRatchet, DoubleRatchet, PublicKey) {
+        let root = [0xC0_u8; 32];
+        let resp_kp = StaticSecret::random_from_rng(thread_rng());
+        let resp_pub = PublicKey::from(&resp_kp);
+
+        // Each peer holds a static ML-KEM keypair; the other side
+        // gets the corresponding public.
+        let init_kyber = KyberKeypair::generate();
+        let resp_kyber = KyberKeypair::generate();
+        let init_kyber_pub = init_kyber.public();
+        let resp_kyber_pub = resp_kyber.public();
+
+        let init = DoubleRatchet::initiator_hybrid(
+            &root,
+            resp_pub,
+            KyberConfig {
+                peer_pub: resp_kyber_pub,
+                own_keypair: init_kyber,
+            },
+        )
+        .unwrap();
+        let resp = DoubleRatchet::responder_hybrid(
+            &root,
+            resp_kp,
+            KyberConfig {
+                peer_pub: init_kyber_pub,
+                own_keypair: resp_kyber,
+            },
+        )
+        .unwrap();
+        (init, resp, resp_pub)
+    }
+
+    #[test]
+    fn hybrid_round_trip_basic() {
+        let (mut a, mut b, _) = hybrid_pair();
+        let w = a.encrypt(b"hi", b"").unwrap();
+        // First frame must carry kyber_ct on hybrid mode.
+        let kyber_len = u16::from_be_bytes(w[40..42].try_into().unwrap()) as usize;
+        assert_eq!(kyber_len, MLKEM768_CT_LEN);
+        assert_eq!(b.decrypt(&w, b"").unwrap(), b"hi");
+
+        // Subsequent same-direction frames carry no kyber_ct.
+        let w2 = a.encrypt(b"hi 2", b"").unwrap();
+        let kyber_len2 = u16::from_be_bytes(w2[40..42].try_into().unwrap()) as usize;
+        assert_eq!(kyber_len2, 0);
+        assert_eq!(b.decrypt(&w2, b"").unwrap(), b"hi 2");
+
+        // b's first reply also carries kyber_ct, since b just
+        // derived its first send chain via the DH ratchet step.
+        let w3 = b.encrypt(b"hi from b", b"").unwrap();
+        let kyber_len3 = u16::from_be_bytes(w3[40..42].try_into().unwrap()) as usize;
+        assert_eq!(kyber_len3, MLKEM768_CT_LEN);
+        assert_eq!(a.decrypt(&w3, b"").unwrap(), b"hi from b");
+    }
+
+    #[test]
+    fn hybrid_back_and_forth_re_encaps_each_direction_change() {
+        let (mut a, mut b, _) = hybrid_pair();
+        // Strict alternation: every iteration's a-send happens
+        // right after a received a frame from b (or it's the
+        // initial send), and every b-send happens right after
+        // b received from a. Both peers therefore have a fresh
+        // send chain on every send → every frame in this loop
+        // carries kyber.
+        for i in 0..6 {
+            let m = format!("a{i}");
+            let w = a.encrypt(m.as_bytes(), b"").unwrap();
+            let klen = u16::from_be_bytes(w[40..42].try_into().unwrap()) as usize;
+            assert_eq!(klen, MLKEM768_CT_LEN, "a-send #{i} should carry kyber");
+            assert_eq!(b.decrypt(&w, b"").unwrap(), m.as_bytes());
+
+            let m = format!("b{i}");
+            let w = b.encrypt(m.as_bytes(), b"").unwrap();
+            let klen = u16::from_be_bytes(w[40..42].try_into().unwrap()) as usize;
+            assert_eq!(klen, MLKEM768_CT_LEN, "b-send #{i} should carry kyber");
+            assert_eq!(a.decrypt(&w, b"").unwrap(), m.as_bytes());
+        }
+    }
+
+    #[test]
+    fn hybrid_out_of_order_within_epoch() {
+        let (mut a, mut b, _) = hybrid_pair();
+        // First frame from a carries kyber; subsequent same-epoch
+        // frames don't. Out-of-order delivery within those
+        // subsequent frames must still decrypt via the stash.
+        let w0 = a.encrypt(b"a0", b"").unwrap(); // kyber-bearing
+        let w1 = a.encrypt(b"a1", b"").unwrap(); // no kyber
+        let w2 = a.encrypt(b"a2", b"").unwrap(); // no kyber
+
+        // Deliver in order: w0 first (must, since it carries
+        // kyber that the receiver mixes into the recv chain).
+        assert_eq!(b.decrypt(&w0, b"").unwrap(), b"a0");
+        // Now w1 and w2 can come in any order.
+        assert_eq!(b.decrypt(&w2, b"").unwrap(), b"a2");
+        assert_eq!(b.decrypt(&w1, b"").unwrap(), b"a1");
+    }
+
+    #[test]
+    fn hybrid_rejects_kyber_on_non_epoch_frame() {
+        let (mut a, mut b, _) = hybrid_pair();
+        let w0 = a.encrypt(b"a0", b"").unwrap(); // legit kyber frame
+        b.decrypt(&w0, b"").unwrap();
+        let w1 = a.encrypt(b"a1", b"").unwrap(); // no-kyber frame
+        // Splice a fake kyber blob into w1's header and re-pack.
+        let real_kyber = &w0[HEADER_PREFIX_LEN..HEADER_PREFIX_LEN + MLKEM768_CT_LEN];
+        let mut tampered = Vec::new();
+        tampered.extend_from_slice(&w1[..40]); // dh_pub + prev_n + n
+        tampered.extend_from_slice(&(MLKEM768_CT_LEN as u16).to_be_bytes());
+        tampered.extend_from_slice(real_kyber);
+        tampered.extend_from_slice(&w1[HEADER_PREFIX_LEN..]); // nonce + ct
+        // Same-epoch frame can't carry a kyber_ct.
+        assert!(b.decrypt(&tampered, b"").is_err());
+        // Legit frame still decrypts.
+        assert_eq!(b.decrypt(&w1, b"").unwrap(), b"a1");
+    }
+
+    #[test]
+    fn hybrid_rejects_wrong_kyber_length() {
+        // Hand-craft a "fresh epoch" frame with a wrong-sized
+        // kyber blob. Must fail validation before we touch any
+        // ratchet state.
+        let (mut _a, mut b, _) = hybrid_pair();
+        let bogus_dh = StaticSecret::random_from_rng(thread_rng());
+        let bogus_dh_pub = PublicKey::from(&bogus_dh);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(bogus_dh_pub.as_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        // Claim a 64-byte kyber blob (real ML-KEM-768 ct is 1088).
+        frame.extend_from_slice(&64u16.to_be_bytes());
+        frame.extend_from_slice(&[0u8; 64]);
+        frame.extend_from_slice(&[0u8; NONCE_LEN]);
+        frame.extend_from_slice(&[0u8; 32 + TAG_LEN]);
+        assert!(b.decrypt(&frame, b"").is_err());
+    }
+
+    #[test]
+    fn hybrid_rejects_kyber_in_non_hybrid_mode() {
+        // Non-hybrid local. A peer frame that includes kyber_ct
+        // must be rejected (no key to decap with — protocol
+        // confusion or downgrade attempt).
+        let (mut a, mut b, _) = pair(); // non-hybrid
+        // Hand-craft a fresh-epoch frame from a third-party DH
+        // with a bogus 1088-byte kyber blob.
+        let bogus_dh = StaticSecret::random_from_rng(thread_rng());
+        let bogus_dh_pub = PublicKey::from(&bogus_dh);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(bogus_dh_pub.as_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&(MLKEM768_CT_LEN as u16).to_be_bytes());
+        frame.extend_from_slice(&[0u8; MLKEM768_CT_LEN]);
+        frame.extend_from_slice(&[0u8; NONCE_LEN]);
+        frame.extend_from_slice(&[0u8; 32 + TAG_LEN]);
+        assert!(b.decrypt(&frame, b"").is_err());
+        // a's legitimate frame still decrypts.
+        let w = a.encrypt(b"still working", b"").unwrap();
+        assert_eq!(b.decrypt(&w, b"").unwrap(), b"still working");
+    }
+
+    #[test]
+    fn hybrid_forged_kyber_does_not_corrupt_state() {
+        let (mut a, mut b, _) = hybrid_pair();
+        let w0 = a.encrypt(b"a0", b"").unwrap();
+
+        // Forge a frame with a fresh DH header and a bogus kyber
+        // ct of the right length. Decap will produce a wrong
+        // shared secret, AEAD will fail, snapshot/commit pattern
+        // rolls back the entire DH ratchet step including the
+        // kyber-mix.
+        let bogus_dh = StaticSecret::random_from_rng(thread_rng());
+        let bogus_dh_pub = PublicKey::from(&bogus_dh);
+        let mut forged = Vec::new();
+        forged.extend_from_slice(bogus_dh_pub.as_bytes());
+        forged.extend_from_slice(&0u32.to_be_bytes());
+        forged.extend_from_slice(&0u32.to_be_bytes());
+        forged.extend_from_slice(&(MLKEM768_CT_LEN as u16).to_be_bytes());
+        forged.extend_from_slice(&[0u8; MLKEM768_CT_LEN]);
+        forged.extend_from_slice(&[0u8; NONCE_LEN]);
+        forged.extend_from_slice(&[0u8; 32 + TAG_LEN]);
+        assert!(b.decrypt(&forged, b"").is_err());
+
+        // Legitimate frame still decrypts — state was rolled back.
+        assert_eq!(b.decrypt(&w0, b"").unwrap(), b"a0");
     }
 }

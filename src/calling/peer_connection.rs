@@ -24,6 +24,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -317,26 +318,75 @@ impl PeerConnection {
         self.set_video_enabled(false).await
     }
 
-    /// Retrieve basic media statistics. Real statistics would query
-    /// underlying transport state; here we return zeroed metrics.
+    /// Retrieve basic media statistics by summarising the WebRTC stats
+    /// report. The report is a map keyed by stat-id with one entry per
+    /// transport, codec, candidate-pair and RTP stream. We aggregate the
+    /// fields relevant to `MediaStats`:
+    ///
+    /// * Outbound counts come from `OutboundRTP` entries (one per
+    ///   sending track).
+    /// * Inbound counts come from `InboundRTP` entries.
+    /// * `packets_lost` is reported by the *remote* end via RTCP and
+    ///   surfaces as `RemoteInboundRTP`.
+    /// * RTT and the live bandwidth estimate come from the nominated
+    ///   `CandidatePair`.
+    ///
+    /// `jitter`, `frame_rate` and `resolution` aren't produced by
+    /// webrtc-rs 0.14 (jitter buffer / decoder values are out of scope
+    /// since the crate doesn't decode), so they remain at their default
+    /// zero/None values.
     pub async fn get_stats(&self) -> Result<MediaStats> {
-        // Fetch the internal WebRTC stats report. This returns a map of
-        // statistics for each transport and track. Summarising these into
-        // a high‑level MediaStats struct requires parsing the report.
-        let _report = self.webrtc_pc.get_stats().await
-            .context("Failed to retrieve WebRTC stats")?;
-        // TODO: Parse stats report into our MediaStats struct. This is
-        // left as an exercise because the report structure is complex.
-        // For now we return zeroed metrics.
+        let report = self.webrtc_pc.get_stats().await;
+
+        let mut bytes_sent: u64 = 0;
+        let mut bytes_received: u64 = 0;
+        let mut packets_sent: u64 = 0;
+        let mut packets_received: u64 = 0;
+        let mut packets_lost: u64 = 0;
+        let mut round_trip_time: f64 = 0.0;
+        let mut bitrate: u32 = 0;
+
+        for entry in report.reports.values() {
+            match entry {
+                StatsReportType::OutboundRTP(s) => {
+                    bytes_sent = bytes_sent.saturating_add(s.bytes_sent);
+                    packets_sent = packets_sent.saturating_add(s.packets_sent);
+                }
+                StatsReportType::InboundRTP(s) => {
+                    bytes_received = bytes_received.saturating_add(s.bytes_received);
+                    packets_received = packets_received.saturating_add(s.packets_received);
+                }
+                StatsReportType::RemoteInboundRTP(s) => {
+                    if s.packets_lost > 0 {
+                        packets_lost = packets_lost.saturating_add(s.packets_lost as u64);
+                    }
+                    if round_trip_time == 0.0 {
+                        if let Some(rtt) = s.round_trip_time {
+                            round_trip_time = rtt;
+                        }
+                    }
+                }
+                StatsReportType::CandidatePair(s) if s.nominated => {
+                    if s.current_round_trip_time > 0.0 {
+                        round_trip_time = s.current_round_trip_time;
+                    }
+                    if s.available_outgoing_bitrate > 0.0 {
+                        bitrate = s.available_outgoing_bitrate as u32;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Ok(MediaStats {
-            bytes_sent: 0,
-            bytes_received: 0,
-            packets_sent: 0,
-            packets_received: 0,
-            packets_lost: 0,
+            bytes_sent,
+            bytes_received,
+            packets_sent,
+            packets_received,
+            packets_lost,
             jitter: 0.0,
-            round_trip_time: 0.0,
-            bitrate: 0,
+            round_trip_time,
+            bitrate,
             frame_rate: None,
             resolution: None,
         })

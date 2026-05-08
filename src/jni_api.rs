@@ -6,7 +6,7 @@ use jni::sys::{jboolean, jbyteArray, jstring};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use lazy_static::lazy_static;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::runtime::Runtime;
@@ -31,7 +31,9 @@ use crate::groups::handshake_handlers::{
     plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
 };
-use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
+use crate::storage::secure_keystore::{
+    set_master_password, KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
+};
 use blake3::Hasher;
 use std::collections::HashMap;
 use zeroize::Zeroize;
@@ -159,9 +161,51 @@ fn jni_catch_jbytearray(f: impl FnOnce() -> jbyteArray) -> jbyteArray {
 
 // --- Initialization & Callbacks ---
 
+/// Install the master-key password the keystore will use when
+/// `nativeInitialize` opens its encrypted files. **Must be called
+/// before `nativeInitialize`** — once the keystore is open the
+/// password has already been consumed, and changing it here won't
+/// rotate the on-disk key.
+///
+/// The Android side is expected to derive the passphrase from a real
+/// secret store (Android Keystore, BiometricPrompt-gated key, user
+/// PIN, ...). The string is moved into a [`SecretString`] which
+/// zeroises on drop; the caller should still treat the original
+/// Kotlin `String` as sensitive (the JVM may keep its own copy in
+/// the string-intern table).
+///
+/// Returns `1` on success, `0` if the password JString couldn't be
+/// read.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSetKeystorePassword(
+    mut env: JNIEnv,
+    _class: JClass,
+    password: JString,
+) -> jboolean {
+    let result = jni_catch_or(|| -> anyhow::Result<()> {
+        let password: String = env
+            .get_string(&password)
+            .map_err(|e| anyhow::anyhow!("invalid password: {e}"))?
+            .into();
+        set_master_password(SecretString::from(password));
+        Ok(())
+    });
+    if result.is_err() {
+        eprintln!("Rust: nativeSetKeystorePassword failed");
+        return 0;
+    }
+    1
+}
+
 /// Bootstrap the Rust core. Kotlin must pass `context.filesDir.absolutePath`
 /// as `data_dir` so the encrypted keystore lands inside the app's
 /// private storage. Idempotent.
+///
+/// Callers must have installed a keystore password via
+/// `nativeSetKeystorePassword` (or set the
+/// `QUBEE_KEYSTORE_PASSWORD` env var) before calling this — opening
+/// the keystore now fails closed instead of falling back to a
+/// hard-coded default.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitialize(
     mut env: JNIEnv,

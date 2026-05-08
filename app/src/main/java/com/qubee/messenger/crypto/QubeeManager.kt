@@ -1,17 +1,21 @@
 package com.qubee.messenger.crypto
 
 import android.content.Context
+import android.util.Base64
+import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.network.NetworkCallback
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import timber.log.Timber
+import java.security.SecureRandom
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class QubeeManager @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val preferences: PreferenceRepository,
 ) {
 
     private var isInitialized = false
@@ -20,6 +24,14 @@ class QubeeManager @Inject constructor(
         try {
             if (isInitialized) return@withContext true
             System.loadLibrary("qubee_crypto")
+
+            if (!installKeystorePassword()) {
+                Timber.e(
+                    "Init aborted: cannot supply a keystore master password — " +
+                        "the Android Keystore-backed prefs file is unavailable."
+                )
+                return@withContext false
+            }
 
             val result = nativeInitialize(context.filesDir.absolutePath)
             if (result) {
@@ -31,6 +43,40 @@ class QubeeManager @Inject constructor(
             Timber.e(e, "Init failed")
             false
         }
+    }
+
+    /**
+     * Source-or-generate the master password that the Rust keystore
+     * uses to wrap its on-disk master key, and hand it to the native
+     * side via [nativeSetKeystorePassword].
+     *
+     * The password is a 256-bit random value persisted in
+     * [PreferenceRepository]'s secret tier — itself backed by
+     * `EncryptedSharedPreferences` and the Android Keystore. If that
+     * tier is unavailable (Keystore unreachable, hardware bound key
+     * compromised, …) we fail closed: better to refuse to start than
+     * to silently weaken the on-disk key to a plaintext-derivable
+     * value, which is what the previous "default_password" fallback
+     * effectively did.
+     *
+     * Returns `true` when a password was successfully installed.
+     */
+    private fun installKeystorePassword(): Boolean {
+        if (!preferences.isEncrypted) {
+            return false
+        }
+        val existing = preferences.readSecret(KEYSTORE_PASSWORD_PREF)
+        val password = existing ?: run {
+            val bytes = ByteArray(KEYSTORE_PASSWORD_BYTES)
+            SecureRandom().nextBytes(bytes)
+            val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP or Base64.NO_PADDING)
+            if (!preferences.saveSecret(KEYSTORE_PASSWORD_PREF, encoded)) {
+                Timber.e("Failed to persist keystore password")
+                return false
+            }
+            encoded
+        }
+        return nativeSetKeystorePassword(password)
     }
 
     fun setNetworkCallback(callback: NetworkCallback) {
@@ -446,6 +492,7 @@ class QubeeManager @Inject constructor(
         nativeListAcceptedInvites()
     }
 
+    private external fun nativeSetKeystorePassword(password: String): Boolean
     private external fun nativeInitialize(dataDir: String): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
@@ -499,4 +546,11 @@ class QubeeManager @Inject constructor(
     private external fun nativeResetIdentity(dataDir: String): Boolean
 
     external fun nativeCleanup()
+
+    private companion object {
+        /** Pref key for the persisted keystore master password. */
+        private const val KEYSTORE_PASSWORD_PREF = "qubee_keystore_master"
+        /** Length in bytes of the random keystore master password. */
+        private const val KEYSTORE_PASSWORD_BYTES = 32
+    }
 }

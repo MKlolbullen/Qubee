@@ -261,11 +261,22 @@ impl ChainKey {
 /// the snapshot pattern needs; a `Vec<u8>` is straightforward to
 /// snapshot and is wiped via `Zeroizing` everywhere it crosses
 /// process memory.
-#[derive(Clone)]
 pub struct KyberKeypair {
     public: mlkem768::PublicKey,
     /// ML-KEM-768 secret key bytes (2400 bytes per FIPS 203).
-    secret_bytes: Vec<u8>,
+    /// `Zeroizing` makes the buffer self-wiping on Drop so a clone
+    /// going out of scope (e.g. during a snapshot/restore round-trip)
+    /// doesn't leave the secret on freed pages.
+    secret_bytes: Zeroizing<Vec<u8>>,
+}
+
+impl Clone for KyberKeypair {
+    fn clone(&self) -> Self {
+        Self {
+            public: self.public,
+            secret_bytes: Zeroizing::new(self.secret_bytes.to_vec()),
+        }
+    }
 }
 
 impl KyberKeypair {
@@ -274,7 +285,7 @@ impl KyberKeypair {
         let (public, secret) = mlkem768::keypair();
         Self {
             public,
-            secret_bytes: secret.as_bytes().to_vec(),
+            secret_bytes: Zeroizing::new(secret.as_bytes().to_vec()),
         }
     }
 
@@ -1009,7 +1020,7 @@ impl DoubleRatchet {
         let kyber = self.kyber.as_ref().map(|ks| {
             let pq_pub = ks.config.peer_pub.as_bytes().to_vec();
             let own_pub = ks.config.own_keypair.public.as_bytes().to_vec();
-            let own_secret = ks.config.own_keypair.secret_bytes.clone();
+            let own_secret = ks.config.own_keypair.secret_bytes.to_vec();
             PersistedKyber {
                 peer_pub: pq_pub,
                 own_pub,
@@ -1094,7 +1105,7 @@ impl DoubleRatchet {
                         peer_pub,
                         own_keypair: KyberKeypair {
                             public: own_pub,
-                            secret_bytes: pk.own_secret,
+                            secret_bytes: Zeroizing::new(pk.own_secret),
                         },
                     },
                 })

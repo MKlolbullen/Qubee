@@ -27,12 +27,16 @@
 //! sessions or where re-handshaking is cheap; long-running channels
 //! need to layer a DH ratchet on top.
 //!
-//! Skipped-message keys are *not* stashed: messages that arrive
-//! out of order but inside the skip window advance the chain past
-//! them (so they're decrypt-able the first time but not after) and
-//! intermediate counters are silently consumed. A future revision
-//! that needs Signal-style replay-tolerance can store a
-//! `HashMap<u32, MessageKey>` of skipped keys.
+//! Skipped-message keys *are* stashed: when a message arrives whose
+//! counter is ahead of the local recv counter (but inside [`MAX_SKIP`]),
+//! the intermediate per-counter keys are derived and stored in a
+//! bounded `HashMap<u32, Zeroizing<[u8; KEY_LEN]>>` so a later out-of-
+//! order arrival of those counters still decrypts. The stash is
+//! capped at [`MAX_SKIPPED_STASH`] entries; once full, the oldest
+//! counter is evicted and any later arrival of *that* counter is
+//! refused. This matches Signal-style replay-tolerance within the
+//! skip window without giving an attacker an unbounded memory
+//! amplifier.
 //!
 //! # Wire format
 //!

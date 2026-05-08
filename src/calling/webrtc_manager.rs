@@ -640,8 +640,8 @@ where
     let mut sample_rates: Vec<u32> = Vec::new();
     if let Some(configs) = configs {
         for cfg in configs {
-            let lo = cfg.min_sample_rate().0;
-            let hi = cfg.max_sample_rate().0;
+            let lo = cfg.min_sample_rate();
+            let hi = cfg.max_sample_rate();
             for &r in PROBE_RATES {
                 if r >= lo && r <= hi && !sample_rates.contains(&r) {
                     sample_rates.push(r);

@@ -1,13 +1,12 @@
-use anyhow::{Context, Result};
-use secrecy::{Secret, ExposeSecret};
+use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use blake3::Hasher;
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::identity::identity_key::{IdentityKey, IdentityKeyPair, DeviceKey, DevicePublicKey, IdentityId, DeviceId, HybridSignature};
 use crate::crypto::enhanced_ratchet::EnhancedHybridRatchet;
-use crate::security::secure_rng;
 
 /// Signal Protocol-inspired key distribution system
 pub struct SignalProtocol {
@@ -15,7 +14,23 @@ pub struct SignalProtocol {
     device_key: DeviceKey,
     signed_prekeys: HashMap<u32, SignedPreKey>,
     one_time_prekeys: HashMap<u32, OneTimePreKey>,
+    /// Private halves of the one-time pre-keys, kept separate from
+    /// the public bundle so `OneTimePreKey`'s Serialize/Deserialize
+    /// derives don't accidentally leak secret material onto the wire.
+    /// Keyed by the same id as `one_time_prekeys`.
+    one_time_prekey_secrets: HashMap<u32, OneTimePreKeySecrets>,
     next_prekey_id: u32,
+}
+
+/// Secret half of a one-time pre-key. Lives only in the local
+/// `SignalProtocol` instance; never serialised, never sent.
+struct OneTimePreKeySecrets {
+    x25519_private: x25519_dalek::StaticSecret,
+    /// ML-KEM-768 secret key bytes. Stored as opaque bytes (rather
+    /// than the typed `pqcrypto_mlkem::mlkem768::SecretKey`) so this
+    /// struct doesn't need to know how to serde-derive across
+    /// pqcrypto types.
+    kyber_private_bytes: Vec<u8>,
 }
 
 /// Signed pre-key for key exchange initialization
@@ -27,12 +42,14 @@ pub struct SignedPreKey {
     pub created_at: u64,
 }
 
-/// One-time pre-key for perfect forward secrecy
+/// One-time pre-key for perfect forward secrecy. Public-only; the
+/// matching secret halves live in
+/// `SignalProtocol::one_time_prekey_secrets`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OneTimePreKey {
     pub id: u32,
     pub x25519_public: x25519_dalek::PublicKey,
-    pub kyber_public: pqcrypto_kyber::kyber768::PublicKey,
+    pub kyber_public: pqcrypto_mlkem::mlkem768::PublicKey,
     pub created_at: u64,
 }
 
@@ -51,6 +68,33 @@ pub struct KeyExchangeResult {
     pub shared_secret: [u8; 64], // Combined classical + post-quantum secret
     pub ratchet: EnhancedHybridRatchet,
     pub used_one_time_key: Option<u32>,
+    /// ML-KEM ciphertexts the initiator must transmit alongside the
+    /// handshake so the responder can decapsulate the matching shared
+    /// secrets. Without these the responder has no way to recover
+    /// `dh{1,2,3}_pq_ss` — the previous shape silently dropped these
+    /// on the floor and the responder substituted `[0u8; 32]`
+    /// placeholders, producing a master secret that didn't match.
+    pub kyber_ciphertexts: HandshakeCiphertexts,
+}
+
+/// ML-KEM-768 ciphertexts produced by the initiator during the X3DH
+/// handshake. Carried out-of-band (Signal stores these in the
+/// initial message envelope) so the responder can recover each
+/// `dh*_pq_ss`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandshakeCiphertexts {
+    /// Ciphertext for DH1: encapsulated against the responder's
+    /// device Kyber public key (carried in the signed-prekey
+    /// bundle).
+    pub dh1: Vec<u8>,
+    /// Ciphertext for DH2: same target as DH1 in this prototype.
+    /// (See module-level note about DH1==DH2 symmetry — separate
+    /// fix.)
+    pub dh2: Vec<u8>,
+    /// Ciphertext for DH3, present iff the bundle carried a
+    /// one-time pre-key. Encapsulated against the OTK's Kyber
+    /// public key.
+    pub dh3: Option<Vec<u8>>,
 }
 
 /// Key distribution server interface
@@ -76,6 +120,7 @@ impl SignalProtocol {
             device_key,
             signed_prekeys: HashMap::new(),
             one_time_prekeys: HashMap::new(),
+            one_time_prekey_secrets: HashMap::new(),
             next_prekey_id: 1,
         })
     }
@@ -114,29 +159,43 @@ impl SignalProtocol {
         for _ in 0..count {
             let prekey_id = self.next_prekey_id;
             self.next_prekey_id += 1;
-            
-            // Generate ephemeral X25519 key pair
-            let x25519_private = x25519_dalek::StaticSecret::new(&mut rand::thread_rng());
+
+            // Generate ephemeral X25519 key pair. Keep the private
+            // half — earlier the variable was named with a leading
+            // underscore and dropped on the floor, which made any
+            // later DH agreement structurally impossible.
+            let x25519_private = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
             let x25519_public = x25519_dalek::PublicKey::from(&x25519_private);
-            
-            // Generate ephemeral Kyber key pair
-            let (kyber_public, _kyber_private) = pqcrypto_kyber::kyber768::keypair();
-            
+
+            // Generate an ML-KEM-768 (FIPS 203 Kyber-768) keypair.
+            // Same fix as above: store the secret bytes so the
+            // responder side can actually decapsulate the matching
+            // ciphertext later.
+            let (kyber_public, kyber_private) = pqcrypto_mlkem::mlkem768::keypair();
+            let kyber_private_bytes = kyber_private.as_bytes().to_vec();
+
             let created_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
                 .as_secs();
-            
+
             let one_time_prekey = OneTimePreKey {
                 id: prekey_id,
                 x25519_public,
                 kyber_public,
                 created_at,
             };
-            
+
+            self.one_time_prekey_secrets.insert(
+                prekey_id,
+                OneTimePreKeySecrets {
+                    x25519_private,
+                    kyber_private_bytes,
+                },
+            );
             self.one_time_prekeys.insert(prekey_id, one_time_prekey.clone());
             prekeys.push(one_time_prekey);
         }
-        
+
         Ok(prekeys)
     }
     
@@ -175,56 +234,75 @@ impl SignalProtocol {
     ) -> Result<KeyExchangeResult> {
         // Verify the signed pre-key signature
         self.verify_prekey_bundle(remote_bundle)?;
-        
+
         // Perform triple Diffie-Hellman (3DH) key exchange
         let shared_secrets = self.perform_3dh_key_exchange(remote_bundle)?;
-        
+
         // Combine classical and post-quantum shared secrets
         let combined_secret = self.combine_shared_secrets(&shared_secrets)?;
-        
+
         // Initialize the double ratchet
         let mut ratchet = EnhancedHybridRatchet::new()?;
         ratchet.initialize_sender(&combined_secret, &self.device_key.public_key())?;
-        
+
         Ok(KeyExchangeResult {
             shared_secret: combined_secret,
             ratchet,
             used_one_time_key: remote_bundle.one_time_prekey.as_ref().map(|otk| otk.id),
+            kyber_ciphertexts: HandshakeCiphertexts {
+                dh1: shared_secrets.dh1_pq_ct.clone(),
+                dh2: shared_secrets.dh2_pq_ct.clone(),
+                dh3: shared_secrets.dh3_pq_ct.clone(),
+            },
         })
     }
     
-    /// Respond to key exchange initiation
+    /// Respond to key exchange initiation. Takes the ML-KEM
+    /// ciphertexts the initiator transmitted alongside the
+    /// handshake; without them DH{1,2,3}_pq can't be recovered.
+    /// `&mut self` so the consumed one-time pre-key (and its secret
+    /// half) can be evicted in the same call.
     pub fn respond_to_key_exchange(
-        &self,
+        &mut self,
         initiator_identity: &IdentityKey,
         initiator_device: &DevicePublicKey,
+        ciphertexts: &HandshakeCiphertexts,
         used_one_time_key: Option<u32>,
     ) -> Result<KeyExchangeResult> {
         // Verify initiator's identity and device key
         self.verify_device_key(initiator_identity, initiator_device)?;
-        
+
         // Reconstruct the key exchange
         let shared_secrets = self.reconstruct_3dh_key_exchange(
             initiator_device,
+            ciphertexts,
             used_one_time_key,
         )?;
-        
+
         // Combine shared secrets
         let combined_secret = self.combine_shared_secrets(&shared_secrets)?;
-        
+
         // Initialize the double ratchet as receiver
         let mut ratchet = EnhancedHybridRatchet::new()?;
         ratchet.initialize_receiver(&combined_secret, initiator_device)?;
-        
-        // Remove used one-time pre-key
+
+        // Evict the consumed one-time pre-key (and its secret half).
+        // Per X3DH this prekey must be single-use; leaving it around
+        // weakens forward secrecy.
         if let Some(otk_id) = used_one_time_key {
             self.one_time_prekeys.remove(&otk_id);
+            self.one_time_prekey_secrets.remove(&otk_id);
         }
-        
+
         Ok(KeyExchangeResult {
             shared_secret: combined_secret,
             ratchet,
             used_one_time_key,
+            // Responder doesn't produce ciphertexts of its own under
+            // X3DH — it only consumes the initiator's. Echo them
+            // back so the result type is uniform; callers on this
+            // side can ignore the field.
+            kyber_ciphertexts: ciphertexts.clone(),
         })
     }
     
@@ -301,39 +379,75 @@ impl SignalProtocol {
         })
     }
     
-    /// Reconstruct key exchange from the receiver's perspective
+    /// Reconstruct shared secrets from the responder's perspective.
+    ///
+    /// DH1 and DH2 decapsulate the initiator's ciphertexts against
+    /// our long-lived device Kyber secret (held inside `DeviceKey`).
+    /// DH3, when the initiator used a one-time pre-key, decapsulates
+    /// against the matching OTK secret we stashed in
+    /// `one_time_prekey_secrets`.
+    ///
+    /// Note on DH1==DH2: the X25519 halves on this branch both run
+    /// `device_key.x25519_agree(&initiator_device.x25519_public)`,
+    /// producing the same value twice. That's a structural defect in
+    /// the prototype's 3DH layout (the initiator should have an
+    /// ephemeral keypair binding DH2/DH3 separately from DH1) and
+    /// affects both peers symmetrically. Out of scope for this
+    /// commit — fixing it requires adding an ephemeral key field to
+    /// the handshake envelope on the initiator side.
     fn reconstruct_3dh_key_exchange(
         &self,
         initiator_device: &DevicePublicKey,
+        ciphertexts: &HandshakeCiphertexts,
         used_one_time_key: Option<u32>,
     ) -> Result<SharedSecrets> {
-        // DH1: Their identity key with our signed pre-key
+        // DH1 — classical leg + ML-KEM decapsulation against our
+        // device Kyber secret.
         let dh1_classical = self.device_key.x25519_agree(&initiator_device.x25519_public);
-        // Note: For PQ, we need the ciphertext from the initiator to decapsulate
-        // This is simplified - in practice, the ciphertext would be transmitted
-        let dh1_pq_ss = [0u8; 32]; // Placeholder
-        let dh1_pq_ct = Vec::new(); // Placeholder
-        
-        // DH2: Their ephemeral key with our identity key
+        let dh1_pq_ss = self
+            .device_key
+            .kyber_decapsulate(&ciphertexts.dh1)?;
+        let dh1_pq_ct = ciphertexts.dh1.clone();
+
+        // DH2 — same target as DH1 today (see method-level note).
         let dh2_classical = self.device_key.x25519_agree(&initiator_device.x25519_public);
-        let dh2_pq_ss = [0u8; 32]; // Placeholder
-        let dh2_pq_ct = Vec::new(); // Placeholder
-        
-        // DH3: Their ephemeral key with our one-time pre-key
-        let (dh3_classical, dh3_pq_ss, dh3_pq_ct) = if let Some(otk_id) = used_one_time_key {
-            if let Some(_otk) = self.one_time_prekeys.get(&otk_id) {
-                // In practice, we would use the one-time pre-key private key
-                let dh3_classical = self.device_key.x25519_agree(&initiator_device.x25519_public);
-                let dh3_pq_ss = [0u8; 32]; // Placeholder
-                let dh3_pq_ct = Vec::new(); // Placeholder
-                (Some(dh3_classical), Some(dh3_pq_ss), Some(dh3_pq_ct))
-            } else {
-                return Err(anyhow::anyhow!("One-time pre-key not found"));
+        let dh2_pq_ss = self
+            .device_key
+            .kyber_decapsulate(&ciphertexts.dh2)?;
+        let dh2_pq_ct = ciphertexts.dh2.clone();
+
+        // DH3 — present iff a one-time pre-key was used. The
+        // initiator must have included the matching ML-KEM
+        // ciphertext for us to decapsulate against the OTK secret
+        // we stashed when we generated the prekey.
+        let (dh3_classical, dh3_pq_ss, dh3_pq_ct) = match used_one_time_key {
+            Some(otk_id) => {
+                let secrets = self
+                    .one_time_prekey_secrets
+                    .get(&otk_id)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "one-time pre-key {otk_id} secret missing — \
+                         either already consumed or never generated locally"
+                    ))?;
+                let dh3_ct = ciphertexts.dh3.as_ref().ok_or_else(|| anyhow::anyhow!(
+                    "initiator referenced one-time pre-key {otk_id} but \
+                     omitted its ML-KEM ciphertext"
+                ))?;
+                let dh3_classical =
+                    secrets.x25519_private.diffie_hellman(&initiator_device.x25519_public).to_bytes();
+                let sk = pqcrypto_mlkem::mlkem768::SecretKey::from_bytes(&secrets.kyber_private_bytes)
+                    .map_err(|e| anyhow::anyhow!("invalid stored OTK secret: {e}"))?;
+                let ct = pqcrypto_mlkem::mlkem768::Ciphertext::from_bytes(dh3_ct)
+                    .map_err(|e| anyhow::anyhow!("invalid DH3 ciphertext: {e}"))?;
+                let shared = pqcrypto_mlkem::mlkem768::decapsulate(&ct, &sk);
+                let mut dh3_pq_ss = [0u8; 32];
+                use pqcrypto_traits::kem::SharedSecret as _;
+                dh3_pq_ss.copy_from_slice(&shared.as_bytes()[..32]);
+                (Some(dh3_classical), Some(dh3_pq_ss), Some(dh3_ct.clone()))
             }
-        } else {
-            (None, None, None)
+            None => (None, None, None),
         };
-        
+
         Ok(SharedSecrets {
             dh1_classical,
             dh1_pq_ss,
@@ -376,7 +490,7 @@ impl SignalProtocol {
         
         // Second round for remaining bytes
         let mut hasher2 = Hasher::new();
-        hasher2.update(&hash.as_bytes());
+        hasher2.update(hash.as_bytes());
         hasher2.update(&[0x01]);
         let hash2 = hasher2.finalize();
         output[32..].copy_from_slice(&hash2.as_bytes()[..32]);

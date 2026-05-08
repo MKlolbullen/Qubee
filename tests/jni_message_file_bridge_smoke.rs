@@ -206,6 +206,7 @@ fn android_jni_message_file_symbols_are_present() {
         "nativeEncryptFile",
         "nativeDecryptFile",
         "nativeSetKeystorePassword",
+        "nativeRegisterVideoInputs",
     ] {
         assert!(
             kotlin.contains(&format!("external fun {symbol}")),

@@ -31,6 +31,7 @@ use crate::groups::handshake_handlers::{
     plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
 };
+use crate::media_devices::{parse_video_inputs_json, set_video_inputs};
 use crate::storage::secure_keystore::{
     set_master_password, KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
 };
@@ -192,6 +193,53 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSetKey
     });
     if result.is_err() {
         eprintln!("Rust: nativeSetKeystorePassword failed");
+        return 0;
+    }
+    1
+}
+
+/// Hand the Rust core the list of video input devices the embedder
+/// has enumerated (Camera2 on Android, AVFoundation on iOS,
+/// V4L/MediaFoundation on desktop). Mirrors the password-plumbing
+/// pattern: Rust can't enumerate cameras portably, so the platform
+/// layer walks them and forwards the result here.
+///
+/// Wire format is a JSON array of:
+///
+/// ```json
+/// {
+///   "id": "0",
+///   "name": "Back Camera",
+///   "is_default": true,
+///   "resolutions": [[1920, 1080], [1280, 720]],
+///   "frame_rates": [30, 60],
+///   "facing": "back"
+/// }
+/// ```
+///
+/// `is_default`, `resolutions`, `frame_rates` and `facing` are all
+/// optional. Calling this replaces any previous registration; safe to
+/// call repeatedly when the camera set changes (e.g.
+/// `onConfigurationChanged`). Returns `1` on success, `0` if the
+/// JSON failed to parse.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRegisterVideoInputs(
+    mut env: JNIEnv,
+    _class: JClass,
+    devices_json: JString,
+) -> jboolean {
+    let result = jni_catch_or(|| -> anyhow::Result<()> {
+        let json: String = env
+            .get_string(&devices_json)
+            .map_err(|e| anyhow::anyhow!("invalid devices_json: {e}"))?
+            .into();
+        let devices = parse_video_inputs_json(&json)
+            .map_err(|e| anyhow::anyhow!("parse video inputs: {e}"))?;
+        set_video_inputs(devices);
+        Ok(())
+    });
+    if result.is_err() {
+        eprintln!("Rust: nativeRegisterVideoInputs failed");
         return 0;
     }
     1

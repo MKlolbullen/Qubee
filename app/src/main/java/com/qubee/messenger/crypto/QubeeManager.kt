@@ -1,12 +1,17 @@
 package com.qubee.messenger.crypto
 
 import android.content.Context
+import android.graphics.ImageFormat
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.util.Base64
 import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.network.NetworkCallback
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import timber.log.Timber
 import java.security.SecureRandom
 import javax.inject.Inject
@@ -37,6 +42,12 @@ class QubeeManager @Inject constructor(
             if (result) {
                 isInitialized = true
                 Timber.d("Qubee initialized at %s", context.filesDir.absolutePath)
+                // Best-effort: feed the platform camera list to the
+                // Rust core so the calling module's
+                // MediaDevicesManager has real video devices to
+                // expose. Does not require runtime CAMERA permission;
+                // we only read characteristics, never open a stream.
+                registerVideoInputs()
             }
             result
         } catch (e: Exception) {
@@ -77,6 +88,93 @@ class QubeeManager @Inject constructor(
             encoded
         }
         return nativeSetKeystorePassword(password)
+    }
+
+    /**
+     * Walk the platform's Camera2 device list and forward it to the
+     * Rust core via [nativeRegisterVideoInputs]. The native side
+     * stashes the result in a process-wide registry that
+     * `MediaDevicesManager::refresh_devices` reads instead of
+     * inventing video devices itself.
+     *
+     * Best-effort by design: a missing CameraManager, a
+     * `CameraAccessException`, or a malformed entry just yields a
+     * shorter list. We never throw out of `initialize()`.
+     *
+     * Capability metadata is capped (max 8 resolutions per camera,
+     * deduped frame rates) so the JSON payload stays tractable on
+     * devices with long output-size lists.
+     */
+    private fun registerVideoInputs() {
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: run {
+            Timber.w("CameraManager unavailable; skipping video input registration")
+            nativeRegisterVideoInputs("[]")
+            return
+        }
+
+        val payload = JSONArray()
+        try {
+            for (cameraId in cm.cameraIdList) {
+                val item = describeCamera(cm, cameraId) ?: continue
+                payload.put(item)
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "Camera2 enumeration failed; falling back to whatever was collected")
+        }
+        nativeRegisterVideoInputs(payload.toString())
+    }
+
+    private fun describeCamera(cm: CameraManager, cameraId: String): JSONObject? {
+        return try {
+            val chars = cm.getCameraCharacteristics(cameraId)
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+
+            val resolutions = JSONArray()
+            map?.getOutputSizes(ImageFormat.YUV_420_888)
+                ?.take(MAX_RESOLUTIONS_PER_CAMERA)
+                ?.forEach { size ->
+                    val pair = JSONArray()
+                    pair.put(size.width)
+                    pair.put(size.height)
+                    resolutions.put(pair)
+                }
+
+            val frameRates = JSONArray()
+            val seenRates = mutableSetOf<Int>()
+            fpsRanges?.forEach { range ->
+                if (seenRates.add(range.upper)) {
+                    frameRates.put(range.upper)
+                }
+            }
+
+            JSONObject().apply {
+                put("id", cameraId)
+                put("name", friendlyCameraName(cameraId, facing))
+                put("is_default", facing == CameraCharacteristics.LENS_FACING_BACK)
+                put("resolutions", resolutions)
+                put("frame_rates", frameRates)
+                facingLabel(facing)?.let { put("facing", it) }
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to describe camera %s", cameraId)
+            null
+        }
+    }
+
+    private fun friendlyCameraName(cameraId: String, facing: Int?): String = when (facing) {
+        CameraCharacteristics.LENS_FACING_FRONT -> "Front camera"
+        CameraCharacteristics.LENS_FACING_BACK -> "Back camera"
+        CameraCharacteristics.LENS_FACING_EXTERNAL -> "External camera ($cameraId)"
+        else -> "Camera $cameraId"
+    }
+
+    private fun facingLabel(facing: Int?): String? = when (facing) {
+        CameraCharacteristics.LENS_FACING_FRONT -> "front"
+        CameraCharacteristics.LENS_FACING_BACK -> "back"
+        CameraCharacteristics.LENS_FACING_EXTERNAL -> "external"
+        else -> null
     }
 
     fun setNetworkCallback(callback: NetworkCallback) {
@@ -493,6 +591,7 @@ class QubeeManager @Inject constructor(
     }
 
     private external fun nativeSetKeystorePassword(password: String): Boolean
+    private external fun nativeRegisterVideoInputs(devicesJson: String): Boolean
     private external fun nativeInitialize(dataDir: String): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
@@ -552,5 +651,9 @@ class QubeeManager @Inject constructor(
         private const val KEYSTORE_PASSWORD_PREF = "qubee_keystore_master"
         /** Length in bytes of the random keystore master password. */
         private const val KEYSTORE_PASSWORD_BYTES = 32
+        /** Cap on resolutions reported per camera to keep the JNI
+         *  payload bounded — Camera2 hands back tens of sizes per
+         *  device on modern phones. The UI only ever shows a handful. */
+        private const val MAX_RESOLUTIONS_PER_CAMERA = 8
     }
 }

@@ -522,8 +522,23 @@ impl MediaDevicesManager {
             }
         };
 
-        // Video stays empty here — see the doc comment above.
-        self.video_inputs = Vec::new();
+        // Video comes from the embedder via the JNI registry —
+        // see `crate::media_devices` and the
+        // `nativeRegisterVideoInputs` JNI entry point. Empty until
+        // someone has called in; the calling module never blocks on
+        // it.
+        self.video_inputs = crate::media_devices::registered_video_inputs()
+            .into_iter()
+            .map(media_device_from_registered_video)
+            .collect();
+        if self.current_devices.video_input.is_none() {
+            self.current_devices.video_input = self
+                .video_inputs
+                .iter()
+                .find(|d| d.is_default)
+                .or_else(|| self.video_inputs.first())
+                .map(|d| d.id.clone());
+        }
 
         // Seed `current_devices` with whichever entry cpal flagged as
         // the host default, falling back to the first enumerated
@@ -544,7 +559,6 @@ impl MediaDevicesManager {
                 .or_else(|| self.audio_outputs.first())
                 .map(|d| d.id.clone());
         }
-        // No video defaults to seed — see above.
 
         Ok(())
     }
@@ -651,6 +665,31 @@ where
             // about; cpal hands us PCM frames either way.
             audio_codecs: vec!["opus".to_string()],
             video_codecs: Vec::new(),
+        },
+    }
+}
+
+/// Translate a JNI-registered video device into our `MediaDevice`.
+/// The embedder is the source of truth for resolutions, frame rates
+/// and lens facing, so we copy fields straight across rather than
+/// inventing capability data.
+fn media_device_from_registered_video(
+    dev: crate::media_devices::RegisteredVideoDevice,
+) -> MediaDevice {
+    MediaDevice {
+        id: format!("video:{}", dev.id),
+        name: dev.name,
+        device_type: MediaDeviceType::VideoInput,
+        is_default: dev.is_default,
+        capabilities: DeviceCapabilities {
+            audio_sample_rates: Vec::new(),
+            video_resolutions: dev.resolutions,
+            video_frame_rates: dev.frame_rates,
+            audio_codecs: Vec::new(),
+            // The negotiated codec depends on the WebRTC offer/answer
+            // exchange, not on what the camera supports natively
+            // (Camera2/AVFoundation hand us raw frames either way).
+            video_codecs: vec!["VP8".to_string(), "VP9".to_string(), "H264".to_string()],
         },
     }
 }

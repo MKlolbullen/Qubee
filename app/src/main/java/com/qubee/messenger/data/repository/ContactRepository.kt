@@ -28,6 +28,18 @@ class ContactRepository @Inject constructor(
 
     fun getAllContactsFlow(): Flow<List<Contact>> = contactDao.getAllContacts()
 
+    /**
+     * Insert (or upsert via REPLACE) a contact row. Used by the
+     * add-contact flow once an `OnboardingBundle` has verified
+     * cryptographically. Caller is responsible for choosing the
+     * primary `id`; convention in this codebase is to reuse the
+     * peer's `identityIdHex` so the local Contact.id matches the
+     * conversational session id later.
+     */
+    suspend fun addContact(contact: Contact) {
+        contactDao.insertContact(contact)
+    }
+
     fun getContactFlow(contactId: String): Flow<Contact?> =
         contactDao.getContactFlow(contactId)
 

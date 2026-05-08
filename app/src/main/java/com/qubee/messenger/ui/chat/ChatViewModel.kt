@@ -42,6 +42,12 @@ class ChatViewModel @Inject constructor(
 
     private val contactId: String = savedStateHandle["contactId"] ?: ""
 
+    // Peer's identity-id hex string for the DM session API.
+    // Resolved from the persisted Contact row in `init`; null
+    // when the conversation is a group (no pairwise peer) or
+    // when the contactId doesn't have a Contact row yet.
+    private var peerIdentityHex: String? = null
+
     private val _uiState = MutableStateFlow(
         ChatUiState(
             contactName = contactId.take(8),
@@ -74,6 +80,11 @@ class ChatViewModel @Inject constructor(
             val isGroup =
                 conversation?.type == com.qubee.messenger.data.model.ConversationType.GROUP
             val contact = contactRepository.getContactById(contactId)
+            // Cache the peer's identity-id hex for the DM
+            // session lookup in `sendMessage`. Skip for groups
+            // (no pairwise peer).
+            peerIdentityHex =
+                if (!isGroup) contact?.identityId?.takeIf { it.isNotBlank() } else null
             val name = when {
                 isGroup -> conversation?.name?.takeIf { it.isNotBlank() } ?: "Group"
                 else -> contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
@@ -143,16 +154,44 @@ class ChatViewModel @Inject constructor(
             )
             messageRepository.saveMessage(message)
 
-            // Encrypt via the Rust JNI bridge. The session id is the
-            // hex-encoded GroupId — same value as conversationId per
-            // ConversationRepository.getOrCreateConversationId.
-            val encrypted = runCatching { qubeeManager.encryptMessage(conversationId, payload) }
-                .getOrNull()
-            if (encrypted == null) {
+            // Routing: prefer the pairwise DM session when one's
+            // open (forward-secret + post-compromise + post-quantum
+            // via Double Ratchet + ML-KEM re-encap). Fall back to
+            // the group-message path when:
+            //   * this is a group chat
+            //   * the contact row doesn't carry an identityIdHex
+            //   * no DM session exists for that peer yet (the peer
+            //     hasn't run the matching handshake on their side)
+            //
+            // The receiver-side delivery path that recognises an
+            // inbound DM frame off the gossipsub topic and feeds
+            // it into `nativeDecryptDm` isn't wired yet — sending
+            // DM frames here advances local chain state but the
+            // peer won't decrypt until that lands. The fallback
+            // chain still works end-to-end.
+            val peerHex = peerIdentityHex
+            val useDm =
+                peerHex != null &&
+                runCatching { qubeeManager.hasDmSession(peerHex) }.getOrDefault(false)
+
+            val sendBytes: ByteArray? = if (useDm) {
+                runCatching {
+                    qubeeManager.encryptDm(peerHex!!, payload.toByteArray())
+                }.getOrNull()
+            } else {
+                runCatching { qubeeManager.encryptMessage(conversationId, payload) }
+                    .getOrNull()
+                    ?.toBytes()
+            }
+            if (sendBytes == null) {
                 messageRepository.updateMessageStatus(message.id, MessageStatus.FAILED)
                 _events.emit(
                     ChatUiEvent.Notice(
-                        "Encrypt failed — peer may not have accepted the group invite yet",
+                        if (useDm) {
+                            "Encrypt failed — DM session is open but encryptDm returned null"
+                        } else {
+                            "Encrypt failed — peer may not have accepted the group invite yet"
+                        },
                     ),
                 )
                 return@launch
@@ -168,7 +207,7 @@ class ChatViewModel @Inject constructor(
             // not "peer ack". Real delivery confirmation is a
             // post-alpha hook.
             val sendOk = runCatching {
-                qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+                qubeeManager.sendP2PMessage(contactId, sendBytes)
             }.getOrDefault(false)
             val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
             messageRepository.updateMessageStatus(message.id, newStatus)

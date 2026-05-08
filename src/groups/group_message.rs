@@ -97,6 +97,38 @@ pub fn canonical_group_message(body: &GroupMessageBody) -> Vec<u8> {
     out
 }
 
+/// Stable 16-byte identifier for a group message, derived
+/// deterministically from the canonical body bytes via BLAKE3.
+/// Both the sender (at encrypt time) and every receiver (at
+/// decrypt time) compute the same id without coordination, so
+/// delivery acks can reference messages without an explicit id
+/// field on the wire envelope.
+///
+/// 16 bytes is enough for collision resistance under the threat
+/// model (a sender can't usefully forge a collision against their
+/// own outbound; the AEAD nonce in the body already guarantees
+/// uniqueness under a fixed group key).
+pub fn group_message_id(body: &GroupMessageBody) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"qubee_group_message_id_v1");
+    hasher.update(&[0u8]);
+    hasher.update(&canonical_group_message(body));
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+/// Convenience: parse a wire envelope and extract its message id.
+/// Returns `None` if the bytes don't carry a `MAGIC_GROUP_MESSAGE`
+/// frame. Used by the JNI side so the Kotlin caller of
+/// `nativeSendGroupMessage` can persist the id for the row it just
+/// wrote, without re-implementing the BLAKE3 in Kotlin.
+pub fn extract_message_id(wire: &[u8]) -> Option<[u8; 16]> {
+    let envelope = GroupMessageEnvelope::from_wire(wire)?;
+    Some(group_message_id(&envelope.body))
+}
+
 /// Decrypted plaintext + sender metadata. Returned to callers (and
 /// surfaced to Kotlin) once the envelope is validated end-to-end.
 #[derive(Clone, Debug)]

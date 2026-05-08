@@ -1213,3 +1213,181 @@ fn ownership_transfer_replays_idempotently() {
         Role::Owner,
     );
 }
+
+// ---------------------------------------------------------------------
+// 5e — MessageAck wire frame (delivery confirmation)
+// ---------------------------------------------------------------------
+
+#[test]
+fn message_ack_round_trips_after_decrypt() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_message_ack, GroupHandshake, MessageAckBody,
+    };
+    use qubee_crypto::groups::group_message::{extract_message_id, group_message_id};
+    use qubee_crypto::groups::handshake_handlers::process_message_ack;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Alice sends. Bob decrypts. Both compute the same message id.
+    let plaintext = b"hello with delivery receipts".as_slice();
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, plaintext).unwrap();
+    let alice_message_id = extract_message_id(&wire).expect("extract id from wire");
+    let decrypted = decrypt_group_message(&bob_gm, &wire).unwrap();
+
+    // Bob recomputes the id from his copy of the body. Should match
+    // exactly — that's how acks reference the same message without
+    // an explicit id field on the envelope.
+    use qubee_crypto::groups::group_message::{GroupMessageBody, GroupMessageEnvelope};
+    let envelope = GroupMessageEnvelope::from_wire(&wire).unwrap();
+    let bob_message_id = group_message_id(&envelope.body);
+    let _ = decrypted; // we just needed the side-effect of decrypt success
+    assert_eq!(alice_message_id, bob_message_id, "id is deterministic");
+
+    // Bob signs an ack and broadcasts. Alice processes it.
+    let ack_body = MessageAckBody {
+        group_id,
+        message_id: bob_message_id,
+        acker_id: bob_kp.identity_id(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let signed = sign_message_ack(&bob_kp, ack_body.clone()).unwrap();
+    let (ack_body, ack_sig) = match signed {
+        GroupHandshake::MessageAck { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Alice's view: Bob is an active member; signature verifies.
+    process_message_ack(&alice_gm, &ack_body, &ack_sig)
+        .expect("Alice accepts Bob's ack on her own outbound");
+    // The handler returns Ok(()) — there's no Rust-side ack store;
+    // the JNI layer dispatches the (message_id, acker_id) tuple to
+    // Kotlin and the Message DAO updates its delivered set.
+}
+
+#[test]
+fn message_ack_from_non_member_rejected() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_message_ack, GroupHandshake, MessageAckBody,
+    };
+    use qubee_crypto::groups::handshake_handlers::process_message_ack;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let (_eve_dir, eve_kp, _eve_gm) = fresh_device("eve");
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    // Eve, not a group member, attempts to ack a message in Alice's
+    // group. Even with a syntactically valid signature, the active-
+    // member gate must reject the ack.
+    let ack_body = MessageAckBody {
+        group_id,
+        message_id: [42u8; 16],
+        acker_id: eve_kp.identity_id(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let signed = sign_message_ack(&eve_kp, ack_body.clone()).unwrap();
+    let (ack_body, ack_sig) = match signed {
+        GroupHandshake::MessageAck { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    let result = process_message_ack(&alice_gm, &ack_body, &ack_sig);
+    assert!(result.is_err(), "non-member ack must be rejected");
+}
+
+#[test]
+fn message_ack_signature_forgery_rejected() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_message_ack, GroupHandshake, MessageAckBody,
+    };
+    use qubee_crypto::groups::handshake_handlers::process_message_ack;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, _bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Sign as Alice but claim to be Bob — verifies against Bob's key
+    // (since the active-member gate matches `acker_id`); signature
+    // can't possibly verify because Alice doesn't have Bob's secret
+    // key.
+    let ack_body = MessageAckBody {
+        group_id,
+        message_id: [7u8; 16],
+        acker_id: bob_kp.identity_id(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let signed = sign_message_ack(&alice_kp, ack_body.clone()).unwrap();
+    let (ack_body, ack_sig) = match signed {
+        GroupHandshake::MessageAck { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    let result = process_message_ack(&alice_gm, &ack_body, &ack_sig);
+    assert!(
+        result.is_err(),
+        "ack signed under wrong key must fail verification",
+    );
+}

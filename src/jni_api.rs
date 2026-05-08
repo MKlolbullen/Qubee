@@ -17,12 +17,13 @@ use crate::identity::identity_key::{IdentityKey, IdentityKeyPair, IdentityId};
 use crate::onboarding::OnboardingBundle;
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_ownership_transfer, sign_request_join, sign_role_change,
-    GroupHandshake, KeyRotationBody, RequestJoinBody,
+    generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_request_join,
+    sign_role_change, GroupHandshake, KeyRotationBody, MessageAckBody, RequestJoinBody,
 };
 use crate::groups::group_permissions::Role;
 use crate::groups::group_message::{
-    decrypt_group_message, encrypt_group_message, GroupMessageEnvelope,
+    decrypt_group_message, encrypt_group_message, extract_message_id, group_message_id,
+    GroupMessageEnvelope,
 };
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
@@ -373,24 +374,130 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
 // --- Helper: Dispatch to Kotlin ---
 fn handle_inbound_group_message(envelope: GroupMessageEnvelope) {
     let result: anyhow::Result<()> = (|| {
-        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-        let gm = gm_guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+        // Compute the canonical message id once, before the AEAD
+        // round-trip — both the auto-ack and the Kotlin dispatch
+        // need it. Hashing the body is cheap relative to the AEAD
+        // op so the up-front cost is negligible.
+        let message_id = group_message_id(&envelope.body);
+        let group_id = envelope.body.group_id;
+        let sender_id = envelope.body.sender_id;
 
-        // Re-frame the envelope so the canonical decrypt helper can
-        // verify + AEAD-decrypt it. We have the envelope already, so
-        // we just need to feed wire bytes back in.
-        let wire = envelope.to_wire()?;
-        let decrypted = decrypt_group_message(gm, &wire)?;
-        drop(gm_guard);
+        let decrypted = {
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            // Re-frame the envelope so the canonical decrypt helper can
+            // verify + AEAD-decrypt it. We have the envelope already, so
+            // we just need to feed wire bytes back in.
+            let wire = envelope.to_wire()?;
+            decrypt_group_message(gm, &wire)?
+        };
 
         dispatch_group_message_to_kotlin(&decrypted);
+
+        // Auto-ack the message back to the group's gossipsub
+        // topic. Self-acks are filtered: we don't ack our own
+        // outbound (we're not going to receive them anyway since
+        // gossipsub doesn't loop a publisher's own packets, but
+        // be defensive in case a future libp2p update changes
+        // that). Best-effort — a failed ack just leaves the
+        // sender's `MessageStatus` at `SENT`, which is the
+        // pre-this-feature default behaviour.
+        if let Some(identity) = active_identity().ok().flatten() {
+            if identity.identity_id() != sender_id {
+                if let Err(e) = publish_message_ack(
+                    identity.as_ref(),
+                    group_id,
+                    message_id,
+                    identity.identity_id(),
+                ) {
+                    tracing::warn!(error = ?e, "auto-ack publish failed");
+                }
+            }
+        }
+
         Ok(())
     })();
     if let Err(e) = result {
         tracing::warn!(error = ?e, "group message dropped");
     }
+}
+
+/// Build, sign, and publish a `MessageAck` for the given decrypted
+/// message. Best-effort: returns `Ok` on a successful enqueue,
+/// `Err` on missing dependencies (no active identity, P2P down).
+/// The caller surfaces failures through tracing rather than
+/// retrying — a missing ack just leaves the sender's
+/// `MessageStatus` at `SENT`.
+fn publish_message_ack(
+    identity: &crate::identity::identity_key::IdentityKeyPair,
+    group_id: GroupId,
+    message_id: [u8; 16],
+    acker_id: crate::identity::identity_key::IdentityId,
+) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let body = MessageAckBody {
+        group_id,
+        message_id,
+        acker_id,
+        timestamp: now,
+    };
+    let signed = sign_message_ack(identity, body)?;
+    let topic = group_topic(&hex::encode(group_id.as_ref()));
+    let wire = signed.to_wire()?;
+    let _ = publish_to_topic(topic, wire);
+    Ok(())
+}
+
+/// Fire the Kotlin-side
+/// `onMessageAcked(group_hex, message_id_hex, acker_hex,
+/// timestamp_seconds)` callback. Best-effort — if the callback
+/// isn't registered yet (e.g. during early boot) the linkage just
+/// isn't fired and the sender's local Message row stays at
+/// `MessageStatus.SENT` until a future ack arrives.
+fn dispatch_message_acked_to_kotlin(body: &MessageAckBody) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let callback_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match callback_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let group_hex = match env.new_string(hex::encode(body.group_id.as_ref())) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let message_id_hex = match env.new_string(hex::encode(body.message_id)) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let acker_hex = match env.new_string(hex::encode(body.acker_id.as_ref() as &[u8])) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let _ = env.call_method(
+        callback_obj,
+        "onMessageAcked",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V",
+        &[
+            JValue::Object(&group_hex),
+            JValue::Object(&message_id_hex),
+            JValue::Object(&acker_hex),
+            JValue::Long(body.timestamp as i64),
+        ],
+    );
 }
 
 fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::DecryptedGroupMessage) {
@@ -881,6 +988,39 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeTransf
     })
 }
 
+/// Extract the canonical 16-byte message id from a wire-format
+/// group-message envelope as a 32-char lowercase hex string.
+///
+/// Used by `ChatViewModel.sendMessage` to stamp the locally-saved
+/// `Message.wireId` column at send time so a later inbound
+/// `onMessageAcked` can look up the row and bump its delivered
+/// count. Returns `null` when the bytes don't carry a
+/// `MAGIC_GROUP_MESSAGE` frame (e.g. the wire is from a P2P
+/// direct path, not a group).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtractMessageId(
+    env: JNIEnv,
+    _class: JClass,
+    wire: jni::objects::JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("convert_byte_array: {e}"))?;
+            let id = match extract_message_id(&bytes) {
+                Some(id) => id,
+                None => return Ok(std::ptr::null_mut()),
+            };
+            let java_str = env
+                .new_string(hex::encode(id))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Render a `Role` back to the canonical wire string used by
 /// `nativePromoteMember` and `nativeListGroupMembers`. The roundtrip
 /// stays in lock-step with the small vocabulary the JNI accepts so
@@ -1125,6 +1265,7 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
         GroupHandshake::MemberAdded { body, .. } => body.adder_id,
         GroupHandshake::RoleChange { body, .. } => body.promoter_id,
         GroupHandshake::OwnershipTransfer { body, .. } => body.donor_id,
+        GroupHandshake::MessageAck { body, .. } => body.acker_id,
         GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
         GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
         GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
@@ -1222,6 +1363,30 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             crate::groups::handshake_handlers::process_ownership_transfer(
                 gm, &body, &signature,
             )?;
+        }
+        GroupHandshake::MessageAck { body, signature } => {
+            // Verify the ack is from an active member with a valid
+            // signature. Self-acks (acker == active identity) are
+            // dropped because we don't update our own outbound rows
+            // off our own ack — they're already SENT locally and
+            // the receive-side dispatch never fires for our own
+            // publishes.
+            let active = active_identity()?;
+            if let Some(ref identity) = active {
+                if identity.identity_id() == body.acker_id {
+                    return Ok(());
+                }
+            }
+            {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                crate::groups::handshake_handlers::process_message_ack(
+                    gm, &body, &signature,
+                )?;
+            }
+            dispatch_message_acked_to_kotlin(&body);
         }
         GroupHandshake::RequestStateSync { body, signature } => {
             // Responder side. Build + sign a snapshot reply and

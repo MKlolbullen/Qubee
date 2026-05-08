@@ -344,6 +344,41 @@ pub fn process_role_change(
     )
 }
 
+/// Existing-member handler for member-broadcast `MessageAck`.
+/// Verifies the acker is currently an active member of the local
+/// group view + the signature matches their `IdentityKey`. Returns
+/// `Ok(())` when the ack is authentic and the acker is allowed to
+/// ack on this group. The JNI caller is responsible for dispatching
+/// the body's `(group_id, message_id, acker_id)` to Kotlin so the
+/// sender's local Message row updates its delivered count.
+///
+/// We deliberately don't track an in-Rust dedupe table — the Kotlin
+/// side stores ack arrival as `acks: Set<acker_id_hex>` per Message
+/// row and dedupes there. Acks for unknown messages (a member who's
+/// been offline through the original send + still sees the ack) are
+/// dropped silently by the Kotlin layer.
+pub fn process_message_ack(
+    gm: &GroupManager,
+    body: &crate::groups::group_handshake::MessageAckBody,
+    signature: &HybridSignature,
+) -> Result<()> {
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("MessageAck for unknown group"))?;
+    let acker = group
+        .members
+        .get(&body.acker_id)
+        .ok_or_else(|| anyhow!("MessageAck acker is not a current member"))?;
+    if acker.member_status != crate::groups::group_manager::MemberStatus::Active {
+        return Err(anyhow!("MessageAck acker is not an active member"));
+    }
+    let acker_key = acker.identity_key.clone();
+    if !crate::groups::group_handshake::verify_message_ack(body, signature, &acker_key)? {
+        return Err(anyhow!("MessageAck signature failed"));
+    }
+    Ok(())
+}
+
 /// Existing-member handler for donor-broadcast `OwnershipTransfer`.
 /// Verifies the broadcast was signed by the local view's current
 /// owner of the group, then applies the atomic Owner ↔ Admin swap.

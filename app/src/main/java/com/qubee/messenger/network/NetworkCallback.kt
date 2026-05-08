@@ -57,4 +57,30 @@ interface NetworkCallback {
     fun onPeerLinked(peerId: String, identityIdHex: String) {
         // default no-op
     }
+
+    /**
+     * Fired by the Rust core when a `MessageAck` arrives for a
+     * group message we sent. The acker has already been verified
+     * as an active member of the group and their signature
+     * checked — this side just looks up the local Message row by
+     * `messageIdHex` and bumps its delivered-ack list.
+     *
+     * Self-acks (we ack'd our own message) are filtered Rust-side
+     * and never reach here.
+     *
+     * @param groupIdHex     hex-encoded GroupId.
+     * @param messageIdHex   32-char hex of the canonical group-
+     *                       message id; matches `Message.wireId`.
+     * @param ackerIdHex     hex-encoded acker IdentityId. Used as
+     *                       the dedupe key in `deliveredAckers`.
+     * @param timestampSeconds acker's send time as Unix seconds.
+     */
+    fun onMessageAcked(
+        groupIdHex: String,
+        messageIdHex: String,
+        ackerIdHex: String,
+        timestampSeconds: Long,
+    ) {
+        // default no-op
+    }
 }

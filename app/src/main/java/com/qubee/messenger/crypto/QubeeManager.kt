@@ -373,6 +373,31 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Extract the canonical 16-byte BLAKE3 message id from a
+     * fresh group-message wire envelope (output of
+     * `encryptGroupMessage`) as a 32-char lowercase hex string.
+     * Used at send time to stamp the local Message row's `wireId`
+     * column so a later inbound `onMessageAcked` can look up the
+     * row and bump its delivered-ack list.
+     *
+     * Returns null when the bytes don't carry a group-message
+     * frame (e.g. the wire is from the direct P2P path) — caller
+     * persists the row without a wireId.
+     */
+    suspend fun extractMessageId(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeExtractMessageId(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust extract-message-id JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust extract-message-id failed")
+            null
+        }
+    }
+
+    /**
      * List the active members of a group, as returned by the Rust
      * core. JSON shape is an array of
      * `{identity_id_hex, display_name, role, is_active, joined_at}`
@@ -521,6 +546,7 @@ class QubeeManager @Inject constructor(
         groupIdHex: String,
         newOwnerIdHex: String,
     ): String?
+    private external fun nativeExtractMessageId(wire: ByteArray): String?
     private external fun nativeSendGroupMessage(
         groupIdHex: String,
         plaintext: ByteArray,

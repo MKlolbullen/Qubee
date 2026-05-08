@@ -27,10 +27,14 @@ import timber.log.Timber
         CryptoKey::class,
     ],
     // v2: Contact gained a `peerId` column (libp2p routing) and a
-    // matching index. fallbackToDestructiveMigration recreates the
-    // DB on the bump; pre-alpha data isn't yet meant to survive
-    // schema changes.
-    version = 2,
+    //     matching index.
+    // v3: Message gained `wireId` (32-char hex of the canonical
+    //     group-message id, used to look up the row when an
+    //     `onMessageAcked` callback arrives) and `deliveredAckers`
+    //     (JSON-encoded list of acker `IdentityId` hex values).
+    // fallbackToDestructiveMigration recreates the DB on the bump;
+    // pre-alpha data isn't yet meant to survive schema changes.
+    version = 3,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)

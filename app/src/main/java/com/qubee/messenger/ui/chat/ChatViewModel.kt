@@ -158,17 +158,28 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
 
+            // Stamp the row with the canonical wire-level message
+            // id so a later inbound `MessageAck` can find this row
+            // and bump its delivered-acker list. Best-effort —
+            // null happens for non-group wires (none today, but
+            // defensive) and is logged silently.
+            val wire = encrypted.toBytes()
+            val wireId = qubeeManager.extractMessageId(wire)
+            if (wireId != null) {
+                messageRepository.updateWireId(message.id, wireId)
+            }
+
             // Publish via libp2p. The "peer id" passed to
             // sendP2PMessage today is whatever the caller hands in;
             // we forward the application-level contactId (the same
             // string ChatFragment received as a nav arg). The Rust
             // side resolves it; if libp2p doesn't have a route the
             // command is queued, not actually delivered. Status =
-            // SENT here means "encrypted bytes left this device",
-            // not "peer ack". Real delivery confirmation is a
-            // post-alpha hook.
+            // SENT here means "encrypted bytes left this device".
+            // The DELIVERED transition lands later when the first
+            // `MessageAck` arrives via `MessageService.onMessageAcked`.
             val sendOk = runCatching {
-                qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+                qubeeManager.sendP2PMessage(contactId, wire)
             }.getOrDefault(false)
             val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
             messageRepository.updateMessageStatus(message.id, newStatus)

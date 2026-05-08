@@ -141,6 +141,20 @@ data class Message(
     val deletedAt: Long? = null,
     val editedAt: Long? = null,
     val disappearsAt: Long? = null,
+    /// 32-char hex of the canonical group-message id (BLAKE3
+    /// truncation; see `group_message_id` in
+    /// `src/groups/group_message.rs`). Stamped at send time via
+    /// `nativeExtractMessageId`. Inbound `onMessageAcked` looks up
+    /// the row by this column to bump `deliveredAckers`. Null for
+    /// rows that don't have a wire-level id yet (P2P direct
+    /// path, pre-this-feature rows that survived migration).
+    val wireId: String? = null,
+    /// JSON-encoded list of acker `IdentityId` hex strings that
+    /// have ack'd this outbound message. Empty until the first
+    /// ack lands. Used for two things: deduping repeat acks from
+    /// the same recipient (set semantics) and rendering the
+    /// "delivered to N of M" hint on the chat row.
+    val deliveredAckers: List<String> = emptyList(),
 )
 
 data class MessageWithSender(

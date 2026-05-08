@@ -57,6 +57,13 @@ interface MessageDao {
     @Query("UPDATE messages SET status = :status WHERE id = :messageId")
     suspend fun updateMessageStatus(messageId: String, status: MessageStatus)
 
+    /// Look up the outbound row a `MessageAck` refers to. Returns
+    /// `null` when no row carries this `wireId` — usually means the
+    /// ack landed for a message we didn't send (e.g. the local user
+    /// is a different group member, not the original sender).
+    @Query("SELECT * FROM messages WHERE wireId = :wireId LIMIT 1")
+    suspend fun getMessageByWireId(wireId: String): Message?
+
     @Query("UPDATE messages SET status = 'READ' WHERE conversationId = :conversationId AND isFromMe = 0")
     suspend fun markAllMessagesAsRead(conversationId: String)
 

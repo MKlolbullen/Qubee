@@ -302,6 +302,36 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Discovered new peer: %s", peerId)
     }
 
+    override fun onMessageAcked(
+        groupIdHex: String,
+        messageIdHex: String,
+        ackerIdHex: String,
+        timestampSeconds: Long,
+    ) {
+        Timber.d(
+            "MessageAck received: group=%s message=%s acker=%s",
+            groupIdHex,
+            messageIdHex,
+            ackerIdHex,
+        )
+        serviceScope.launch {
+            try {
+                val applied = messageRepository.applyAck(messageIdHex, ackerIdHex)
+                if (!applied) {
+                    Timber.d("Ignored ack for unknown wireId=%s", messageIdHex)
+                }
+            } catch (e: Exception) {
+                Timber.e(
+                    e,
+                    "Failed to apply ack: group=%s message=%s acker=%s",
+                    groupIdHex,
+                    messageIdHex,
+                    ackerIdHex,
+                )
+            }
+        }
+    }
+
     override fun onPeerLinked(peerId: String, identityIdHex: String) {
         Timber.d("Linking peer %s ↔ identity %s", peerId, identityIdHex)
         serviceScope.launch {

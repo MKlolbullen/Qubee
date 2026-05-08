@@ -21,6 +21,15 @@ data class IdentityBundle(
     @SerializedName("fingerprint") val fingerprint: String,
     @SerializedName("share_link") val shareLink: String? = null,
     @SerializedName("max_group_members") val maxGroupMembers: Int? = null,
+    /**
+     * Base64-encoded bytes of the embedded `DmPreKeyBundle`,
+     * when the Rust core attached one (v3 onboarding bundles
+     * always do; older bundles parsed from disk may not).
+     * Decode and pass to `QubeeManager.initiateDmHandshake` to
+     * open a forward-secret + post-quantum-secure DM session
+     * with this identity in one step.
+     */
+    @SerializedName("dm_prekey_bundle_b64") val dmPrekeyBundleB64: String? = null,
 ) {
     companion object {
         private val gson = Gson()

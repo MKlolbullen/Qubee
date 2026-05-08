@@ -1476,9 +1476,74 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListAc
 // ---------------------------------------------------------------------------
 
 const DM_PREKEY_SECRETS_PREFIX: &str = "dm_prekey_secrets_";
+const DM_PREKEY_PUBLIC_PREFIX: &str = "dm_prekey_public_";
 
 fn dm_prekey_secrets_key(spk_id: u32) -> String {
     format!("{DM_PREKEY_SECRETS_PREFIX}{spk_id}")
+}
+
+fn dm_prekey_public_key(spk_id: u32) -> String {
+    format!("{DM_PREKEY_PUBLIC_PREFIX}{spk_id}")
+}
+
+/// Persist a DM prekey under `spk_id` — both the private secrets
+/// (for `nativeRespondToDmHandshake` lookups) and the serialized
+/// public bundle (so `nativeLoadOnboardingBundle` can re-emit
+/// the same bundle on app restart without re-deriving and
+/// breaking already-handed-out share links).
+fn persist_dm_prekey_for_spk_id(
+    spk_id: u32,
+    secrets: &DmPreKeySecrets,
+    public_bundle_bytes: &[u8],
+) -> anyhow::Result<()> {
+    let secrets_bytes = secrets.persist()?;
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+
+    let secret_meta = KeyMetadata {
+        algorithm: "qubee_dm_prekey_secrets_v1".to_string(),
+        key_size: secrets_bytes.len(),
+        usage: vec![KeyUsage::KeyAgreement],
+        expiry: None,
+        tags: HashMap::new(),
+    };
+    ks.store_key(
+        &dm_prekey_secrets_key(spk_id),
+        &secrets_bytes,
+        KeyType::PreKey,
+        secret_meta,
+    )?;
+
+    let public_meta = KeyMetadata {
+        algorithm: "qubee_dm_prekey_public_v1".to_string(),
+        key_size: public_bundle_bytes.len(),
+        usage: vec![KeyUsage::KeyAgreement],
+        expiry: None,
+        tags: HashMap::new(),
+    };
+    ks.store_key(
+        &dm_prekey_public_key(spk_id),
+        public_bundle_bytes,
+        KeyType::PreKey,
+        public_meta,
+    )?;
+    Ok(())
+}
+
+/// Companion to [`persist_dm_prekey_for_spk_id`]. Returns `None`
+/// when no public bundle was persisted under `spk_id` (i.e. the
+/// identity record predates this commit's prekey-on-onboarding
+/// flow).
+fn load_persisted_dm_prekey_public(spk_id: u32) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    Ok(ks
+        .retrieve_key(&dm_prekey_public_key(spk_id))?
+        .map(|s| s.expose_secret().clone()))
 }
 
 /// Generate a fresh DM prekey bundle for the active identity,
@@ -1504,28 +1569,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
             let spk_id = spk_id as u32;
             let (bundle, secrets) =
                 dm_handshake::generate_prekey_bundle(identity.as_ref(), spk_id)?;
-            let secrets_bytes = secrets.persist()?;
-            let metadata = KeyMetadata {
-                algorithm: "qubee_dm_prekey_secrets_v1".to_string(),
-                key_size: secrets_bytes.len(),
-                usage: vec![KeyUsage::KeyAgreement],
-                expiry: None,
-                tags: HashMap::new(),
-            };
-            {
-                let mut ks_guard = KEYSTORE.lock().unwrap();
-                let ks = ks_guard
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-                ks.store_key(
-                    &dm_prekey_secrets_key(spk_id),
-                    &secrets_bytes,
-                    KeyType::PreKey,
-                    metadata,
-                )?;
-            }
+            let bundle_bytes = bundle.to_wire()?;
+            persist_dm_prekey_for_spk_id(spk_id, &secrets, &bundle_bytes)?;
             let arr = env
-                .byte_array_from_slice(&bundle.to_wire()?)
+                .byte_array_from_slice(&bundle_bytes)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
             Ok(arr.into_raw())
         })();
@@ -1998,8 +2045,32 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
 
         let result: anyhow::Result<serde_json::Value> = (|| {
             let keypair = IdentityKeyPair::generate()?;
-            let bundle = OnboardingBundle::create(&keypair, &display_name, &user_id)?;
+            // Generate a fresh DM prekey bundle for the new
+            // identity and persist its secrets so the new
+            // installation can immediately respond to handshake
+            // inits referring to spk_id=1. Embedding the public
+            // bundle inside the OnboardingBundle means receivers
+            // who scan the QR can establish a DM session in one
+            // step instead of needing a separate prekey-exchange
+            // round-trip.
+            let (dm_bundle, dm_secrets) =
+                dm_handshake::generate_prekey_bundle(&keypair, 1)?;
+            let dm_bytes = dm_bundle.to_wire()?;
+            let bundle = OnboardingBundle::create(
+                &keypair,
+                &display_name,
+                &user_id,
+                Some(dm_bytes),
+            )?;
             store_identity_to_keystore(&keypair, &user_id, &display_name)?;
+            // Persist secrets keyed by spk_id=1 so future
+            // `nativeRespondToDmHandshake` calls can find them,
+            // and persist the public bundle bytes alongside so
+            // `nativeLoadOnboardingBundle` can re-emit the same
+            // bundle on app restart without re-deriving (which
+            // would produce a different X25519/ML-KEM keypair
+            // and break already-handed-out share links).
+            persist_dm_prekey_for_spk_id(1, &dm_secrets, &dm_bundle.to_wire()?)?;
             *ACTIVE_IDENTITY.lock().unwrap() = Some(Arc::new(keypair));
             bundle_to_json(&bundle)
         })();
@@ -2040,10 +2111,21 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
                 .ok_or_else(|| anyhow::anyhow!("active identity record missing"))?;
             let blob: PersistedActiveIdentity = bincode::deserialize(secret.expose_secret())?;
 
+            // Re-attach the persisted DM prekey bundle (spk_id=1
+            // by convention from `nativeCreateOnboardingBundle`)
+            // so the reloaded bundle still advertises a working
+            // prekey for incoming handshake inits. If no
+            // persisted public bundle is on disk (older identity
+            // record from before this commit) we fall through to
+            // a no-DM bundle — receivers that scan it skip the
+            // auto-DM path and can prompt the owner to re-publish
+            // their QR.
+            let dm_bytes = load_persisted_dm_prekey_public(1)?;
             let bundle = OnboardingBundle::create(
                 identity.as_ref(),
                 blob.display_name.clone(),
                 blob.user_id.clone(),
+                dm_bytes,
             )?;
             bundle_to_json(&bundle)
         })();
@@ -2063,6 +2145,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
 
 fn bundle_to_json(bundle: &OnboardingBundle) -> anyhow::Result<serde_json::Value> {
     let share_link = bundle.to_share_link()?;
+    // Surface the embedded DM prekey bundle as base64 so the
+    // Kotlin side can pass it back into
+    // `nativeInitiateDmHandshake` without needing to hex-decode
+    // the share link itself. Null when the bundle is from a
+    // pre-v3 identity record.
+    let dm_prekey_bundle_b64 = bundle.dm_prekey_bundle.as_ref().map(|b| {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        STANDARD.encode(b)
+    });
     Ok(json!({
         "user_id": bundle.user_id,
         "display_name": bundle.display_name,
@@ -2070,6 +2161,7 @@ fn bundle_to_json(bundle: &OnboardingBundle) -> anyhow::Result<serde_json::Value
         "fingerprint": bundle.public_key.fingerprint(),
         "share_link": share_link,
         "max_group_members": QUBEE_MAX_GROUP_MEMBERS,
+        "dm_prekey_bundle_b64": dm_prekey_bundle_b64,
     }))
 }
 

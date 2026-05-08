@@ -52,6 +52,8 @@ use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyS
 use secrecy::ExposeSecret;
 use std::collections::HashMap as StdHashMap;
 
+pub mod handshake;
+
 /// Single 1:1 DM session. Wraps a [`DoubleRatchet`] plus the
 /// peer identity it's bound to. Encrypt/decrypt delegate to the
 /// ratchet; the peer id is carried so the [`SessionManager`]

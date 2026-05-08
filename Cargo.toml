@@ -62,6 +62,11 @@ hex = "0.4"
 # `cargo build` works out of the box; pass `--features calling` to
 # pull WebRTC in.
 webrtc = { version = "0.14", optional = true }
+# Cross-platform host-audio enumeration for `MediaDevicesManager`.
+# Pulls in ALSA/PulseAudio on Linux, CoreAudio on macOS, WASAPI on
+# Windows. We only use it from the calling module's device-listing
+# helpers, so it's gated behind `calling` like webrtc-rs itself.
+cpal = { version = "0.17", optional = true }
 # Logging is used by the WebRTC crate for diagnostics. Pulled in
 # unconditionally — it's small, it's a well-behaved facade, and
 # several other deps want it too.
@@ -108,7 +113,7 @@ default = []
 # does *not* compile clean today — the API paths target an older
 # version of webrtc-rs and several files reference types that have
 # moved. Enabling this is for active development, not for users.
-calling = ["dep:webrtc"]
+calling = ["dep:webrtc", "dep:cpal"]
 # Compile the legacy prototype modules (`hybrid_ratchet`,
 # `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
 # They reference dependency APIs that have since drifted; enabling

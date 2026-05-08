@@ -452,70 +452,100 @@ impl MediaDevicesManager {
         Ok(manager)
     }
     
-    /// Refresh the list of available devices
+    /// Repopulate `audio_inputs`, `audio_outputs` and the
+    /// "currently-selected" defaults from the host audio system via
+    /// cpal. ALSA / PulseAudio on Linux, CoreAudio on macOS, WASAPI
+    /// on Windows; on Android cpal lacks a working backend, so the
+    /// audio lists come back empty and the embedder is expected to
+    /// drive them via JNI from `AudioManager`.
+    ///
+    /// `video_inputs` stays empty: cpal is audio-only and there's no
+    /// good cross-platform crate for camera enumeration. Real video
+    /// device lists belong in the embedder layer (Camera2 on
+    /// Android, AVFoundation on macOS, V4L on Linux, MediaFoundation
+    /// on Windows).
+    ///
+    /// Failures inside cpal aren't fatal — they get logged and the
+    /// affected list is left empty so a partially-working host
+    /// doesn't take the whole call manager down.
     pub async fn refresh_devices(&mut self) -> Result<()> {
-        // This would interface with the actual media device APIs
-        // For now, we'll create some mock devices
-        
-        self.audio_inputs = vec![
-            MediaDevice {
-                id: "default_audio_input".to_string(),
-                name: "Default Microphone".to_string(),
-                device_type: MediaDeviceType::AudioInput,
-                is_default: true,
-                capabilities: DeviceCapabilities {
-                    audio_sample_rates: vec![8000, 16000, 44100, 48000],
-                    video_resolutions: Vec::new(),
-                    video_frame_rates: Vec::new(),
-                    audio_codecs: vec!["opus".to_string(), "PCMU".to_string()],
-                    video_codecs: Vec::new(),
-                },
-            },
-        ];
-        
-        self.video_inputs = vec![
-            MediaDevice {
-                id: "default_video_input".to_string(),
-                name: "Default Camera".to_string(),
-                device_type: MediaDeviceType::VideoInput,
-                is_default: true,
-                capabilities: DeviceCapabilities {
-                    audio_sample_rates: Vec::new(),
-                    video_resolutions: vec![(640, 480), (1280, 720), (1920, 1080)],
-                    video_frame_rates: vec![15, 30, 60],
-                    audio_codecs: Vec::new(),
-                    video_codecs: vec!["VP8".to_string(), "VP9".to_string(), "H264".to_string()],
-                },
-            },
-        ];
-        
-        self.audio_outputs = vec![
-            MediaDevice {
-                id: "default_audio_output".to_string(),
-                name: "Default Speaker".to_string(),
-                device_type: MediaDeviceType::AudioOutput,
-                is_default: true,
-                capabilities: DeviceCapabilities {
-                    audio_sample_rates: vec![8000, 16000, 44100, 48000],
-                    video_resolutions: Vec::new(),
-                    video_frame_rates: Vec::new(),
-                    audio_codecs: vec!["opus".to_string(), "PCMU".to_string()],
-                    video_codecs: Vec::new(),
-                },
-            },
-        ];
-        
-        // Set defaults if not already set
+        use cpal::traits::{DeviceTrait, HostTrait};
+
+        let host = cpal::default_host();
+
+        let default_input_name = host
+            .default_input_device()
+            .and_then(|d| d.name().ok());
+        let default_output_name = host
+            .default_output_device()
+            .and_then(|d| d.name().ok());
+
+        self.audio_inputs = match host.input_devices() {
+            Ok(devices) => devices
+                .enumerate()
+                .filter_map(|(i, dev)| {
+                    let name = dev.name().ok()?;
+                    let configs = dev.supported_input_configs().ok();
+                    Some(media_device_from_cpal(
+                        i,
+                        &name,
+                        MediaDeviceType::AudioInput,
+                        Some(&name) == default_input_name.as_ref(),
+                        configs,
+                    ))
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("cpal input_devices failed: {e}");
+                Vec::new()
+            }
+        };
+
+        self.audio_outputs = match host.output_devices() {
+            Ok(devices) => devices
+                .enumerate()
+                .filter_map(|(i, dev)| {
+                    let name = dev.name().ok()?;
+                    let configs = dev.supported_output_configs().ok();
+                    Some(media_device_from_cpal(
+                        i,
+                        &name,
+                        MediaDeviceType::AudioOutput,
+                        Some(&name) == default_output_name.as_ref(),
+                        configs,
+                    ))
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("cpal output_devices failed: {e}");
+                Vec::new()
+            }
+        };
+
+        // Video stays empty here — see the doc comment above.
+        self.video_inputs = Vec::new();
+
+        // Seed `current_devices` with whichever entry cpal flagged as
+        // the host default, falling back to the first enumerated
+        // device. Preserves any selection the caller already made.
         if self.current_devices.audio_input.is_none() {
-            self.current_devices.audio_input = Some("default_audio_input".to_string());
-        }
-        if self.current_devices.video_input.is_none() {
-            self.current_devices.video_input = Some("default_video_input".to_string());
+            self.current_devices.audio_input = self
+                .audio_inputs
+                .iter()
+                .find(|d| d.is_default)
+                .or_else(|| self.audio_inputs.first())
+                .map(|d| d.id.clone());
         }
         if self.current_devices.audio_output.is_none() {
-            self.current_devices.audio_output = Some("default_audio_output".to_string());
+            self.current_devices.audio_output = self
+                .audio_outputs
+                .iter()
+                .find(|d| d.is_default)
+                .or_else(|| self.audio_outputs.first())
+                .map(|d| d.id.clone());
         }
-        
+        // No video defaults to seed — see above.
+
         Ok(())
     }
     
@@ -567,6 +597,87 @@ impl MediaDevicesManager {
     pub fn get_current_devices(&self) -> &CurrentDevices {
         &self.current_devices
     }
+}
+
+/// Translate a cpal device into our `MediaDevice`. The numeric index
+/// disambiguates devices that share a display name (USB hubs do this
+/// regularly). `configs` is the iterator returned by either
+/// `supported_input_configs()` or `supported_output_configs()` — we
+/// fold it into the sample-rate set here, deduping by exact match
+/// rather than overlapping ranges (cpal hands back `Range<u32>`-like
+/// structs but we want a flat list of probe-able rates for the UI).
+fn media_device_from_cpal<I>(
+    index: usize,
+    name: &str,
+    device_type: MediaDeviceType,
+    is_default: bool,
+    configs: Option<I>,
+) -> MediaDevice
+where
+    I: Iterator<Item = cpal::SupportedStreamConfigRange>,
+{
+    // The default cpal sample-rate ladder we probe against. cpal's
+    // SupportedStreamConfigRange exposes [min, max], not the
+    // individual rates the device actually advertises, so we list the
+    // rates a webrtc/Opus pipeline cares about and keep the ones that
+    // fall inside any returned range.
+    const PROBE_RATES: &[u32] = &[8_000, 16_000, 24_000, 32_000, 44_100, 48_000, 96_000];
+
+    let mut sample_rates: Vec<u32> = Vec::new();
+    if let Some(configs) = configs {
+        for cfg in configs {
+            let lo = cfg.min_sample_rate().0;
+            let hi = cfg.max_sample_rate().0;
+            for &r in PROBE_RATES {
+                if r >= lo && r <= hi && !sample_rates.contains(&r) {
+                    sample_rates.push(r);
+                }
+            }
+        }
+        sample_rates.sort_unstable();
+    }
+
+    MediaDevice {
+        id: format!("audio:{index}:{}", sanitize_device_id(name)),
+        name: name.to_string(),
+        device_type,
+        is_default,
+        capabilities: DeviceCapabilities {
+            audio_sample_rates: sample_rates,
+            video_resolutions: Vec::new(),
+            video_frame_rates: Vec::new(),
+            // Codec list reflects what the calling pipeline negotiates
+            // over WebRTC, not anything the OS audio device cares
+            // about; cpal hands us PCM frames either way.
+            audio_codecs: vec!["opus".to_string()],
+            video_codecs: Vec::new(),
+        },
+    }
+}
+
+/// Reduce a device name to an id-safe slug: ASCII alphanumerics and
+/// `-`/`_`, lowercase, max 64 chars. Names from cpal can contain
+/// arbitrary unicode (especially on Linux with PulseAudio
+/// `description` fields), so the raw value isn't safe to round-trip
+/// through anywhere expecting a stable handle.
+fn sanitize_device_id(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(64));
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.extend(c.to_lowercase());
+        } else if c == '-' || c == '_' {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push('x');
+    }
+    out
 }
 
 impl Default for MediaStreamConfig {

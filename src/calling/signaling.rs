@@ -155,19 +155,3 @@ impl SignalingClient {
         self.server.send_message(recipient, message).await
     }
 }
-
-/// Backwards compatibility for the previous `CallSignal` type. The
-/// older implementation serialised signalling messages directly as
-/// bincode blobs. We retain the ability to serialise and
-/// deserialise messages for transport over the encrypted chat layer.
-impl SignalingMessage {
-    /// Serializes the signal to bytes for encryption.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
-    }
-
-    /// Tries to parse bytes into a `SignalingMessage`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
-    }
-}

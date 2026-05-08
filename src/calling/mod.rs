@@ -46,10 +46,6 @@
 //!    `peer_connection`'s newly-updated surface. Treat the first
 //!    `--features calling` build as a starting point, not the end of
 //!    the audit.
-//! 3. **The `CallSignal` compatibility shim** at the bottom of
-//!    `signaling.rs` has no callers. If it stays unused, drop it; if
-//!    you intended to revive it for the message pipeline, write the
-//!    test that drives it before bringing it back.
 //!
 //! ## Things that look right
 //!

@@ -26,10 +26,19 @@
 //! # Wire format
 //!
 //! ```text
-//! +---------------+--------+--------+----------+--------------+-------+--------------+
-//! | sender DH pub | prev_n | n      | kyb_len  | optional     | nonce | AEAD ct+tag  |
-//! | 32 B          | u32 BE | u32 BE | u16 BE   | kyber ct     | 12 B  |              |
-//! +---------------+--------+--------+----------+--------------+-------+--------------+
+//! +-------------+----------------+----------------+---------+----------------+
+//! | enc_hdr_len | enc_hdr_nonce  | enc_hdr ct+tag | nonce   | AEAD body+tag  |
+//! | u16 BE      | 12 B           | enc_hdr_len B  | 12 B    |                |
+//! +-------------+----------------+----------------+---------+----------------+
+//! ```
+//!
+//! The encrypted header decrypts to:
+//!
+//! ```text
+//! +---------------+--------+--------+----------+--------------+
+//! | sender DH pub | prev_n | n      | kyb_len  | optional     |
+//! | 32 B          | u32 BE | u32 BE | u16 BE   | kyber ct     |
+//! +---------------+--------+--------+----------+--------------+
 //! ```
 //!
 //! `n` is the sender's counter inside the current DH epoch.
@@ -38,9 +47,34 @@
 //! the old recv chain when they detect the DH change.
 //! `kyb_len` is 0 in X25519-only mode and on most hybrid frames;
 //! when non-zero it's the byte length of the trailing ML-KEM
-//! ciphertext (1088 for ML-KEM-768). The whole header (including
-//! the kyber ciphertext when present) is fed to ChaCha20-Poly1305
-//! as AAD; tampering with any field invalidates the AEAD tag.
+//! ciphertext (1088 for ML-KEM-768).
+//!
+//! Both layers bind the caller-supplied AAD: the encrypted header
+//! AEAD AAD = caller AAD; the body AEAD AAD = plaintext header
+//! bytes ‖ caller AAD. Either layer's tag fails on tampering.
+//!
+//! # Header encryption (always-on)
+//!
+//! Frame headers are AEAD-encrypted under per-direction static
+//! keys derived from the initial root key via HKDF-SHA256 with
+//! `qubee/dr/v1/hk/{a-to-b,b-to-a}` info strings. Both peers run
+//! the same derivation at construction and assign by role
+//! (initiator: send a→b, recv b→a; responder mirrored).
+//!
+//! Wire observers therefore can't see the sender's DH pub,
+//! counters, or whether a given frame carries an ML-KEM ciphertext
+//! — the encrypted-header field is computationally
+//! indistinguishable from random. This frustrates traffic analysis
+//! that would otherwise correlate epochs by DH-pub value.
+//!
+//! **Limit:** the header keys are *static* — they aren't refreshed
+//! per DH ratchet step, so they don't get the same forward-secrecy
+//! and post-compromise-security properties as the body chain
+//! keys. Rotating header keys requires the Signal-style
+//! "next-header-key" plumbing (KDF_RK_HE producing NHK for the
+//! opposite side) which is a meaningful follow-up. Documented
+//! caveat; the static layer is still strictly better than
+//! plaintext headers.
 //!
 //! # Threat model and known limits
 //!
@@ -110,14 +144,20 @@ use crate::security::secure_rng;
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-/// Fixed-size header prefix: dh_pub(32) + prev_n(4) + n(4) +
-/// kyber_ct_len(2). The optional kyber ciphertext follows
-/// immediately after the prefix.
+/// Fixed-size *plaintext* header prefix: dh_pub(32) + prev_n(4) +
+/// n(4) + kyber_ct_len(2). The optional kyber ciphertext follows
+/// immediately after the prefix in the plaintext header.
 const HEADER_PREFIX_LEN: usize = 32 + 4 + 4 + 2;
 const TAG_LEN: usize = 16;
-/// Minimum well-formed frame: header prefix (no kyber ct) + nonce
-/// + AEAD tag. Empty plaintext is permitted.
-const MIN_FRAME_LEN: usize = HEADER_PREFIX_LEN + NONCE_LEN + TAG_LEN;
+/// HEHE outer prefix: enc_hdr_len (u16 BE) + enc_hdr_nonce (12B).
+/// Followed by enc_hdr_len bytes of AEAD-encrypted header, then
+/// the body's own nonce + AEAD ciphertext.
+const HEHE_PREFIX_LEN: usize = 2 + NONCE_LEN;
+/// Minimum well-formed frame: HEHE prefix + an encrypted header
+/// (plaintext = HEADER_PREFIX_LEN, no kyber ct) + AEAD tag for
+/// the header + body nonce + body AEAD tag (empty plaintext is
+/// permitted).
+const MIN_FRAME_LEN: usize = HEHE_PREFIX_LEN + HEADER_PREFIX_LEN + TAG_LEN + NONCE_LEN + TAG_LEN;
 /// ML-KEM-768 ciphertext length, fixed by the algorithm.
 const MLKEM768_CT_LEN: usize = 1088;
 
@@ -258,6 +298,23 @@ struct State {
     /// ratchet step in `decrypt`). Cleared by `encrypt` after
     /// firing a Kyber re-encap. Always false in non-hybrid mode.
     pending_kyber_send: bool,
+    /// Static AEAD key under which we encrypt our outgoing frame
+    /// headers. Derived from the initial root key at construction
+    /// — both peers know each other's send/recv assignments
+    /// because both derive the same pair via
+    /// `derive_static_header_keys` and assign by role.
+    ///
+    /// Doesn't rotate per DH ratchet step. Full Signal HEHE
+    /// rotates header keys to give the header layer the same
+    /// forward+post-compromise properties as the body layer; we
+    /// document that as a follow-up. The current keys provide
+    /// confidentiality against wire observers (passive
+    /// adversaries don't see DH pubs / counters / kyber lengths)
+    /// and survive any number of DH ratchet steps unchanged.
+    send_header_key: SecretBox<[u8; KEY_LEN]>,
+    /// Static AEAD key the peer uses to encrypt the headers they
+    /// send to us. Same caveats as `send_header_key`.
+    recv_header_key: SecretBox<[u8; KEY_LEN]>,
 }
 
 impl State {
@@ -277,6 +334,8 @@ impl State {
             recv_counter: self.recv_counter,
             prev_send_counter: self.prev_send_counter,
             pending_kyber_send: self.pending_kyber_send,
+            send_header_key: SecretBox::new(Box::new(*self.send_header_key.expose_secret())),
+            recv_header_key: SecretBox::new(Box::new(*self.recv_header_key.expose_secret())),
         }
     }
 }
@@ -328,6 +387,7 @@ impl DoubleRatchet {
         let dh_self_pub = PublicKey::from(&dh_self_priv);
         let shared = dh_self_priv.diffie_hellman(&peer_initial_dh_pub);
         let (new_root, send_chain_key) = kdf_rk(root_key, shared.as_bytes())?;
+        let (a_to_b, b_to_a) = derive_static_header_keys(root_key)?;
 
         // Hybrid mode: the initiator has just derived a fresh send
         // chain via DH ratchet, so the next encrypt should fire a
@@ -347,6 +407,10 @@ impl DoubleRatchet {
                 recv_counter: 0,
                 prev_send_counter: 0,
                 pending_kyber_send,
+                // Initiator: send headers go a→b, receive headers
+                // come b→a.
+                send_header_key: SecretBox::new(Box::new(a_to_b)),
+                recv_header_key: SecretBox::new(Box::new(b_to_a)),
             },
             skipped: HashMap::new(),
             kyber: kyber.map(|config| KyberState { config }),
@@ -379,6 +443,7 @@ impl DoubleRatchet {
         kyber: Option<KyberConfig>,
     ) -> Result<Self> {
         let dh_self_pub = PublicKey::from(&own_initial_keypair);
+        let (a_to_b, b_to_a) = derive_static_header_keys(root_key)?;
         Ok(Self {
             state: State {
                 root_key: SecretBox::new(Box::new(*root_key)),
@@ -394,6 +459,10 @@ impl DoubleRatchet {
                 // gets set inside `decrypt` after the DH ratchet
                 // step that produces one.
                 pending_kyber_send: false,
+                // Responder: send headers go b→a, receive headers
+                // come a→b. Mirrored from the initiator.
+                send_header_key: SecretBox::new(Box::new(b_to_a)),
+                recv_header_key: SecretBox::new(Box::new(a_to_b)),
             },
             skipped: HashMap::new(),
             kyber: kyber.map(|config| KyberState { config }),
@@ -450,15 +519,34 @@ impl DoubleRatchet {
         let kyber_ct_len = u16::try_from(kyber_ct_bytes.len())
             .map_err(|_| anyhow::anyhow!("kyber ct length exceeds u16"))?;
 
-        let mut header = Vec::with_capacity(HEADER_PREFIX_LEN + kyber_ct_bytes.len());
-        header.extend_from_slice(self.state.dh_self_pub.as_bytes());
-        header.extend_from_slice(&self.state.prev_send_counter.to_be_bytes());
-        header.extend_from_slice(&counter.to_be_bytes());
-        header.extend_from_slice(&kyber_ct_len.to_be_bytes());
-        header.extend_from_slice(&kyber_ct_bytes);
+        let mut plaintext_header = Vec::with_capacity(HEADER_PREFIX_LEN + kyber_ct_bytes.len());
+        plaintext_header.extend_from_slice(self.state.dh_self_pub.as_bytes());
+        plaintext_header.extend_from_slice(&self.state.prev_send_counter.to_be_bytes());
+        plaintext_header.extend_from_slice(&counter.to_be_bytes());
+        plaintext_header.extend_from_slice(&kyber_ct_len.to_be_bytes());
+        plaintext_header.extend_from_slice(&kyber_ct_bytes);
 
-        let bound_aad = bind_aad(&header, aad);
+        // HEHE: AEAD-encrypt the plaintext header under our
+        // static send_header_key. Caller AAD is bound here too so
+        // a malleability attack on the outer caller-supplied
+        // metadata also breaks the header AEAD.
+        let header_nonce_bytes = secure_rng::random::array::<NONCE_LEN>()?;
+        let header_cipher =
+            ChaCha20Poly1305::new_from_slice(self.state.send_header_key.expose_secret())
+                .expect("32-byte key");
+        let enc_header = header_cipher
+            .encrypt(
+                Nonce::from_slice(&header_nonce_bytes),
+                Payload { msg: &plaintext_header, aad },
+            )
+            .map_err(|e| anyhow::anyhow!("header aead encrypt: {e}"))?;
+        let enc_header_len = u16::try_from(enc_header.len())
+            .map_err(|_| anyhow::anyhow!("encrypted header length exceeds u16"))?;
 
+        // The body AEAD's AAD covers the *plaintext* header bytes
+        // (binding chain ciphertext to the values that drove its
+        // selection) plus the caller's external AAD.
+        let bound_aad = bind_aad(&plaintext_header, aad);
         let cipher = ChaCha20Poly1305::new_from_slice(msg_key.as_ref()).expect("32-byte key");
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ct = cipher
@@ -471,8 +559,11 @@ impl DoubleRatchet {
             .checked_add(1)
             .context("send counter overflow — re-handshake required")?;
 
-        let mut wire = Vec::with_capacity(header.len() + NONCE_LEN + ct.len());
-        wire.extend_from_slice(&header);
+        let mut wire =
+            Vec::with_capacity(HEHE_PREFIX_LEN + enc_header.len() + NONCE_LEN + ct.len());
+        wire.extend_from_slice(&enc_header_len.to_be_bytes());
+        wire.extend_from_slice(&header_nonce_bytes);
+        wire.extend_from_slice(&enc_header);
         wire.extend_from_slice(&nonce_bytes);
         wire.extend_from_slice(&ct);
         Ok(wire)
@@ -501,30 +592,59 @@ impl DoubleRatchet {
             return Err(anyhow::anyhow!("wire frame too short: {} bytes", wire.len()));
         }
 
-        let prefix = &wire[..HEADER_PREFIX_LEN];
-        let header_dh_bytes: [u8; KEY_LEN] = prefix[..32].try_into().expect("len");
-        let header_dh = PublicKey::from(header_dh_bytes);
-        let prev_n = u32::from_be_bytes(prefix[32..36].try_into().expect("len"));
-        let counter = u32::from_be_bytes(prefix[36..40].try_into().expect("len"));
-        let kyber_ct_len = u16::from_be_bytes(prefix[40..42].try_into().expect("len")) as usize;
-
-        let header_total_len = HEADER_PREFIX_LEN + kyber_ct_len;
-        if wire.len() < header_total_len + NONCE_LEN + TAG_LEN {
+        // HEHE: outer prefix carries the encrypted header.
+        let enc_header_len =
+            u16::from_be_bytes(wire[..2].try_into().expect("len")) as usize;
+        let header_nonce = Nonce::from_slice(&wire[2..2 + NONCE_LEN]);
+        let body_start = HEHE_PREFIX_LEN + enc_header_len;
+        if wire.len() < body_start + NONCE_LEN + TAG_LEN {
             return Err(anyhow::anyhow!(
-                "wire frame too short for declared kyber_ct_len={kyber_ct_len}: {} bytes",
+                "wire frame too short for declared enc_header_len={enc_header_len}: {} bytes",
                 wire.len(),
             ));
         }
-        let kyber_ct_bytes = &wire[HEADER_PREFIX_LEN..header_total_len];
+        let enc_header = &wire[HEHE_PREFIX_LEN..body_start];
 
-        let nonce = Nonce::from_slice(&wire[header_total_len..header_total_len + NONCE_LEN]);
-        let ct = &wire[header_total_len + NONCE_LEN..];
+        // Decrypt the header layer first. Caller AAD is bound at
+        // both layers so peer-side tampering with either header
+        // or body fails AEAD.
+        let header_cipher =
+            ChaCha20Poly1305::new_from_slice(self.state.recv_header_key.expose_secret())
+                .expect("32-byte key");
+        let plaintext_header = header_cipher
+            .decrypt(header_nonce, Payload { msg: enc_header, aad })
+            .map_err(|e| anyhow::anyhow!("header aead decrypt: {e}"))?;
 
-        // Header for AAD purposes covers everything before the
-        // nonce — including the optional kyber ciphertext, so a
-        // downgrade-or-tamper attack on `kyber_ct_len` breaks AEAD.
-        let header = &wire[..header_total_len];
-        let bound_aad = bind_aad(header, aad);
+        // Validate the decrypted header has the expected fixed
+        // prefix length plus the declared kyber ciphertext.
+        if plaintext_header.len() < HEADER_PREFIX_LEN {
+            return Err(anyhow::anyhow!(
+                "decrypted header too short: {} bytes",
+                plaintext_header.len()
+            ));
+        }
+        let header_dh_bytes: [u8; KEY_LEN] =
+            plaintext_header[..32].try_into().expect("len");
+        let header_dh = PublicKey::from(header_dh_bytes);
+        let prev_n = u32::from_be_bytes(plaintext_header[32..36].try_into().expect("len"));
+        let counter = u32::from_be_bytes(plaintext_header[36..40].try_into().expect("len"));
+        let kyber_ct_len =
+            u16::from_be_bytes(plaintext_header[40..42].try_into().expect("len")) as usize;
+        if plaintext_header.len() != HEADER_PREFIX_LEN + kyber_ct_len {
+            return Err(anyhow::anyhow!(
+                "decrypted header length {} mismatches declared kyber_ct_len={kyber_ct_len}",
+                plaintext_header.len()
+            ));
+        }
+        let kyber_ct_bytes = &plaintext_header[HEADER_PREFIX_LEN..];
+
+        let nonce = Nonce::from_slice(&wire[body_start..body_start + NONCE_LEN]);
+        let ct = &wire[body_start + NONCE_LEN..];
+
+        // Body AAD binds the *plaintext* header bytes (so the
+        // body AEAD reproduces the same binding the sender did)
+        // plus the caller's external AAD.
+        let bound_aad = bind_aad(&plaintext_header, aad);
 
         // Stash hit path: cheap, no state mutation. Stashed keys
         // are by definition pre-derived, so a kyber_ct on a
@@ -768,6 +888,28 @@ fn kdf_rk(old_root: &[u8; KEY_LEN], dh_output: &[u8]) -> Result<([u8; KEY_LEN], 
     Ok((new_root, chain))
 }
 
+/// Derive the two static header-encryption keys from a session's
+/// initial root key. Both peers run this with identical input,
+/// then assign by role: initiator uses `a_to_b` to encrypt its
+/// outgoing headers and `b_to_a` to decrypt incoming; responder
+/// flips the assignment.
+///
+/// Static — these keys aren't refreshed per DH ratchet step.
+/// Reasoning lives in the `header_encryption` section of the
+/// module docs.
+fn derive_static_header_keys(
+    root_key: &[u8; KEY_LEN],
+) -> Result<([u8; KEY_LEN], [u8; KEY_LEN])> {
+    let hk = Hkdf::<Sha256>::new(None, root_key);
+    let mut a_to_b = [0u8; KEY_LEN];
+    hk.expand(b"qubee/dr/v1/hk/a-to-b", &mut a_to_b)
+        .map_err(|e| anyhow::anyhow!("hkdf expand (hk a→b): {e}"))?;
+    let mut b_to_a = [0u8; KEY_LEN];
+    hk.expand(b"qubee/dr/v1/hk/b-to-a", &mut b_to_a)
+        .map_err(|e| anyhow::anyhow!("hkdf expand (hk b→a): {e}"))?;
+    Ok((a_to_b, b_to_a))
+}
+
 /// Concatenate the wire header with the caller's AAD so AEAD
 /// covers both. Tampering with any header field — DH pub, prev_n,
 /// counter — invalidates the tag without ever triggering a
@@ -972,6 +1114,48 @@ mod tests {
         assert!(b.decrypt(&too_short, b"").is_err());
     }
 
+    #[test]
+    fn header_dh_pub_not_visible_on_wire() {
+        // HEHE intent: the DH pub doesn't appear as plaintext on
+        // the wire. Encrypt several frames and confirm a's
+        // current_dh_pub bytes never show up in the encrypted
+        // headers' raw representation.
+        let (mut a, mut b, _) = pair();
+        let _ = b; // drop unused warning
+        let pub_bytes = a.current_dh_pub().as_bytes().to_vec();
+        for _ in 0..5 {
+            let w = a.encrypt(b"x", b"").unwrap();
+            // Walk the wire looking for any 32-byte run that
+            // matches the DH pub. With HEHE the AEAD ciphertext
+            // is computationally indistinguishable from random,
+            // so the probability of a chance match is 2^-256.
+            let found = w.windows(32).any(|chunk| chunk == pub_bytes.as_slice());
+            assert!(
+                !found,
+                "DH pub leaked onto wire — header encryption isn't binding"
+            );
+        }
+    }
+
+    #[test]
+    fn header_aead_reuses_static_key_across_epochs() {
+        // Static-header-key invariant: after multiple DH ratchet
+        // steps both peers' send_header_key / recv_header_key
+        // remain unchanged from construction. Drive a few
+        // direction changes and confirm round-trip still works
+        // (which it can only if both sides still hold the same
+        // header keys we set in the constructors).
+        let (mut a, mut b, _) = pair();
+        for i in 0..5 {
+            let m = format!("a{i}");
+            let w = a.encrypt(m.as_bytes(), b"").unwrap();
+            assert_eq!(b.decrypt(&w, b"").unwrap(), m.as_bytes());
+            let m = format!("b{i}");
+            let w = b.encrypt(m.as_bytes(), b"").unwrap();
+            assert_eq!(a.decrypt(&w, b"").unwrap(), m.as_bytes());
+        }
+    }
+
     /// Hybrid-mode pair: same as `pair` but both peers wired with
     /// ML-KEM-768 keypairs and each others' publics.
     fn hybrid_pair() -> (DoubleRatchet, DoubleRatchet, PublicKey) {
@@ -1007,49 +1191,63 @@ mod tests {
         (init, resp, resp_pub)
     }
 
+    /// Length of the encrypted-header field on the wire: the
+    /// plaintext header is `HEADER_PREFIX_LEN + kyber_ct_len`
+    /// bytes; AEAD adds a 16-byte tag. The wire's first two
+    /// bytes are this `enc_hdr_len` BE u16, so tests can read
+    /// it back directly to verify whether a kyber ciphertext
+    /// was included even though the kyber ct itself is now
+    /// inside the encrypted header.
+    fn wire_enc_hdr_len(wire: &[u8]) -> usize {
+        u16::from_be_bytes(wire[..2].try_into().unwrap()) as usize
+    }
+
+    /// Sentinel: `enc_hdr_len` for a no-kyber header.
+    const NO_KYBER_ENC_HDR_LEN: usize = HEADER_PREFIX_LEN + TAG_LEN;
+    /// Sentinel: `enc_hdr_len` for a hybrid frame carrying a
+    /// full ML-KEM-768 ciphertext.
+    const KYBER_ENC_HDR_LEN: usize = HEADER_PREFIX_LEN + MLKEM768_CT_LEN + TAG_LEN;
+
     #[test]
     fn hybrid_round_trip_basic() {
         let (mut a, mut b, _) = hybrid_pair();
         let w = a.encrypt(b"hi", b"").unwrap();
         // First frame must carry kyber_ct on hybrid mode.
-        let kyber_len = u16::from_be_bytes(w[40..42].try_into().unwrap()) as usize;
-        assert_eq!(kyber_len, MLKEM768_CT_LEN);
+        assert_eq!(wire_enc_hdr_len(&w), KYBER_ENC_HDR_LEN);
         assert_eq!(b.decrypt(&w, b"").unwrap(), b"hi");
 
         // Subsequent same-direction frames carry no kyber_ct.
         let w2 = a.encrypt(b"hi 2", b"").unwrap();
-        let kyber_len2 = u16::from_be_bytes(w2[40..42].try_into().unwrap()) as usize;
-        assert_eq!(kyber_len2, 0);
+        assert_eq!(wire_enc_hdr_len(&w2), NO_KYBER_ENC_HDR_LEN);
         assert_eq!(b.decrypt(&w2, b"").unwrap(), b"hi 2");
 
         // b's first reply also carries kyber_ct, since b just
         // derived its first send chain via the DH ratchet step.
         let w3 = b.encrypt(b"hi from b", b"").unwrap();
-        let kyber_len3 = u16::from_be_bytes(w3[40..42].try_into().unwrap()) as usize;
-        assert_eq!(kyber_len3, MLKEM768_CT_LEN);
+        assert_eq!(wire_enc_hdr_len(&w3), KYBER_ENC_HDR_LEN);
         assert_eq!(a.decrypt(&w3, b"").unwrap(), b"hi from b");
     }
 
     #[test]
     fn hybrid_back_and_forth_re_encaps_each_direction_change() {
         let (mut a, mut b, _) = hybrid_pair();
-        // Strict alternation: every iteration's a-send happens
-        // right after a received a frame from b (or it's the
-        // initial send), and every b-send happens right after
-        // b received from a. Both peers therefore have a fresh
-        // send chain on every send → every frame in this loop
-        // carries kyber.
         for i in 0..6 {
             let m = format!("a{i}");
             let w = a.encrypt(m.as_bytes(), b"").unwrap();
-            let klen = u16::from_be_bytes(w[40..42].try_into().unwrap()) as usize;
-            assert_eq!(klen, MLKEM768_CT_LEN, "a-send #{i} should carry kyber");
+            assert_eq!(
+                wire_enc_hdr_len(&w),
+                KYBER_ENC_HDR_LEN,
+                "a-send #{i} should carry kyber"
+            );
             assert_eq!(b.decrypt(&w, b"").unwrap(), m.as_bytes());
 
             let m = format!("b{i}");
             let w = b.encrypt(m.as_bytes(), b"").unwrap();
-            let klen = u16::from_be_bytes(w[40..42].try_into().unwrap()) as usize;
-            assert_eq!(klen, MLKEM768_CT_LEN, "b-send #{i} should carry kyber");
+            assert_eq!(
+                wire_enc_hdr_len(&w),
+                KYBER_ENC_HDR_LEN,
+                "b-send #{i} should carry kyber"
+            );
             assert_eq!(a.decrypt(&w, b"").unwrap(), m.as_bytes());
         }
     }

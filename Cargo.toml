@@ -31,6 +31,14 @@ pqcrypto-mlkem = "0.1"
 pqcrypto-mldsa = "0.1"
 pqcrypto-traits = "0.3"
 chacha20poly1305 = "0.10.1"
+# Memory-hard password hash for the keystore master-key wrapper.
+# Replaces a single BLAKE3 round with a fixed global salt — that
+# derivation had no work factor, so an attacker who lifted the
+# master-key file off disk could brute-force weak passwords cheaply
+# and rainbow-table across users (every install used the same salt).
+# Default features pull in password-hash + rand which we don't use;
+# zeroize on so internal scratch buffers get wiped.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand_chacha = "0.3"

@@ -1,16 +1,36 @@
 use anyhow::{Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
-use blake3::Hasher;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::sync::{OnceLock, RwLock};
+use zeroize::Zeroize;
 use crate::security::secure_rng;
+
+/// On-disk format version for the password-encrypted master-key file.
+/// Bumped from the implicit "v0" (raw nonce + ciphertext, BLAKE3-derived
+/// key with a hard-coded global salt) to "v1" (versioned header,
+/// per-instance Argon2id salt). Old "v0" files no longer load.
+const MASTER_KEY_FORMAT_V1: u8 = 1;
+/// Length of the per-instance salt persisted alongside each master-key
+/// file. 16 bytes is the OWASP-recommended minimum for password hashes.
+const MASTER_KEY_SALT_LEN: usize = 16;
+/// ChaCha20-Poly1305 nonce length.
+const MASTER_KEY_NONCE_LEN: usize = 12;
+/// Argon2id parameters used for the master-key wrapping. Matches the
+/// OWASP cheat sheet's "second-tier" recommendation: m=19 MiB, t=2,
+/// p=1, output 32 bytes. ~50–150 ms on a modern phone, dominating the
+/// keystore-open cost; raises the per-guess attack cost by ~6 orders
+/// of magnitude vs the old single BLAKE3 round.
+const ARGON2_MEMORY_KIB: u32 = 19_456;
+const ARGON2_ITERATIONS: u32 = 2;
+const ARGON2_PARALLELISM: u32 = 1;
 
 /// Process-wide override for the master-key password. Set this from
 /// the embedding application (e.g. via the JNI bridge after pulling a
@@ -303,56 +323,88 @@ impl SecureKeyStore {
     }
     
     fn load_master_key(path: &Path) -> Result<SecretBox<[u8; 32]>> {
-        let encrypted_data = fs::read(path)
+        let raw = fs::read(path)
             .context("Failed to read master key file")?;
-        
-        // For now, we'll use a simple key derivation from user password
-        // In a real implementation, this would use platform-specific secure storage
-        let password = Self::get_user_password()?;
-        let derived_key = Self::derive_key_from_password(&password)?;
-        
+
+        if raw.is_empty() {
+            return Err(anyhow::anyhow!("master key file is empty"));
+        }
+
+        let header_len = 1 + MASTER_KEY_SALT_LEN + MASTER_KEY_NONCE_LEN;
+        // ChaCha20-Poly1305 ciphertext is plaintext (32 bytes) + 16-byte
+        // tag, so a well-formed file is exactly header + 48 bytes.
+        if raw.len() < header_len + 48 {
+            return Err(anyhow::anyhow!(
+                "master key file truncated: {} bytes",
+                raw.len()
+            ));
+        }
+
+        let version = raw[0];
+        if version != MASTER_KEY_FORMAT_V1 {
+            return Err(anyhow::anyhow!(
+                "unsupported master key format version {} (expected {}). \
+                 Pre-Argon2id keystores aren't readable; wipe and re-onboard.",
+                version, MASTER_KEY_FORMAT_V1
+            ));
+        }
+
+        let salt = &raw[1..1 + MASTER_KEY_SALT_LEN];
+        let nonce_bytes = &raw[1 + MASTER_KEY_SALT_LEN..header_len];
+        let ciphertext = &raw[header_len..];
+
+        let mut password = Self::get_user_password()?;
+        let derive_result = Self::derive_key_from_password(&password, salt);
+        password.zeroize();
+        let mut derived_key = derive_result?;
+
         let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
-        let nonce = Nonce::from_slice(&encrypted_data[..12]);
-        let ciphertext = &encrypted_data[12..];
-        
+        let nonce = Nonce::from_slice(nonce_bytes);
         let decrypted = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {}", e))?;
-        
+            .map_err(|e| anyhow::anyhow!("master key decrypt failed (wrong password?): {e}"));
+        derived_key.zeroize();
+        let decrypted = decrypted?;
+
         if decrypted.len() != 32 {
-            return Err(anyhow::anyhow!("Invalid master key size"));
+            return Err(anyhow::anyhow!("invalid master key size"));
         }
-        
+
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(&decrypted);
-        
         Ok(SecretBox::new(Box::new(key_array)))
     }
-    
+
     fn save_master_key(&self) -> Result<()> {
         let master_key_path = self.storage_path.with_extension("master");
         Self::save_master_key_to_path(&self.master_key, &master_key_path)
     }
-    
+
     fn save_master_key_to_path(master_key: &SecretBox<[u8; 32]>, path: &Path) -> Result<()> {
-        let password = Self::get_user_password()?;
-        let derived_key = Self::derive_key_from_password(&password)?;
-        
+        let salt = secure_rng::random::array::<MASTER_KEY_SALT_LEN>()?;
+        let nonce_bytes = secure_rng::random::array::<MASTER_KEY_NONCE_LEN>()?;
+
+        let mut password = Self::get_user_password()?;
+        let derive_result = Self::derive_key_from_password(&password, &salt);
+        password.zeroize();
+        let mut derived_key = derive_result?;
+
         let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
-        let nonce_bytes = secure_rng::random::array::<12>()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
         let encrypted = cipher
             .encrypt(nonce, master_key.expose_secret().as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
-        
-        let mut file_data = Vec::with_capacity(12 + encrypted.len());
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e));
+        derived_key.zeroize();
+        let encrypted = encrypted?;
+
+        let mut file_data = Vec::with_capacity(1 + salt.len() + nonce_bytes.len() + encrypted.len());
+        file_data.push(MASTER_KEY_FORMAT_V1);
+        file_data.extend_from_slice(&salt);
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
-        
+
         fs::write(path, file_data)
             .context("Failed to write master key file")?;
-        
         Ok(())
     }
     
@@ -402,16 +454,26 @@ impl SecureKeyStore {
         }
     }
     
-    fn derive_key_from_password(password: &str) -> Result<[u8; 32]> {
-        let mut hasher = Hasher::new();
-        hasher.update(password.as_bytes());
-        hasher.update(b"qubee_keystore_salt");
-        
-        let hash = hasher.finalize();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&hash.as_bytes()[..32]);
-        
-        Ok(key)
+    /// Stretch the user-supplied password into a 32-byte
+    /// ChaCha20-Poly1305 key via Argon2id. The caller is responsible
+    /// for zeroising both inputs and the returned key once it's no
+    /// longer needed; the keystore's own callers do this around every
+    /// invocation.
+    fn derive_key_from_password(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+        let params = Params::new(
+            ARGON2_MEMORY_KIB,
+            ARGON2_ITERATIONS,
+            ARGON2_PARALLELISM,
+            Some(32),
+        )
+        .map_err(|e| anyhow::anyhow!("argon2 params: {e}"))?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+        let mut output = [0u8; 32];
+        argon2
+            .hash_password_into(password.as_bytes(), salt, &mut output)
+            .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?;
+        Ok(output)
     }
     
     fn load_keys(&mut self) -> Result<()> {

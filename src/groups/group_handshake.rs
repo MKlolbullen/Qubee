@@ -28,9 +28,7 @@ use sha2::Sha256;
 
 use crate::groups::group_manager::GroupId;
 use crate::groups::group_permissions::Role;
-use crate::identity::identity_key::{
-    HybridSignature, IdentityId, IdentityKey, IdentityKeyPair,
-};
+use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
 use crate::security::secure_rng;
 
 /// Magic prefix on every handshake frame so the gossipsub dispatch
@@ -605,10 +603,7 @@ pub fn sign_request_join(
 
 /// Verify the joiner's signature on a `RequestJoin`. Returns the body
 /// on success.
-pub fn verify_request_join(
-    body: &RequestJoinBody,
-    signature: &HybridSignature,
-) -> Result<bool> {
+pub fn verify_request_join(body: &RequestJoinBody, signature: &HybridSignature) -> Result<bool> {
     let payload = canonical_request_join(body)?;
     body.joiner_public_key
         .verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
@@ -701,10 +696,7 @@ pub fn verify_member_added(
 }
 
 /// Sign a `RoleChange` payload with the promoter's keypair.
-pub fn sign_role_change(
-    keypair: &IdentityKeyPair,
-    body: RoleChangeBody,
-) -> Result<GroupHandshake> {
+pub fn sign_role_change(keypair: &IdentityKeyPair, body: RoleChangeBody) -> Result<GroupHandshake> {
     let payload = canonical_role_change(&body)?;
     let signature = keypair.sign(&payload)?;
     Ok(GroupHandshake::RoleChange { body, signature })

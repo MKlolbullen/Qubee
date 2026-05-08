@@ -267,8 +267,7 @@ fn stale_generation_after_rotation_is_rejected() {
 
     let stale = local - 1; // claim we sent this *before* the join landed
     let wire = forge_message_with_generation(&alice_gm, &alice_kp, group_id, b"stale", stale);
-    let result =
-        qubee_crypto::groups::group_message::decrypt_group_message(&bob_gm, &wire);
+    let result = qubee_crypto::groups::group_message::decrypt_group_message(&bob_gm, &wire);
     assert!(
         result.is_err(),
         "decrypt must reject a frame whose generation is older than local",
@@ -314,8 +313,7 @@ fn future_generation_is_rejected() {
     let local = bob_gm.get_group(&group_id).unwrap().version;
     let future = local + 5;
     let wire = forge_message_with_generation(&alice_gm, &alice_kp, group_id, b"future", future);
-    let result =
-        qubee_crypto::groups::group_message::decrypt_group_message(&bob_gm, &wire);
+    let result = qubee_crypto::groups::group_message::decrypt_group_message(&bob_gm, &wire);
     assert!(
         result.is_err(),
         "decrypt must reject a frame whose generation is newer than local",
@@ -533,8 +531,8 @@ fn existing_members_learn_about_late_joiners() {
         "After MemberAdded, Bob's group version must match Alice's (alice={alice_v}, bob={bob_v})",
     );
     let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hello carol+bob").unwrap();
-    let decrypted = decrypt_group_message(&bob_gm, &wire)
-        .expect("Bob must decrypt Alice's post-join message");
+    let decrypted =
+        decrypt_group_message(&bob_gm, &wire).expect("Bob must decrypt Alice's post-join message");
     assert_eq!(decrypted.plaintext, b"hello carol+bob");
 }
 
@@ -638,7 +636,12 @@ fn non_owner_cannot_promote_member() {
 
     // Bob (a Member, not Owner) tries to promote himself on his own
     // local view. Must fail with the owner-only gate.
-    let result = bob_gm.promote_member(group_id, bob_kp.identity_id(), bob_kp.identity_id(), Role::Admin);
+    let result = bob_gm.promote_member(
+        group_id,
+        bob_kp.identity_id(),
+        bob_kp.identity_id(),
+        Role::Admin,
+    );
     assert!(result.is_err(), "non-owner must not be able to promote");
 }
 
@@ -655,8 +658,7 @@ fn non_owner_cannot_promote_member() {
 #[test]
 fn message_older_than_max_age_is_rejected() {
     use qubee_crypto::groups::group_message::{
-        canonical_group_message, GroupMessageBody, GroupMessageEnvelope,
-        GROUP_MESSAGE_MAX_AGE_SECS,
+        canonical_group_message, GroupMessageBody, GroupMessageEnvelope, GROUP_MESSAGE_MAX_AGE_SECS,
     };
 
     let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
@@ -689,9 +691,7 @@ fn message_older_than_max_age_is_rejected() {
     // cryptography. So forging a stale frame is just: sign normally,
     // then mutate the public timestamp field on the signature struct
     // to a value past max_age_secs in the past.
-    let aead_payload = alice_gm
-        .encrypt_group_message(&group_id, b"stale")
-        .unwrap();
+    let aead_payload = alice_gm.encrypt_group_message(&group_id, b"stale").unwrap();
     let body = GroupMessageBody {
         group_id,
         sender_id: alice_id,
@@ -807,13 +807,9 @@ fn lagging_member_resyncs_after_missing_member_added() {
     // Bob applies the response. Now his local view should contain
     // Carol with a non-empty kyber_pub, and his version should match
     // Alice's.
-    let applied = process_state_sync_response(
-        &mut bob_gm,
-        bob_kp.identity_id(),
-        &resp_body,
-        &resp_sig,
-    )
-    .expect("Bob applies the response without error");
+    let applied =
+        process_state_sync_response(&mut bob_gm, bob_kp.identity_id(), &resp_body, &resp_sig)
+            .expect("Bob applies the response without error");
     assert!(applied, "Bob should accept a response addressed to him");
 
     let bob_view = bob_gm.get_group(&group_id).unwrap();
@@ -1003,13 +999,9 @@ fn lagging_member_resyncs_after_missing_key_rotation() {
 
     // Bob applies the response. After this, Bob's local key
     // matches Alice's post-rotation key.
-    let applied = process_state_sync_response(
-        &mut bob_gm,
-        bob_kp.identity_id(),
-        &resp_body,
-        &resp_sig,
-    )
-    .expect("Bob applies the response without error");
+    let applied =
+        process_state_sync_response(&mut bob_gm, bob_kp.identity_id(), &resp_body, &resp_sig)
+            .expect("Bob applies the response without error");
     assert!(applied, "Bob should accept a response addressed to him");
 
     let bob_post_resync = bob_gm.export_group_key(&group_id).unwrap();

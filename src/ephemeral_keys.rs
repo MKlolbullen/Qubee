@@ -1,13 +1,13 @@
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use anyhow::{Result, anyhow};
 
 pub type EphemeralKeyStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 pub fn verify_and_pin_ephemeral_key(
     store: &EphemeralKeyStore,
     sender_id: &str,
-    ephemeral_pk: &[u8]
+    ephemeral_pk: &[u8],
 ) -> Result<()> {
     let mut pinned = store.lock().unwrap();
 

@@ -55,10 +55,7 @@ pub enum SignalingMessage {
     },
     /// Signal that a participant has hung up. The recipient should
     /// close its local peer connection and mark the call as ended.
-    HangUp {
-        call_id: CallId,
-        sender: IdentityId,
-    },
+    HangUp { call_id: CallId, sender: IdentityId },
 }
 
 /// In‑memory signaling server that routes messages between
@@ -86,10 +83,7 @@ impl SignalingServer {
     /// same identity it will be replaced. Clients should call
     /// `register_client` before attempting to send or receive
     /// signaling messages.
-    pub async fn register_client(
-        &self,
-        identity: IdentityId,
-    ) -> SignalingClient {
+    pub async fn register_client(&self, identity: IdentityId) -> SignalingClient {
         let (tx, rx) = mpsc::unbounded_channel();
         {
             let mut clients = self.clients.write().await;
@@ -111,9 +105,12 @@ impl SignalingServer {
     ) -> Result<()> {
         let clients = self.clients.read().await;
         if let Some(tx) = clients.get(&recipient) {
-            tx.send(message).map_err(|e| anyhow::anyhow!(e.to_string()))?
+            tx.send(message)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
         } else {
-            return Err(anyhow::anyhow!("No signaling client registered for recipient"));
+            return Err(anyhow::anyhow!(
+                "No signaling client registered for recipient"
+            ));
         }
         Ok(())
     }
@@ -147,11 +144,7 @@ impl SignalingClient {
     /// Send a signaling message to another participant via the
     /// associated server. This is simply a convenience wrapper around
     /// [`SignalingServer::send_message`].
-    pub async fn send_to(
-        &self,
-        recipient: IdentityId,
-        message: SignalingMessage,
-    ) -> Result<()> {
+    pub async fn send_to(&self, recipient: IdentityId, message: SignalingMessage) -> Result<()> {
         self.server.send_message(recipient, message).await
     }
 }

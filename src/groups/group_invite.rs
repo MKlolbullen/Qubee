@@ -56,7 +56,10 @@ impl InvitePayload {
     pub fn to_invite_link(&self) -> Result<String> {
         let bytes = bincode::serialize(self).context("invite serialize failed")?;
         let token = URL_SAFE_NO_PAD.encode(bytes);
-        Ok(format!("{}://{}/{}", QUBEE_URI_SCHEME, QUBEE_INVITE_HOST, token))
+        Ok(format!(
+            "{}://{}/{}",
+            QUBEE_URI_SCHEME, QUBEE_INVITE_HOST, token
+        ))
     }
 
     /// Parse a `qubee://invite/<token>` deep link and verify its

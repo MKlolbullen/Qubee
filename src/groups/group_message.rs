@@ -22,9 +22,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::groups::group_manager::{GroupId, GroupManager};
-use crate::identity::identity_key::{
-    HybridSignature, IdentityId, IdentityKey, IdentityKeyPair,
-};
+use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
 
 /// Magic prefix for a group-message frame. Distinct from the
 /// handshake magic so the dispatch loop can tell the two apart
@@ -133,7 +131,9 @@ pub fn encrypt_group_message(
         timestamp: now_secs(),
     };
     let payload = canonical_group_message(&body);
-    let signature = sender_identity.sign(&payload).context("sign group message")?;
+    let signature = sender_identity
+        .sign(&payload)
+        .context("sign group message")?;
     let envelope = GroupMessageEnvelope { body, signature };
     envelope.to_wire()
 }
@@ -153,10 +153,7 @@ pub fn encrypt_group_message(
 /// `process_key_rotation` flips the kicked member's status, so any
 /// later GroupMessage from them is rejected here on purely local
 /// state.
-pub fn decrypt_group_message(
-    gm: &GroupManager,
-    wire: &[u8],
-) -> Result<DecryptedGroupMessage> {
+pub fn decrypt_group_message(gm: &GroupManager, wire: &[u8]) -> Result<DecryptedGroupMessage> {
     let envelope = GroupMessageEnvelope::from_wire(wire)
         .ok_or_else(|| anyhow!("not a group message frame"))?;
     let body = &envelope.body;
@@ -185,7 +182,10 @@ pub fn decrypt_group_message(
         .members
         .get(&body.sender_id)
         .ok_or_else(|| anyhow!("decrypt: sender not in group"))?;
-    if !matches!(sender.member_status, crate::groups::group_manager::MemberStatus::Active) {
+    if !matches!(
+        sender.member_status,
+        crate::groups::group_manager::MemberStatus::Active
+    ) {
         return Err(anyhow!("decrypt: sender is not an active member"));
     }
     let sender_key: IdentityKey = sender.identity_key.clone();

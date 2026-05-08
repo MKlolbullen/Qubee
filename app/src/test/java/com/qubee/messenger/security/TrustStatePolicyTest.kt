@@ -130,6 +130,80 @@ class TrustStatePolicyTest {
         assertFalse(TrustStatePolicy.canRenderAsVerified(updated))
     }
 
+    @Test
+    fun outOfBandVerificationOnUnknownContactBumpsToVerified() {
+        val key = byteArrayOf(7, 8, 9, 10)
+        val contact = Contact(
+            id = "bob",
+            identityId = "bob-id",
+            displayName = "Bob",
+            identityKey = null,
+            trustLevel = TrustLevel.UNKNOWN,
+            verificationStatus = ContactVerificationStatus.UNVERIFIED,
+        )
+
+        val updated = TrustStatePolicy.applyOutOfBandVerification(
+            contact = contact,
+            observedIdentityKey = key,
+            nowMillis = 5_555L,
+        )
+
+        assertEquals(TrustLevel.VERIFIED, updated.trustLevel)
+        assertEquals(ContactVerificationStatus.VERIFIED, updated.verificationStatus)
+        assertArrayEquals(key, updated.identityKey)
+        assertEquals(5_555L, updated.updatedAt)
+        assertTrue(TrustStatePolicy.canRenderAsVerified(updated))
+    }
+
+    @Test
+    fun outOfBandVerificationOnKeyChangedContactBumpsToVerifiedAndUpdatesKey() {
+        val newKey = byteArrayOf(11, 22, 33)
+        val contact = Contact(
+            id = "carol",
+            identityId = "carol-id",
+            displayName = "Carol",
+            identityKey = byteArrayOf(0, 0, 0, 0),
+            trustLevel = TrustLevel.KEY_CHANGED,
+            verificationStatus = ContactVerificationStatus.UNVERIFIED,
+        )
+
+        val updated = TrustStatePolicy.applyOutOfBandVerification(
+            contact = contact,
+            observedIdentityKey = newKey,
+            nowMillis = 6_000L,
+        )
+
+        assertEquals(TrustLevel.VERIFIED, updated.trustLevel)
+        assertEquals(ContactVerificationStatus.VERIFIED, updated.verificationStatus)
+        assertArrayEquals(newKey, updated.identityKey)
+        assertFalse(TrustStatePolicy.requiresKeyChangeWarning(updated))
+    }
+
+    @Test
+    fun outOfBandVerificationCannotSilentlyClearCompromisedFlag() {
+        val key = byteArrayOf(1, 2, 3)
+        val contact = Contact(
+            id = "dave",
+            identityId = "dave-id",
+            displayName = "Dave",
+            identityKey = key,
+            trustLevel = TrustLevel.COMPROMISED,
+            verificationStatus = ContactVerificationStatus.UNVERIFIED,
+        )
+
+        val updated = TrustStatePolicy.applyOutOfBandVerification(
+            contact = contact,
+            observedIdentityKey = key,
+            nowMillis = 7_000L,
+        )
+
+        // Identity-equal — caller can detect "policy declined" by
+        // referential equality and refuse to write a no-op row.
+        assertTrue(updated === contact)
+        assertEquals(TrustLevel.COMPROMISED, updated.trustLevel)
+        assertFalse(TrustStatePolicy.canRenderAsVerified(updated))
+    }
+
     private fun verifiedContact(identityKey: ByteArray): Contact = Contact(
         id = "alice",
         identityId = "alice-id",

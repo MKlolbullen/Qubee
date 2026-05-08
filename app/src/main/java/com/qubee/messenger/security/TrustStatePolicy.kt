@@ -88,6 +88,41 @@ object TrustStatePolicy {
     }
 
     /**
+     * Apply a successful out-of-band verification ceremony (typed
+     * fingerprint match, SAS visual match, or QR scan) to an existing
+     * contact.
+     *
+     * Distinct from [applyObservedIdentityKey], which captures keys
+     * the transport / handshake / receive paths happen to see — those
+     * are *passive* observations that may auto-downgrade a previously
+     * VERIFIED contact whose key changed. This method captures an
+     * *active* user gesture: the user has compared the keys over a
+     * separate channel and explicitly confirmed they match.
+     *
+     * Rules:
+     * - COMPROMISED is sticky. The user has previously marked this
+     *   contact as compromised; one OOB ceremony shouldn't
+     *   silently un-compromise them. Returns the contact unchanged
+     *   so the caller can decide whether to clear the COMPROMISED
+     *   flag through a separate explicit action.
+     * - All other trust levels: stamp the observed key, set
+     *   [TrustLevel.VERIFIED] + [ContactVerificationStatus.VERIFIED].
+     */
+    fun applyOutOfBandVerification(
+        contact: Contact,
+        observedIdentityKey: ByteArray,
+        nowMillis: Long,
+    ): Contact {
+        if (contact.trustLevel == TrustLevel.COMPROMISED) return contact
+        return contact.copy(
+            identityKey = observedIdentityKey.copyOf(),
+            trustLevel = TrustLevel.VERIFIED,
+            verificationStatus = ContactVerificationStatus.VERIFIED,
+            updatedAt = nowMillis,
+        )
+    }
+
+    /**
      * Whether this contact is allowed to render as high-trust / verified in chat UI.
      */
     fun canRenderAsVerified(contact: Contact?): Boolean =

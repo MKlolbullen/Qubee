@@ -1,14 +1,14 @@
 // Modules that survived the round-9 audit and `cargo check` clean.
-pub mod errors;
-pub mod logging;
 pub mod config;
 pub mod ephemeral_keys;
-pub mod identity;
+pub mod errors;
 pub mod groups;
-pub mod onboarding;
+pub mod identity;
+pub mod logging;
 pub mod network;
-pub mod storage;
+pub mod onboarding;
 pub mod security;
+pub mod storage;
 
 // Legacy modules from the early prototype. They lean on dependency
 // versions and APIs that no longer match Cargo.toml; some reference
@@ -19,17 +19,17 @@ pub mod security;
 //   cargo build --features legacy
 //
 #[cfg(feature = "legacy")]
-pub mod hybrid_ratchet;
-#[cfg(feature = "legacy")]
-pub mod secure_message;
+pub mod audio;
 #[cfg(feature = "legacy")]
 pub mod file_transfer;
 #[cfg(feature = "legacy")]
-pub mod audio;
+pub mod hybrid_ratchet;
+#[cfg(feature = "legacy")]
+pub mod oob_secrets;
 #[cfg(feature = "legacy")]
 pub mod sas;
 #[cfg(feature = "legacy")]
-pub mod oob_secrets;
+pub mod secure_message;
 
 // WebRTC-backed calling. Behind a feature flag because the in-tree
 // implementation hasn't been ported to webrtc 0.14 yet — see

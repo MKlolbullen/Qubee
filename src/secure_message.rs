@@ -1,15 +1,15 @@
 // src/secure_message.rs
 // Handles text message encryption/decryption with Sealed Sender and ephemeral keys
 
+use crate::ephemeral_keys::{verify_and_pin_ephemeral_key, EphemeralKeyStore};
+use crate::hybrid_ratchet::HybridRatchet;
 use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, Secret};
+use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+use pqcrypto_dilithium::dilithium2;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
-use serde::{Serialize, Deserialize};
-use pqcrypto_dilithium::dilithium2;
-use crate::hybrid_ratchet::HybridRatchet;
-use crate::ephemeral_keys::{EphemeralKeyStore, verify_and_pin_ephemeral_key};
+use secrecy::{ExposeSecret, Secret};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct SecureMsg {
@@ -28,17 +28,19 @@ impl SecureMsg {
         peer_pq_pk: &pqcrypto_kyber::kyber768::PublicKey,
         identity_sk: &dilithium2::SecretKey,
         plaintext: &[u8],
-        is_dummy: bool
+        is_dummy: bool,
     ) -> Result<SecureMsg> {
         let (header, _mklen) = r.dr.send(plaintext.len() as u32);
         r.send_ctr = r.send_ctr.wrapping_add(1);
 
         let pq_ct = if r.send_ctr % crate::hybrid_ratchet::PQ_REKEY_PERIOD == 0 {
             Some(r.pq_reencap(peer_pq_pk)?)
-        } else { None };
+        } else {
+            None
+        };
 
         let ephemeral_sk = dilithium2::keypair().0;
-        let ephemeral_pk = dilithium2::keypair().1.0.to_vec();
+        let ephemeral_pk = dilithium2::keypair().1 .0.to_vec();
 
         let root = r.derive_root_key();
         let cipher = ChaCha20Poly1305::new(Key::from_slice(root.expose_secret()));
@@ -46,10 +48,11 @@ impl SecureMsg {
         OsRng.fill_bytes(&mut nonce);
 
         let mut flagged_plaintext = Vec::new();
-        flagged_plaintext.push(if is_dummy {1} else {0});
+        flagged_plaintext.push(if is_dummy { 1 } else { 0 });
         flagged_plaintext.extend_from_slice(plaintext);
 
-        let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), &flagged_plaintext)
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), &flagged_plaintext)
             .context("text message encryption failed")?;
 
         let signature = dilithium2::sign(&ciphertext, &ephemeral_sk).0.to_vec();
@@ -69,7 +72,7 @@ impl SecureMsg {
         r: &mut HybridRatchet,
         msg: &SecureMsg,
         sender_id: &str,
-        ephemeral_store: &EphemeralKeyStore
+        ephemeral_store: &EphemeralKeyStore,
     ) -> Result<Option<Vec<u8>>> {
         if let Some(ct) = &msg.pq_ct {
             r.pq_decaps(ct)?;
@@ -79,7 +82,8 @@ impl SecureMsg {
 
         let root = r.derive_root_key();
         let cipher = ChaCha20Poly1305::new(Key::from_slice(root.expose_secret()));
-        let decrypted = cipher.decrypt(Nonce::from_slice(&msg.nonce), &msg.body)
+        let decrypted = cipher
+            .decrypt(Nonce::from_slice(&msg.nonce), &msg.body)
             .context("text message decryption failed")?;
 
         let ephemeral_pk = dilithium2::PublicKey::from_bytes(&msg.ephemeral_pk)?;

@@ -95,8 +95,7 @@ fn invite_handshake_converges_on_shared_group_state() {
     let request_wire = signed_request.to_wire().expect("wire");
 
     // Round-trip through the gossipsub-equivalent (no real network).
-    let decoded =
-        GroupHandshake::from_wire(&request_wire).expect("RequestJoin should round-trip");
+    let decoded = GroupHandshake::from_wire(&request_wire).expect("RequestJoin should round-trip");
     let (req_body_in, req_sig_in) = match decoded {
         GroupHandshake::RequestJoin { body, signature } => (body, signature),
         _ => panic!("expected RequestJoin"),
@@ -106,7 +105,9 @@ fn invite_handshake_converges_on_shared_group_state() {
     let outcome = process_request_join(&mut alice_gm, &alice_kp, &req_body_in, &req_sig_in)
         .expect("process_request_join");
     let (accepted_body, accepted_sig) = match outcome {
-        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
+        HandshakeOutcome::Accept {
+            body, signature, ..
+        } => (body, signature),
         other => panic!("expected Accept, got {other:?}"),
     };
 
@@ -294,10 +295,15 @@ fn key_rotation_after_removal_converges_on_new_key() {
         GroupHandshake::RequestJoin { body, signature } => (body, signature),
         _ => unreachable!(),
     };
-    let bob_accepted = match process_request_join(&mut alice_gm, &alice_kp, &bob_request.0, &bob_request.1).unwrap() {
-        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
-        _ => panic!("expected Accept for Bob"),
-    };
+    let bob_accepted =
+        match process_request_join(&mut alice_gm, &alice_kp, &bob_request.0, &bob_request.1)
+            .unwrap()
+        {
+            HandshakeOutcome::Accept {
+                body, signature, ..
+            } => (body, signature),
+            _ => panic!("expected Accept for Bob"),
+        };
     process_join_accepted(
         &mut bob_gm,
         payload.inviter_id,
@@ -333,10 +339,15 @@ fn key_rotation_after_removal_converges_on_new_key() {
         GroupHandshake::RequestJoin { body, signature } => (body, signature),
         _ => unreachable!(),
     };
-    let carol_accepted = match process_request_join(&mut alice_gm, &alice_kp, &carol_request.0, &carol_request.1).unwrap() {
-        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
-        _ => panic!("expected Accept for Carol"),
-    };
+    let carol_accepted =
+        match process_request_join(&mut alice_gm, &alice_kp, &carol_request.0, &carol_request.1)
+            .unwrap()
+        {
+            HandshakeOutcome::Accept {
+                body, signature, ..
+            } => (body, signature),
+            _ => panic!("expected Accept for Carol"),
+        };
     process_join_accepted(
         &mut carol_gm,
         payload.inviter_id,
@@ -347,8 +358,14 @@ fn key_rotation_after_removal_converges_on_new_key() {
     .unwrap();
 
     let pre_rotation_key = alice_gm.export_group_key(&group_id).unwrap();
-    assert_eq!(pre_rotation_key, bob_gm.export_group_key(&group_id).unwrap());
-    assert_eq!(pre_rotation_key, carol_gm.export_group_key(&group_id).unwrap());
+    assert_eq!(
+        pre_rotation_key,
+        bob_gm.export_group_key(&group_id).unwrap()
+    );
+    assert_eq!(
+        pre_rotation_key,
+        carol_gm.export_group_key(&group_id).unwrap()
+    );
 
     // -------- Alice kicks Bob --------
     let rotation_signed = plan_key_rotation(
@@ -369,8 +386,13 @@ fn key_rotation_after_removal_converges_on_new_key() {
     assert_ne!(post_rotation_key_alice, pre_rotation_key);
 
     // Carol applies the rotation broadcast.
-    process_key_rotation(&mut carol_gm, carol_kp.identity_id(), &rotation_body, &rotation_sig)
-        .unwrap();
+    process_key_rotation(
+        &mut carol_gm,
+        carol_kp.identity_id(),
+        &rotation_body,
+        &rotation_sig,
+    )
+    .unwrap();
     assert_eq!(
         carol_gm.export_group_key(&group_id).unwrap(),
         post_rotation_key_alice,
@@ -380,8 +402,13 @@ fn key_rotation_after_removal_converges_on_new_key() {
     // Bob applies the rotation broadcast — he's the removed member,
     // so he should NOT pick up the new key. His local membership
     // record drops the kyber secret.
-    process_key_rotation(&mut bob_gm, bob_kp.identity_id(), &rotation_body, &rotation_sig)
-        .unwrap();
+    process_key_rotation(
+        &mut bob_gm,
+        bob_kp.identity_id(),
+        &rotation_body,
+        &rotation_sig,
+    )
+    .unwrap();
     assert_ne!(
         bob_gm.export_group_key(&group_id).unwrap(),
         post_rotation_key_alice,

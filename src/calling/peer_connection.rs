@@ -156,7 +156,9 @@ impl PeerConnection {
         // disabled in the config, we could disable corresponding
         // interceptors here.
         let api = APIBuilder::new().build();
-        let pc = api.new_peer_connection(rtc_config).await
+        let pc = api
+            .new_peer_connection(rtc_config)
+            .await
             .context("Failed to create WebRTC peer connection")?;
         Ok(PeerConnection {
             call_id,
@@ -184,7 +186,9 @@ impl PeerConnection {
     /// cached state to `Closed` so callers reading the field directly
     /// see the terminal value without an extra round-trip.
     pub async fn close(&mut self) -> Result<()> {
-        self.webrtc_pc.close().await
+        self.webrtc_pc
+            .close()
+            .await
             .context("Failed to close peer connection")?;
         self.state = PeerConnectionState::Closed;
         Ok(())
@@ -225,7 +229,10 @@ impl PeerConnection {
                 // Cast the track into a trait object. The add_track
                 // function expects an Arc<dyn TrackLocal + Send + Sync>.
                 let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                let sender = self.webrtc_pc.add_track(dyn_track).await
+                let sender = self
+                    .webrtc_pc
+                    .add_track(dyn_track)
+                    .await
                     .context("Failed to add audio track to peer connection")?;
                 *track_opt = Some(track);
                 *sender_opt = Some(sender);
@@ -256,7 +263,9 @@ impl PeerConnection {
                     // Replace the track on the sender. Some WebRTC
                     // implementations require `Some` to re-add.
                     let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                    sender.replace_track(Some(dyn_track)).await
+                    sender
+                        .replace_track(Some(dyn_track))
+                        .await
                         .context("Failed to enable audio track")?;
                 }
             }
@@ -264,7 +273,9 @@ impl PeerConnection {
             // Disable audio by replacing the track on the RTP sender
             // with None. This will cause silence on the remote end.
             if let Some(sender) = sender_opt.as_ref() {
-                sender.replace_track(None).await
+                sender
+                    .replace_track(None)
+                    .await
                     .context("Failed to disable audio track")?;
             }
         }
@@ -296,7 +307,10 @@ impl PeerConnection {
                     "qubee-video".to_string(),
                 ));
                 let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                let sender = self.webrtc_pc.add_track(dyn_track).await
+                let sender = self
+                    .webrtc_pc
+                    .add_track(dyn_track)
+                    .await
                     .context("Failed to add video track to peer connection")?;
                 *track_opt = Some(track);
                 *sender_opt = Some(sender);
@@ -321,13 +335,17 @@ impl PeerConnection {
                 };
                 if let Some(sender) = sender_opt.as_ref() {
                     let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                    sender.replace_track(Some(dyn_track)).await
+                    sender
+                        .replace_track(Some(dyn_track))
+                        .await
                         .context("Failed to enable video track")?;
                 }
             }
         } else {
             if let Some(sender) = sender_opt.as_ref() {
-                sender.replace_track(None).await
+                sender
+                    .replace_track(None)
+                    .await
                     .context("Failed to disable video track")?;
             }
         }
@@ -367,6 +385,17 @@ impl PeerConnection {
     /// since the crate doesn't decode), so they remain at their default
     /// zero/None values.
     pub async fn get_stats(&self) -> Result<MediaStats> {
+        // Fetch the internal WebRTC stats report. This returns a map of
+        // statistics for each transport and track. Summarising these into
+        // a high‑level MediaStats struct requires parsing the report.
+        let _report = self
+            .webrtc_pc
+            .get_stats()
+            .await
+            .context("Failed to retrieve WebRTC stats")?;
+        // TODO: Parse stats report into our MediaStats struct. This is
+        // left as an exercise because the report structure is complex.
+        // For now we return zeroed metrics.
         let report = self.webrtc_pc.get_stats().await;
 
         let mut bytes_sent: u64 = 0;
@@ -433,7 +462,9 @@ impl PeerConnection {
             sdp_mline_index: Some(candidate.sdp_mline_index as u16),
             username_fragment: None,
         };
-        self.webrtc_pc.add_ice_candidate(init).await
+        self.webrtc_pc
+            .add_ice_candidate(init)
+            .await
             .context("Failed to add ICE candidate")?;
         Ok(())
     }
@@ -445,7 +476,9 @@ impl PeerConnection {
     pub async fn create_offer(&self) -> Result<String> {
         let offer = self.webrtc_pc.create_offer(None).await
             .context("Failed to create SDP offer")?;
-        self.webrtc_pc.set_local_description(offer.clone()).await
+        self.webrtc_pc
+            .set_local_description(offer.clone())
+            .await
             .context("Failed to set local description for offer")?;
         Ok(offer.sdp)
     }
@@ -454,13 +487,20 @@ impl PeerConnection {
     pub async fn create_answer(&self, offer: &str) -> Result<String> {
         // webrtc 0.14 doesn't allow direct struct-literal construction
         // of RTCSessionDescription — use the typed constructors instead.
-        let remote_desc = RTCSessionDescription::offer(offer.to_string())
-            .context("Invalid SDP offer")?;
-        self.webrtc_pc.set_remote_description(remote_desc).await
+        let remote_desc =
+            RTCSessionDescription::offer(offer.to_string()).context("Invalid SDP offer")?;
+        self.webrtc_pc
+            .set_remote_description(remote_desc)
+            .await
             .context("Failed to set remote offer description")?;
-        let answer = self.webrtc_pc.create_answer(None).await
+        let answer = self
+            .webrtc_pc
+            .create_answer(None)
+            .await
             .context("Failed to create SDP answer")?;
-        self.webrtc_pc.set_local_description(answer.clone()).await
+        self.webrtc_pc
+            .set_local_description(answer.clone())
+            .await
             .context("Failed to set local description for answer")?;
         Ok(answer.sdp)
     }
@@ -468,9 +508,11 @@ impl PeerConnection {
     /// Set the remote SDP description, expected to be an answer to a
     /// previously generated local offer.
     pub async fn set_remote_description(&self, description: &str) -> Result<()> {
-        let remote_desc = RTCSessionDescription::answer(description.to_string())
-            .context("Invalid SDP answer")?;
-        self.webrtc_pc.set_remote_description(remote_desc).await
+        let remote_desc =
+            RTCSessionDescription::answer(description.to_string()).context("Invalid SDP answer")?;
+        self.webrtc_pc
+            .set_remote_description(remote_desc)
+            .await
             .context("Failed to set remote description")?;
         Ok(())
     }

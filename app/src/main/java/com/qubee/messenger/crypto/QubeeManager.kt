@@ -602,9 +602,55 @@ class QubeeManager @Inject constructor(
     // ----------------------------------------------------------------------
 
     /**
-     * Open a new initiator-side DM session against [peerIdHex].
-     * `rootKey` and `peerInitialDhPub` come from a pairwise
-     * handshake (X3DH-style) that's done out-of-band of this class.
+     * Generate a fresh DM prekey bundle for the active identity.
+     * Persists the secrets to the encrypted keystore under
+     * [spkId]; returns the public bundle's wire bytes for the
+     * caller to advertise (e.g. embed in a contact-add QR).
+     *
+     * `spkId` is a caller-controlled rotation counter. The
+     * embedder bumps it each time it generates a new bundle and
+     * keeps secrets alive for every spkId currently published.
+     */
+    suspend fun generateDmPreKeyBundle(spkId: Int): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeGenerateDmPreKeyBundle(spkId)
+    }
+
+    /**
+     * Run the X3DH/PQXDH-style handshake from the initiator
+     * side: parse the peer's bundle, derive the shared root_key,
+     * sign the handshake init, open + persist a local DM
+     * session, and return the wire bytes of the handshake init
+     * for the embedder to deliver to the peer.
+     *
+     * Returns null on any failure (malformed bundle, signature
+     * verification failure, keystore unavailable, etc.).
+     */
+    suspend fun initiateDmHandshake(peerBundle: ByteArray): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        nativeInitiateDmHandshake(peerBundle)
+    }
+
+    /**
+     * Run the handshake from the responder side: parse the
+     * incoming wire bytes, look up our matching prekey secrets
+     * by `used_spk_id`, derive the same root_key, open + persist
+     * a local DM session, and return the initiator's IdentityId
+     * (hex-encoded) so the caller can surface the new contact
+     * in the UI.
+     */
+    suspend fun respondToDmHandshake(handshakeMessage: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            nativeRespondToDmHandshake(handshakeMessage)
+        }
+
+    /**
+     * Open a new initiator-side DM session against [peerIdHex]
+     * with pre-derived `rootKey` and `peerInitialDhPub`.
+     * Lower-level than [initiateDmHandshake] — bypasses the
+     * handshake module, useful for tests / advanced integrators
+     * that want to drive the X3DH derivation themselves.
      * Returns true on success, false on any failure (already-open
      * session, malformed inputs, keystore unavailable).
      */
@@ -710,6 +756,13 @@ class QubeeManager @Inject constructor(
         plaintext: ByteArray,
     ): String?
     private external fun nativeResetIdentity(dataDir: String): Boolean
+
+    // 1:1 DM handshake JNI surface — implemented in
+    // src/jni_api.rs alongside the corresponding handshake module
+    // in src/sessions/handshake.rs.
+    private external fun nativeGenerateDmPreKeyBundle(spkId: Int): ByteArray?
+    private external fun nativeInitiateDmHandshake(peerBundle: ByteArray): ByteArray?
+    private external fun nativeRespondToDmHandshake(handshakeMessage: ByteArray): String?
 
     // 1:1 DM session JNI surface — implemented in
     // src/jni_api.rs alongside the corresponding `nativeOpenDm…`

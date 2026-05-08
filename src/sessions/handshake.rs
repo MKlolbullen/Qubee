@@ -83,6 +83,7 @@ use pqcrypto_traits::kem::{
     SharedSecret as _,
 };
 use rand::thread_rng;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{PublicKey as DhPublicKey, StaticSecret as DhStaticSecret};
@@ -169,6 +170,131 @@ pub struct DmHandshakeInit {
     pub timestamp: u64,
     /// Hybrid signature over `canonical_handshake_init_bytes`.
     pub signature: HybridSignature,
+}
+
+/// Bincode-friendly wire representation of [`DmPreKeyBundle`].
+/// `IdentityKey` and `HybridSignature` already have manual
+/// `Serialize`/`Deserialize` impls; we serialise the X25519 +
+/// ML-KEM bytes directly because neither type has a serde
+/// derivation we can rely on.
+#[derive(Serialize, Deserialize)]
+struct DmPreKeyBundleWire {
+    identity: IdentityKey,
+    spk_pub: [u8; 32],
+    kem_pub: Vec<u8>,
+    spk_id: u32,
+    timestamp: u64,
+    signature: HybridSignature,
+}
+
+/// Bincode-friendly wire representation of [`DmHandshakeInit`].
+#[derive(Serialize, Deserialize)]
+struct DmHandshakeInitWire {
+    initiator_identity: IdentityKey,
+    ephemeral_pub: [u8; 32],
+    kem_ciphertext: Vec<u8>,
+    used_spk_id: u32,
+    used_spk_pub: [u8; 32],
+    timestamp: u64,
+    signature: HybridSignature,
+}
+
+impl DmPreKeyBundle {
+    /// Serialize to bincode bytes for transport (e.g. embedded
+    /// in a contact-add QR / shared via signalling channel).
+    pub fn to_wire(&self) -> Result<Vec<u8>> {
+        let wire = DmPreKeyBundleWire {
+            identity: self.identity.clone(),
+            spk_pub: *self.spk_pub.as_bytes(),
+            kem_pub: self.kem_pub.as_bytes().to_vec(),
+            spk_id: self.spk_id,
+            timestamp: self.timestamp,
+            signature: self.signature.clone(),
+        };
+        bincode::serialize(&wire).context("DmPreKeyBundle serialize")
+    }
+
+    /// Deserialize from bytes produced by [`to_wire`].
+    pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        let wire: DmPreKeyBundleWire =
+            bincode::deserialize(bytes).context("DmPreKeyBundle deserialize")?;
+        let kem_pub = mlkem768::PublicKey::from_bytes(&wire.kem_pub)
+            .map_err(|e| anyhow!("invalid kem_pub on wire: {e}"))?;
+        Ok(Self {
+            identity: wire.identity,
+            spk_pub: DhPublicKey::from(wire.spk_pub),
+            kem_pub,
+            spk_id: wire.spk_id,
+            timestamp: wire.timestamp,
+            signature: wire.signature,
+        })
+    }
+}
+
+impl DmHandshakeInit {
+    pub fn to_wire(&self) -> Result<Vec<u8>> {
+        let wire = DmHandshakeInitWire {
+            initiator_identity: self.initiator_identity.clone(),
+            ephemeral_pub: *self.ephemeral_pub.as_bytes(),
+            kem_ciphertext: self.kem_ciphertext.clone(),
+            used_spk_id: self.used_spk_id,
+            used_spk_pub: *self.used_spk_pub.as_bytes(),
+            timestamp: self.timestamp,
+            signature: self.signature.clone(),
+        };
+        bincode::serialize(&wire).context("DmHandshakeInit serialize")
+    }
+
+    pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        let wire: DmHandshakeInitWire =
+            bincode::deserialize(bytes).context("DmHandshakeInit deserialize")?;
+        Ok(Self {
+            initiator_identity: wire.initiator_identity,
+            ephemeral_pub: DhPublicKey::from(wire.ephemeral_pub),
+            kem_ciphertext: wire.kem_ciphertext,
+            used_spk_id: wire.used_spk_id,
+            used_spk_pub: DhPublicKey::from(wire.used_spk_pub),
+            timestamp: wire.timestamp,
+            signature: wire.signature,
+        })
+    }
+}
+
+impl DmPreKeySecrets {
+    /// Bytes for keystore persistence. Round-trips through
+    /// [`DmPreKeySecrets::restore`]. The contained material is
+    /// secret — caller is expected to encrypt at rest, which
+    /// `SecureKeyStore::store_key` does.
+    pub fn persist(&self) -> Result<Vec<u8>> {
+        #[derive(Serialize, Deserialize)]
+        struct PersistedSecrets {
+            spk_priv: [u8; 32],
+            kem_secret_bytes: Vec<u8>,
+            spk_id: u32,
+        }
+        let p = PersistedSecrets {
+            spk_priv: self.spk_priv.to_bytes(),
+            kem_secret_bytes: self.kem_secret_bytes.clone(),
+            spk_id: self.spk_id,
+        };
+        bincode::serialize(&p).context("DmPreKeySecrets serialize")
+    }
+
+    pub fn restore(bytes: &[u8]) -> Result<Self> {
+        #[derive(Serialize, Deserialize)]
+        struct PersistedSecrets {
+            spk_priv: [u8; 32],
+            kem_secret_bytes: Vec<u8>,
+            spk_id: u32,
+        }
+        let p: PersistedSecrets =
+            bincode::deserialize(bytes).context("DmPreKeySecrets deserialize")?;
+        Ok(Self {
+            spk_priv: DhStaticSecret::from(p.spk_priv),
+            kem_secret_bytes: p.kem_secret_bytes,
+            spk_id: p.spk_id,
+        })
+    }
 }
 
 /// Result of the initiator's [`initiate`] call.
@@ -609,6 +735,34 @@ mod tests {
             .timestamp
             .saturating_sub(HANDSHAKE_MAX_AGE_SECS + 60);
         assert!(respond(&secrets, &init_out.message).is_err());
+    }
+
+    #[test]
+    fn wire_round_trip_bundle_and_handshake() {
+        // Both wire helpers round-trip without losing
+        // signature-validating bytes — crucial for the JNI
+        // bridge, which carries these structs as opaque byte[]s.
+        let alice = fresh_identity();
+        let bob = fresh_identity();
+        let (bundle, secrets) = generate_prekey_bundle(&bob, 42).unwrap();
+
+        let wire = bundle.to_wire().unwrap();
+        let restored = DmPreKeyBundle::from_wire(&wire).unwrap();
+        // Initiating against the restored bundle still produces
+        // a valid handshake (sig still verifies, keys still
+        // line up).
+        let init_out = initiate(&alice, &restored).unwrap();
+
+        let msg_wire = init_out.message.to_wire().unwrap();
+        let restored_msg = DmHandshakeInit::from_wire(&msg_wire).unwrap();
+        let resp_out = respond(&secrets, &restored_msg).unwrap();
+        assert_eq!(init_out.root_key, resp_out.root_key);
+
+        // Secret persistence round-trip.
+        let s_wire = secrets.persist().unwrap();
+        let restored_secrets = DmPreKeySecrets::restore(&s_wire).unwrap();
+        let resp_again = respond(&restored_secrets, &restored_msg).unwrap();
+        assert_eq!(resp_again.root_key, resp_out.root_key);
     }
 
     #[test]

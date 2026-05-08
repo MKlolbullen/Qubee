@@ -32,6 +32,9 @@ use crate::groups::handshake_handlers::{
     HandshakeOutcome,
 };
 use crate::media_devices::{parse_video_inputs_json, set_video_inputs};
+use crate::sessions::handshake::{
+    self as dm_handshake, DmHandshakeInit, DmPreKeyBundle, DmPreKeySecrets,
+};
 use crate::sessions::SessionManager;
 use crate::storage::secure_keystore::{
     set_master_password, KeyMetadata, KeyType, KeyUsage, SecureKeyStore,
@@ -1444,6 +1447,186 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListAc
             Ok(serde_json::Value::Array(arr))
         })();
         ok_or_null(env, result)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1:1 DM handshake + session surface
+//
+// Two layers:
+//
+// * `nativeGenerateDmPreKeyBundle` / `nativeInitiateDmHandshake`
+//   / `nativeRespondToDmHandshake` run the X3DH/PQXDH-style
+//   pairwise handshake. They produce / consume the wire bytes
+//   peers exchange to agree on a shared root_key, and they
+//   open the local session as a side-effect (persisted into
+//   the keystore alongside the chain state).
+// * The remaining `nativeOpenDm…` / `nativeEncryptDm` /
+//   `nativeDecryptDm` / `nativeDropDmSession` operate on
+//   already-open sessions. Direct callers (tests, advanced
+//   integrators) can still drive `nativeOpenDmInitiator/Responder
+//   Session` against pre-derived root_keys, but the typical
+//   Android flow goes through the handshake exports.
+//
+// All entry points require the keystore to be initialised
+// (i.e. `nativeInitialize` has run); without that there's no
+// place to persist state. Returns 0 / null on any failure so
+// the Kotlin side can surface a generic "couldn't open session"
+// without each call site duplicating the error mapping.
+// ---------------------------------------------------------------------------
+
+const DM_PREKEY_SECRETS_PREFIX: &str = "dm_prekey_secrets_";
+
+fn dm_prekey_secrets_key(spk_id: u32) -> String {
+    format!("{DM_PREKEY_SECRETS_PREFIX}{spk_id}")
+}
+
+/// Generate a fresh DM prekey bundle for the active identity,
+/// persist the secrets in the identity keystore under
+/// `dm_prekey_secrets_<spk_id>`, and return the public bundle's
+/// wire bytes for the caller to advertise.
+///
+/// `spk_id` is caller-controlled — a 32-bit rotation counter
+/// the embedder bumps each time it generates a new bundle. The
+/// responder needs to keep secrets alive for every spk_id it's
+/// currently published; rotation policy lives at the embedder
+/// layer (e.g. "rotate weekly, keep last two for grace period").
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenerateDmPreKeyBundle(
+    env: JNIEnv,
+    _class: JClass,
+    spk_id: jni::sys::jint,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let spk_id = spk_id as u32;
+            let (bundle, secrets) =
+                dm_handshake::generate_prekey_bundle(identity.as_ref(), spk_id)?;
+            let secrets_bytes = secrets.persist()?;
+            let metadata = KeyMetadata {
+                algorithm: "qubee_dm_prekey_secrets_v1".to_string(),
+                key_size: secrets_bytes.len(),
+                usage: vec![KeyUsage::KeyAgreement],
+                expiry: None,
+                tags: HashMap::new(),
+            };
+            {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                ks.store_key(
+                    &dm_prekey_secrets_key(spk_id),
+                    &secrets_bytes,
+                    KeyType::PreKey,
+                    metadata,
+                )?;
+            }
+            let arr = env
+                .byte_array_from_slice(&bundle.to_wire()?)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Run the X3DH/PQXDH-style handshake from the *initiator*
+/// side: parse the peer's bundle, derive `root_key`, sign the
+/// handshake init, open a local DM session, persist it, and
+/// return the wire bytes of the handshake init for the
+/// embedder to deliver to the responder.
+///
+/// Caller is responsible for actually transmitting the returned
+/// bytes (e.g. over P2P / push). This function is purely the
+/// "produce the bytes" side; delivery is out of scope.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitiateDmHandshake(
+    env: JNIEnv,
+    _class: JClass,
+    peer_bundle: JByteArray,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let bundle_bytes = env
+                .convert_byte_array(&peer_bundle)
+                .map_err(|e| anyhow::anyhow!("invalid peer_bundle: {e}"))?;
+            let bundle = DmPreKeyBundle::from_wire(&bundle_bytes)?;
+
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let outcome = dm_handshake::initiate(identity.as_ref(), &bundle)?;
+
+            let peer_id = bundle.identity.identity_id;
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let mut sm = SESSION_MANAGER.lock().unwrap();
+            sm.establish_initiator_persistent(
+                ks,
+                peer_id,
+                &outcome.root_key,
+                outcome.peer_initial_dh_pub,
+            )?;
+
+            let arr = env
+                .byte_array_from_slice(&outcome.message.to_wire()?)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Run the handshake from the *responder* side: parse the
+/// initiator's wire message, look up our matching prekey secrets
+/// by `used_spk_id` from the keystore, derive the same
+/// `root_key`, open a local DM session, persist it, and return
+/// the initiator's `IdentityId` (hex-encoded) so the caller can
+/// surface the new contact in the UI.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRespondToDmHandshake(
+    env: JNIEnv,
+    _class: JClass,
+    handshake_msg: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let msg_bytes = env
+                .convert_byte_array(&handshake_msg)
+                .map_err(|e| anyhow::anyhow!("invalid handshake_msg: {e}"))?;
+            let msg = DmHandshakeInit::from_wire(&msg_bytes)?;
+
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let secrets_bytes = ks
+                .retrieve_key(&dm_prekey_secrets_key(msg.used_spk_id))?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no prekey secrets for spk_id {} (rotated out?)", msg.used_spk_id
+                ))?;
+            let secrets = DmPreKeySecrets::restore(secrets_bytes.expose_secret())?;
+            let outcome = dm_handshake::respond(&secrets, &msg)?;
+
+            let mut sm = SESSION_MANAGER.lock().unwrap();
+            sm.establish_responder_persistent(
+                ks,
+                outcome.peer_id,
+                &outcome.root_key,
+                outcome.own_initial_keypair,
+            )?;
+
+            let peer_id_hex = hex::encode(outcome.peer_id.as_ref());
+            let java_str = env
+                .new_string(peer_id_hex)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
     })
 }
 

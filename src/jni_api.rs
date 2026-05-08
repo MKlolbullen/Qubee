@@ -728,12 +728,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendGr
             let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
 
             let (wire, generation) = {
-                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
                 let gm = gm_guard
-                    .as_ref()
+                    .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                let wire = encrypt_group_message(gm, identity.as_ref(), group_id, &plaintext)?;
                 let generation = gm.get_group(&group_id).map(|g| g.version).unwrap_or(0);
+                let wire = encrypt_group_message(gm, identity.as_ref(), group_id, &plaintext)?;
                 (wire, generation)
             };
 
@@ -1896,9 +1896,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
                 .into();
             let identity = active_identity()?
                 .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
-            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             let wire =
                 encrypt_group_message(gm, identity.as_ref(), group_id, plaintext_str.as_bytes())?;
@@ -1935,9 +1935,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
             let wire = env
                 .convert_byte_array(&encrypted_envelope)
                 .map_err(|e| anyhow::anyhow!("invalid encrypted_envelope: {e}"))?;
-            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             let decrypted = decrypt_group_message(gm, &wire)?;
             let plaintext = String::from_utf8(decrypted.plaintext)
@@ -1971,9 +1971,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
                 .map_err(|e| anyhow::anyhow!("invalid file_data: {e}"))?;
             let identity = active_identity()?
                 .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
-            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             let wire = encrypt_group_message(gm, identity.as_ref(), group_id, &plaintext)?;
             let arr = env
@@ -2001,9 +2001,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
             let wire = env
                 .convert_byte_array(&encrypted_envelope)
                 .map_err(|e| anyhow::anyhow!("invalid encrypted_envelope: {e}"))?;
-            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             let decrypted = decrypt_group_message(gm, &wire)?;
             let arr = env

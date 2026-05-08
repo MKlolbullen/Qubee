@@ -137,11 +137,11 @@ fn join_bob_to_alice(
 fn jni_message_bridge_core_semantics_non_empty_envelope_and_round_trip() {
     let (_alice_dir, alice_kp, mut alice_gm, group_id, code, inviter_name) = create_alice_group();
     let alice_id = alice_kp.identity_id();
-    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) =
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) =
         join_bob_to_alice(&alice_kp, &mut alice_gm, group_id, code, inviter_name);
 
     let plaintext = b"Qubee JNI message bridge smoke test";
-    let envelope = encrypt_group_message(&alice_gm, &alice_kp, group_id, plaintext)
+    let envelope = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, plaintext)
         .expect("nativeEncryptMessage core path should encrypt");
 
     assert!(!envelope.is_empty(), "encrypted message envelope must be non-empty");
@@ -155,7 +155,7 @@ fn jni_message_bridge_core_semantics_non_empty_envelope_and_round_trip() {
         "encrypted message envelope must not equal plaintext bytes"
     );
 
-    let decrypted = decrypt_group_message(&bob_gm, &envelope)
+    let decrypted = decrypt_group_message(&mut bob_gm, &envelope)
         .expect("nativeDecryptMessage core path should decrypt");
 
     assert_eq!(decrypted.plaintext, plaintext);
@@ -168,11 +168,11 @@ fn jni_message_bridge_core_semantics_non_empty_envelope_and_round_trip() {
 fn jni_file_bridge_core_semantics_non_empty_envelope_and_round_trip() {
     let (_alice_dir, alice_kp, mut alice_gm, group_id, code, inviter_name) = create_alice_group();
     let alice_id = alice_kp.identity_id();
-    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) =
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) =
         join_bob_to_alice(&alice_kp, &mut alice_gm, group_id, code, inviter_name);
 
     let file_bytes: Vec<u8> = (0..=255).cycle().take(4096).collect();
-    let envelope = encrypt_group_message(&alice_gm, &alice_kp, group_id, &file_bytes)
+    let envelope = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, &file_bytes)
         .expect("nativeEncryptFile core path should encrypt binary bytes");
 
     assert!(!envelope.is_empty(), "encrypted file envelope must be non-empty");
@@ -186,7 +186,7 @@ fn jni_file_bridge_core_semantics_non_empty_envelope_and_round_trip() {
         "encrypted file envelope must not equal raw file bytes"
     );
 
-    let decrypted = decrypt_group_message(&bob_gm, &envelope)
+    let decrypted = decrypt_group_message(&mut bob_gm, &envelope)
         .expect("nativeDecryptFile core path should decrypt binary bytes");
 
     assert_eq!(decrypted.plaintext, file_bytes);

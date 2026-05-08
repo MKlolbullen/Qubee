@@ -116,26 +116,59 @@ pub struct DecryptedGroupMessage {
 /// callers can assume that's the case after a successful join or
 /// `plan_key_rotation`.
 pub fn encrypt_group_message(
-    gm: &GroupManager,
+    gm: &mut GroupManager,
     sender_identity: &IdentityKeyPair,
     group_id: GroupId,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let group = gm
+    let sender_id = sender_identity.identity_id();
+    // Snapshot the generation up front so the AEAD AAD and the
+    // signed body see exactly the same value as
+    // `encrypt_with_sender_chain`. Reading `gm.get_group` after
+    // the encrypt would also work but adds a borrow dance.
+    let generation = gm
         .get_group(&group_id)
-        .ok_or_else(|| anyhow!("encrypt: unknown group"))?;
-    let aead_payload = gm.encrypt_group_message(&group_id, plaintext)?;
+        .ok_or_else(|| anyhow!("encrypt: unknown group"))?
+        .version;
+    let timestamp = now_secs();
+    let aad = sender_chain_aad(&group_id, &sender_id, generation, timestamp);
+    let aead_payload =
+        gm.encrypt_group_message(&group_id, &sender_id, generation, plaintext, &aad)?;
     let body = GroupMessageBody {
         group_id,
-        sender_id: sender_identity.identity_id(),
-        generation: group.version,
+        sender_id,
+        generation,
         aead_payload,
-        timestamp: now_secs(),
+        timestamp,
     };
     let payload = canonical_group_message(&body);
     let signature = sender_identity.sign(&payload).context("sign group message")?;
     let envelope = GroupMessageEnvelope { body, signature };
     envelope.to_wire()
+}
+
+/// AEAD AAD for the sender-chain layer. Binds the AEAD ciphertext
+/// to the same envelope metadata the outer hybrid signature covers
+/// (group_id, sender_id, generation, timestamp); ties the two
+/// authentication layers together so a substitution attack on
+/// either alone breaks the other.
+fn sender_chain_aad(
+    group_id: &GroupId,
+    sender_id: &IdentityId,
+    generation: u64,
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
+    out.extend_from_slice(b"qubee/sk/v1/aad");
+    out.push(0u8);
+    out.extend_from_slice(group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(sender_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&generation.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out
 }
 
 /// Validate + decrypt a wire-format group-message frame.
@@ -154,49 +187,63 @@ pub fn encrypt_group_message(
 /// later GroupMessage from them is rejected here on purely local
 /// state.
 pub fn decrypt_group_message(
-    gm: &GroupManager,
+    gm: &mut GroupManager,
     wire: &[u8],
 ) -> Result<DecryptedGroupMessage> {
     let envelope = GroupMessageEnvelope::from_wire(wire)
         .ok_or_else(|| anyhow!("not a group message frame"))?;
-    let body = &envelope.body;
+    let body = envelope.body;
 
-    let group = gm
-        .get_group(&body.group_id)
-        .ok_or_else(|| anyhow!("decrypt: unknown group"))?;
+    // All non-mutating checks happen up-front against an
+    // immutable borrow of `gm`. We extract the sender's identity
+    // key here so the immutable borrow is released before the
+    // mutable `decrypt_group_message` call below.
+    let sender_key: IdentityKey = {
+        let group = gm
+            .get_group(&body.group_id)
+            .ok_or_else(|| anyhow!("decrypt: unknown group"))?;
 
-    // Generation gate: closes the small race where a kicked-then-
-    // rotated member's already-in-flight message lands after the
-    // local rotation but before the gossipsub mesh has fully
-    // settled. `body.generation` is the sender's snapshot of
-    // `group.version` at send time; we accept only equal-version
-    // frames. Strict policy because the alternative — buffer
-    // future-generation frames until the matching KeyRotation
-    // arrives — needs reorder-safe state we don't yet have.
-    if body.generation != group.version {
-        return Err(anyhow!(
-            "decrypt: generation mismatch (frame={}, local={})",
-            body.generation,
-            group.version
-        ));
-    }
+        // Generation gate: closes the small race where a kicked-
+        // then-rotated member's already-in-flight message lands
+        // after the local rotation but before the gossipsub mesh
+        // has fully settled. `body.generation` is the sender's
+        // snapshot of `group.version` at send time; we accept
+        // only equal-version frames. Strict policy because the
+        // alternative — buffer future-generation frames until the
+        // matching KeyRotation arrives — needs reorder-safe state
+        // we don't yet have.
+        if body.generation != group.version {
+            return Err(anyhow!(
+                "decrypt: generation mismatch (frame={}, local={})",
+                body.generation,
+                group.version
+            ));
+        }
 
-    let sender = group
-        .members
-        .get(&body.sender_id)
-        .ok_or_else(|| anyhow!("decrypt: sender not in group"))?;
-    if !matches!(sender.member_status, crate::groups::group_manager::MemberStatus::Active) {
-        return Err(anyhow!("decrypt: sender is not an active member"));
-    }
-    let sender_key: IdentityKey = sender.identity_key.clone();
+        let sender = group
+            .members
+            .get(&body.sender_id)
+            .ok_or_else(|| anyhow!("decrypt: sender not in group"))?;
+        if !matches!(sender.member_status, crate::groups::group_manager::MemberStatus::Active) {
+            return Err(anyhow!("decrypt: sender is not an active member"));
+        }
+        sender.identity_key.clone()
+    };
 
-    let payload = canonical_group_message(body);
+    let payload = canonical_group_message(&body);
     if !sender_key.verify_with_max_age(&payload, &envelope.signature, GROUP_MESSAGE_MAX_AGE_SECS)? {
         return Err(anyhow!("decrypt: signature failed or message expired"));
     }
 
+    let aad = sender_chain_aad(&body.group_id, &body.sender_id, body.generation, body.timestamp);
     let plaintext = gm
-        .decrypt_group_message(&body.group_id, &body.aead_payload)
+        .decrypt_group_message(
+            &body.group_id,
+            &body.sender_id,
+            body.generation,
+            &body.aead_payload,
+            &aad,
+        )
         .context("AEAD decrypt")?;
 
     Ok(DecryptedGroupMessage {

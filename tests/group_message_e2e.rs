@@ -113,7 +113,7 @@ fn round_trip_encrypted_group_message() {
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
 
-    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -128,9 +128,9 @@ fn round_trip_encrypted_group_message() {
     );
 
     let payload = b"Hello from Alice".as_slice();
-    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, payload).unwrap();
+    let wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, payload).unwrap();
 
-    let decrypted = decrypt_group_message(&bob_gm, &wire).expect("Bob decrypts");
+    let decrypted = decrypt_group_message(&mut bob_gm, &wire).expect("Bob decrypts");
     assert_eq!(decrypted.plaintext, payload);
     assert_eq!(decrypted.sender_id, alice_id);
     assert_eq!(decrypted.group_id, group_id);
@@ -194,10 +194,10 @@ fn rejects_message_from_non_member() {
         )
         .unwrap();
 
-    let wire = encrypt_group_message(&mallory_gm, &mallory_kp, group_id, b"forged").unwrap();
+    let wire = encrypt_group_message(&mut mallory_gm, &mallory_kp, group_id, b"forged").unwrap();
 
     // Alice's GM never enrolled Mallory — must reject.
-    let result = decrypt_group_message(&alice_gm, &wire);
+    let result = decrypt_group_message(&mut alice_gm, &wire);
     assert!(result.is_err(), "Alice must reject message from non-member");
 }
 
@@ -208,7 +208,7 @@ fn rejects_message_from_non_member() {
 /// generation to test the receiver's gate. So we duplicate the
 /// minimum framing logic here, mirroring `encrypt_group_message`.
 fn forge_message_with_generation(
-    gm: &GroupManager,
+    gm: &mut GroupManager,
     sender_kp: &IdentityKeyPair,
     group_id: qubee_crypto::groups::group_manager::GroupId,
     plaintext: &[u8],
@@ -217,16 +217,35 @@ fn forge_message_with_generation(
     use qubee_crypto::groups::group_message::{
         canonical_group_message, GroupMessageBody, GroupMessageEnvelope,
     };
-    let aead_payload = gm.encrypt_group_message(&group_id, plaintext).unwrap();
+    let sender_id = sender_kp.identity_id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Match `encrypt_group_message`'s AAD shape so the forged
+    // frame round-trips through the sender-chain decrypt path
+    // even though it was signed by an unauthorised sender — the
+    // generation gate / signature checks elsewhere are what we're
+    // exercising in these tests, not the AEAD.
+    let mut aad = Vec::with_capacity(80);
+    aad.extend_from_slice(b"qubee/sk/v1/aad");
+    aad.push(0u8);
+    aad.extend_from_slice(group_id.as_ref());
+    aad.push(0u8);
+    aad.extend_from_slice(sender_id.as_ref());
+    aad.push(0u8);
+    aad.extend_from_slice(&generation.to_le_bytes());
+    aad.push(0u8);
+    aad.extend_from_slice(&timestamp.to_le_bytes());
+    let aead_payload = gm
+        .encrypt_group_message(&group_id, &sender_id, generation, plaintext, &aad)
+        .unwrap();
     let body = GroupMessageBody {
         group_id,
-        sender_id: sender_kp.identity_id(),
+        sender_id,
         generation,
         aead_payload,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        timestamp,
     };
     let payload = canonical_group_message(&body);
     let signature = sender_kp.sign(&payload).unwrap();
@@ -255,7 +274,7 @@ fn stale_generation_after_rotation_is_rejected() {
     let invitation = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -267,9 +286,9 @@ fn stale_generation_after_rotation_is_rejected() {
     assert!(local >= 1, "post-join group version must be at least 1");
 
     let stale = local - 1; // claim we sent this *before* the join landed
-    let wire = forge_message_with_generation(&alice_gm, &alice_kp, group_id, b"stale", stale);
+    let wire = forge_message_with_generation(&mut alice_gm, &alice_kp, group_id, b"stale", stale);
     let result =
-        qubee_crypto::groups::group_message::decrypt_group_message(&bob_gm, &wire);
+        qubee_crypto::groups::group_message::decrypt_group_message(&mut bob_gm, &wire);
     assert!(
         result.is_err(),
         "decrypt must reject a frame whose generation is older than local",
@@ -304,7 +323,7 @@ fn future_generation_is_rejected() {
     let invitation = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -314,9 +333,9 @@ fn future_generation_is_rejected() {
 
     let local = bob_gm.get_group(&group_id).unwrap().version;
     let future = local + 5;
-    let wire = forge_message_with_generation(&alice_gm, &alice_kp, group_id, b"future", future);
+    let wire = forge_message_with_generation(&mut alice_gm, &alice_kp, group_id, b"future", future);
     let result =
-        qubee_crypto::groups::group_message::decrypt_group_message(&bob_gm, &wire);
+        qubee_crypto::groups::group_message::decrypt_group_message(&mut bob_gm, &wire);
     assert!(
         result.is_err(),
         "decrypt must reject a frame whose generation is newer than local",
@@ -342,7 +361,7 @@ fn wire_format_magic_prefix_is_stable() {
         .unwrap();
     alice_gm.ensure_group_key(group_id).unwrap();
 
-    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();
+    let wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, b"hi").unwrap();
     assert!(wire.starts_with(b"QUBEE_GMS\x01"));
 }
 
@@ -533,8 +552,8 @@ fn existing_members_learn_about_late_joiners() {
         bob_v, alice_v,
         "After MemberAdded, Bob's group version must match Alice's (alice={alice_v}, bob={bob_v})",
     );
-    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hello carol+bob").unwrap();
-    let decrypted = decrypt_group_message(&bob_gm, &wire)
+    let wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, b"hello carol+bob").unwrap();
+    let decrypted = decrypt_group_message(&mut bob_gm, &wire)
         .expect("Bob must decrypt Alice's post-join message");
     assert_eq!(decrypted.plaintext, b"hello carol+bob");
 }
@@ -603,9 +622,9 @@ fn owner_can_promote_member_and_broadcast_role_change() {
     assert_eq!(alice_v, bob_v, "post-RoleChange version must agree");
 
     // Subsequent encrypted message round-trips fine.
-    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"role-change ok").unwrap();
+    let wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, b"role-change ok").unwrap();
     let decrypted =
-        decrypt_group_message(&bob_gm, &wire).expect("post-RoleChange decryption works");
+        decrypt_group_message(&mut bob_gm, &wire).expect("post-RoleChange decryption works");
     assert_eq!(decrypted.plaintext, b"role-change ok");
 }
 
@@ -676,7 +695,7 @@ fn message_older_than_max_age_is_rejected() {
     let invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, _bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -690,18 +709,30 @@ fn message_older_than_max_age_is_rejected() {
     // cryptography. So forging a stale frame is just: sign normally,
     // then mutate the public timestamp field on the signature struct
     // to a value past max_age_secs in the past.
+    let generation = alice_gm.get_group(&group_id).unwrap().version;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut aad = Vec::with_capacity(80);
+    aad.extend_from_slice(b"qubee/sk/v1/aad");
+    aad.push(0u8);
+    aad.extend_from_slice(group_id.as_ref());
+    aad.push(0u8);
+    aad.extend_from_slice(alice_id.as_ref());
+    aad.push(0u8);
+    aad.extend_from_slice(&generation.to_le_bytes());
+    aad.push(0u8);
+    aad.extend_from_slice(&timestamp.to_le_bytes());
     let aead_payload = alice_gm
-        .encrypt_group_message(&group_id, b"stale")
+        .encrypt_group_message(&group_id, &alice_id, generation, b"stale", &aad)
         .unwrap();
     let body = GroupMessageBody {
         group_id,
         sender_id: alice_id,
-        generation: alice_gm.get_group(&group_id).unwrap().version,
+        generation,
         aead_payload,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        timestamp,
     };
     let payload = canonical_group_message(&body);
     let mut signature = alice_kp.sign(&payload).unwrap();
@@ -710,7 +741,7 @@ fn message_older_than_max_age_is_rejected() {
     signature.timestamp = signature.timestamp - GROUP_MESSAGE_MAX_AGE_SECS - 60;
     let wire = GroupMessageEnvelope { body, signature }.to_wire().unwrap();
 
-    let result = decrypt_group_message(&bob_gm, &wire);
+    let result = decrypt_group_message(&mut bob_gm, &wire);
     assert!(
         result.is_err(),
         "stale-timestamp frame must be rejected by the freshness gate",
@@ -862,7 +893,7 @@ fn state_sync_response_addressed_to_someone_else_is_ignored() {
     let invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -1023,8 +1054,8 @@ fn lagging_member_resyncs_after_missing_key_rotation() {
     // Bob decrypts. Without the key delivery, decrypt would have
     // bounced (different keys on either side).
     let payload = b"hello after rotation".as_slice();
-    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, payload).unwrap();
-    let decrypted = decrypt_group_message(&bob_gm, &wire)
+    let wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, payload).unwrap();
+    let decrypted = decrypt_group_message(&mut bob_gm, &wire)
         .expect("Bob must decrypt Alice's post-rotation message after resync");
     assert_eq!(decrypted.plaintext, payload);
 }

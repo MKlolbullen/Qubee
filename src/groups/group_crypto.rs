@@ -1,14 +1,12 @@
 use anyhow::Result;
-use secrecy::SecretBox;
+use secrecy::{ExposeSecret, SecretBox};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::groups::group_manager::GroupId;
+use crate::groups::sender_keys::SenderChain;
+use crate::identity::identity_key::IdentityId;
 use crate::security::secure_rng;
-
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-use secrecy::ExposeSecret;
 
 /// Symmetric key used for encrypting group messages. It stores the raw
 /// 256‑bit secret along with the creation timestamp. In a complete
@@ -36,13 +34,27 @@ pub struct GroupKeyRotation {
     pub rotated_at: u64,
 }
 
-/// Manages symmetric keys for group chats. Keys are stored in a simple
-/// in‑memory map keyed by `GroupId`. In a production system keys
-/// should be stored in secure hardware or an encrypted keystore and
-/// derived via a ratchet mechanism. This module provides just enough
-/// functionality to allow the rest of the group manager to compile.
+/// Manages per-group symmetric state. Two layers:
+///
+/// * **Group key** — shared 256-bit secret negotiated during the
+///   join handshake (KEM-wrapped) and rotated on member-add/remove.
+///   Seeds the per-sender chains; never used directly to encrypt
+///   group messages anymore.
+/// * **Sender chains** — one [`SenderChain`] per `(group, sender,
+///   generation)` triple. Each member maintains their own send
+///   chain plus a tracked recv chain for every other active sender
+///   in groups they're members of. Forward secrecy at the message
+///   level; chains reset every time `group.version` bumps.
+///
+/// Chain state is held in memory; the `GroupManager` layer is
+/// responsible for persisting it to the encrypted keystore on
+/// every encrypt/decrypt so a process restart doesn't desync
+/// counters from the peer's view. `GroupCrypto` exposes
+/// `serialize_sender_chain` / `install_sender_chain` for that
+/// purpose.
 pub struct GroupCrypto {
     keys: HashMap<GroupId, GroupKey>,
+    sender_chains: HashMap<(GroupId, IdentityId, u64), SenderChain>,
 }
 
 impl GroupCrypto {
@@ -50,6 +62,7 @@ impl GroupCrypto {
     pub fn new() -> Result<Self> {
         Ok(GroupCrypto {
             keys: HashMap::new(),
+            sender_chains: HashMap::new(),
         })
     }
 
@@ -126,47 +139,117 @@ impl GroupCrypto {
         self.keys.get(group_id)
     }
 
-    /// Encrypt a plaintext message for the given group using the
-    /// current group key. A fresh nonce is generated for each
-    /// encryption and is prefixed to the returned ciphertext. The
-    /// resulting vector has the format `[nonce | ciphertext]`.
-    pub fn encrypt_message(&self, group_id: &GroupId, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let key = self
-            .get_group_key(group_id)
-            .ok_or_else(|| anyhow::anyhow!("Group key not found"))?;
-        // Derive a cipher from the 256‑bit group key
-        let cipher = ChaCha20Poly1305::new(key.key.expose_secret().into());
-        // Generate a random 96‑bit nonce
-        let nonce_bytes = secure_rng::random::array::<12>()?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        // Encrypt the plaintext. chacha20poly1305::Error doesn't impl
-        // Display so we can't use anyhow's `.context`; map manually.
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| anyhow::anyhow!("Group message encryption failed: {e:?}"))?;
-        // Prepend nonce to ciphertext
-        let mut output = Vec::with_capacity(12 + ciphertext.len());
-        output.extend_from_slice(&nonce_bytes);
-        output.extend_from_slice(&ciphertext);
-        Ok(output)
+    /// Encrypt a plaintext message under the local member's
+    /// per-`(group, sender, generation)` send chain. Lazy-initialises
+    /// the chain on first use from the group key + sender id +
+    /// generation via [`SenderChain::from_group_seed`]; subsequent
+    /// calls advance the chain. Returns the wire format
+    /// `[counter: u32 BE][nonce: 12B][AEAD ct + tag]`.
+    pub fn encrypt_with_sender_chain(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let chain = self.ensure_sender_chain(group_id, sender_id, generation)?;
+        chain.encrypt(plaintext, aad)
     }
 
-    /// Decrypt a group message. Expects the input to have the nonce
-    /// prepended as returned by `encrypt_message`. Returns the
-    /// plaintext on success.
-    pub fn decrypt_message(&self, group_id: &GroupId, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 12 {
-            return Err(anyhow::anyhow!("Ciphertext too short"));
+    /// Decrypt a frame produced by `encrypt_with_sender_chain`,
+    /// against the recv side of the same `(group, sender,
+    /// generation)` chain. Lazy-initialises the chain on first use
+    /// (deterministic from the same inputs as the sender), then
+    /// advances it.
+    pub fn decrypt_with_sender_chain(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        wire: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let chain = self.ensure_sender_chain(group_id, sender_id, generation)?;
+        chain.decrypt(wire, aad)
+    }
+
+    /// Get-or-init a sender chain. The chain is derived
+    /// deterministically from `(group_key, group_id, sender_id,
+    /// generation)`, so both peers (the sender and any tracking
+    /// receiver) land on identical state when they first touch a
+    /// `(group, sender, generation)` triple they haven't seen yet.
+    fn ensure_sender_chain(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+    ) -> Result<&mut SenderChain> {
+        let key_triple = (*group_id, *sender_id, generation);
+        if !self.sender_chains.contains_key(&key_triple) {
+            let group_key_bytes = self
+                .keys
+                .get(group_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no group key for {group_id:?}; chain seed unavailable"
+                ))?
+                .key
+                .expose_secret();
+            let chain = SenderChain::from_group_seed(
+                group_key_bytes,
+                group_id,
+                sender_id,
+                generation,
+            )?;
+            self.sender_chains.insert(key_triple, chain);
         }
-        let key = self
-            .get_group_key(group_id)
-            .ok_or_else(|| anyhow::anyhow!("Group key not found"))?;
-        let cipher = ChaCha20Poly1305::new(key.key.expose_secret().into());
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Group message decryption failed: {e:?}"))?;
-        Ok(plaintext)
+        Ok(self
+            .sender_chains
+            .get_mut(&key_triple)
+            .expect("just inserted"))
+    }
+
+    /// Serialize a sender chain for keystore persistence. Returns
+    /// `None` if no such chain exists yet (caller hasn't touched
+    /// this triple via encrypt/decrypt). The `GroupManager` layer
+    /// calls this after every chain advance to write the new state
+    /// to the encrypted keystore.
+    pub fn serialize_sender_chain(
+        &self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.sender_chains.get(&(*group_id, *sender_id, generation)) {
+            Some(chain) => Ok(Some(chain.persist()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Install a previously persisted sender chain — used by
+    /// `GroupManager::load_groups_from_storage` to restore chain
+    /// state across process restarts.
+    pub fn install_sender_chain(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let chain = SenderChain::restore(bytes)?;
+        self.sender_chains
+            .insert((*group_id, *sender_id, generation), chain);
+        Ok(())
+    }
+
+    /// Forget any sender chains for a group whose generation is
+    /// older than `min_generation`. Called after a key rotation:
+    /// once `group.version` advances, frames from the old
+    /// generation are rejected by the generation gate in
+    /// `decrypt_group_message` anyway, so the chains can't be
+    /// useful and just sit holding key material.
+    pub fn drop_stale_sender_chains(&mut self, group_id: &GroupId, min_generation: u64) {
+        self.sender_chains
+            .retain(|(gid, _sid, gen), _| !(gid == group_id && *gen < min_generation));
     }
 }

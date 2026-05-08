@@ -288,7 +288,7 @@ async fn p2p_two_node_e2e() {
 
     // -------- Alice publishes an encrypted GroupMessage; Bob decrypts --------
     let payload = b"hello over libp2p";
-    let msg_wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, payload)
+    let msg_wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, payload)
         .expect("encrypt_group_message");
     send_cmd(
         &alice_node,
@@ -307,7 +307,7 @@ async fn p2p_two_node_e2e() {
     let NodeEvent::MessageReceived { data: msg_data, .. } = bob_evt else {
         unreachable!()
     };
-    let decrypted = decrypt_group_message(&bob_gm, &msg_data).expect("decrypt over wire");
+    let decrypted = decrypt_group_message(&mut bob_gm, &msg_data).expect("decrypt over wire");
     assert_eq!(decrypted.plaintext, payload);
     assert_eq!(decrypted.sender_id, alice_id);
     assert_eq!(decrypted.group_id, group_id);

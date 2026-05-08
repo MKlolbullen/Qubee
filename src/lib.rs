@@ -10,6 +10,7 @@ pub mod network;
 pub mod storage;
 pub mod security;
 pub mod media_devices;
+pub mod crypto;
 
 // Legacy modules from the early prototype. They lean on dependency
 // versions and APIs that no longer match Cargo.toml; some reference

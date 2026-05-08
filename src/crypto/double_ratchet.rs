@@ -53,28 +53,43 @@
 //! AEAD AAD = caller AAD; the body AEAD AAD = plaintext header
 //! bytes ‖ caller AAD. Either layer's tag fails on tampering.
 //!
-//! # Header encryption (always-on)
+//! # Header encryption (always-on, Signal HEHE-style)
 //!
-//! Frame headers are AEAD-encrypted under per-direction static
-//! keys derived from the initial root key via HKDF-SHA256 with
-//! `qubee/dr/v1/hk/{a-to-b,b-to-a}` info strings. Both peers run
-//! the same derivation at construction and assign by role
-//! (initiator: send a→b, recv b→a; responder mirrored).
+//! Frame headers are AEAD-encrypted under rotating per-direction
+//! header keys that move in lockstep with the DH chains.
+//!
+//! Each peer maintains four header-key slots:
+//!
+//! * **HKs** — current send header key (encrypts outgoing
+//!   headers)
+//! * **HKr** — current recv header key (tries first when
+//!   decrypting an incoming header)
+//! * **NHKs** — next send header key (becomes HKs at the next
+//!   DH ratchet step)
+//! * **NHKr** — next recv header key (tried as a fallback when
+//!   HKr fails; success there signals a peer-side ratchet)
+//!
+//! Initial values come from `derive_initial_header_keys(root_key)`
+//! which produces two shared keys (`shared_hk_init`, `shared_nhk_init`).
+//! Initiator: HKs = `shared_hk_init`, NHKr = `shared_nhk_init`,
+//! NHKs = derived from `KDF_RK_HE` on the initial DH, HKr = None.
+//! Responder: HKs = None, HKr = None, NHKs = `shared_nhk_init`,
+//! NHKr = `shared_hk_init`.
+//!
+//! On every DH ratchet step (triggered when a frame's header
+//! decrypts under NHKr instead of HKr), both NHK→HK promotions
+//! fire and the two `KDF_RK_HE` calls produce fresh NHKs/NHKr
+//! values. The peer-side equivalent NHKs/NHKr derive from the
+//! same DH output, so both sides stay aligned.
 //!
 //! Wire observers therefore can't see the sender's DH pub,
 //! counters, or whether a given frame carries an ML-KEM ciphertext
 //! — the encrypted-header field is computationally
-//! indistinguishable from random. This frustrates traffic analysis
-//! that would otherwise correlate epochs by DH-pub value.
-//!
-//! **Limit:** the header keys are *static* — they aren't refreshed
-//! per DH ratchet step, so they don't get the same forward-secrecy
-//! and post-compromise-security properties as the body chain
-//! keys. Rotating header keys requires the Signal-style
-//! "next-header-key" plumbing (KDF_RK_HE producing NHK for the
-//! opposite side) which is a meaningful follow-up. Documented
-//! caveat; the static layer is still strictly better than
-//! plaintext headers.
+//! indistinguishable from random. The rotating-key construction
+//! also gives the header layer the same forward-secrecy and
+//! post-compromise-security guarantees as the body chain: a
+//! state read at time *t* doesn't decrypt headers from before *t*
+//! after the next ratchet step has rolled past.
 //!
 //! # Threat model and known limits
 //!
@@ -298,23 +313,24 @@ struct State {
     /// ratchet step in `decrypt`). Cleared by `encrypt` after
     /// firing a Kyber re-encap. Always false in non-hybrid mode.
     pending_kyber_send: bool,
-    /// Static AEAD key under which we encrypt our outgoing frame
-    /// headers. Derived from the initial root key at construction
-    /// — both peers know each other's send/recv assignments
-    /// because both derive the same pair via
-    /// `derive_static_header_keys` and assign by role.
-    ///
-    /// Doesn't rotate per DH ratchet step. Full Signal HEHE
-    /// rotates header keys to give the header layer the same
-    /// forward+post-compromise properties as the body layer; we
-    /// document that as a follow-up. The current keys provide
-    /// confidentiality against wire observers (passive
-    /// adversaries don't see DH pubs / counters / kyber lengths)
-    /// and survive any number of DH ratchet steps unchanged.
-    send_header_key: SecretBox<[u8; KEY_LEN]>,
-    /// Static AEAD key the peer uses to encrypt the headers they
-    /// send to us. Same caveats as `send_header_key`.
-    recv_header_key: SecretBox<[u8; KEY_LEN]>,
+    /// Current send header key (Signal HEHE: HKs). Encrypts
+    /// every outgoing header. `None` for the responder until
+    /// they receive their first frame and run a DH ratchet step
+    /// (which produces the first send chain *and* promotes the
+    /// initial NHKs into HKs).
+    hks: Option<SecretBox<[u8; KEY_LEN]>>,
+    /// Current recv header key (HKr). Tries first when decrypting
+    /// an incoming header. `None` until the first DH ratchet
+    /// step on receive — initial frames decrypt via NHKr instead.
+    hkr: Option<SecretBox<[u8; KEY_LEN]>>,
+    /// Next send header key (NHKs). Becomes HKs at the next DH
+    /// ratchet step. Always populated after construction (both
+    /// peers seed it from the initial root key).
+    nhks: SecretBox<[u8; KEY_LEN]>,
+    /// Next recv header key (NHKr). Tried as a fallback when
+    /// HKr fails — success on this branch signals a peer-side
+    /// DH ratchet that we now need to mirror locally.
+    nhkr: SecretBox<[u8; KEY_LEN]>,
 }
 
 impl State {
@@ -334,10 +350,17 @@ impl State {
             recv_counter: self.recv_counter,
             prev_send_counter: self.prev_send_counter,
             pending_kyber_send: self.pending_kyber_send,
-            send_header_key: SecretBox::new(Box::new(*self.send_header_key.expose_secret())),
-            recv_header_key: SecretBox::new(Box::new(*self.recv_header_key.expose_secret())),
+            hks: clone_opt_key(&self.hks),
+            hkr: clone_opt_key(&self.hkr),
+            nhks: SecretBox::new(Box::new(*self.nhks.expose_secret())),
+            nhkr: SecretBox::new(Box::new(*self.nhkr.expose_secret())),
         }
     }
+}
+
+fn clone_opt_key(k: &Option<SecretBox<[u8; KEY_LEN]>>) -> Option<SecretBox<[u8; KEY_LEN]>> {
+    k.as_ref()
+        .map(|s| SecretBox::new(Box::new(*s.expose_secret())))
 }
 
 /// Stash key: scoped to a specific DH epoch so a counter from an
@@ -386,8 +409,8 @@ impl DoubleRatchet {
         let dh_self_priv = StaticSecret::random_from_rng(thread_rng());
         let dh_self_pub = PublicKey::from(&dh_self_priv);
         let shared = dh_self_priv.diffie_hellman(&peer_initial_dh_pub);
-        let (new_root, send_chain_key) = kdf_rk(root_key, shared.as_bytes())?;
-        let (a_to_b, b_to_a) = derive_static_header_keys(root_key)?;
+        let (new_root, send_chain_key, nhks_post) = kdf_rk(root_key, shared.as_bytes())?;
+        let (shared_hk_init, shared_nhk_init) = derive_initial_header_keys(root_key)?;
 
         // Hybrid mode: the initiator has just derived a fresh send
         // chain via DH ratchet, so the next encrypt should fire a
@@ -407,10 +430,20 @@ impl DoubleRatchet {
                 recv_counter: 0,
                 prev_send_counter: 0,
                 pending_kyber_send,
-                // Initiator: send headers go a→b, receive headers
-                // come b→a.
-                send_header_key: SecretBox::new(Box::new(a_to_b)),
-                recv_header_key: SecretBox::new(Box::new(b_to_a)),
+                // Initiator: HKs = shared HK_a→b (matches the
+                // responder's NHKr until the responder's first
+                // DH ratchet step). HKr = None — recv chain
+                // isn't established until the responder replies.
+                // NHKs = freshly-derived from KDF_RK_HE on the
+                // initial DH; this becomes HKs at the first DH
+                // ratchet step (initiator-side, after receiving
+                // the responder's reply). NHKr = shared NHK_b→a
+                // (matches the responder's NHKs until they
+                // ratchet).
+                hks: Some(SecretBox::new(Box::new(shared_hk_init))),
+                hkr: None,
+                nhks: SecretBox::new(Box::new(nhks_post)),
+                nhkr: SecretBox::new(Box::new(shared_nhk_init)),
             },
             skipped: HashMap::new(),
             kyber: kyber.map(|config| KyberState { config }),
@@ -443,7 +476,7 @@ impl DoubleRatchet {
         kyber: Option<KyberConfig>,
     ) -> Result<Self> {
         let dh_self_pub = PublicKey::from(&own_initial_keypair);
-        let (a_to_b, b_to_a) = derive_static_header_keys(root_key)?;
+        let (shared_hk_init, shared_nhk_init) = derive_initial_header_keys(root_key)?;
         Ok(Self {
             state: State {
                 root_key: SecretBox::new(Box::new(*root_key)),
@@ -459,10 +492,19 @@ impl DoubleRatchet {
                 // gets set inside `decrypt` after the DH ratchet
                 // step that produces one.
                 pending_kyber_send: false,
-                // Responder: send headers go b→a, receive headers
-                // come a→b. Mirrored from the initiator.
-                send_header_key: SecretBox::new(Box::new(b_to_a)),
-                recv_header_key: SecretBox::new(Box::new(a_to_b)),
+                // Responder: HKs = None (no send chain yet).
+                // HKr = None (initial frame from the initiator
+                // decrypts via NHKr — once that succeeds we
+                // promote NHKr into HKr inside the DH ratchet
+                // path). NHKs = NHK_b→a; NHKr = HK_a→b — this
+                // last assignment is the load-bearing one: the
+                // initiator's first frame encrypts its header
+                // under hk_ab, and our NHKr equals hk_ab, so
+                // the decrypt-via-NHKr branch fires correctly.
+                hks: None,
+                hkr: None,
+                nhks: SecretBox::new(Box::new(shared_nhk_init)),
+                nhkr: SecretBox::new(Box::new(shared_hk_init)),
             },
             skipped: HashMap::new(),
             kyber: kyber.map(|config| KyberState { config }),
@@ -526,14 +568,23 @@ impl DoubleRatchet {
         plaintext_header.extend_from_slice(&kyber_ct_len.to_be_bytes());
         plaintext_header.extend_from_slice(&kyber_ct_bytes);
 
-        // HEHE: AEAD-encrypt the plaintext header under our
-        // static send_header_key. Caller AAD is bound here too so
-        // a malleability attack on the outer caller-supplied
-        // metadata also breaks the header AEAD.
+        // HEHE: AEAD-encrypt the plaintext header under HKs.
+        // Caller AAD binds at this layer too so any tampering
+        // with the outer caller-supplied metadata also breaks
+        // the header AEAD. HKs can be None on the responder side
+        // before its first DH ratchet — that case is what the
+        // outer "no send chain" guard at the top of `encrypt`
+        // catches, so by the time we get here HKs is Some.
+        let hks = self
+            .state
+            .hks
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "no send header key — DH ratchet hasn't promoted NHKs into HKs yet"
+            ))?;
         let header_nonce_bytes = secure_rng::random::array::<NONCE_LEN>()?;
         let header_cipher =
-            ChaCha20Poly1305::new_from_slice(self.state.send_header_key.expose_secret())
-                .expect("32-byte key");
+            ChaCha20Poly1305::new_from_slice(hks.expose_secret()).expect("32-byte key");
         let enc_header = header_cipher
             .encrypt(
                 Nonce::from_slice(&header_nonce_bytes),
@@ -605,15 +656,40 @@ impl DoubleRatchet {
         }
         let enc_header = &wire[HEHE_PREFIX_LEN..body_start];
 
-        // Decrypt the header layer first. Caller AAD is bound at
-        // both layers so peer-side tampering with either header
-        // or body fails AEAD.
-        let header_cipher =
-            ChaCha20Poly1305::new_from_slice(self.state.recv_header_key.expose_secret())
-                .expect("32-byte key");
-        let plaintext_header = header_cipher
-            .decrypt(header_nonce, Payload { msg: enc_header, aad })
-            .map_err(|e| anyhow::anyhow!("header aead decrypt: {e}"))?;
+        // Decrypt the header layer first. Try HKr (current recv
+        // header key) — success means same-epoch frame. On
+        // failure, try NHKr — success there means the peer
+        // ratcheted and we need to mirror.
+        let (plaintext_header, decrypted_via_nhkr) =
+            if let Some(hkr) = self.state.hkr.as_ref() {
+                let cipher = ChaCha20Poly1305::new_from_slice(hkr.expose_secret())
+                    .expect("32-byte key");
+                match cipher.decrypt(header_nonce, Payload { msg: enc_header, aad }) {
+                    Ok(pt) => (pt, false),
+                    Err(_) => {
+                        let nhkr_cipher =
+                            ChaCha20Poly1305::new_from_slice(self.state.nhkr.expose_secret())
+                                .expect("32-byte key");
+                        let pt = nhkr_cipher
+                            .decrypt(header_nonce, Payload { msg: enc_header, aad })
+                            .map_err(|e| anyhow::anyhow!(
+                                "header aead decrypt failed under both HKr and NHKr: {e}"
+                            ))?;
+                        (pt, true)
+                    }
+                }
+            } else {
+                // Responder before first ratchet, or initiator
+                // before first reply — only NHKr is set.
+                let cipher = ChaCha20Poly1305::new_from_slice(self.state.nhkr.expose_secret())
+                    .expect("32-byte key");
+                let pt = cipher
+                    .decrypt(header_nonce, Payload { msg: enc_header, aad })
+                    .map_err(|e| anyhow::anyhow!(
+                        "header aead decrypt under NHKr (no HKr available): {e}"
+                    ))?;
+                (pt, true)
+            };
 
         // Validate the decrypted header has the expected fixed
         // prefix length plus the declared kyber ciphertext.
@@ -673,10 +749,26 @@ impl DoubleRatchet {
         let mut working = self.state.snapshot();
         let mut pending_skipped: Vec<(SkipKey, Zeroizing<[u8; KEY_LEN]>)> = Vec::new();
 
-        let triggers_dh = match working.dh_peer {
-            None => true,
-            Some(prev) => prev.as_bytes() != &header_dh_bytes,
-        };
+        let triggers_dh = decrypted_via_nhkr;
+        // Cross-check: a frame that decrypted under HKr should
+        // also have header_dh matching our current dh_peer, and
+        // a frame that decrypted under NHKr shouldn't. If these
+        // disagree the peer is in a state we don't expect; reject
+        // before committing.
+        let dh_matches_peer = working
+            .dh_peer
+            .map(|p| p.as_bytes() == &header_dh_bytes)
+            .unwrap_or(false);
+        if triggers_dh && dh_matches_peer {
+            return Err(anyhow::anyhow!(
+                "frame decrypted under NHKr but header_dh matches current peer dh; protocol confusion"
+            ));
+        }
+        if !triggers_dh && !dh_matches_peer {
+            return Err(anyhow::anyhow!(
+                "frame decrypted under HKr but header_dh doesn't match current peer dh; protocol confusion"
+            ));
+        }
 
         // Validate hybrid-mode invariants: kyber_ct is present iff
         // (we're hybrid AND this frame triggers a DH ratchet step).
@@ -738,13 +830,24 @@ impl DoubleRatchet {
                 }
             }
 
-            // DH(self_priv, header_dh) → new root + recv chain.
+            // Promote NHK → HK. Per Signal HEHE spec, the NHKr
+            // that just decrypted this frame's header becomes
+            // HKr, and NHKs (which both peers seeded at
+            // construction) becomes HKs. Fresh NHK values are
+            // produced by the kdf_rk_he calls below.
+            working.hkr = Some(SecretBox::new(Box::new(*working.nhkr.expose_secret())));
+            working.hks = Some(SecretBox::new(Box::new(*working.nhks.expose_secret())));
+
+            // DH(self_priv, header_dh) → new root + recv chain
+            // + NHKr (next recv header key for the *next* DH
+            // ratchet step).
             let shared_recv = working.dh_self_priv.diffie_hellman(&header_dh);
-            let (new_root, recv_chain_key) = kdf_rk(
+            let (new_root, recv_chain_key, new_nhkr) = kdf_rk(
                 working.root_key.expose_secret(),
                 shared_recv.as_bytes(),
             )?;
             working.root_key = SecretBox::new(Box::new(new_root));
+            working.nhkr = SecretBox::new(Box::new(new_nhkr));
             let mut new_recv_chain = ChainKey::from_bytes(recv_chain_key);
 
             // Hybrid mode: decapsulate the peer's kyber ciphertext
@@ -771,18 +874,22 @@ impl DoubleRatchet {
             working.recv_counter = 0;
 
             // Generate fresh send keypair and DH against the same
-            // header_dh → new root + send chain. The send keypair
-            // is what we'll publish in our next outgoing header.
+            // header_dh → new root + send chain + new NHKs.
+            // The send keypair is what we'll publish in our next
+            // outgoing header; the NHKs from this kdf_rk_he is
+            // what becomes HKs at our *next* DH ratchet step
+            // (i.e. when the peer ratchets back to us).
             // pending_kyber_send=true so the next encrypt fires
             // its own re-encap into this newly-derived send chain.
             let new_priv = StaticSecret::random_from_rng(thread_rng());
             let new_pub = PublicKey::from(&new_priv);
             let shared_send = new_priv.diffie_hellman(&header_dh);
-            let (new_root2, send_chain_key) = kdf_rk(
+            let (new_root2, send_chain_key, new_nhks) = kdf_rk(
                 working.root_key.expose_secret(),
                 shared_send.as_bytes(),
             )?;
             working.root_key = SecretBox::new(Box::new(new_root2));
+            working.nhks = SecretBox::new(Box::new(new_nhks));
             working.dh_self_priv = new_priv;
             working.dh_self_pub = new_pub;
             working.send_chain = Some(ChainKey::from_bytes(send_chain_key));
@@ -873,41 +980,60 @@ impl DoubleRatchet {
     }
 }
 
-/// HKDF that derives `(new_root, chain_seed)` from `(old_root,
-/// dh_output)`. Salt = old root key, IKM = DH output, info =
-/// fixed domain string. 64-byte output is split 32:32.
-fn kdf_rk(old_root: &[u8; KEY_LEN], dh_output: &[u8]) -> Result<([u8; KEY_LEN], [u8; KEY_LEN])> {
+/// Signal-style `KDF_RK_HE`: derives `(new_root, chain_seed,
+/// next_header_key)` from `(old_root, dh_output)`. Salt = old
+/// root key, IKM = DH output, info = fixed domain string.
+/// 96-byte output is split 32:32:32.
+///
+/// The third slot is the **next** header key for *this* direction
+/// — the header key that becomes "current" after the next DH
+/// ratchet step. Both peers' lifecycles align: peer A's NHKs
+/// matches peer B's NHKr, so when A ratchets its NHKs into HKs
+/// (the key it actually uses to encrypt the next-epoch headers),
+/// B's NHKr (which it tries on header decrypt failure) decrypts
+/// them and triggers B's matching ratchet step.
+fn kdf_rk(
+    old_root: &[u8; KEY_LEN],
+    dh_output: &[u8],
+) -> Result<([u8; KEY_LEN], [u8; KEY_LEN], [u8; KEY_LEN])> {
     let hk = Hkdf::<Sha256>::new(Some(old_root), dh_output);
-    let mut out = [0u8; KEY_LEN * 2];
+    let mut out = [0u8; KEY_LEN * 3];
     hk.expand(INFO_RK, &mut out)
         .map_err(|e| anyhow::anyhow!("hkdf expand (rk): {e}"))?;
     let mut new_root = [0u8; KEY_LEN];
     let mut chain = [0u8; KEY_LEN];
+    let mut nhk = [0u8; KEY_LEN];
     new_root.copy_from_slice(&out[..KEY_LEN]);
-    chain.copy_from_slice(&out[KEY_LEN..]);
-    Ok((new_root, chain))
+    chain.copy_from_slice(&out[KEY_LEN..2 * KEY_LEN]);
+    nhk.copy_from_slice(&out[2 * KEY_LEN..]);
+    Ok((new_root, chain, nhk))
 }
 
-/// Derive the two static header-encryption keys from a session's
-/// initial root key. Both peers run this with identical input,
-/// then assign by role: initiator uses `a_to_b` to encrypt its
-/// outgoing headers and `b_to_a` to decrypt incoming; responder
-/// flips the assignment.
+/// Derive the two shared initial header-encryption keys from the
+/// session's initial root key. Matches Signal's
+/// `shared_hka` / `shared_nhkb` (which the spec assumes come from
+/// the X3DH "associated data" — we re-derive from `root_key`
+/// instead).
 ///
-/// Static — these keys aren't refreshed per DH ratchet step.
-/// Reasoning lives in the `header_encryption` section of the
-/// module docs.
-fn derive_static_header_keys(
+/// Role-specific assignment:
+///
+/// * Initiator: HKs = `shared_hk_init`, NHKr = `shared_nhk_init`.
+/// * Responder: NHKs = `shared_nhk_init`, NHKr = `shared_hk_init`.
+///
+/// The "a→b" frames go out under `shared_hk_init` (Alice's HKs;
+/// Bob's NHKr); the "b→a" frames go out under `shared_nhk_init`
+/// once Bob promotes NHKs into HKs at his first DH ratchet step.
+fn derive_initial_header_keys(
     root_key: &[u8; KEY_LEN],
 ) -> Result<([u8; KEY_LEN], [u8; KEY_LEN])> {
     let hk = Hkdf::<Sha256>::new(None, root_key);
-    let mut a_to_b = [0u8; KEY_LEN];
-    hk.expand(b"qubee/dr/v1/hk/a-to-b", &mut a_to_b)
-        .map_err(|e| anyhow::anyhow!("hkdf expand (hk a→b): {e}"))?;
-    let mut b_to_a = [0u8; KEY_LEN];
-    hk.expand(b"qubee/dr/v1/hk/b-to-a", &mut b_to_a)
-        .map_err(|e| anyhow::anyhow!("hkdf expand (hk b→a): {e}"))?;
-    Ok((a_to_b, b_to_a))
+    let mut shared_hk_init = [0u8; KEY_LEN];
+    hk.expand(b"qubee/dr/v1/hk/init", &mut shared_hk_init)
+        .map_err(|e| anyhow::anyhow!("hkdf expand (initial hk): {e}"))?;
+    let mut shared_nhk_init = [0u8; KEY_LEN];
+    hk.expand(b"qubee/dr/v1/nhk/init", &mut shared_nhk_init)
+        .map_err(|e| anyhow::anyhow!("hkdf expand (initial nhk): {e}"))?;
+    Ok((shared_hk_init, shared_nhk_init))
 }
 
 /// Concatenate the wire header with the caller's AAD so AEAD
@@ -1138,15 +1264,16 @@ mod tests {
     }
 
     #[test]
-    fn header_aead_reuses_static_key_across_epochs() {
-        // Static-header-key invariant: after multiple DH ratchet
-        // steps both peers' send_header_key / recv_header_key
-        // remain unchanged from construction. Drive a few
-        // direction changes and confirm round-trip still works
-        // (which it can only if both sides still hold the same
-        // header keys we set in the constructors).
+    fn header_keys_rotate_through_epochs() {
+        // The HEHE key lifecycle: construction seeds shared
+        // initial header keys, every DH ratchet step promotes
+        // NHK→HK and derives fresh NHK via kdf_rk_he. Driving
+        // several round-trips exercises both peers' lifecycle in
+        // lockstep — every direction change requires the recv
+        // side's HKr to track the send side's HKs without
+        // explicit coordination.
         let (mut a, mut b, _) = pair();
-        for i in 0..5 {
+        for i in 0..6 {
             let m = format!("a{i}");
             let w = a.encrypt(m.as_bytes(), b"").unwrap();
             assert_eq!(b.decrypt(&w, b"").unwrap(), m.as_bytes());
@@ -1154,6 +1281,30 @@ mod tests {
             let w = b.encrypt(m.as_bytes(), b"").unwrap();
             assert_eq!(a.decrypt(&w, b"").unwrap(), m.as_bytes());
         }
+        // After all those direction changes, fresh frames still
+        // round-trip — only achievable if every NHKs/NHKr
+        // promotion + kdf_rk_he derivation lined up between the
+        // two peers.
+        let final_a_w = a.encrypt(b"final", b"").unwrap();
+        assert_eq!(b.decrypt(&final_a_w, b"").unwrap(), b"final");
+    }
+
+    #[test]
+    fn responder_first_frame_decrypts_under_nhkr() {
+        // Pinned regression: the responder has HKr=None at
+        // construction and only NHKr seeded from the shared
+        // initial-header-key. The initiator's first frame
+        // therefore must decrypt via NHKr (no current HKr to
+        // try first), which triggers the DH ratchet on the
+        // responder side and promotes NHKr→HKr.
+        let (mut a, mut b, _) = pair();
+        let w = a.encrypt(b"hi", b"").unwrap();
+        assert_eq!(b.decrypt(&w, b"").unwrap(), b"hi");
+        // Subsequent same-direction frame decrypts via b's NEW
+        // HKr (header_dh hasn't changed, so no second ratchet
+        // step fires).
+        let w2 = a.encrypt(b"hi 2", b"").unwrap();
+        assert_eq!(b.decrypt(&w2, b"").unwrap(), b"hi 2");
     }
 
     /// Hybrid-mode pair: same as `pair` but both peers wired with

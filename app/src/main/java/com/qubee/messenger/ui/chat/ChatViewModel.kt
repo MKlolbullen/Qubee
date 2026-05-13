@@ -171,9 +171,9 @@ class ChatViewModel @Inject constructor(
             // wired (recognising the envelope variant and routing
             // to nativeDecryptDm), re-enable the encryptDm branch
             // here gated on an explicit "handshake completed both
-            // sides" predicate, not on `hasDmSession` alone.
-            @Suppress("UNUSED_VARIABLE")
-            val peerHex = peerIdentityHex
+            // sides" predicate, not on `hasDmSession` alone. The
+            // peer's IdentityId for that future call lives in
+            // `peerIdentityHex`.
 
             val sendBytes: ByteArray? =
                 runCatching { qubeeManager.encryptMessage(conversationId, payload) }

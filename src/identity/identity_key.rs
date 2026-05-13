@@ -663,4 +663,25 @@ mod tests {
         let fp = kp.public_key().fingerprint();
         assert_eq!(fp.len(), 19); // "XXXX XXXX XXXX XXXX"
     }
+
+    #[test]
+    fn identity_key_rejects_mismatched_identity_id() {
+        // Locks in the security-critical consistency check in
+        // IdentityKey::try_from: a wire blob whose advertised
+        // identity_id doesn't match the hash of its public keys
+        // must be rejected. Without this, an attacker could ship
+        // an IdentityKey with a forged id and sign under another
+        // identity — the canonical prekey/handshake payloads only
+        // cover identity_id, not the pubkey bytes.
+        let kp = IdentityKeyPair::generate().unwrap();
+        let pk = kp.public_key();
+        let mut wire = WireIdentityKey::from(&pk);
+        wire.identity_id.0[0] ^= 0x01;
+        let bytes = bincode::serialize(&wire).unwrap();
+        let err = IdentityKey::from_bytes(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("identity_id/public-key mismatch"),
+            "expected mismatch error, got: {err}",
+        );
+    }
 }

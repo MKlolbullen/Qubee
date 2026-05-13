@@ -17,7 +17,8 @@ object HexUtils {
         for (i in out.indices) {
             val hi = Character.digit(hex[2 * i], 16)
             val lo = Character.digit(hex[2 * i + 1], 16)
-            require(hi >= 0 && lo >= 0) { "non-hex char at index ${2 * i}" }
+            require(hi >= 0) { "non-hex char at index ${2 * i}" }
+            require(lo >= 0) { "non-hex char at index ${2 * i + 1}" }
             out[i] = ((hi shl 4) or lo).toByte()
         }
         return out

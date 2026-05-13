@@ -1307,7 +1307,38 @@ impl GroupManager {
             };
             self.keystore.store_key(&key_name, &serialized, KeyType::EncryptionKey, metadata)?;
         }
+        // Also write the current symmetric group key so a restart
+        // can repopulate `GroupCrypto::keys` before any new sender
+        // chain has to be derived. Without this, after restart any
+        // `(group, sender, generation)` triple that didn't already
+        // have a persisted chain snapshot fails inside
+        // `ensure_sender_chain` with "no group key … chain seed
+        // unavailable" — including the first message every existing
+        // member sends after relaunch.
+        self.persist_group_key(group_id)?;
         Ok(())
+    }
+
+    /// Persist the in-memory symmetric group key for `group_id` to
+    /// the encrypted keystore under `group_key_<hex>`. No-op if the
+    /// group has no key yet — the call sites all run after
+    /// `create_group_key` / `set_group_key`, so we'd never overwrite
+    /// a real key with absence.
+    fn persist_group_key(&mut self, group_id: &GroupId) -> Result<()> {
+        let bytes = match self.group_crypto.export_group_key(group_id) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let key_name = format!("group_key_{}", hex::encode(group_id.as_ref()));
+        let metadata = KeyMetadata {
+            algorithm: "qubee_group_key_v1".to_string(),
+            key_size: bytes.len(),
+            usage: vec![KeyUsage::Encryption],
+            expiry: None,
+            tags: StdHashMap::new(),
+        };
+        self.keystore
+            .store_key(&key_name, &bytes, KeyType::EncryptionKey, metadata)
     }
 
     /// Retrieve all events logged for the given group. Events are
@@ -1355,10 +1386,36 @@ impl GroupManager {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>> {
+        // Same transactional shape as decrypt: snapshot pre-advance
+        // chain state so a keystore-write failure can roll RAM back
+        // to disk and the next retry emits a frame the peer can
+        // still align against.
+        let snapshot = self
+            .group_crypto
+            .serialize_sender_chain(group_id, sender_id, generation)?;
         let wire = self.group_crypto.encrypt_with_sender_chain(
             group_id, sender_id, generation, plaintext, aad,
         )?;
-        self.persist_sender_chain(group_id, sender_id, generation)?;
+        if let Err(persist_err) =
+            self.persist_sender_chain(group_id, sender_id, generation)
+        {
+            match snapshot {
+                Some(bytes) => {
+                    if let Err(restore_err) = self.group_crypto.install_sender_chain(
+                        group_id, sender_id, generation, &bytes,
+                    ) {
+                        return Err(anyhow::anyhow!(
+                            "persist failed ({persist_err}); rollback also failed ({restore_err})"
+                        ));
+                    }
+                }
+                None => {
+                    self.group_crypto
+                        .drop_sender_chain(group_id, sender_id, generation);
+                }
+            }
+            return Err(persist_err);
+        }
         Ok(wire)
     }
 
@@ -1366,6 +1423,13 @@ impl GroupManager {
     /// sender chain for `(group_id, sender_id, generation)`,
     /// stashing any out-of-order keys; persists the new chain
     /// state back to the keystore on success.
+    ///
+    /// Transactional with respect to the keystore: snapshot the
+    /// chain (or its absence) up-front, decrypt against the
+    /// in-memory chain, persist. If persistence fails the in-memory
+    /// chain rolls back to the pre-decrypt snapshot so the next
+    /// retry has the same chain position as disk and the same wire
+    /// frame can be re-played end-to-end.
     pub fn decrypt_group_message(
         &mut self,
         group_id: &GroupId,
@@ -1374,10 +1438,37 @@ impl GroupManager {
         wire: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>> {
+        let snapshot = self
+            .group_crypto
+            .serialize_sender_chain(group_id, sender_id, generation)?;
         let pt = self.group_crypto.decrypt_with_sender_chain(
             group_id, sender_id, generation, wire, aad,
         )?;
-        self.persist_sender_chain(group_id, sender_id, generation)?;
+        if let Err(persist_err) =
+            self.persist_sender_chain(group_id, sender_id, generation)
+        {
+            // Roll the in-memory chain back to whatever was on
+            // disk before. If there was no chain snapshot (first
+            // frame for this triple) we drop the freshly-derived
+            // one so the next attempt re-derives from the group
+            // seed cleanly.
+            match snapshot {
+                Some(bytes) => {
+                    if let Err(restore_err) = self.group_crypto.install_sender_chain(
+                        group_id, sender_id, generation, &bytes,
+                    ) {
+                        return Err(anyhow::anyhow!(
+                            "persist failed ({persist_err}); rollback also failed ({restore_err})"
+                        ));
+                    }
+                }
+                None => {
+                    self.group_crypto
+                        .drop_sender_chain(group_id, sender_id, generation);
+                }
+            }
+            return Err(persist_err);
+        }
         Ok(pt)
     }
 
@@ -1450,12 +1541,44 @@ impl GroupManager {
             }
         }
 
-        // Restore any persisted sender chains so sequence numbers
-        // continue from where they were before the process exited.
-        // Without this, on next launch we'd derive fresh chains
-        // (counter=0) while peers' views are at whatever counter
-        // they reached, and AEAD decrypt would fail until the next
-        // generation rotation reset everyone.
+        // Restore symmetric group keys first — `ensure_sender_chain`
+        // can't derive a fresh chain without `GroupCrypto::keys`
+        // being populated, so the first post-restart send from
+        // anyone (including us) would otherwise fail with "no
+        // group key … chain seed unavailable" for any triple
+        // that didn't already have a persisted chain snapshot.
+        let group_key_names = self
+            .keystore
+            .list_keys()
+            .into_iter()
+            .filter(|k| k.starts_with("group_key_"))
+            .collect::<Vec<_>>();
+        for key_name in group_key_names {
+            let group_id = match parse_group_key_id(&key_name) {
+                Some(g) => g,
+                None => continue,
+            };
+            if let Some(secret_data) = self.keystore.retrieve_key(&key_name)? {
+                let bytes = secret_data.expose_secret();
+                if bytes.len() != 32 {
+                    tracing::warn!(
+                        "skipping malformed group key {key_name} ({} bytes)",
+                        bytes.len()
+                    );
+                    continue;
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                self.group_crypto.set_group_key(group_id, arr);
+            }
+        }
+
+        // Then restore any persisted sender chains so sequence
+        // numbers continue from where they were before the process
+        // exited. Without this, on next launch we'd derive fresh
+        // chains (counter=0) while peers' views are at whatever
+        // counter they reached, and AEAD decrypt would fail until
+        // the next generation rotation reset everyone.
         let chain_keys = self
             .keystore
             .list_keys()
@@ -1470,13 +1593,39 @@ impl GroupManager {
                 };
             if let Some(secret_data) = self.keystore.retrieve_key(&key_name)? {
                 let bytes = secret_data.expose_secret();
-                let _ = self
-                    .group_crypto
-                    .install_sender_chain(&group_id, &sender_id, generation, bytes);
+                if let Err(e) = self.group_crypto.install_sender_chain(
+                    &group_id, &sender_id, generation, bytes,
+                ) {
+                    // Don't fail the whole load — a single corrupt
+                    // chain shouldn't prevent the rest of the
+                    // groups/sessions from coming back up. But log
+                    // loudly instead of swallowing silently so the
+                    // failure is visible.
+                    tracing::warn!(
+                        "skipping unrestorable sender chain {key_name}: {e}"
+                    );
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Inverse of the `group_key_<hex>` keystore-key naming convention.
+/// Returns `None` for malformed names so a non-conforming entry
+/// (older blob shape, accidental rename) just gets skipped.
+fn parse_group_key_id(key_name: &str) -> Option<GroupId> {
+    let hex_part = key_name.strip_prefix("group_key_")?;
+    if hex_part.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(hex_part).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(GroupId::from_bytes(arr))
 }
 
 /// Inverse of [`GroupManager::sender_chain_keystore_id`]. Returns

@@ -305,7 +305,7 @@ impl IdentityKeyPair {
         )
     }
 
-    fn derive_identity_id(
+    pub(crate) fn derive_identity_id(
         classical_public: &VerifyingKey,
         pq_public: &mldsa44::PublicKey,
     ) -> IdentityId {
@@ -424,6 +424,22 @@ impl TryFrom<WireIdentityKey> for IdentityKey {
             .map_err(|e| anyhow!("invalid Ed25519 pub: {e}"))?;
         let pq_public = mldsa44::PublicKey::from_bytes(&w.pq_public)
             .map_err(|e| anyhow!("invalid PQ pub: {e}"))?;
+        // Recompute the canonical identity_id from the public-key
+        // bytes and reject any wire blob whose advertised id
+        // doesn't match. Without this check a peer could ship an
+        // `IdentityKey` whose `identity_id` field disagrees with
+        // its public keys; the canonical handshake/prekey-bundle
+        // signatures only cover `identity_id`, so the inconsistency
+        // would let signatures claim a false identity.
+        // `IdentityKeyPair::from_bytes` already does this; the
+        // public-facing deserialisation must agree.
+        let expected_id =
+            IdentityKeyPair::derive_identity_id(&classical_public, &pq_public);
+        if expected_id != w.identity_id {
+            return Err(anyhow!(
+                "identity_id/public-key mismatch on IdentityKey deserialise"
+            ));
+        }
         Ok(IdentityKey {
             classical_public,
             pq_public,

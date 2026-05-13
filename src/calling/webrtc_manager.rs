@@ -531,34 +531,34 @@ impl MediaDevicesManager {
             .into_iter()
             .map(media_device_from_registered_video)
             .collect();
-        if self.current_devices.video_input.is_none() {
-            self.current_devices.video_input = self
-                .video_inputs
-                .iter()
-                .find(|d| d.is_default)
-                .or_else(|| self.video_inputs.first())
-                .map(|d| d.id.clone());
+
+        // Re-seed each `current_devices.*` slot in two cases:
+        // (1) nothing was selected yet, and (2) the previously
+        // selected id no longer exists in the refreshed list (the
+        // device unplugged, or cpal/Android handed us a new id for
+        // the same hardware). Treating "id missing" the same as
+        // "id None" avoids leaving stale references that break the
+        // next capture/output setup.
+        fn reseed(
+            selection: &mut Option<String>,
+            available: &[MediaDevice],
+        ) {
+            let needs_seed = match selection.as_deref() {
+                None => true,
+                Some(id) => !available.iter().any(|d| d.id == id),
+            };
+            if needs_seed {
+                *selection = available
+                    .iter()
+                    .find(|d| d.is_default)
+                    .or_else(|| available.first())
+                    .map(|d| d.id.clone());
+            }
         }
 
-        // Seed `current_devices` with whichever entry cpal flagged as
-        // the host default, falling back to the first enumerated
-        // device. Preserves any selection the caller already made.
-        if self.current_devices.audio_input.is_none() {
-            self.current_devices.audio_input = self
-                .audio_inputs
-                .iter()
-                .find(|d| d.is_default)
-                .or_else(|| self.audio_inputs.first())
-                .map(|d| d.id.clone());
-        }
-        if self.current_devices.audio_output.is_none() {
-            self.current_devices.audio_output = self
-                .audio_outputs
-                .iter()
-                .find(|d| d.is_default)
-                .or_else(|| self.audio_outputs.first())
-                .map(|d| d.id.clone());
-        }
+        reseed(&mut self.current_devices.video_input, &self.video_inputs);
+        reseed(&mut self.current_devices.audio_input, &self.audio_inputs);
+        reseed(&mut self.current_devices.audio_output, &self.audio_outputs);
 
         Ok(())
     }

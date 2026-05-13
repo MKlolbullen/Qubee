@@ -9,6 +9,7 @@ import com.qubee.messenger.data.repository.database.dao.ContactDao
 import com.qubee.messenger.data.repository.database.dao.CryptoKeyDao
 import com.qubee.messenger.identity.IdentityBundle
 import com.qubee.messenger.security.TrustStatePolicy
+import com.qubee.messenger.util.HexUtils
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import java.util.UUID
@@ -186,7 +187,7 @@ class ContactRepository @Inject constructor(
         val bundle = IdentityBundle.fromJson(json) ?: return null
 
         val now = System.currentTimeMillis()
-        val identityKey = runCatching { hexToBytes(bundle.identityIdHex) }.getOrNull()
+        val identityKey = runCatching { HexUtils.hexToBytes(bundle.identityIdHex) }.getOrNull()
         val existing = contactDao.getContactByIdentityId(bundle.identityIdHex)
 
         val contact = if (existing != null) {
@@ -253,15 +254,4 @@ class ContactRepository @Inject constructor(
         return qubeeManager.generateSASForContact(peerKey).orEmpty()
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
-        require(hex.length % 2 == 0) { "odd-length hex: ${hex.length}" }
-        val out = ByteArray(hex.length / 2)
-        for (i in out.indices) {
-            val hi = Character.digit(hex[2 * i], 16)
-            val lo = Character.digit(hex[2 * i + 1], 16)
-            require(hi >= 0 && lo >= 0) { "non-hex char at index ${2 * i}" }
-            out[i] = ((hi shl 4) or lo).toByte()
-        }
-        return out
-    }
 }

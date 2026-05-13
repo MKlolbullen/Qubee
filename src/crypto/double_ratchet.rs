@@ -188,6 +188,13 @@ pub const MAX_SKIP: u32 = 1024;
 /// flight" intuition.
 pub const MAX_SKIPPED_STASH: usize = 4096;
 
+/// Cap on retained historical receive header keys (one per
+/// previous DH epoch). Bounded so an attacker can't drive memory
+/// growth by forcing repeated DH ratchet steps. Frames from epochs
+/// older than the FIFO window can no longer be decrypted even if
+/// their body key is still in [`MAX_SKIPPED_STASH`].
+pub const MAX_HISTORICAL_HKRS: usize = 64;
+
 // HKDF info strings. Distinct from the chain ratchet's so an
 // attacker who somehow exfiltrates a chain key from one ratchet
 // can't replay it against the other.
@@ -353,6 +360,16 @@ struct State {
     /// HKr fails — success on this branch signals a peer-side
     /// DH ratchet that we now need to mirror locally.
     nhkr: SecretBox<[u8; KEY_LEN]>,
+    /// Receive header keys retained from previous DH epochs,
+    /// keyed by the old `dh_peer` bytes that epoch was bound to.
+    /// Needed so late frames from a retired epoch can still get
+    /// their header decrypted long enough to look up the matching
+    /// body key in `skipped`. Without this, a stash entry keyed
+    /// by `(old_dh_peer, counter)` is unreachable as soon as the
+    /// header key gets rotated out of HKr/NHKr.
+    /// FIFO-evicted at [`MAX_HISTORICAL_HKRS`] so an attacker
+    /// can't grow this without bound.
+    historical_hkrs: Vec<([u8; KEY_LEN], SecretBox<[u8; KEY_LEN]>)>,
 }
 
 impl State {
@@ -376,7 +393,30 @@ impl State {
             hkr: clone_opt_key(&self.hkr),
             nhks: SecretBox::new(Box::new(*self.nhks.expose_secret())),
             nhkr: SecretBox::new(Box::new(*self.nhkr.expose_secret())),
+            historical_hkrs: self
+                .historical_hkrs
+                .iter()
+                .map(|(p, k)| (*p, SecretBox::new(Box::new(*k.expose_secret()))))
+                .collect(),
         }
+    }
+
+    /// Insert a retired receive header key with FIFO eviction at
+    /// the cap. Used when a DH ratchet step rotates the current
+    /// HKr out — the old key stays available so frames from that
+    /// epoch can still get their header decrypted.
+    fn push_historical_hkr(
+        &mut self,
+        dh_peer: [u8; KEY_LEN],
+        hkr: SecretBox<[u8; KEY_LEN]>,
+    ) {
+        if self.historical_hkrs.iter().any(|(p, _)| *p == dh_peer) {
+            return;
+        }
+        if self.historical_hkrs.len() >= MAX_HISTORICAL_HKRS {
+            self.historical_hkrs.remove(0);
+        }
+        self.historical_hkrs.push((dh_peer, hkr));
     }
 }
 
@@ -466,6 +506,7 @@ impl DoubleRatchet {
                 hkr: None,
                 nhks: SecretBox::new(Box::new(nhks_post)),
                 nhkr: SecretBox::new(Box::new(shared_nhk_init)),
+                historical_hkrs: Vec::new(),
             },
             skipped: HashMap::new(),
             kyber: kyber.map(|config| KyberState { config }),
@@ -527,6 +568,7 @@ impl DoubleRatchet {
                 hkr: None,
                 nhks: SecretBox::new(Box::new(shared_nhk_init)),
                 nhkr: SecretBox::new(Box::new(shared_hk_init)),
+                historical_hkrs: Vec::new(),
             },
             skipped: HashMap::new(),
             kyber: kyber.map(|config| KyberState { config }),
@@ -543,38 +585,42 @@ impl DoubleRatchet {
     /// chain until the first incoming frame triggers the DH
     /// ratchet step that derives one.
     pub fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        // Commit-on-success: do every fallible thing (kyber mix,
+        // chain step, two AEAD encrypts, counter increment) on a
+        // local working copy of the send chain. Only on full
+        // success does the working copy replace self.state's send
+        // chain and the pending_kyber_send flag clear. Any earlier
+        // `?` bails out leaving self.state untouched, so a retry
+        // emits the same counter under the same key.
+        let mut working_chain = self
+            .state
+            .send_chain
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "no send chain: responder must receive the first message before sending"
+            ))?
+            .duplicate();
+
         // Hybrid-mode re-encap: stir a fresh ML-KEM shared secret
         // into the send chain *before* deriving this message's
         // key, so the post-quantum entropy lands on the message
         // we're about to send. Fires only on the first frame
         // after a fresh send chain (initiator construction or
         // post-DH-ratchet-step on receive).
-        let kyber_ct_bytes: Vec<u8> = if self.state.pending_kyber_send {
+        let pending_kyber = self.state.pending_kyber_send;
+        let kyber_ct_bytes: Vec<u8> = if pending_kyber {
             let kyber = self.kyber.as_ref().expect(
                 "pending_kyber_send true ⇒ hybrid mode (config invariant)",
             );
-            let send_chain = self.state.send_chain.as_mut().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no send chain: responder must receive the first message before re-encap"
-                )
-            })?;
             let (shared_secret, ct) = mlkem768::encapsulate(&kyber.config.peer_pub);
-            send_chain.mix_in(shared_secret.as_bytes())?;
-            self.state.pending_kyber_send = false;
+            working_chain.mix_in(shared_secret.as_bytes())?;
             ct.as_bytes().to_vec()
         } else {
             Vec::new()
         };
 
-        let send_chain = self
-            .state
-            .send_chain
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!(
-                "no send chain: responder must receive the first message before sending"
-            ))?;
         let counter = self.state.send_counter;
-        let msg_key = send_chain.step()?;
+        let msg_key = working_chain.step()?;
         let nonce_bytes = secure_rng::random::array::<NONCE_LEN>()?;
 
         // Bound check: ML-KEM ct length must fit a u16. Always
@@ -626,11 +672,19 @@ impl DoubleRatchet {
             .encrypt(nonce, Payload { msg: plaintext, aad: &bound_aad })
             .map_err(|e| anyhow::anyhow!("aead encrypt: {e}"))?;
 
-        self.state.send_counter = self
+        let next_counter = self
             .state
             .send_counter
             .checked_add(1)
             .context("send counter overflow — re-handshake required")?;
+        // All fallible operations done — commit working chain,
+        // clear the kyber pending flag if we fired re-encap, and
+        // advance the send counter.
+        self.state.send_chain = Some(working_chain);
+        if pending_kyber {
+            self.state.pending_kyber_send = false;
+        }
+        self.state.send_counter = next_counter;
 
         let mut wire =
             Vec::with_capacity(HEHE_PREFIX_LEN + enc_header.len() + NONCE_LEN + ct.len());
@@ -681,37 +735,62 @@ impl DoubleRatchet {
         // Decrypt the header layer first. Try HKr (current recv
         // header key) — success means same-epoch frame. On
         // failure, try NHKr — success there means the peer
-        // ratcheted and we need to mirror.
-        let (plaintext_header, decrypted_via_nhkr) =
-            if let Some(hkr) = self.state.hkr.as_ref() {
-                let cipher = ChaCha20Poly1305::new_from_slice(hkr.expose_secret())
-                    .expect("32-byte key");
-                match cipher.decrypt(header_nonce, Payload { msg: enc_header, aad }) {
-                    Ok(pt) => (pt, false),
-                    Err(_) => {
-                        let nhkr_cipher =
-                            ChaCha20Poly1305::new_from_slice(self.state.nhkr.expose_secret())
-                                .expect("32-byte key");
-                        let pt = nhkr_cipher
-                            .decrypt(header_nonce, Payload { msg: enc_header, aad })
-                            .map_err(|e| anyhow::anyhow!(
-                                "header aead decrypt failed under both HKr and NHKr: {e}"
-                            ))?;
-                        (pt, true)
-                    }
-                }
+        // ratcheted and we need to mirror. If both fail, fall
+        // back to the historical-HKr map: those are receive
+        // header keys retained from epochs we've already
+        // ratcheted past, kept around so frames from those
+        // epochs can still find their body key in the skipped
+        // stash.
+        let try_hkr = |hkr: &SecretBox<[u8; KEY_LEN]>| -> Option<Vec<u8>> {
+            let cipher =
+                ChaCha20Poly1305::new_from_slice(hkr.expose_secret()).expect("32-byte key");
+            cipher
+                .decrypt(header_nonce, Payload { msg: enc_header, aad })
+                .ok()
+        };
+        let (plaintext_header, decrypted_via_nhkr, decrypted_via_historical) = if let Some(
+            hkr,
+        ) =
+            self.state.hkr.as_ref()
+        {
+            if let Some(pt) = try_hkr(hkr) {
+                (pt, false, false)
+            } else if let Some(pt) = try_hkr(&self.state.nhkr) {
+                (pt, true, false)
+            } else if let Some(pt) = self
+                .state
+                .historical_hkrs
+                .iter()
+                .find_map(|(_, hkr)| try_hkr(hkr))
+            {
+                (pt, false, true)
             } else {
-                // Responder before first ratchet, or initiator
-                // before first reply — only NHKr is set.
-                let cipher = ChaCha20Poly1305::new_from_slice(self.state.nhkr.expose_secret())
-                    .expect("32-byte key");
-                let pt = cipher
-                    .decrypt(header_nonce, Payload { msg: enc_header, aad })
-                    .map_err(|e| anyhow::anyhow!(
-                        "header aead decrypt under NHKr (no HKr available): {e}"
-                    ))?;
-                (pt, true)
-            };
+                return Err(anyhow::anyhow!(
+                    "header aead decrypt failed under HKr, NHKr, and historical keys"
+                ));
+            }
+        } else {
+            // Responder before first ratchet, or initiator
+            // before first reply — only NHKr is set. We may
+            // still have historical keys if we previously
+            // ratcheted, were restored from disk, and the peer
+            // ratcheted back to an even older epoch (rare but
+            // possible after recovery scenarios).
+            if let Some(pt) = try_hkr(&self.state.nhkr) {
+                (pt, true, false)
+            } else if let Some(pt) = self
+                .state
+                .historical_hkrs
+                .iter()
+                .find_map(|(_, hkr)| try_hkr(hkr))
+            {
+                (pt, false, true)
+            } else {
+                return Err(anyhow::anyhow!(
+                    "header aead decrypt under NHKr (no HKr available) failed"
+                ));
+            }
+        };
 
         // Validate the decrypted header has the expected fixed
         // prefix length plus the declared kyber ciphertext.
@@ -764,6 +843,21 @@ impl DoubleRatchet {
                     Err(anyhow::anyhow!("aead decrypt (stashed): {e}"))
                 }
             };
+        }
+
+        // If the header only decrypted via a historical HKr, the
+        // frame is from a retired epoch. The stash-hit branch
+        // above is the *only* legitimate path for those frames —
+        // their body key was derived during the DH ratchet step
+        // that retired the epoch and stashed under `(old_dh_peer,
+        // counter)`. A miss here means the key has been consumed
+        // or evicted, so the frame is unrecoverable. Bail before
+        // even snapshotting to avoid corrupting current state
+        // with an old-epoch DH ratchet.
+        if decrypted_via_historical {
+            return Err(anyhow::anyhow!(
+                "old-epoch frame: body key missing from stash (consumed, evicted, or never derived)"
+            ));
         }
 
         // Full path: snapshot state, mutate working copy through
@@ -850,6 +944,19 @@ impl DoubleRatchet {
                         key,
                     ));
                 }
+            }
+
+            // Before rotating HKr out, retain the old key under
+            // the old `dh_peer` so any late frames from that
+            // epoch can still get their header decrypted long
+            // enough to look up the stashed body key. FIFO-evicted
+            // at MAX_HISTORICAL_HKRS so this can't grow unbounded.
+            if let (Some(old_hkr), Some(old_dh_peer)) =
+                (working.hkr.as_ref(), working.dh_peer)
+            {
+                let old_hkr_copy =
+                    SecretBox::new(Box::new(*old_hkr.expose_secret()));
+                working.push_historical_hkr(*old_dh_peer.as_bytes(), old_hkr_copy);
             }
 
             // Promote NHK → HK. Per Signal HEHE spec, the NHKr
@@ -1028,6 +1135,16 @@ impl DoubleRatchet {
             }
         });
 
+        let historical_hkrs: Vec<PersistedHistoricalHkr> = self
+            .state
+            .historical_hkrs
+            .iter()
+            .map(|(p, k)| PersistedHistoricalHkr {
+                dh_peer: *p,
+                hkr: *k.expose_secret(),
+            })
+            .collect();
+
         let persisted = Persisted {
             root_key: *self.state.root_key.expose_secret(),
             dh_self_priv: self.state.dh_self_priv.to_bytes(),
@@ -1053,6 +1170,7 @@ impl DoubleRatchet {
             nhkr: *self.state.nhkr.expose_secret(),
             skipped: skipped_entries,
             kyber,
+            historical_hkrs,
         };
         bincode::serialize(&persisted)
             .map_err(|e| anyhow::anyhow!("double ratchet serialize: {e}"))
@@ -1071,6 +1189,13 @@ impl DoubleRatchet {
                 "persisted stash size {} exceeds MAX_SKIPPED_STASH {}",
                 p.skipped.len(),
                 MAX_SKIPPED_STASH
+            ));
+        }
+        if p.historical_hkrs.len() > MAX_HISTORICAL_HKRS {
+            return Err(anyhow::anyhow!(
+                "persisted historical_hkrs size {} exceeds MAX_HISTORICAL_HKRS {}",
+                p.historical_hkrs.len(),
+                MAX_HISTORICAL_HKRS
             ));
         }
 
@@ -1113,6 +1238,12 @@ impl DoubleRatchet {
             None => None,
         };
 
+        let historical_hkrs: Vec<([u8; KEY_LEN], SecretBox<[u8; KEY_LEN]>)> = p
+            .historical_hkrs
+            .into_iter()
+            .map(|h| (h.dh_peer, SecretBox::new(Box::new(h.hkr))))
+            .collect();
+
         Ok(Self {
             state: State {
                 root_key: SecretBox::new(Box::new(p.root_key)),
@@ -1129,6 +1260,7 @@ impl DoubleRatchet {
                 hkr: p.hkr.map(|b| SecretBox::new(Box::new(b))),
                 nhks: SecretBox::new(Box::new(p.nhks)),
                 nhkr: SecretBox::new(Box::new(p.nhkr)),
+                historical_hkrs,
             },
             skipped,
             kyber,
@@ -1172,6 +1304,19 @@ struct Persisted {
     nhkr: [u8; KEY_LEN],
     skipped: Vec<PersistedSkipEntry>,
     kyber: Option<PersistedKyber>,
+    /// FIFO list of `(retired_dh_peer, retired_hkr)` pairs.
+    /// Defaulted in bincode via `serde(default)` so old persisted
+    /// blobs (pre-historical-hkr) still decode — they'll just
+    /// have no late-frame recovery until a fresh DH ratchet
+    /// retires a key under the new code.
+    #[serde(default)]
+    historical_hkrs: Vec<PersistedHistoricalHkr>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedHistoricalHkr {
+    dh_peer: [u8; KEY_LEN],
+    hkr: [u8; KEY_LEN],
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1615,6 +1760,7 @@ mod tests {
             nhkr: [0u8; KEY_LEN],
             skipped: over,
             kyber: None,
+            historical_hkrs: Vec::new(),
         };
         let bytes = bincode::serialize(&p).unwrap();
         assert!(DoubleRatchet::restore(&bytes).is_err());

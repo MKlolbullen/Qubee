@@ -41,6 +41,7 @@ import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.identity.IdentityBundle
+import com.qubee.messenger.util.HexUtils
 import com.qubee.messenger.util.QrUtils
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -125,10 +126,19 @@ class AddContactViewModel @Inject constructor(
             // Persist the contact row first. Reuse the peer's
             // identityIdHex as the local primary key so the
             // ChatViewModel's `contactId` route maps cleanly.
+            // Also stamp identityKey from the same hex — fingerprint
+            // computation and verification flows look at this field,
+            // and leaving it null surfaces as "Not available" in the
+            // chat header plus blocks ContactVerificationViewModel
+            // from ever showing a SAS.
+            val identityKeyBytes = runCatching {
+                HexUtils.hexToBytes(current.identityIdHex)
+            }.getOrNull()
             val contact = Contact(
                 id = current.identityIdHex,
                 identityId = current.identityIdHex,
                 displayName = current.displayName,
+                identityKey = identityKeyBytes,
                 trustLevel = TrustLevel.UNKNOWN,
                 verificationStatus = ContactVerificationStatus.UNVERIFIED,
             )

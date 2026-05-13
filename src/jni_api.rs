@@ -1120,6 +1120,17 @@ fn active_identity() -> anyhow::Result<Option<Arc<IdentityKeyPair>>> {
     Ok(ACTIVE_IDENTITY.lock().unwrap().clone())
 }
 
+/// Read just the active identity's [`IdentityId`]. Errors when no
+/// identity has been loaded yet — callers (e.g. the DM AAD path)
+/// can't proceed without a local identity to canonicalize against.
+fn active_identity_id() -> anyhow::Result<IdentityId> {
+    let guard = ACTIVE_IDENTITY.lock().unwrap();
+    let kp = guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+    Ok(kp.identity_id())
+}
+
 /// Read the persisted display name from the keystore. Used to label
 /// outbound `RequestJoin` payloads so the inviter sees a name.
 fn active_display_name() -> anyhow::Result<String> {
@@ -1715,23 +1726,29 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOpenDm
 ) -> jboolean {
     let result = jni_catch_or(|| -> anyhow::Result<()> {
         let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
-        let root_bytes = env
+        let mut root_bytes = env
             .convert_byte_array(&root_key)
             .map_err(|e| anyhow::anyhow!("invalid root_key: {e}"))?;
-        if root_bytes.len() != 32 {
-            return Err(anyhow::anyhow!(
-                "root_key must be 32 bytes; got {}", root_bytes.len()
-            ));
+        let root_len = root_bytes.len();
+        if root_len != 32 {
+            root_bytes.zeroize();
+            return Err(anyhow::anyhow!("root_key must be 32 bytes; got {}", root_len));
         }
         let mut root_arr = [0u8; 32];
         root_arr.copy_from_slice(&root_bytes);
+        root_bytes.zeroize();
 
         let dh_bytes = env
             .convert_byte_array(&peer_initial_dh_pub)
-            .map_err(|e| anyhow::anyhow!("invalid peer_initial_dh_pub: {e}"))?;
+            .map_err(|e| {
+                root_arr.zeroize();
+                anyhow::anyhow!("invalid peer_initial_dh_pub: {e}")
+            })?;
         if dh_bytes.len() != 32 {
+            let len = dh_bytes.len();
+            root_arr.zeroize();
             return Err(anyhow::anyhow!(
-                "peer_initial_dh_pub must be 32 bytes; got {}", dh_bytes.len()
+                "peer_initial_dh_pub must be 32 bytes; got {}", len
             ));
         }
         let mut dh_arr = [0u8; 32];
@@ -1739,12 +1756,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOpenDm
         let peer_dh = x25519_dalek::PublicKey::from(dh_arr);
 
         let mut ks_guard = KEYSTORE.lock().unwrap();
-        let ks = ks_guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        let ks = match ks_guard.as_mut() {
+            Some(ks) => ks,
+            None => {
+                root_arr.zeroize();
+                return Err(anyhow::anyhow!("keystore not initialised"));
+            }
+        };
         let mut sm = SESSION_MANAGER.lock().unwrap();
-        sm.establish_initiator_persistent(ks, peer_id, &root_arr, peer_dh)?;
-        Ok(())
+        let outcome = sm.establish_initiator_persistent(ks, peer_id, &root_arr, peer_dh);
+        root_arr.zeroize();
+        outcome
     });
     if result.is_err() {
         eprintln!("Rust: nativeOpenDmInitiatorSession failed");
@@ -1767,42 +1789,77 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOpenDm
 ) -> jboolean {
     let result = jni_catch_or(|| -> anyhow::Result<()> {
         let peer_id = parse_identity_id_hex(&mut env, peer_id_hex)?;
-        let root_bytes = env
+        let mut root_bytes = env
             .convert_byte_array(&root_key)
             .map_err(|e| anyhow::anyhow!("invalid root_key: {e}"))?;
-        if root_bytes.len() != 32 {
-            return Err(anyhow::anyhow!(
-                "root_key must be 32 bytes; got {}", root_bytes.len()
-            ));
+        let root_len = root_bytes.len();
+        if root_len != 32 {
+            root_bytes.zeroize();
+            return Err(anyhow::anyhow!("root_key must be 32 bytes; got {}", root_len));
         }
         let mut root_arr = [0u8; 32];
         root_arr.copy_from_slice(&root_bytes);
+        root_bytes.zeroize();
 
-        let priv_bytes = env
+        let mut priv_bytes = env
             .convert_byte_array(&own_initial_dh_priv)
-            .map_err(|e| anyhow::anyhow!("invalid own_initial_dh_priv: {e}"))?;
-        if priv_bytes.len() != 32 {
+            .map_err(|e| {
+                root_arr.zeroize();
+                anyhow::anyhow!("invalid own_initial_dh_priv: {e}")
+            })?;
+        let priv_len = priv_bytes.len();
+        if priv_len != 32 {
+            priv_bytes.zeroize();
+            root_arr.zeroize();
             return Err(anyhow::anyhow!(
-                "own_initial_dh_priv must be 32 bytes; got {}", priv_bytes.len()
+                "own_initial_dh_priv must be 32 bytes; got {}", priv_len
             ));
         }
         let mut priv_arr = [0u8; 32];
         priv_arr.copy_from_slice(&priv_bytes);
+        priv_bytes.zeroize();
+        // `StaticSecret::from` consumes the array; the type itself
+        // zeroizes on drop, so this transfer leaves no stray copy.
         let own_dh = x25519_dalek::StaticSecret::from(priv_arr);
+        priv_arr.zeroize();
 
         let mut ks_guard = KEYSTORE.lock().unwrap();
-        let ks = ks_guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        let ks = match ks_guard.as_mut() {
+            Some(ks) => ks,
+            None => {
+                root_arr.zeroize();
+                return Err(anyhow::anyhow!("keystore not initialised"));
+            }
+        };
         let mut sm = SESSION_MANAGER.lock().unwrap();
-        sm.establish_responder_persistent(ks, peer_id, &root_arr, own_dh)?;
-        Ok(())
+        let outcome = sm.establish_responder_persistent(ks, peer_id, &root_arr, own_dh);
+        root_arr.zeroize();
+        outcome
     });
     if result.is_err() {
         eprintln!("Rust: nativeOpenDmResponderSession failed");
         return 0;
     }
     1
+}
+
+/// Build the canonical AAD for a DM exchange between `local` and
+/// `peer`. Both sides of an AEAD must derive identical AAD or the
+/// auth tag check fails; using just one side's identity (e.g. the
+/// recipient on encrypt vs the sender on decrypt) is asymmetric
+/// and broke every DM. Ordering the two ids lexicographically
+/// before concatenation gives both endpoints the same byte string.
+fn canonical_dm_aad(local: &IdentityId, peer: &IdentityId) -> Vec<u8> {
+    let (lo, hi) = if local.as_ref() <= peer.as_ref() {
+        (local.as_ref(), peer.as_ref())
+    } else {
+        (peer.as_ref(), local.as_ref())
+    };
+    let mut out = Vec::with_capacity(b"qubee_dm_pair_v1\0".len() + lo.len() + hi.len());
+    out.extend_from_slice(b"qubee_dm_pair_v1\0");
+    out.extend_from_slice(lo);
+    out.extend_from_slice(hi);
+    out
 }
 
 /// Encrypt a plaintext message to `peer_id_hex` against the
@@ -1821,15 +1878,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
             let pt = env
                 .convert_byte_array(&plaintext)
                 .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?;
+            // AAD: canonical pair (min(local,peer)||max(local,peer))
+            // binds the AEAD to the conversation, not to a single
+            // endpoint, so both sides derive identical bytes.
+            let local_id = active_identity_id()?;
+            let aad = canonical_dm_aad(&local_id, &peer_id);
             let mut ks_guard = KEYSTORE.lock().unwrap();
             let ks = ks_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let mut sm = SESSION_MANAGER.lock().unwrap();
-            // AAD: peer id binds the AEAD ciphertext to the
-            // intended recipient, defending against a substitution
-            // attack that re-routes a frame to a different session.
-            let wire = sm.encrypt_persistent(ks, &peer_id, &pt, peer_id.as_ref())?;
+            let wire = sm.encrypt_persistent(ks, &peer_id, &pt, &aad)?;
             let arr = env
                 .byte_array_from_slice(&wire)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
@@ -1854,13 +1913,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
             let wire_bytes = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let local_id = active_identity_id()?;
+            let aad = canonical_dm_aad(&local_id, &peer_id);
             let mut ks_guard = KEYSTORE.lock().unwrap();
             let ks = ks_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let mut sm = SESSION_MANAGER.lock().unwrap();
-            let pt =
-                sm.decrypt_persistent(ks, &peer_id, &wire_bytes, peer_id.as_ref())?;
+            let pt = sm.decrypt_persistent(ks, &peer_id, &wire_bytes, &aad)?;
             let arr = env
                 .byte_array_from_slice(&pt)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
@@ -2055,12 +2115,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // round-trip.
             let (dm_bundle, dm_secrets) =
                 dm_handshake::generate_prekey_bundle(&keypair, 1)?;
+            // Single serialization, then clone once into the
+            // OnboardingBundle (the canonical signature input) and
+            // reuse for the on-disk persistence below — guarantees
+            // both copies are byte-identical.
             let dm_bytes = dm_bundle.to_wire()?;
+            let dm_bytes_for_bundle = dm_bytes.clone();
             let bundle = OnboardingBundle::create(
                 &keypair,
                 &display_name,
                 &user_id,
-                Some(dm_bytes),
+                Some(dm_bytes_for_bundle),
             )?;
             store_identity_to_keystore(&keypair, &user_id, &display_name)?;
             // Persist secrets keyed by spk_id=1 so future
@@ -2070,7 +2135,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // bundle on app restart without re-deriving (which
             // would produce a different X25519/ML-KEM keypair
             // and break already-handed-out share links).
-            persist_dm_prekey_for_spk_id(1, &dm_secrets, &dm_bundle.to_wire()?)?;
+            persist_dm_prekey_for_spk_id(1, &dm_secrets, &dm_bytes)?;
             *ACTIVE_IDENTITY.lock().unwrap() = Some(Arc::new(keypair));
             bundle_to_json(&bundle)
         })();

@@ -154,44 +154,36 @@ class ChatViewModel @Inject constructor(
             )
             messageRepository.saveMessage(message)
 
-            // Routing: prefer the pairwise DM session when one's
-            // open (forward-secret + post-compromise + post-quantum
-            // via Double Ratchet + ML-KEM re-encap). Fall back to
-            // the group-message path when:
-            //   * this is a group chat
-            //   * the contact row doesn't carry an identityIdHex
-            //   * no DM session exists for that peer yet (the peer
-            //     hasn't run the matching handshake on their side)
+            // Routing: forced to the group-message path until the
+            // receiver-side DM delivery plumbing lands. We *could*
+            // call `encryptDm` here when `hasDmSession(peerHex)`
+            // returns true (the local Double Ratchet would happily
+            // emit a frame), but the gossipsub-side handler that
+            // recognises an inbound DM envelope and feeds it into
+            // `nativeDecryptDm` doesn't exist yet, so the peer
+            // can't consume it. Worse, every outbound DM frame
+            // advances our local chain unilaterally — leaving the
+            // session permanently out of step with the peer once
+            // the receive path *does* land. Group fallback keeps
+            // working end-to-end, so default to that.
             //
-            // The receiver-side delivery path that recognises an
-            // inbound DM frame off the gossipsub topic and feeds
-            // it into `nativeDecryptDm` isn't wired yet — sending
-            // DM frames here advances local chain state but the
-            // peer won't decrypt until that lands. The fallback
-            // chain still works end-to-end.
+            // TODO(dm-receiver): once the inbound DM handler is
+            // wired (recognising the envelope variant and routing
+            // to nativeDecryptDm), re-enable the encryptDm branch
+            // here gated on an explicit "handshake completed both
+            // sides" predicate, not on `hasDmSession` alone.
+            @Suppress("UNUSED_VARIABLE")
             val peerHex = peerIdentityHex
-            val useDm =
-                peerHex != null &&
-                runCatching { qubeeManager.hasDmSession(peerHex) }.getOrDefault(false)
 
-            val sendBytes: ByteArray? = if (useDm) {
-                runCatching {
-                    qubeeManager.encryptDm(peerHex!!, payload.toByteArray())
-                }.getOrNull()
-            } else {
+            val sendBytes: ByteArray? =
                 runCatching { qubeeManager.encryptMessage(conversationId, payload) }
                     .getOrNull()
                     ?.toBytes()
-            }
             if (sendBytes == null) {
                 messageRepository.updateMessageStatus(message.id, MessageStatus.FAILED)
                 _events.emit(
                     ChatUiEvent.Notice(
-                        if (useDm) {
-                            "Encrypt failed — DM session is open but encryptDm returned null"
-                        } else {
-                            "Encrypt failed — peer may not have accepted the group invite yet"
-                        },
+                        "Encrypt failed — peer may not have accepted the group invite yet",
                     ),
                 )
                 return@launch

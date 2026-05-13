@@ -242,6 +242,22 @@ impl GroupCrypto {
         Ok(())
     }
 
+    /// Drop a single sender chain by full triple. Used by
+    /// `GroupManager::decrypt_group_message`'s rollback path
+    /// when a persist failure on a *freshly-derived* chain
+    /// (i.e. one with no on-disk snapshot to restore from)
+    /// needs to discard the in-memory copy so the retry derives
+    /// it cleanly from the group seed again.
+    pub fn drop_sender_chain(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+    ) {
+        self.sender_chains
+            .remove(&(*group_id, *sender_id, generation));
+    }
+
     /// Forget any sender chains for a group whose generation is
     /// older than `min_generation`. Called after a key rotation:
     /// once `group.version` advances, frames from the old

@@ -300,11 +300,11 @@ impl SessionManager {
     // crypto/ and storage/.
 
     /// Encrypt `plaintext` to `peer_id` and persist the advanced
-    /// ratchet state to the encrypted keystore. Atomic from the
-    /// caller's perspective: AEAD failure leaves both the in-memory
-    /// session and the keystore unchanged (DoubleRatchet's
-    /// snapshot/commit pattern handles the in-memory side; we only
-    /// touch the keystore on success).
+    /// ratchet state to the encrypted keystore. Atomic with respect
+    /// to the in-memory ratchet: if the AEAD step fails the
+    /// ratchet's own snapshot/commit keeps RAM clean, and if the
+    /// keystore write fails we restore the pre-encrypt ratchet
+    /// snapshot so RAM stays aligned with disk.
     pub fn encrypt_persistent(
         &mut self,
         keystore: &mut SecureKeyStore,
@@ -316,13 +316,22 @@ impl SessionManager {
             .sessions
             .get_mut(peer_id)
             .ok_or_else(|| anyhow!("no DM session for peer"))?;
+        let snapshot = session.ratchet.persist()?;
         let wire = session.encrypt(plaintext, aad)?;
-        Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet)?;
+        if let Err(err) = Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet) {
+            // RAM has advanced past disk; roll back so the next
+            // retry doesn't emit a frame the peer cannot match
+            // against their (still pre-advance) snapshot.
+            session.ratchet = DoubleRatchet::restore(&snapshot)?;
+            return Err(err);
+        }
         Ok(wire)
     }
 
     /// Decrypt a frame from `peer_id` and persist the advanced
-    /// ratchet state. Same atomicity as `encrypt_persistent`.
+    /// ratchet state. Same atomicity as `encrypt_persistent`: a
+    /// keystore-write failure restores the pre-decrypt ratchet so
+    /// the next restart doesn't see a half-advanced session.
     pub fn decrypt_persistent(
         &mut self,
         keystore: &mut SecureKeyStore,
@@ -334,8 +343,12 @@ impl SessionManager {
             .sessions
             .get_mut(peer_id)
             .ok_or_else(|| anyhow!("no DM session for peer"))?;
+        let snapshot = session.ratchet.persist()?;
         let pt = session.decrypt(wire, aad)?;
-        Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet)?;
+        if let Err(err) = Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet) {
+            session.ratchet = DoubleRatchet::restore(&snapshot)?;
+            return Err(err);
+        }
         Ok(pt)
     }
 
@@ -461,6 +474,18 @@ impl SessionManager {
                 Some(p) => p,
                 None => continue,
             };
+            // Don't overwrite an already-live session — its
+            // in-memory ratchet may have advanced past whatever's
+            // on disk, and clobbering it here silently rewinds
+            // state and breaks later decrypts. Idempotent restore
+            // means a second call is a no-op for entries we've
+            // already loaded.
+            if self.sessions.contains_key(&peer_id) {
+                tracing::debug!(
+                    "load_from_keystore: skipping {peer_id:?} (already in memory)"
+                );
+                continue;
+            }
             let bytes = match keystore.retrieve_key(&key_id)? {
                 Some(b) => b,
                 None => continue,

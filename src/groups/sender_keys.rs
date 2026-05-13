@@ -138,10 +138,13 @@ impl SenderChain {
     }
 
     /// Encrypt `plaintext` (with `aad` covering associated
-    /// metadata) on the sender side. Counter advances on success.
+    /// metadata) on the sender side. Commit-on-success: chain key
+    /// and counter only advance after AEAD succeeds, so a failed
+    /// nonce-gen or AEAD leaves the chain undisturbed and a retry
+    /// emits the same counter under the same key.
     pub fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let counter = self.next_counter;
-        let msg_key = self.step()?;
+        let (next_chain_key, msg_key) = chain_advance(self.chain_key.expose_secret())?;
         let nonce_bytes = secure_rng::random::array::<NONCE_LEN>()?;
 
         let cipher = ChaCha20Poly1305::new_from_slice(msg_key.as_ref()).expect("32-byte key");
@@ -150,10 +153,13 @@ impl SenderChain {
             .encrypt(nonce, Payload { msg: plaintext, aad })
             .map_err(|e| anyhow::anyhow!("aead encrypt: {e}"))?;
 
-        self.next_counter = self
+        let next_counter = self
             .next_counter
             .checked_add(1)
             .context("send counter overflow — re-handshake required")?;
+        // All fallible operations done — commit.
+        self.chain_key = SecretBox::new(Box::new(next_chain_key));
+        self.next_counter = next_counter;
 
         let mut wire = Vec::with_capacity(COUNTER_LEN + NONCE_LEN + ct.len());
         wire.extend_from_slice(&counter.to_be_bytes());
@@ -232,14 +238,6 @@ impl SenderChain {
             self.stash_message_key(c, k);
         }
         Ok(pt)
-    }
-
-    /// Step the chain in place, returning the per-message key and
-    /// replacing `self.chain_key` with the chained successor.
-    fn step(&mut self) -> Result<Zeroizing<[u8; KEY_LEN]>> {
-        let (next, msg) = chain_advance(self.chain_key.expose_secret())?;
-        self.chain_key = SecretBox::new(Box::new(next));
-        Ok(msg)
     }
 
     fn stash_message_key(&mut self, counter: u32, key: Zeroizing<[u8; KEY_LEN]>) {

@@ -1,21 +1,17 @@
 // src/jni_api.rs
 
-use jni::{JNIEnv, JavaVM};
-use jni::objects::{JByteArray, JClass, JObject, JString, JValue, GlobalRef};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jstring};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use jni::{JNIEnv, JavaVM};
 use lazy_static::lazy_static;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 // Core modules
-use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
-use crate::identity::identity_key::{IdentityKey, IdentityKeyPair, IdentityId};
-use crate::onboarding::OnboardingBundle;
-use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_handshake::{
     generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_request_join,
     sign_role_change, GroupHandshake, KeyRotationBody, MessageAckBody, RequestJoinBody,
@@ -28,10 +24,16 @@ use crate::groups::group_message::{
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
+use crate::groups::group_message::{
+    decrypt_group_message, encrypt_group_message, GroupMessageEnvelope,
+};
 use crate::groups::handshake_handlers::{
     plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
 };
+use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
+use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
+use crate::onboarding::OnboardingBundle;
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
 use std::collections::HashMap;
@@ -131,9 +133,7 @@ where
 /// errors-and-panics to fold into a caller-provided fallback.
 /// Panics fold into `Err(...)` so the caller can decide the
 /// fallback by chaining `.unwrap_or(...)`.
-fn jni_catch_or<T>(
-    f: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
+fn jni_catch_or<T>(f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!("panic during JNI call")),
@@ -146,16 +146,14 @@ fn jni_catch_or<T>(
 /// a JNI null-pointer return, which is what every existing call
 /// site already does on a non-panic error path.
 fn jni_catch_jstring(f: impl FnOnce() -> jstring) -> jstring {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .unwrap_or(std::ptr::null_mut())
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(std::ptr::null_mut())
 }
 
 /// `jbyteArray` variant of [`jni_catch_jstring`]. Same shape — a
 /// raw `*mut _jobject` that can't impl `Default`, so we hand-roll
 /// the null fallback.
 fn jni_catch_jbytearray(f: impl FnOnce() -> jbyteArray) -> jbyteArray {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .unwrap_or(std::ptr::null_mut())
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(std::ptr::null_mut())
 }
 
 // --- Initialization & Callbacks ---
@@ -302,7 +300,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
     bootstrap_nodes: JString,
 ) -> jboolean {
     catch_unwind_result(|| {
-        let _bootstrap_str: String = env.get_string(&bootstrap_nodes).expect("Invalid string").into();
+        let _bootstrap_str: String = env
+            .get_string(&bootstrap_nodes)
+            .expect("Invalid string")
+            .into();
 
         std::thread::spawn(|| {
             let rt = Runtime::new().unwrap();
@@ -313,8 +314,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                     "Starting P2P Node",
                 );
 
-                let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32); 
-                let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32); 
+                let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
+                let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32);
 
                 match P2PNode::new(id_keys, rx_cmd).await {
                     Ok(node) => {
@@ -346,7 +347,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         });
 
                         node.run(tx_event).await;
-                    },
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to start P2P node");
                     }
@@ -371,11 +372,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
         let data_vec = env.convert_byte_array(&data).expect("Invalid data");
 
         let commander_lock = P2P_COMMANDER.lock().unwrap();
-        
+
         if let Some(commander) = commander_lock.as_ref() {
             let cmd = P2PCommand::SendMessage {
                 peer_id: peer_id_str,
-                data: data_vec
+                data: data_vec,
             };
 
             match commander.try_send(cmd) {
@@ -574,7 +575,7 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
         Ok(e) => e,
         Err(_) => return,
     };
-    
+
     let callback_lock = CALLBACK_HANDLER.lock().unwrap();
     let callback_obj = match callback_lock.as_ref() {
         Some(o) => o,
@@ -592,7 +593,7 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
                 "(Ljava/lang/String;[B)V",
                 &[JValue::Object(&j_sender), JValue::Object(&j_data)],
             );
-        },
+        }
         NodeEvent::PeerDiscovered { peer_id } => {
             let j_peer = env.new_string(peer_id).unwrap();
             let _ = env.call_method(
@@ -711,7 +712,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             } else {
                 Some(expires_at_seconds as u64)
             };
-            let max_uses = if max_uses < 0 { None } else { Some(max_uses as u32) };
+            let max_uses = if max_uses < 0 {
+                None
+            } else {
+                Some(max_uses as u32)
+            };
 
             let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
@@ -759,8 +764,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendGr
         };
 
         let result: anyhow::Result<serde_json::Value> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
             let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
 
             let (wire, generation) = {
@@ -814,8 +819,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
         };
 
         let result: anyhow::Result<serde_json::Value> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
             let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
             let member_id = IdentityId::from(parse_hex32(Some(member_id_hex.as_str()))?);
 
@@ -824,13 +829,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
                 let gm = gm_guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                plan_key_rotation(
-                    gm,
-                    identity.as_ref(),
-                    group_id,
-                    Some(member_id),
-                    &reason,
-                )?
+                plan_key_rotation(gm, identity.as_ref(), group_id, Some(member_id), &reason)?
             };
 
             let generation = match &signed {
@@ -1412,8 +1411,8 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
         GroupHandshake::RequestStateSync { body, signature } => {
             // Responder side. Build + sign a snapshot reply and
             // publish it back on the group's gossipsub topic.
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let topic = group_topic(&hex::encode(body.group_id.as_ref()));
             let response = {
                 let gm_guard = GROUP_MANAGER.lock().unwrap();
@@ -1439,8 +1438,8 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             // Requester side — gossipsub fan-out delivers the
             // reply to everyone on the topic, so process_state_sync_response
             // self-filters by self_id == body.requester_id.
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
                 .as_mut()
@@ -1460,8 +1459,8 @@ fn on_key_rotation(
     body: KeyRotationBody,
     signature: crate::identity::identity_key::HybridSignature,
 ) -> anyhow::Result<()> {
-    let identity = active_identity()?
-        .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    let identity =
+        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
     // Don't process our own rotations as if we received them — we
     // already installed the new key in plan_key_rotation.
     if body.rotator_id == identity.identity_id() {
@@ -1479,8 +1478,8 @@ fn on_request_join(
     signature: crate::identity::identity_key::HybridSignature,
 ) -> anyhow::Result<()> {
     // We only act on RequestJoins for invitations *we* minted.
-    let identity = active_identity()?
-        .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    let identity =
+        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
 
     let outcome = {
         let mut gm_guard = GROUP_MANAGER.lock().unwrap();
@@ -1511,7 +1510,10 @@ fn on_request_join(
             };
             let _ = publish_to_topic(topic, added.to_wire()?);
         }
-        HandshakeOutcome::Reject { body: rejected, signature: rejected_sig } => {
+        HandshakeOutcome::Reject {
+            body: rejected,
+            signature: rejected_sig,
+        } => {
             let signed = GroupHandshake::JoinRejected {
                 body: rejected,
                 signature: rejected_sig,
@@ -1531,8 +1533,8 @@ fn on_join_accepted(
     body: crate::groups::group_handshake::JoinAcceptedBody,
     signature: crate::identity::identity_key::HybridSignature,
 ) -> anyhow::Result<()> {
-    let identity = active_identity()?
-        .ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    let identity =
+        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
     if body.joiner_id != identity.identity_id() {
         return Ok(());
     }
@@ -1853,9 +1855,21 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildI
             let v: serde_json::Value = serde_json::from_str(&raw)?;
             let group_id = parse_hex32(v.get("group_id_hex").and_then(|s| s.as_str()))?;
             let inviter_id = parse_hex32(v.get("inviter_id_hex").and_then(|s| s.as_str()))?;
-            let group_name = v.get("group_name").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            let inviter_name = v.get("inviter_name").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            let invitation_code = v.get("invitation_code").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let group_name = v
+                .get("group_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let inviter_name = v
+                .get("inviter_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let invitation_code = v
+                .get("invitation_code")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
             let expires_at = v.get("expires_at").and_then(|s| s.as_u64());
 
             let invitation = GroupInvitation {
@@ -2009,10 +2023,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
         hasher.update(second);
         let digest = hasher.finalize();
         let h = digest.as_bytes();
-        let value: u32 = ((h[0] as u32) << 24)
-            | ((h[1] as u32) << 16)
-            | ((h[2] as u32) << 8)
-            | (h[3] as u32);
+        let value: u32 =
+            ((h[0] as u32) << 24) | ((h[1] as u32) << 16) | ((h[2] as u32) << 8) | (h[3] as u32);
         // Reduce each 16-bit half to 0..=9999 so the {:04} format
         // spec is a 4-digit ceiling, not just a minimum width.
         let high = ((value >> 16) & 0xFFFF) % 10_000;
@@ -2069,8 +2081,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
                 .get_string(&plaintext)
                 .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?
                 .into();
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
                 .as_ref()
@@ -2144,8 +2156,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
             let plaintext = env
                 .convert_byte_array(&file_data)
                 .map_err(|e| anyhow::anyhow!("invalid file_data: {e}"))?;
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
                 .as_ref()
@@ -2280,8 +2292,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
             let peer_bytes: Vec<u8> = env
                 .convert_byte_array(&peer_identity_key)
                 .map_err(|e| anyhow::anyhow!("invalid peer_identity_key bytes: {e}"))?;
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let our_bytes = identity.public_key().to_bytes();
 
             let (first, second) = if our_bytes <= peer_bytes {
@@ -2326,8 +2338,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyF
 ) -> jstring {
     jni_catch_jstring(|| {
         let result: anyhow::Result<jstring> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let java_str = env
                 .new_string(identity.public_key().fingerprint())
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
@@ -2374,8 +2386,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetMyI
 fn my_identity_id_hex_impl(env: JNIEnv) -> jstring {
     jni_catch_jstring(|| {
         let result: anyhow::Result<jstring> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
             let java_str = env
                 .new_string(id_hex)

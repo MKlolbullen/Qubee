@@ -21,7 +21,9 @@ use qubee_crypto::groups::group_handshake::{
     KeyRotationBody, MemberAddedBody, RequestJoinBody, RoleChangeBody, HANDSHAKE_MAGIC,
 };
 use qubee_crypto::groups::group_manager::GroupId;
-use qubee_crypto::groups::group_message::{canonical_group_message, GroupMessageBody, MAGIC_GROUP_MESSAGE};
+use qubee_crypto::groups::group_message::{
+    canonical_group_message, GroupMessageBody, MAGIC_GROUP_MESSAGE,
+};
 use qubee_crypto::groups::group_permissions::Role;
 use qubee_crypto::identity::identity_key::{IdentityId, IdentityKeyPair};
 
@@ -252,9 +254,7 @@ fn canonical_payload_uses_explicit_length_prefixes_not_bincode() {
 // ---------------------------------------------------------------------
 
 use proptest::prelude::*;
-use qubee_crypto::groups::group_handshake::{
-    sign_request_join, sign_role_change, GroupHandshake,
-};
+use qubee_crypto::groups::group_handshake::{sign_request_join, sign_role_change, GroupHandshake};
 use qubee_crypto::groups::group_message::GroupMessageEnvelope;
 
 fn config_64() -> ProptestConfig {

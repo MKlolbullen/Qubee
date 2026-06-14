@@ -202,9 +202,15 @@ class ContactRepository @Inject constructor(
     /**
      * Verify a peer's `IdentityKey` against a verification payload via
      * the Rust core's hybrid Ed25519 + ML-DSA-44 check. On success,
-     * stamp the contact's trust state through `TrustStatePolicy`
-     * (which is the choke point that downgrades a previously-verified
-     * contact whose key changed).
+     * route the contact through `TrustStatePolicy.applyOutOfBandVerification`,
+     * which honours COMPROMISED stickiness — a contact previously
+     * marked compromised is not silently un-compromised by a single
+     * OOB pass.
+     *
+     * Returns `true` only when both the JNI verification AND a trust
+     * transition succeeded. A COMPROMISED contact yields `false` here
+     * so the UI can keep flagging the OOB result as inconclusive
+     * until the user explicitly clears the compromised state.
      */
     suspend fun verifyIdentityKey(
         contactId: String,
@@ -215,16 +221,17 @@ class ContactRepository @Inject constructor(
         if (!ok) return false
         val existing = contactDao.getContactById(contactId) ?: return false
         val now = System.currentTimeMillis()
-        val withKey = TrustStatePolicy.applyObservedIdentityKey(
+        val verified = TrustStatePolicy.applyOutOfBandVerification(
             contact = existing,
             observedIdentityKey = key,
             nowMillis = now,
         )
-        val verified = withKey.copy(
-            trustLevel = TrustLevel.VERIFIED,
-            verificationStatus = ContactVerificationStatus.VERIFIED,
-            updatedAt = now,
-        )
+        if (verified === existing) {
+            // Policy declined the upgrade (e.g. COMPROMISED is sticky).
+            // Don't write a no-op row, and surface the refusal to the
+            // caller so the UI can keep the dialog open.
+            return false
+        }
         contactDao.updateContact(verified)
         return true
     }

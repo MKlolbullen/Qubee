@@ -36,7 +36,14 @@ fn fresh_device(label: &str) -> (TempDir, IdentityKeyPair, GroupManager) {
     (dir, kp, gm)
 }
 
-fn create_alice_group() -> (TempDir, IdentityKeyPair, GroupManager, GroupId, String, String) {
+fn create_alice_group() -> (
+    TempDir,
+    IdentityKeyPair,
+    GroupManager,
+    GroupId,
+    String,
+    String,
+) {
     use qubee_crypto::groups::group_manager::{GroupSettings, GroupType};
 
     let (alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
@@ -143,14 +150,16 @@ fn jni_message_bridge_core_semantics_non_empty_envelope_and_round_trip() {
     let envelope = encrypt_group_message(&alice_gm, &alice_kp, group_id, plaintext)
         .expect("nativeEncryptMessage core path should encrypt");
 
-    assert!(!envelope.is_empty(), "encrypted message envelope must be non-empty");
+    assert!(
+        !envelope.is_empty(),
+        "encrypted message envelope must be non-empty"
+    );
     assert!(
         envelope.starts_with(MAGIC_GROUP_MESSAGE),
         "message envelope must use the group-message wire prefix"
     );
     assert_ne!(
-        envelope,
-        plaintext,
+        envelope, plaintext,
         "encrypted message envelope must not equal plaintext bytes"
     );
 
@@ -174,14 +183,16 @@ fn jni_file_bridge_core_semantics_non_empty_envelope_and_round_trip() {
     let envelope = encrypt_group_message(&alice_gm, &alice_kp, group_id, &file_bytes)
         .expect("nativeEncryptFile core path should encrypt binary bytes");
 
-    assert!(!envelope.is_empty(), "encrypted file envelope must be non-empty");
+    assert!(
+        !envelope.is_empty(),
+        "encrypted file envelope must be non-empty"
+    );
     assert!(
         envelope.starts_with(MAGIC_GROUP_MESSAGE),
         "file envelope must use the group-message wire prefix until a dedicated file envelope exists"
     );
     assert_ne!(
-        envelope,
-        file_bytes,
+        envelope, file_bytes,
         "encrypted file envelope must not equal raw file bytes"
     );
 

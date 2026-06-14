@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Group permissions system with role-based access control
@@ -35,24 +35,24 @@ pub enum Permission {
     RemoveMembers,
     BanMembers,
     UnbanMembers,
-    
+
     // Role management
     ManageRoles,
     AssignModerator,
     AssignAdmin,
-    
+
     // Group management
     ManageSettings,
     ChangeGroupName,
     ChangeGroupDescription,
     ChangeGroupAvatar,
     DeleteGroup,
-    
+
     // Invitation management
     CreateInvites,
     RevokeInvites,
     ManageInviteSettings,
-    
+
     // Message management
     SendMessages,
     DeleteOwnMessages,
@@ -61,26 +61,26 @@ pub enum Permission {
     EditAnyMessage,
     PinMessages,
     UnpinMessages,
-    
+
     // Media and file sharing
     SendFiles,
     SendImages,
     SendVideos,
     SendAudio,
     SendDocuments,
-    
+
     // Communication features
     StartVoiceCall,
     StartVideoCall,
     StartScreenShare,
     ManageCallSettings,
-    
+
     // Moderation
     MuteMembers,
     UnmuteMembers,
     SetSlowMode,
     ManageAutoModeration,
-    
+
     // Advanced features
     CreatePolls,
     ManagePolls,
@@ -88,12 +88,12 @@ pub enum Permission {
     ManageEvents,
     AccessAuditLog,
     ManageIntegrations,
-    
+
     // Read permissions
     ReadMessages,
     ReadMemberList,
     ReadGroupInfo,
-    
+
     // Custom permissions
     Custom(String),
 }
@@ -157,17 +157,17 @@ impl GroupPermissions {
     /// Create default permissions for a standard group
     pub fn default() -> Self {
         let mut role_permissions = HashMap::new();
-        
+
         // Owner permissions (all permissions)
         let owner_permissions = Self::all_permissions();
         role_permissions.insert(Role::Owner, owner_permissions);
-        
+
         // Admin permissions (most permissions except ownership transfer)
         let mut admin_permissions = Self::all_permissions();
         admin_permissions.remove(&Permission::DeleteGroup);
         admin_permissions.remove(&Permission::AssignAdmin);
         role_permissions.insert(Role::Admin, admin_permissions);
-        
+
         // Moderator permissions (moderation and basic management)
         let moderator_permissions = hashset![
             Permission::AddMembers,
@@ -196,7 +196,7 @@ impl GroupPermissions {
             Permission::ReadGroupInfo,
         ];
         role_permissions.insert(Role::Moderator, moderator_permissions);
-        
+
         // Member permissions (basic communication)
         let member_permissions = hashset![
             Permission::SendMessages,
@@ -215,7 +215,7 @@ impl GroupPermissions {
             Permission::ReadGroupInfo,
         ];
         role_permissions.insert(Role::Member, member_permissions);
-        
+
         // Observer permissions (read-only)
         let observer_permissions = hashset![
             Permission::ReadMessages,
@@ -223,32 +223,34 @@ impl GroupPermissions {
             Permission::ReadGroupInfo,
         ];
         role_permissions.insert(Role::Observer, observer_permissions);
-        
+
         GroupPermissions {
             role_permissions,
             custom_overrides: HashMap::new(),
         }
     }
-    
+
     /// Create permissions for a broadcast channel
     pub fn broadcast_channel() -> Self {
         let mut permissions = Self::default();
-        
+
         // Only admins can send messages in broadcast channels
         let member_permissions = hashset![
             Permission::ReadMessages,
             Permission::ReadMemberList,
             Permission::ReadGroupInfo,
         ];
-        permissions.role_permissions.insert(Role::Member, member_permissions);
-        
+        permissions
+            .role_permissions
+            .insert(Role::Member, member_permissions);
+
         permissions
     }
-    
+
     /// Create permissions for an announcement channel
     pub fn announcement_channel() -> Self {
         let mut permissions = Self::broadcast_channel();
-        
+
         // Even more restrictive - only owners can send messages
         let admin_permissions = hashset![
             Permission::AddMembers,
@@ -266,11 +268,13 @@ impl GroupPermissions {
             Permission::ReadGroupInfo,
             Permission::AccessAuditLog,
         ];
-        permissions.role_permissions.insert(Role::Admin, admin_permissions);
-        
+        permissions
+            .role_permissions
+            .insert(Role::Admin, admin_permissions);
+
         permissions
     }
-    
+
     /// Check if a role has a specific permission
     pub fn role_has_permission(&self, role: &Role, permission: &Permission) -> bool {
         if let Some(permissions) = self.role_permissions.get(role) {
@@ -279,7 +283,7 @@ impl GroupPermissions {
             false
         }
     }
-    
+
     /// Add a permission to a role
     pub fn add_permission_to_role(&mut self, role: Role, permission: Permission) {
         self.role_permissions
@@ -287,36 +291,33 @@ impl GroupPermissions {
             .or_insert_with(HashSet::new)
             .insert(permission);
     }
-    
+
     /// Remove a permission from a role
     pub fn remove_permission_from_role(&mut self, role: &Role, permission: &Permission) {
         if let Some(permissions) = self.role_permissions.get_mut(role) {
             permissions.remove(permission);
         }
     }
-    
+
     /// Create a custom role with specific permissions
     pub fn create_custom_role(&mut self, role_name: String, permissions: HashSet<Permission>) {
         let custom_role = Role::Custom(role_name);
         self.role_permissions.insert(custom_role, permissions);
     }
-    
+
     /// Get all permissions for a role
     pub fn get_role_permissions(&self, role: &Role) -> HashSet<Permission> {
-        self.role_permissions
-            .get(role)
-            .cloned()
-            .unwrap_or_default()
+        self.role_permissions.get(role).cloned().unwrap_or_default()
     }
-    
+
     /// Check if a permission is valid for the group type
     pub fn is_permission_valid(&self, permission: &Permission) -> bool {
         match permission {
             Permission::Custom(_) => true, // Custom permissions are always valid
-            _ => true, // All standard permissions are valid by default
+            _ => true,                     // All standard permissions are valid by default
         }
     }
-    
+
     /// Get all available permissions
     fn all_permissions() -> HashSet<Permission> {
         hashset![
@@ -325,24 +326,20 @@ impl GroupPermissions {
             Permission::RemoveMembers,
             Permission::BanMembers,
             Permission::UnbanMembers,
-            
             // Role management
             Permission::ManageRoles,
             Permission::AssignModerator,
             Permission::AssignAdmin,
-            
             // Group management
             Permission::ManageSettings,
             Permission::ChangeGroupName,
             Permission::ChangeGroupDescription,
             Permission::ChangeGroupAvatar,
             Permission::DeleteGroup,
-            
             // Invitation management
             Permission::CreateInvites,
             Permission::RevokeInvites,
             Permission::ManageInviteSettings,
-            
             // Message management
             Permission::SendMessages,
             Permission::DeleteOwnMessages,
@@ -351,26 +348,22 @@ impl GroupPermissions {
             Permission::EditAnyMessage,
             Permission::PinMessages,
             Permission::UnpinMessages,
-            
             // Media and file sharing
             Permission::SendFiles,
             Permission::SendImages,
             Permission::SendVideos,
             Permission::SendAudio,
             Permission::SendDocuments,
-            
             // Communication features
             Permission::StartVoiceCall,
             Permission::StartVideoCall,
             Permission::StartScreenShare,
             Permission::ManageCallSettings,
-            
             // Moderation
             Permission::MuteMembers,
             Permission::UnmuteMembers,
             Permission::SetSlowMode,
             Permission::ManageAutoModeration,
-            
             // Advanced features
             Permission::CreatePolls,
             Permission::ManagePolls,
@@ -378,14 +371,13 @@ impl GroupPermissions {
             Permission::ManageEvents,
             Permission::AccessAuditLog,
             Permission::ManageIntegrations,
-            
             // Read permissions
             Permission::ReadMessages,
             Permission::ReadMemberList,
             Permission::ReadGroupInfo,
         ]
     }
-    
+
     /// Check if one role is higher than another
     pub fn is_role_higher(&self, role1: &Role, role2: &Role) -> bool {
         let hierarchy = self.get_role_hierarchy();
@@ -393,7 +385,7 @@ impl GroupPermissions {
         let level2 = hierarchy.get(role2).unwrap_or(&0);
         level1 > level2
     }
-    
+
     /// Get role hierarchy levels
     fn get_role_hierarchy(&self) -> HashMap<Role, u8> {
         let mut hierarchy = HashMap::new();
@@ -404,24 +396,24 @@ impl GroupPermissions {
         hierarchy.insert(Role::Observer, 20);
         hierarchy
     }
-    
+
     /// Validate permission change
     pub fn can_modify_role(&self, modifier_role: &Role, target_role: &Role) -> bool {
         // Owners can modify any role
         if *modifier_role == Role::Owner {
             return true;
         }
-        
+
         // Admins can modify roles below them
         if *modifier_role == Role::Admin {
             return !matches!(target_role, Role::Owner | Role::Admin);
         }
-        
+
         // Moderators can only modify members and observers
         if *modifier_role == Role::Moderator {
             return matches!(target_role, Role::Member | Role::Observer);
         }
-        
+
         false
     }
 }
@@ -516,97 +508,100 @@ pub(crate) use hashset;
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_permissions() {
         let permissions = GroupPermissions::default();
-        
+
         // Owner should have all permissions
         assert!(permissions.role_has_permission(&Role::Owner, &Permission::DeleteGroup));
         assert!(permissions.role_has_permission(&Role::Owner, &Permission::SendMessages));
-        
+
         // Member should have basic permissions
         assert!(permissions.role_has_permission(&Role::Member, &Permission::SendMessages));
         assert!(!permissions.role_has_permission(&Role::Member, &Permission::DeleteGroup));
-        
+
         // Observer should only have read permissions
         assert!(permissions.role_has_permission(&Role::Observer, &Permission::ReadMessages));
         assert!(!permissions.role_has_permission(&Role::Observer, &Permission::SendMessages));
     }
-    
+
     #[test]
     fn test_broadcast_channel_permissions() {
         let permissions = GroupPermissions::broadcast_channel();
-        
+
         // Members should not be able to send messages in broadcast channels
         assert!(!permissions.role_has_permission(&Role::Member, &Permission::SendMessages));
         assert!(permissions.role_has_permission(&Role::Member, &Permission::ReadMessages));
-        
+
         // Admins should still be able to send messages
         assert!(permissions.role_has_permission(&Role::Admin, &Permission::SendMessages));
     }
-    
+
     #[test]
     fn test_role_hierarchy() {
         let permissions = GroupPermissions::default();
-        
+
         assert!(permissions.is_role_higher(&Role::Owner, &Role::Admin));
         assert!(permissions.is_role_higher(&Role::Admin, &Role::Moderator));
         assert!(permissions.is_role_higher(&Role::Moderator, &Role::Member));
         assert!(permissions.is_role_higher(&Role::Member, &Role::Observer));
-        
+
         assert!(!permissions.is_role_higher(&Role::Member, &Role::Admin));
     }
-    
+
     #[test]
     fn test_role_modification_permissions() {
         let permissions = GroupPermissions::default();
-        
+
         // Owner can modify any role
         assert!(permissions.can_modify_role(&Role::Owner, &Role::Admin));
         assert!(permissions.can_modify_role(&Role::Owner, &Role::Member));
-        
+
         // Admin can modify lower roles but not owner or other admins
         assert!(!permissions.can_modify_role(&Role::Admin, &Role::Owner));
         assert!(!permissions.can_modify_role(&Role::Admin, &Role::Admin));
         assert!(permissions.can_modify_role(&Role::Admin, &Role::Member));
-        
+
         // Moderator can only modify members and observers
         assert!(!permissions.can_modify_role(&Role::Moderator, &Role::Admin));
         assert!(permissions.can_modify_role(&Role::Moderator, &Role::Member));
         assert!(permissions.can_modify_role(&Role::Moderator, &Role::Observer));
-        
+
         // Members cannot modify roles
         assert!(!permissions.can_modify_role(&Role::Member, &Role::Observer));
     }
-    
+
     #[test]
     fn test_custom_role_creation() {
         let mut permissions = GroupPermissions::default();
-        
+
         let custom_permissions = hashset![
             Permission::SendMessages,
             Permission::SendImages,
             Permission::ReadMessages,
         ];
-        
+
         permissions.create_custom_role("ImagePoster".to_string(), custom_permissions.clone());
-        
+
         let custom_role = Role::Custom("ImagePoster".to_string());
-        assert_eq!(permissions.get_role_permissions(&custom_role), custom_permissions);
-        
+        assert_eq!(
+            permissions.get_role_permissions(&custom_role),
+            custom_permissions
+        );
+
         assert!(permissions.role_has_permission(&custom_role, &Permission::SendImages));
         assert!(!permissions.role_has_permission(&custom_role, &Permission::DeleteAnyMessage));
     }
-    
+
     #[test]
     fn test_permission_modification() {
         let mut permissions = GroupPermissions::default();
-        
+
         // Remove a permission from members
         permissions.remove_permission_from_role(&Role::Member, &Permission::SendFiles);
         assert!(!permissions.role_has_permission(&Role::Member, &Permission::SendFiles));
-        
+
         // Add a permission to observers
         permissions.add_permission_to_role(Role::Observer, Permission::SendMessages);
         assert!(permissions.role_has_permission(&Role::Observer, &Permission::SendMessages));

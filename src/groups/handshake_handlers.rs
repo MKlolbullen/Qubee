@@ -15,10 +15,10 @@ use zeroize::Zeroize;
 use crate::groups::group_handshake::{
     sign_join_accepted, sign_join_rejected, sign_key_rotation, sign_member_added,
     sign_state_sync_response, verify_join_accepted, verify_key_rotation, verify_member_added,
-    verify_request_join, verify_request_state_sync, verify_role_change,
-    verify_state_sync_response, GroupHandshake, GroupMemberSummary, JoinAcceptedBody,
-    JoinRejectedBody, KeyRotationBody, MemberAddedBody, MemberKeyDelivery, RequestJoinBody,
-    RequestStateSyncBody, RoleChangeBody, StateSyncResponseBody, WrappedGroupKey,
+    verify_request_join, verify_request_state_sync, verify_role_change, verify_state_sync_response,
+    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, KeyRotationBody,
+    MemberAddedBody, MemberKeyDelivery, RequestJoinBody, RequestStateSyncBody, RoleChangeBody,
+    StateSyncResponseBody, WrappedGroupKey,
 };
 use crate::groups::group_manager::{GroupId, GroupManager, GroupMember, MemberStatus};
 use crate::groups::group_permissions::{Permission, Role};
@@ -163,15 +163,13 @@ pub fn process_request_join(
         wrapped_group_key,
         snapshot_version,
     };
-    let (accepted_body, accepted_signature) = match sign_join_accepted(
-        inviter_identity,
-        accepted_body,
-    )? {
-        crate::groups::group_handshake::GroupHandshake::JoinAccepted { body, signature } => {
-            (body, signature)
-        }
-        _ => unreachable!("sign_join_accepted always returns JoinAccepted"),
-    };
+    let (accepted_body, accepted_signature) =
+        match sign_join_accepted(inviter_identity, accepted_body)? {
+            crate::groups::group_handshake::GroupHandshake::JoinAccepted { body, signature } => {
+                (body, signature)
+            }
+            _ => unreachable!("sign_join_accepted always returns JoinAccepted"),
+        };
 
     let member_added_payload = MemberAddedBody {
         group_id: body.group_id,
@@ -180,15 +178,13 @@ pub fn process_request_join(
         new_version: snapshot_version,
         timestamp: now,
     };
-    let (member_added_body, member_added_signature) = match sign_member_added(
-        inviter_identity,
-        member_added_payload,
-    )? {
-        crate::groups::group_handshake::GroupHandshake::MemberAdded { body, signature } => {
-            (body, signature)
-        }
-        _ => unreachable!("sign_member_added always returns MemberAdded"),
-    };
+    let (member_added_body, member_added_signature) =
+        match sign_member_added(inviter_identity, member_added_payload)? {
+            crate::groups::group_handshake::GroupHandshake::MemberAdded { body, signature } => {
+                (body, signature)
+            }
+            _ => unreachable!("sign_member_added always returns MemberAdded"),
+        };
 
     Ok(HandshakeOutcome::Accept {
         body: accepted_body,
@@ -491,14 +487,12 @@ pub fn process_request_state_sync(
         wrapped_group_key,
         timestamp: now_secs(),
     };
-    let (resp_body, resp_sig) =
-        match sign_state_sync_response(responder_identity, response)? {
-            crate::groups::group_handshake::GroupHandshake::StateSyncResponse {
-                body,
-                signature,
-            } => (body, signature),
-            _ => unreachable!("sign_state_sync_response always returns StateSyncResponse"),
-        };
+    let (resp_body, resp_sig) = match sign_state_sync_response(responder_identity, response)? {
+        crate::groups::group_handshake::GroupHandshake::StateSyncResponse { body, signature } => {
+            (body, signature)
+        }
+        _ => unreachable!("sign_state_sync_response always returns StateSyncResponse"),
+    };
     Ok(Some((resp_body, resp_sig)))
 }
 
@@ -549,26 +543,24 @@ pub fn process_state_sync_response(
     // gracefully on the next KeyRotation broadcast.
     if let Some(wrapped) = &body.wrapped_group_key {
         match gm.load_my_kyber_secret(body.group_id) {
-            Ok(Some(secret_bytes)) => {
-                match wrapped.unwrap(&secret_bytes) {
-                    Ok(mut key_bytes) => {
-                        let install = gm.install_group_key(body.group_id, &key_bytes);
-                        key_bytes.zeroize();
-                        if let Err(e) = install {
-                            eprintln!(
-                                "warning: state-sync key install failed for group {}: {e:#}",
-                                hex::encode(body.group_id.as_ref()),
-                            );
-                        }
-                    }
-                    Err(e) => {
+            Ok(Some(secret_bytes)) => match wrapped.unwrap(&secret_bytes) {
+                Ok(mut key_bytes) => {
+                    let install = gm.install_group_key(body.group_id, &key_bytes);
+                    key_bytes.zeroize();
+                    if let Err(e) = install {
                         eprintln!(
-                            "warning: state-sync key unwrap failed for group {}: {e:#}",
+                            "warning: state-sync key install failed for group {}: {e:#}",
                             hex::encode(body.group_id.as_ref()),
                         );
                     }
                 }
-            }
+                Err(e) => {
+                    eprintln!(
+                        "warning: state-sync key unwrap failed for group {}: {e:#}",
+                        hex::encode(body.group_id.as_ref()),
+                    );
+                }
+            },
             Ok(None) => {
                 eprintln!(
                     "warning: state-sync key delivery for group {} skipped — no local Kyber secret",
@@ -665,10 +657,7 @@ pub fn plan_key_rotation(
         // Use the group's `version` as the monotonic generation —
         // remove_member already bumped it, so this counter only ever
         // moves forward without us having to keep separate state.
-        generation: gm
-            .get_group(&group_id)
-            .map(|g| g.version)
-            .unwrap_or(0),
+        generation: gm.get_group(&group_id).map(|g| g.version).unwrap_or(0),
         rotator_id,
         removed_member_id: removed_member,
         deliveries,
@@ -736,7 +725,12 @@ pub fn process_key_rotation(
     if let Some(removed) = body.removed_member_id {
         if removed != local_id {
             // We're not the one being kicked — sync our membership.
-            let _ = gm.remove_member(body.group_id, body.rotator_id, removed, "rotation".to_string());
+            let _ = gm.remove_member(
+                body.group_id,
+                body.rotator_id,
+                removed,
+                "rotation".to_string(),
+            );
         } else {
             // The KeyRotation announces our own removal. Do nothing
             // with the wrapped keys (they wouldn't be addressed to

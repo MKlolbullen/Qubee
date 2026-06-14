@@ -16,9 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
-use crate::identity::identity_key::{
-    HybridSignature, IdentityId, IdentityKey, IdentityKeyPair,
-};
+use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
 
 pub const QUBEE_IDENTITY_HOST: &str = "identity";
 /// Domain separator for the bytes the bundle's signature covers.
@@ -87,10 +85,11 @@ impl OnboardingBundle {
     /// than [`ONBOARDING_BUNDLE_TTL_SECS`].
     pub fn verify(&self) -> Result<()> {
         let payload = canonical_payload(&self.display_name, &self.user_id, &self.public_key)?;
-        match self
-            .public_key
-            .verify_with_max_age(&payload, &self.signature, ONBOARDING_BUNDLE_TTL_SECS)
-        {
+        match self.public_key.verify_with_max_age(
+            &payload,
+            &self.signature,
+            ONBOARDING_BUNDLE_TTL_SECS,
+        ) {
             Ok(true) => Ok(()),
             Ok(false) => Err(anyhow!(
                 "onboarding bundle is invalid (bad signature, wrong signer, or expired)"

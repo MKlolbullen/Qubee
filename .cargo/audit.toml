@@ -1,0 +1,41 @@
+# cargo-audit configuration.
+#
+# Each ignore entry must include a comment explaining the trade-off
+# and a tracking pointer (upstream issue, planned upgrade window,
+# etc.). Ignored advisories are reviewed quarterly.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.0-alpha.5 — pinned through libp2p 0.55's
+    # libp2p-dns + libp2p-mdns. Bumping past libp2p 0.55 is a major
+    # surface change (Behaviour API drift across the 0.55 → 0.56
+    # transition); we'd rather track upstream until libp2p picks up
+    # the 0.25.x patch release. Both advisories are network-side
+    # DoS-style issues, mitigated in practice because:
+    #
+    # - mDNS is opt-in via `enable_mdns: bool` in `P2PNodeConfig`
+    #   (default off in tests, only on for local discovery).
+    # - DNS resolution happens once per dialed multiaddr, not on
+    #   every packet, so an attacker can't trivially feed us
+    #   compressed names at sustained rate.
+    #
+    # If upstream libp2p hasn't moved by 2026-09, we should switch
+    # to a no-mdns profile and re-evaluate.
+    "RUSTSEC-2026-0118",  # NSEC3 closest-encloser unbounded loop
+    "RUSTSEC-2026-0119",  # O(n²) name-compression CPU exhaustion
+
+    # lru 0.12.5 — `IterMut` Stacked Borrows violation. Transitive
+    # via libp2p-swarm 0.46. We don't use lru directly. Tracked
+    # alongside the libp2p 0.55 → 0.56 bump above; same upstream
+    # cadence.
+    "RUSTSEC-2026-0002",
+
+    # rand 0.9.2 — unsound `rand::rng()` thread-local interaction
+    # with custom global loggers. We pin our direct dependency to
+    # `rand 0.8`; the 0.9 in the tree is transitive via
+    # hickory-proto, proptest, and yamux. Our code never calls the
+    # affected `rand::rng()` API (we go through `rand::Rng` on
+    # explicit `OsRng` / `ChaCha20Rng` instances or the project's
+    # `secure_rng` helper). Tracked alongside the libp2p bump.
+    "RUSTSEC-2026-0097",
+]

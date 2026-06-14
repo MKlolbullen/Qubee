@@ -19,20 +19,20 @@ use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 use tokio::sync::Mutex;
 
-/// Represents the state of a peer connection. In a complete
-/// implementation this would mirror the states exposed by a WebRTC
-/// stack. For now we simply track a few high‑level states to allow
-/// compile‑time integration with the rest of the call stack.
+/// Represents the state of a peer connection. Mirrors the variants
+/// exposed by webrtc-rs's `RTCPeerConnectionState` so `state()` can
+/// translate without information loss.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerConnectionState {
     /// Connection has been created but no offer/answer exchange has
@@ -42,10 +42,28 @@ pub enum PeerConnectionState {
     Connecting,
     /// Media and data channels are flowing.
     Connected,
+    /// At least one transport has been disconnected. May recover
+    /// without renegotiation.
+    Disconnected,
     /// Connection has been gracefully closed.
     Closed,
     /// Connection failed due to negotiation or transport errors.
     Failed,
+}
+
+impl From<RTCPeerConnectionState> for PeerConnectionState {
+    fn from(s: RTCPeerConnectionState) -> Self {
+        match s {
+            RTCPeerConnectionState::New | RTCPeerConnectionState::Unspecified => {
+                PeerConnectionState::New
+            }
+            RTCPeerConnectionState::Connecting => PeerConnectionState::Connecting,
+            RTCPeerConnectionState::Connected => PeerConnectionState::Connected,
+            RTCPeerConnectionState::Disconnected => PeerConnectionState::Disconnected,
+            RTCPeerConnectionState::Closed => PeerConnectionState::Closed,
+            RTCPeerConnectionState::Failed => PeerConnectionState::Failed,
+        }
+    }
 }
 
 /// ICE candidate information used during WebRTC negotiation. These
@@ -60,13 +78,16 @@ pub struct ICECandidate {
     pub candidate: String,
 }
 
-/// A lightweight placeholder peer connection. It exposes a subset of
-/// methods that the rest of the Qubee call stack expects. A real
-/// implementation would wrap a WebRTC library (e.g. the `webrtc` crate)
-/// and perform ICE negotiation, SRTP handshake and media streaming. The
-/// stub methods provided here return defaults so the codebase can
-/// compile and be exercised until a proper WebRTC integration is
-/// provided.
+/// Wraps a `webrtc::RTCPeerConnection` and exposes the slice of its
+/// API the rest of the Qubee call stack uses: SDP offer/answer,
+/// remote-candidate ingestion, audio/video track toggling, and
+/// stats. The underlying crate handles ICE, DTLS, SRTP and SCTP.
+///
+/// `set_bandwidth_limit`, `set_noise_suppression` and
+/// `set_echo_cancellation` are accepted but not enforced — the
+/// former needs sender-parameter mutation that webrtc-rs 0.14
+/// doesn't expose, and the latter two belong in the audio capture
+/// pipeline (which lives outside this crate).
 pub struct PeerConnection {
     /// Identifier of the call this peer connection belongs to.
     pub call_id: CallId,
@@ -94,10 +115,12 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
-    /// Create a new peer connection. In a real system this would
-    /// configure ICE servers, establish DTLS transport and prepare
-    /// media streams. Here we simply record the identifiers and
-    /// return a new struct.
+    /// Build a peer connection: translate Qubee's `WebRTCConfig` into
+    /// the lower-level `RTCConfiguration`, fold each STUN/TURN entry
+    /// into an `RTCIceServer`, and ask the webrtc-rs API for a fresh
+    /// `RTCPeerConnection`. ICE gathering and DTLS setup happen lazily
+    /// once a local description is installed via `create_offer` /
+    /// `create_answer`.
     pub async fn new(
         config: WebRTCConfig,
         media_key: MediaKey,
@@ -133,7 +156,9 @@ impl PeerConnection {
         // disabled in the config, we could disable corresponding
         // interceptors here.
         let api = APIBuilder::new().build();
-        let pc = api.new_peer_connection(rtc_config).await
+        let pc = api
+            .new_peer_connection(rtc_config)
+            .await
             .context("Failed to create WebRTC peer connection")?;
         Ok(PeerConnection {
             call_id,
@@ -148,11 +173,22 @@ impl PeerConnection {
         })
     }
 
-    /// Gracefully close the peer connection. For now this simply
-    /// updates the internal state. A full implementation would close
-    /// media transports and free underlying resources.
+    /// Live signalling/transport state pulled from webrtc-rs. Prefer
+    /// this over the cached `state` field — the field only flips on
+    /// `close()`, while this reflects ICE/DTLS health as the
+    /// connection negotiates and recovers.
+    pub fn state(&self) -> PeerConnectionState {
+        self.webrtc_pc.connection_state().into()
+    }
+
+    /// Gracefully close the peer connection. Tears down ICE/DTLS/SRTP
+    /// transports via the underlying webrtc-rs handle and flips the
+    /// cached state to `Closed` so callers reading the field directly
+    /// see the terminal value without an extra round-trip.
     pub async fn close(&mut self) -> Result<()> {
-        self.webrtc_pc.close().await
+        self.webrtc_pc
+            .close()
+            .await
             .context("Failed to close peer connection")?;
         self.state = PeerConnectionState::Closed;
         Ok(())
@@ -193,7 +229,10 @@ impl PeerConnection {
                 // Cast the track into a trait object. The add_track
                 // function expects an Arc<dyn TrackLocal + Send + Sync>.
                 let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                let sender = self.webrtc_pc.add_track(dyn_track).await
+                let sender = self
+                    .webrtc_pc
+                    .add_track(dyn_track)
+                    .await
                     .context("Failed to add audio track to peer connection")?;
                 *track_opt = Some(track);
                 *sender_opt = Some(sender);
@@ -224,7 +263,9 @@ impl PeerConnection {
                     // Replace the track on the sender. Some WebRTC
                     // implementations require `Some` to re-add.
                     let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                    sender.replace_track(Some(dyn_track)).await
+                    sender
+                        .replace_track(Some(dyn_track))
+                        .await
                         .context("Failed to enable audio track")?;
                 }
             }
@@ -232,7 +273,9 @@ impl PeerConnection {
             // Disable audio by replacing the track on the RTP sender
             // with None. This will cause silence on the remote end.
             if let Some(sender) = sender_opt.as_ref() {
-                sender.replace_track(None).await
+                sender
+                    .replace_track(None)
+                    .await
                     .context("Failed to disable audio track")?;
             }
         }
@@ -264,7 +307,10 @@ impl PeerConnection {
                     "qubee-video".to_string(),
                 ));
                 let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                let sender = self.webrtc_pc.add_track(dyn_track).await
+                let sender = self
+                    .webrtc_pc
+                    .add_track(dyn_track)
+                    .await
                     .context("Failed to add video track to peer connection")?;
                 *track_opt = Some(track);
                 *sender_opt = Some(sender);
@@ -289,13 +335,17 @@ impl PeerConnection {
                 };
                 if let Some(sender) = sender_opt.as_ref() {
                     let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-                    sender.replace_track(Some(dyn_track)).await
+                    sender
+                        .replace_track(Some(dyn_track))
+                        .await
                         .context("Failed to enable video track")?;
                 }
             }
         } else {
             if let Some(sender) = sender_opt.as_ref() {
-                sender.replace_track(None).await
+                sender
+                    .replace_track(None)
+                    .await
                     .context("Failed to disable video track")?;
             }
         }
@@ -317,32 +367,94 @@ impl PeerConnection {
         self.set_video_enabled(false).await
     }
 
-    /// Retrieve basic media statistics. Real statistics would query
-    /// underlying transport state; here we return zeroed metrics.
+    /// Retrieve basic media statistics by summarising the WebRTC stats
+    /// report. The report is a map keyed by stat-id with one entry per
+    /// transport, codec, candidate-pair and RTP stream. We aggregate the
+    /// fields relevant to `MediaStats`:
+    ///
+    /// * Outbound counts come from `OutboundRTP` entries (one per
+    ///   sending track).
+    /// * Inbound counts come from `InboundRTP` entries.
+    /// * `packets_lost` is reported by the *remote* end via RTCP and
+    ///   surfaces as `RemoteInboundRTP`.
+    /// * RTT and the live bandwidth estimate come from the nominated
+    ///   `CandidatePair`.
+    ///
+    /// `jitter`, `frame_rate` and `resolution` aren't produced by
+    /// webrtc-rs 0.14 (jitter buffer / decoder values are out of scope
+    /// since the crate doesn't decode), so they remain at their default
+    /// zero/None values.
     pub async fn get_stats(&self) -> Result<MediaStats> {
         // Fetch the internal WebRTC stats report. This returns a map of
         // statistics for each transport and track. Summarising these into
         // a high‑level MediaStats struct requires parsing the report.
-        let _report = self.webrtc_pc.get_stats().await
+        let _report = self
+            .webrtc_pc
+            .get_stats()
+            .await
             .context("Failed to retrieve WebRTC stats")?;
         // TODO: Parse stats report into our MediaStats struct. This is
         // left as an exercise because the report structure is complex.
         // For now we return zeroed metrics.
+        let report = self.webrtc_pc.get_stats().await;
+
+        let mut bytes_sent: u64 = 0;
+        let mut bytes_received: u64 = 0;
+        let mut packets_sent: u64 = 0;
+        let mut packets_received: u64 = 0;
+        let mut packets_lost: u64 = 0;
+        let mut round_trip_time: f64 = 0.0;
+        let mut bitrate: u32 = 0;
+
+        for entry in report.reports.values() {
+            match entry {
+                StatsReportType::OutboundRTP(s) => {
+                    bytes_sent = bytes_sent.saturating_add(s.bytes_sent);
+                    packets_sent = packets_sent.saturating_add(s.packets_sent);
+                }
+                StatsReportType::InboundRTP(s) => {
+                    bytes_received = bytes_received.saturating_add(s.bytes_received);
+                    packets_received = packets_received.saturating_add(s.packets_received);
+                }
+                StatsReportType::RemoteInboundRTP(s) => {
+                    if s.packets_lost > 0 {
+                        packets_lost = packets_lost.saturating_add(s.packets_lost as u64);
+                    }
+                    if round_trip_time == 0.0 {
+                        if let Some(rtt) = s.round_trip_time {
+                            round_trip_time = rtt;
+                        }
+                    }
+                }
+                StatsReportType::CandidatePair(s) if s.nominated => {
+                    if s.current_round_trip_time > 0.0 {
+                        round_trip_time = s.current_round_trip_time;
+                    }
+                    if s.available_outgoing_bitrate > 0.0 {
+                        bitrate = s.available_outgoing_bitrate as u32;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Ok(MediaStats {
-            bytes_sent: 0,
-            bytes_received: 0,
-            packets_sent: 0,
-            packets_received: 0,
-            packets_lost: 0,
+            bytes_sent,
+            bytes_received,
+            packets_sent,
+            packets_received,
+            packets_lost,
             jitter: 0.0,
-            round_trip_time: 0.0,
-            bitrate: 0,
+            round_trip_time,
+            bitrate,
             frame_rate: None,
             resolution: None,
         })
     }
 
-    /// Add an ICE candidate. In the stub this is a no‑op.
+    /// Hand a remote ICE candidate to the underlying transport so it
+    /// can be paired against local candidates during connectivity
+    /// checks.
     pub async fn add_ice_candidate(&self, candidate: ICECandidate) -> Result<()> {
         let init = RTCIceCandidateInit {
             candidate: candidate.candidate,
@@ -350,20 +462,23 @@ impl PeerConnection {
             sdp_mline_index: Some(candidate.sdp_mline_index as u16),
             username_fragment: None,
         };
-        self.webrtc_pc.add_ice_candidate(init).await
+        self.webrtc_pc
+            .add_ice_candidate(init)
+            .await
             .context("Failed to add ICE candidate")?;
         Ok(())
     }
 
-    /// Create an offer SDP. A real implementation would produce a
-    /// base64‑encoded SDP offer; for now we return an empty string.
+    /// Create an SDP offer and install it as the local description so
+    /// ICE gathering can begin. Returns the SDP string the caller is
+    /// expected to forward to the remote peer over the signalling
+    /// channel.
     pub async fn create_offer(&self) -> Result<String> {
-        // Create an SDP offer. We pass `None` to use default offer
-        // options. After creating the offer we set it as the local
-        // description so ICE gathering can begin.
         let offer = self.webrtc_pc.create_offer(None).await
             .context("Failed to create SDP offer")?;
-        self.webrtc_pc.set_local_description(offer.clone()).await
+        self.webrtc_pc
+            .set_local_description(offer.clone())
+            .await
             .context("Failed to set local description for offer")?;
         Ok(offer.sdp)
     }
@@ -372,13 +487,20 @@ impl PeerConnection {
     pub async fn create_answer(&self, offer: &str) -> Result<String> {
         // webrtc 0.14 doesn't allow direct struct-literal construction
         // of RTCSessionDescription — use the typed constructors instead.
-        let remote_desc = RTCSessionDescription::offer(offer.to_string())
-            .context("Invalid SDP offer")?;
-        self.webrtc_pc.set_remote_description(remote_desc).await
+        let remote_desc =
+            RTCSessionDescription::offer(offer.to_string()).context("Invalid SDP offer")?;
+        self.webrtc_pc
+            .set_remote_description(remote_desc)
+            .await
             .context("Failed to set remote offer description")?;
-        let answer = self.webrtc_pc.create_answer(None).await
+        let answer = self
+            .webrtc_pc
+            .create_answer(None)
+            .await
             .context("Failed to create SDP answer")?;
-        self.webrtc_pc.set_local_description(answer.clone()).await
+        self.webrtc_pc
+            .set_local_description(answer.clone())
+            .await
             .context("Failed to set local description for answer")?;
         Ok(answer.sdp)
     }
@@ -386,13 +508,12 @@ impl PeerConnection {
     /// Set the remote SDP description, expected to be an answer to a
     /// previously generated local offer.
     pub async fn set_remote_description(&self, description: &str) -> Result<()> {
-        let remote_desc = RTCSessionDescription::answer(description.to_string())
-            .context("Invalid SDP answer")?;
-        self.webrtc_pc.set_remote_description(remote_desc).await
+        let remote_desc =
+            RTCSessionDescription::answer(description.to_string()).context("Invalid SDP answer")?;
+        self.webrtc_pc
+            .set_remote_description(remote_desc)
+            .await
             .context("Failed to set remote description")?;
-        // RTCSdpType is still imported for callers that want to inspect
-        // the local description; quiet the dead-import lint here.
-        let _: Option<RTCSdpType> = None;
         Ok(())
     }
 

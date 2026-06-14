@@ -10,7 +10,10 @@
 //! the double ratchet) and that frame boundaries are preserved by the caller.
 
 use anyhow::{Context, Result};
-use chacha20poly1305::{aead::{Aead, KeyInit, OsRng}, ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, OsRng},
+    ChaCha20Poly1305, Key, Nonce,
+};
 use hkdf::Hkdf;
 use rand::RngCore;
 use secrecy::{ExposeSecret, Secret};

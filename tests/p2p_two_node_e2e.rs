@@ -23,7 +23,7 @@ use qubee_crypto::groups::group_handshake::{
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType};
 use qubee_crypto::groups::group_message::{decrypt_group_message, encrypt_group_message};
 use qubee_crypto::groups::handshake_handlers::{
-    plan_key_rotation, process_join_accepted, process_request_join, process_key_rotation,
+    plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
 };
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
@@ -189,8 +189,22 @@ async fn p2p_two_node_e2e() {
     .await;
 
     let topic = build_group_topic(&hex::encode(group_id.as_ref()));
-    send_cmd(&alice_node, P2PCommand::Subscribe { topic: topic.clone() }, "alice").await;
-    send_cmd(&bob_node, P2PCommand::Subscribe { topic: topic.clone() }, "bob").await;
+    send_cmd(
+        &alice_node,
+        P2PCommand::Subscribe {
+            topic: topic.clone(),
+        },
+        "alice",
+    )
+    .await;
+    send_cmd(
+        &bob_node,
+        P2PCommand::Subscribe {
+            topic: topic.clone(),
+        },
+        "bob",
+    )
+    .await;
 
     // Gossipsub needs at least one heartbeat for the mesh to form.
     // for_testing() pins this at 100 ms; sleep a few cycles to be safe.
@@ -236,7 +250,9 @@ async fn p2p_two_node_e2e() {
     let outcome = process_request_join(&mut alice_gm, &alice_kp, &req_body_in, &req_sig_in)
         .expect("process_request_join");
     let (acc_body, acc_sig) = match outcome {
-        HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
+        HandshakeOutcome::Accept {
+            body, signature, ..
+        } => (body, signature),
         other => panic!("expected Accept, got {other:?}"),
     };
     let accepted_wire = GroupHandshake::JoinAccepted {
@@ -382,7 +398,9 @@ async fn p2p_key_rotation_e2e() {
         };
         let outcome = process_request_join(owner_gm, owner_kp, &rb, &rs).unwrap();
         let (ab, as_) = match outcome {
-            HandshakeOutcome::Accept { body, signature, .. } => (body, signature),
+            HandshakeOutcome::Accept {
+                body, signature, ..
+            } => (body, signature),
             other => panic!("expected Accept, got {other:?}"),
         };
         process_join_accepted(joiner_gm, owner_kp.identity_id(), &ab, &as_, &kyber_secret).unwrap();
@@ -430,8 +448,22 @@ async fn p2p_key_rotation_e2e() {
     .await;
 
     let topic = build_group_topic(&hex::encode(group_id.as_ref()));
-    send_cmd(&alice_node, P2PCommand::Subscribe { topic: topic.clone() }, "alice").await;
-    send_cmd(&carol_node, P2PCommand::Subscribe { topic: topic.clone() }, "carol").await;
+    send_cmd(
+        &alice_node,
+        P2PCommand::Subscribe {
+            topic: topic.clone(),
+        },
+        "alice",
+    )
+    .await;
+    send_cmd(
+        &carol_node,
+        P2PCommand::Subscribe {
+            topic: topic.clone(),
+        },
+        "carol",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // -------- Alice runs plan_key_rotation locally, broadcasts it --------
@@ -445,7 +477,10 @@ async fn p2p_key_rotation_e2e() {
     .expect("plan_key_rotation");
     let rotation_wire = signed_rotation.to_wire().expect("wire encode rotation");
     let post_key_alice = alice_gm.export_group_key(&group_id).unwrap();
-    assert_ne!(post_key_alice, pre_key, "Alice's local key must already have rotated");
+    assert_ne!(
+        post_key_alice, pre_key,
+        "Alice's local key must already have rotated"
+    );
 
     send_cmd(
         &alice_node,

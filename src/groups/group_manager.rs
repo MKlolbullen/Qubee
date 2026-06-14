@@ -1,14 +1,14 @@
 use anyhow::Result;
+use blake3::Hasher;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
-use blake3::Hasher;
 
-use crate::identity::identity_key::{IdentityId, IdentityKey};
 use crate::groups::group_crypto::GroupCrypto;
-use crate::groups::group_permissions::{GroupPermissions, Permission, Role};
 use crate::groups::group_events::{GroupEvent, GroupEventType};
+use crate::groups::group_permissions::{GroupPermissions, Permission, Role};
+use crate::identity::identity_key::{IdentityId, IdentityKey};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeystore};
 use std::collections::HashMap as StdHashMap;
 
@@ -168,7 +168,7 @@ impl GroupManager {
     /// Create a new group manager
     pub fn new(keystore: SecureKeystore) -> Result<Self> {
         let group_crypto = GroupCrypto::new()?;
-        
+
         Ok(GroupManager {
             groups: HashMap::new(),
             member_groups: HashMap::new(),
@@ -176,7 +176,7 @@ impl GroupManager {
             keystore,
         })
     }
-    
+
     /// Create a new group
     pub fn create_group(
         &mut self,
@@ -189,9 +189,7 @@ impl GroupManager {
     ) -> Result<GroupId> {
         let group_id = self.generate_group_id(&name, &creator_id)?;
 
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
         // Generate the owner's long-lived per-group Kyber keypair so
         // future rotations from a promoted admin can deliver back to
@@ -215,10 +213,10 @@ impl GroupManager {
             custom_permissions: None,
             kyber_pub: owner_kyber_pub,
         };
-        
+
         let mut members = HashMap::new();
         members.insert(creator_id, creator_member);
-        
+
         let group = Group {
             id: group_id,
             name,
@@ -232,7 +230,7 @@ impl GroupManager {
             last_updated: current_time,
             version: 1,
         };
-        
+
         // Generate group key
         self.group_crypto.create_group_key(group_id)?;
 
@@ -246,7 +244,7 @@ impl GroupManager {
         // Persist the owner's Kyber secret so KeyRotation broadcasts
         // from a promoted admin can be unwrapped after process restart.
         self.store_my_kyber_secret(group_id, &owner_kyber_secret)?;
-        
+
         // Log group creation event
         self.log_group_event(
             group_id,
@@ -254,13 +252,13 @@ impl GroupManager {
             GroupEventType::GroupCreated,
             format!("Group '{}' created", self.groups[&group_id].name),
         )?;
-        
+
         // Store in keystore
         self.store_group_securely(&group_id)?;
-        
+
         Ok(group_id)
     }
-    
+
     /// Add a member to a group
     pub fn add_member(
         &mut self,
@@ -273,15 +271,17 @@ impl GroupManager {
     ) -> Result<()> {
         // Check if admin has permission to add members
         self.check_permission(group_id, admin_id, Permission::AddMembers)?;
-        
-        let group = self.groups.get_mut(&group_id)
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
+
         // Check if member already exists
         if group.members.contains_key(&new_member_id) {
             return Err(anyhow::anyhow!("Member already in group"));
         }
-        
+
         // Check member limit. The group's own setting may be lower, but the
         // global Qubee cap (16 incl. creator) is always enforced.
         let effective_cap = group
@@ -295,11 +295,9 @@ impl GroupManager {
                 effective_cap
             ));
         }
-        
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
         let new_member = GroupMember {
             identity_id: new_member_id,
             identity_key: new_member_key,
@@ -330,7 +328,7 @@ impl GroupManager {
         // a key they were never told. Rotation on *removal* is what
         // enforces forward secrecy in this codebase — see
         // `rotate_group_key_after_removal`.
-        
+
         // Log event
         self.log_group_event(
             group_id,
@@ -338,12 +336,12 @@ impl GroupManager {
             GroupEventType::MemberAdded,
             format!("Member {} added to group", new_member_id),
         )?;
-        
+
         self.store_group_securely(&group_id)?;
-        
+
         Ok(())
     }
-    
+
     /// Insert a member into the local view of an existing group. Used
     /// by `process_member_added` when an inviter broadcasts a
     /// `MemberAdded` so that existing members learn about a late
@@ -372,9 +370,7 @@ impl GroupManager {
             // value than what we already had.
             if new_version > group.version {
                 group.version = new_version;
-                group.last_updated = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)?
-                    .as_secs();
+                group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 self.store_group_securely(&group_id)?;
             }
             return Ok(());
@@ -391,9 +387,7 @@ impl GroupManager {
             ));
         }
         group.members.insert(new_member_id, new_member);
-        group.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         // Adopt the inviter's post-enrolment version verbatim so the
         // strict generation gate in `decrypt_group_message` lines up.
         group.version = new_version;
@@ -415,38 +409,38 @@ impl GroupManager {
     ) -> Result<()> {
         // Check permissions
         self.check_permission(group_id, admin_id, Permission::RemoveMembers)?;
-        
-        let group = self.groups.get_mut(&group_id)
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
+
         // Cannot remove the owner
         if let Some(member) = group.members.get(&member_id) {
             if member.role == Role::Owner {
                 return Err(anyhow::anyhow!("Cannot remove group owner"));
             }
         }
-        
+
         // Update member status
         if let Some(member) = group.members.get_mut(&member_id) {
-            member.member_status = MemberStatus::Removed { reason: reason.clone() };
-            member.last_seen = SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs();
+            member.member_status = MemberStatus::Removed {
+                reason: reason.clone(),
+            };
+            member.last_seen = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         }
-        
+
         // Update member groups mapping
         if let Some(member_groups) = self.member_groups.get_mut(&member_id) {
             member_groups.remove(&group_id);
         }
-        
-        group.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         group.version += 1;
-        
+
         // Rotate group key for backward secrecy
         self.group_crypto.rotate_group_key(group_id)?;
-        
+
         // Log event
         self.log_group_event(
             group_id,
@@ -454,12 +448,12 @@ impl GroupManager {
             GroupEventType::MemberRemoved,
             format!("Member {} removed: {}", member_id, reason),
         )?;
-        
+
         self.store_group_securely(&group_id)?;
-        
+
         Ok(())
     }
-    
+
     /// Owner-only role promotion (or demotion). Mutates the local
     /// view via `update_member_role`, then returns a `RoleChangeBody`
     /// the caller can sign + broadcast via `sign_role_change`. Returns
@@ -722,8 +716,7 @@ impl GroupManager {
             .ok_or_else(|| anyhow::anyhow!("apply_state_sync: group not found"))?;
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let snapshot_ids: HashSet<IdentityId> =
-            snapshot.iter().map(|m| m.identity_id).collect();
+        let snapshot_ids: HashSet<IdentityId> = snapshot.iter().map(|m| m.identity_id).collect();
 
         // Mark anyone we have locally but not in the snapshot as
         // removed; preserves the role / kyber_pub history without
@@ -828,12 +821,12 @@ impl GroupManager {
         if let Some(msg) = log_msg {
             self.log_group_event(group_id, admin_id, GroupEventType::RoleChanged, msg)?;
         }
-        
+
         self.store_group_securely(&group_id)?;
-        
+
         Ok(())
     }
-    
+
     /// Create a group invitation
     pub fn create_invitation(
         &mut self,
@@ -844,15 +837,19 @@ impl GroupManager {
     ) -> Result<GroupInvitation> {
         // Check permissions
         self.check_permission(group_id, admin_id, Permission::CreateInvites)?;
-        
-        let group = self.groups.get(&group_id)
+
+        let group = self
+            .groups
+            .get(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
-        let admin = group.members.get(&admin_id)
+
+        let admin = group
+            .members
+            .get(&admin_id)
             .ok_or_else(|| anyhow::anyhow!("Admin not found in group"))?;
-        
+
         let invitation_code = self.generate_invitation_code(group_id, admin_id)?;
-        
+
         let invitation = GroupInvitation {
             group_id,
             group_name: group.name.clone(),
@@ -862,11 +859,9 @@ impl GroupManager {
             expires_at,
             max_uses,
             current_uses: 0,
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs(),
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         };
-        
+
         // Store invitation
         let invitation_key = format!("invitation_{}", invitation.invitation_code);
         let serialized = bincode::serialize(&invitation)?;
@@ -877,20 +872,27 @@ impl GroupManager {
             expiry: invitation.expires_at,
             tags: StdHashMap::new(),
         };
-        self.keystore
-            .store_key(&invitation_key, &serialized, KeyType::EncryptionKey, metadata)?;
+        self.keystore.store_key(
+            &invitation_key,
+            &serialized,
+            KeyType::EncryptionKey,
+            metadata,
+        )?;
 
         // Log event
         self.log_group_event(
             group_id,
             admin_id,
             GroupEventType::InvitationCreated,
-            format!("Invitation created with code {}", invitation.invitation_code),
+            format!(
+                "Invitation created with code {}",
+                invitation.invitation_code
+            ),
         )?;
 
         Ok(invitation)
     }
-    
+
     /// Stamp a member's long-lived Kyber-768 public key in place.
     /// The handshake captures the joiner's ephemeral Kyber pubkey in
     /// the RequestJoin and we persist it here so future key rotations
@@ -921,11 +923,7 @@ impl GroupManager {
     /// group inside the encrypted keystore. Used by the joiner to
     /// keep the secret around so future `KeyRotation` messages can be
     /// decapsulated even after a process restart.
-    pub fn store_my_kyber_secret(
-        &mut self,
-        group_id: GroupId,
-        secret_bytes: &[u8],
-    ) -> Result<()> {
+    pub fn store_my_kyber_secret(&mut self, group_id: GroupId, secret_bytes: &[u8]) -> Result<()> {
         let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
         let metadata = KeyMetadata {
             algorithm: "kyber768".to_string(),
@@ -1054,8 +1052,12 @@ impl GroupManager {
             expiry: invitation.expires_at,
             tags: StdHashMap::new(),
         };
-        self.keystore
-            .store_key(&invitation_key, &serialized, KeyType::EncryptionKey, metadata)?;
+        self.keystore.store_key(
+            &invitation_key,
+            &serialized,
+            KeyType::EncryptionKey,
+            metadata,
+        )?;
 
         Ok(invitation.group_id)
     }
@@ -1221,47 +1223,49 @@ impl GroupManager {
                 continue;
             }
             if let Some(secret) = self.keystore.retrieve_key(&key_id)? {
-                if let Ok(entry) = bincode::deserialize::<AcceptedExternalInvite>(secret.expose_secret()) {
+                if let Ok(entry) =
+                    bincode::deserialize::<AcceptedExternalInvite>(secret.expose_secret())
+                {
                     out.push(entry);
                 }
             }
         }
         Ok(out)
     }
-    
+
     /// Leave a group
     pub fn leave_group(&mut self, group_id: GroupId, member_id: IdentityId) -> Result<()> {
-        let group = self.groups.get_mut(&group_id)
+        let group = self
+            .groups
+            .get_mut(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
+
         // Owner cannot leave (must transfer ownership first)
         if let Some(member) = group.members.get(&member_id) {
             if member.role == Role::Owner {
-                return Err(anyhow::anyhow!("Owner cannot leave group without transferring ownership"));
+                return Err(anyhow::anyhow!(
+                    "Owner cannot leave group without transferring ownership"
+                ));
             }
         }
-        
+
         // Update member status
         if let Some(member) = group.members.get_mut(&member_id) {
             member.member_status = MemberStatus::Left;
-            member.last_seen = SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs();
+            member.last_seen = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         }
-        
+
         // Update member groups mapping
         if let Some(member_groups) = self.member_groups.get_mut(&member_id) {
             member_groups.remove(&group_id);
         }
-        
-        group.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         group.version += 1;
-        
+
         // Rotate group key
         self.group_crypto.rotate_group_key(group_id)?;
-        
+
         // Log event
         self.log_group_event(
             group_id,
@@ -1269,12 +1273,12 @@ impl GroupManager {
             GroupEventType::MemberLeft,
             format!("Member {} left the group", member_id),
         )?;
-        
+
         self.store_group_securely(&group_id)?;
-        
+
         Ok(())
     }
-    
+
     /// Update group settings
     pub fn update_group_settings(
         &mut self,
@@ -1284,16 +1288,16 @@ impl GroupManager {
     ) -> Result<()> {
         // Check permissions
         self.check_permission(group_id, admin_id, Permission::ManageSettings)?;
-        
-        let group = self.groups.get_mut(&group_id)
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
+
         group.settings = new_settings;
-        group.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         group.version += 1;
-        
+
         // Log event
         self.log_group_event(
             group_id,
@@ -1301,17 +1305,17 @@ impl GroupManager {
             GroupEventType::SettingsChanged,
             "Group settings updated".to_string(),
         )?;
-        
+
         self.store_group_securely(&group_id)?;
-        
+
         Ok(())
     }
-    
+
     /// Get a group by ID
     pub fn get_group(&self, group_id: &GroupId) -> Option<&Group> {
         self.groups.get(group_id)
     }
-    
+
     /// Get all groups for a member
     pub fn get_member_groups(&self, member_id: &IdentityId) -> Vec<&Group> {
         if let Some(group_ids) = self.member_groups.get(member_id) {
@@ -1323,7 +1327,7 @@ impl GroupManager {
             Vec::new()
         }
     }
-    
+
     /// Get active members of a group
     pub fn get_active_members(&self, group_id: &GroupId) -> Vec<&GroupMember> {
         if let Some(group) = self.groups.get(group_id) {
@@ -1336,7 +1340,7 @@ impl GroupManager {
             Vec::new()
         }
     }
-    
+
     /// Check if a member has a specific permission
     pub fn check_permission(
         &self,
@@ -1344,63 +1348,66 @@ impl GroupManager {
         member_id: IdentityId,
         permission: Permission,
     ) -> Result<()> {
-        let group = self.groups.get(&group_id)
+        let group = self
+            .groups
+            .get(&group_id)
             .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
-        
-        let member = group.members.get(&member_id)
+
+        let member = group
+            .members
+            .get(&member_id)
             .ok_or_else(|| anyhow::anyhow!("Member not found in group"))?;
-        
+
         if member.member_status != MemberStatus::Active {
             return Err(anyhow::anyhow!("Member is not active"));
         }
-        
+
         // Check custom permissions first
         if let Some(custom_permissions) = &member.custom_permissions {
             if custom_permissions.contains(&permission) {
                 return Ok(());
             }
         }
-        
+
         // Check role-based permissions
-        if group.permissions.role_has_permission(&member.role, &permission) {
+        if group
+            .permissions
+            .role_has_permission(&member.role, &permission)
+        {
             Ok(())
         } else {
             Err(anyhow::anyhow!("Permission denied"))
         }
     }
-    
+
     /// Generate a unique group ID
     fn generate_group_id(&self, name: &str, creator_id: &IdentityId) -> Result<GroupId> {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
         let mut hasher = Hasher::new();
         hasher.update(name.as_bytes());
         hasher.update(creator_id.as_ref());
         hasher.update(&current_time.to_le_bytes());
         hasher.update(b"qubee_group_id");
-        
+
         let hash = hasher.finalize();
         Ok(GroupId(hash.as_bytes()[..32].try_into().unwrap()))
     }
-    
+
     /// Generate an invitation code
     fn generate_invitation_code(&self, group_id: GroupId, admin_id: IdentityId) -> Result<String> {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-        
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
         let mut hasher = Hasher::new();
         hasher.update(group_id.as_ref());
         hasher.update(admin_id.as_ref());
         hasher.update(&current_time.to_le_bytes());
         hasher.update(b"qubee_invitation");
-        
+
         let hash = hasher.finalize();
         Ok(hex::encode(&hash.as_bytes()[..16]))
     }
-    
+
     /// Log a group event
     fn log_group_event(
         &mut self,
@@ -1414,16 +1421,14 @@ impl GroupManager {
             actor_id,
             event_type,
             description,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         };
-        
+
         // Store event in keystore. We classify group events as message keys
         // since they represent logged messages rather than cryptographic
         // material. The serialized event is stored under a key name that
         // includes the group ID and timestamp. We include minimal metadata
-        // describing the format and size of the stored data.  
+        // describing the format and size of the stored data.
         let event_key = format!("group_event_{}_{}", group_id, event.timestamp);
         let serialized = bincode::serialize(&event)?;
         let metadata = KeyMetadata {
@@ -1433,11 +1438,12 @@ impl GroupManager {
             expiry: None,
             tags: StdHashMap::new(),
         };
-        self.keystore.store_key(&event_key, &serialized, KeyType::MessageKey, metadata)?;
-        
+        self.keystore
+            .store_key(&event_key, &serialized, KeyType::MessageKey, metadata)?;
+
         Ok(())
     }
-    
+
     /// Store group securely
     fn store_group_securely(&mut self, group_id: &GroupId) -> Result<()> {
         if let Some(group) = self.groups.get(group_id) {
@@ -1450,7 +1456,8 @@ impl GroupManager {
                 expiry: None,
                 tags: StdHashMap::new(),
             };
-            self.keystore.store_key(&key_name, &serialized, KeyType::EncryptionKey, metadata)?;
+            self.keystore
+                .store_key(&key_name, &serialized, KeyType::EncryptionKey, metadata)?;
         }
         Ok(())
     }
@@ -1494,7 +1501,7 @@ impl GroupManager {
     pub fn decrypt_group_message(&self, group_id: &GroupId, data: &[u8]) -> Result<Vec<u8>> {
         self.group_crypto.decrypt_message(group_id, data)
     }
-    
+
     /// Load groups from storage
     pub fn load_groups_from_storage(&mut self) -> Result<()> {
         // List all keys and filter to those representing stored group objects
@@ -1530,12 +1537,12 @@ impl GroupId {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         GroupId(bytes)
     }
-    
+
     /// Get the bytes of the group ID
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-    
+
     /// Get a reference to the underlying bytes
     pub fn as_ref(&self) -> &[u8] {
         &self.0
@@ -1589,7 +1596,7 @@ mod tests {
     use super::*;
     use crate::identity::identity_key::IdentityKeyPair;
     use tempfile::TempDir;
-    
+
     #[test]
     fn test_group_creation() {
         // Create a temporary keystore for testing
@@ -1597,27 +1604,31 @@ mod tests {
         let keystore_path = temp_dir.path().join("group_keystore.db");
         let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
-        
+
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
         let creator_key = creator_keypair.public_key();
         let creator_id = creator_key.identity_id;
-        
-        let group_id = group_manager.create_group(
-            creator_id,
-            creator_key,
-            "Test Group".to_string(),
-            "A test group".to_string(),
-            GroupType::Private,
-            GroupSettings::default(),
-        ).expect("Should create group");
-        
-        let group = group_manager.get_group(&group_id).expect("Should find group");
+
+        let group_id = group_manager
+            .create_group(
+                creator_id,
+                creator_key,
+                "Test Group".to_string(),
+                "A test group".to_string(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("Should create group");
+
+        let group = group_manager
+            .get_group(&group_id)
+            .expect("Should find group");
         assert_eq!(group.name, "Test Group");
         assert_eq!(group.members.len(), 1);
         assert!(group.members.contains_key(&creator_id));
         assert_eq!(group.members[&creator_id].role, Role::Owner);
     }
-    
+
     #[test]
     fn test_member_management() {
         // Create a temporary keystore for testing
@@ -1625,61 +1636,70 @@ mod tests {
         let keystore_path = temp_dir.path().join("group_keystore.db");
         let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
-        
+
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
         let creator_key = creator_keypair.public_key();
         let creator_id = creator_key.identity_id;
-        
+
         let member_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
         let member_key = member_keypair.public_key();
         let member_id = member_key.identity_id;
-        
-        let group_id = group_manager.create_group(
-            creator_id,
-            creator_key,
-            "Test Group".to_string(),
-            "A test group".to_string(),
-            GroupType::Private,
-            GroupSettings::default(),
-        ).expect("Should create group");
-        
+
+        let group_id = group_manager
+            .create_group(
+                creator_id,
+                creator_key,
+                "Test Group".to_string(),
+                "A test group".to_string(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("Should create group");
+
         // Add member
-        group_manager.add_member(
-            group_id,
-            creator_id,
-            member_id,
-            member_key,
-            "Test Member".to_string(),
-            Role::Member,
-        ).expect("Should add member");
-        
-        let group = group_manager.get_group(&group_id).expect("Should find group");
+        group_manager
+            .add_member(
+                group_id,
+                creator_id,
+                member_id,
+                member_key,
+                "Test Member".to_string(),
+                Role::Member,
+            )
+            .expect("Should add member");
+
+        let group = group_manager
+            .get_group(&group_id)
+            .expect("Should find group");
         assert_eq!(group.members.len(), 2);
         assert!(group.members.contains_key(&member_id));
-        
+
         // Update role
-        group_manager.update_member_role(
-            group_id,
-            creator_id,
-            member_id,
-            Role::Admin,
-        ).expect("Should update role");
-        
-        let group = group_manager.get_group(&group_id).expect("Should find group");
+        group_manager
+            .update_member_role(group_id, creator_id, member_id, Role::Admin)
+            .expect("Should update role");
+
+        let group = group_manager
+            .get_group(&group_id)
+            .expect("Should find group");
         assert_eq!(group.members[&member_id].role, Role::Admin);
-        
+
         // Remove member
-        group_manager.remove_member(
-            group_id,
-            creator_id,
-            member_id,
-            "Test removal".to_string(),
-        ).expect("Should remove member");
-        
-        let group = group_manager.get_group(&group_id).expect("Should find group");
-        assert_eq!(group.members[&member_id].member_status, MemberStatus::Removed { reason: "Test removal".to_string() });
+        group_manager
+            .remove_member(group_id, creator_id, member_id, "Test removal".to_string())
+            .expect("Should remove member");
+
+        let group = group_manager
+            .get_group(&group_id)
+            .expect("Should find group");
+        assert_eq!(
+            group.members[&member_id].member_status,
+            MemberStatus::Removed {
+                reason: "Test removal".to_string()
+            }
+        );
     }
-    
+
     #[test]
     fn test_group_invitations() {
         // Create a temporary keystore for testing
@@ -1687,47 +1707,50 @@ mod tests {
         let keystore_path = temp_dir.path().join("group_keystore.db");
         let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
-        
+
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
         let creator_key = creator_keypair.public_key();
         let creator_id = creator_key.identity_id;
-        
-        let group_id = group_manager.create_group(
-            creator_id,
-            creator_key,
-            "Test Group".to_string(),
-            "A test group".to_string(),
-            GroupType::Private,
-            GroupSettings::default(),
-        ).expect("Should create group");
-        
+
+        let group_id = group_manager
+            .create_group(
+                creator_id,
+                creator_key,
+                "Test Group".to_string(),
+                "A test group".to_string(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("Should create group");
+
         // Create invitation
-        let invitation = group_manager.create_invitation(
-            group_id,
-            creator_id,
-            None,
-            Some(5),
-        ).expect("Should create invitation");
-        
+        let invitation = group_manager
+            .create_invitation(group_id, creator_id, None, Some(5))
+            .expect("Should create invitation");
+
         assert_eq!(invitation.group_id, group_id);
         assert_eq!(invitation.max_uses, Some(5));
         assert_eq!(invitation.current_uses, 0);
-        
+
         // Join with invitation
         let joiner_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
         let joiner_key = joiner_keypair.public_key();
         let joiner_id = joiner_key.identity_id;
-        
-        let joined_group_id = group_manager.join_group_with_invitation(
-            invitation.invitation_code,
-            joiner_id,
-            joiner_key,
-            "Joiner".to_string(),
-        ).expect("Should join group");
-        
+
+        let joined_group_id = group_manager
+            .join_group_with_invitation(
+                invitation.invitation_code,
+                joiner_id,
+                joiner_key,
+                "Joiner".to_string(),
+            )
+            .expect("Should join group");
+
         assert_eq!(joined_group_id, group_id);
 
-        let group = group_manager.get_group(&group_id).expect("Should find group");
+        let group = group_manager
+            .get_group(&group_id)
+            .expect("Should find group");
         assert_eq!(group.members.len(), 2);
         assert!(group.members.contains_key(&joiner_id));
     }
@@ -1769,7 +1792,8 @@ mod tests {
         // bootstrap (`nativeInitialize` → `load_groups_from_storage`).
         let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore reopen");
         let mut gm = GroupManager::new(keystore).expect("gm reopen");
-        gm.load_groups_from_storage().expect("load_groups_from_storage");
+        gm.load_groups_from_storage()
+            .expect("load_groups_from_storage");
 
         let groups = gm.get_member_groups(&creator_id);
         assert_eq!(
@@ -1785,4 +1809,3 @@ mod tests {
         );
     }
 }
-

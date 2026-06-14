@@ -2,6 +2,7 @@ package com.qubee.messenger.crypto
 
 import android.content.Context
 import com.qubee.messenger.network.NetworkCallback
+import com.qubee.messenger.security.SqlCipherKeyProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -21,7 +22,20 @@ class QubeeManager @Inject constructor(
             if (isInitialized) return@withContext true
             System.loadLibrary("qubee_crypto")
 
-            val result = nativeInitialize(context.filesDir.absolutePath)
+            // Fetch the hardware-Keystore-derived passphrase that
+            // protects the Rust core's on-disk private identity keys.
+            // Fail closed: if the Keystore is unavailable we refuse to
+            // initialise rather than fall back to an unprotected
+            // keystore. (Pre-this-change the Rust side used a hardcoded
+            // passphrase; that hole is now closed.)
+            val passphrase = try {
+                SqlCipherKeyProvider(context).getOrCreateCoreKeystorePassphrase()
+            } catch (e: SecurityException) {
+                Timber.e(e, "Keystore passphrase unavailable; refusing to init core")
+                return@withContext false
+            }
+
+            val result = nativeInitialize(context.filesDir.absolutePath, passphrase)
             if (result) {
                 isInitialized = true
                 Timber.d("Qubee initialized at %s", context.filesDir.absolutePath)
@@ -496,7 +510,7 @@ class QubeeManager @Inject constructor(
         nativeListAcceptedInvites()
     }
 
-    private external fun nativeInitialize(dataDir: String): Boolean
+    private external fun nativeInitialize(dataDir: String, keystorePassphrase: String): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
     private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean

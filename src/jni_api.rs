@@ -162,12 +162,22 @@ fn jni_catch_jbytearray(f: impl FnOnce() -> jbyteArray) -> jbyteArray {
 
 /// Bootstrap the Rust core. Kotlin must pass `context.filesDir.absolutePath`
 /// as `data_dir` so the encrypted keystore lands inside the app's
-/// private storage. Idempotent.
+/// private storage, and a `keystore_passphrase` hex string fetched from
+/// the Android hardware Keystore (`SqlCipherKeyProvider`).
+///
+/// **Security:** the passphrase is the only thing protecting the
+/// on-disk identity private keys at rest. It MUST be a high-entropy
+/// secret from the platform Keystore — never a constant. A `.master`
+/// file written by an older build (wrapped under the former hardcoded
+/// passphrase) is transparently re-wrapped under this passphrase on
+/// first open, so existing installs migrate without losing their
+/// identity. Idempotent.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitialize(
     mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
+    keystore_passphrase: JString,
 ) -> jboolean {
     let result = jni_catch_or(|| -> anyhow::Result<()> {
         let mut init = INITIALIZED.lock().unwrap();
@@ -180,19 +190,30 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
             .map_err(|e| anyhow::anyhow!("invalid data_dir: {e}"))?
             .into();
 
+        let passphrase: String = env
+            .get_string(&keystore_passphrase)
+            .map_err(|e| anyhow::anyhow!("invalid keystore_passphrase: {e}"))?
+            .into();
+        if passphrase.is_empty() {
+            return Err(anyhow::anyhow!(
+                "empty keystore passphrase; refusing to open keystore under no protection"
+            ));
+        }
+        let passphrase_bytes = passphrase.as_bytes();
+
         if let Ok(vm) = env.get_java_vm() {
             *JVM.lock().unwrap() = Some(vm);
         }
 
         let mut id_path = PathBuf::from(&dir);
         id_path.push("qubee_keys.db");
-        let id_keystore = SecureKeyStore::new(&id_path)
+        let id_keystore = SecureKeyStore::new(&id_path, passphrase_bytes)
             .map_err(|e| anyhow::anyhow!("identity keystore open failed: {e}"))?;
         *KEYSTORE.lock().unwrap() = Some(id_keystore);
 
         let mut groups_path = PathBuf::from(&dir);
         groups_path.push("qubee_groups.db");
-        let groups_keystore = SecureKeyStore::new(&groups_path)
+        let groups_keystore = SecureKeyStore::new(&groups_path, passphrase_bytes)
             .map_err(|e| anyhow::anyhow!("groups keystore open failed: {e}"))?;
         let mut group_mgr = GroupManager::new(groups_keystore)
             .map_err(|e| anyhow::anyhow!("group manager init failed: {e}"))?;

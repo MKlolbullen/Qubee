@@ -52,6 +52,31 @@ between minor versions.
   `tracing` calls (error / warn / info by signal class). The
   one secret-leak-risk line dropped its `{e:#}` interpolation.
 
+### Security
+
+- **Private identity keys now genuinely encrypted at rest.** The Rust
+  core keystore (`qubee_keys.db` / `qubee_groups.db`) previously
+  wrapped its master key under a hardcoded `"default_password"`,
+  making the on-disk Ed25519 + ML-DSA private keys recoverable by
+  anyone with the files. `nativeInitialize` now takes a 256-bit
+  passphrase derived in the Android hardware Keystore
+  (`SqlCipherKeyProvider.getOrCreateCoreKeystorePassphrase`,
+  independent from the SQLCipher DB key — key separation). The
+  wrapping KDF moved to BLAKE3 `derive_key`. Existing installs
+  migrate transparently from the legacy passphrase on first launch
+  (non-destructive, one-directional). Init fails closed if the
+  Keystore is unavailable.
+- **StrongBox-backed Keystore master key** where the device supports
+  it, falling back to TEE-backed otherwise. Pure hardening — the key
+  material never leaves secure hardware either way.
+- **Foreground service hardened for Android 14.**
+  `MessageService.onStartCommand` now binds the `dataSync` foreground
+  type explicitly via `ServiceCompat.startForeground(..., FOREGROUND_SERVICE_TYPE_DATA_SYNC)`
+  and catches `ForegroundServiceStartNotAllowedException` (API 31+)
+  so a mistimed background start degrades to "service not started"
+  instead of crashing the process. `MessageService.start()` guards
+  the same case at the call site.
+
 ### Fixed
 
 - **Lost-update race in `MessageRepository.applyAck`** — two acks

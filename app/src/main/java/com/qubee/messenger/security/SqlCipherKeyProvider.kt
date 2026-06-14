@@ -76,10 +76,57 @@ class SqlCipherKeyProvider(private val context: Context) {
     }
 
     /**
-     * Drops both the wrapped DB key and the underlying Keystore master
-     * key. Use after a "Reset identity" so the next launch generates
-     * a fresh key (and the existing DB file should be deleted by the
-     * caller before that happens).
+     * Returns the passphrase that protects the Rust core's on-disk
+     * keystore (`qubee_keys.db.master` / `qubee_groups.db.master`),
+     * which is where the actual Ed25519 + ML-DSA *private identity
+     * keys* live. Generated on first call and persisted (wrapped under
+     * the same Keystore master key as the DB key), returned verbatim
+     * thereafter.
+     *
+     * This is an **independent** 32-byte random secret — NOT the
+     * SQLCipher DB key. Key separation: a compromise of one secret
+     * doesn't hand over the other. Returned as a 64-char lowercase
+     * hex string because the JNI bridge passes it as a `String`; the
+     * Rust side treats the UTF-8 bytes of that hex as the passphrase
+     * (it never needs to decode it — it just needs a stable
+     * high-entropy byte string).
+     *
+     * Before this existed, the Rust keystore wrapped its master key
+     * under a hardcoded `"default_password"`, meaning the private keys
+     * at rest were recoverable by anyone with the files. This closes
+     * that hole by binding them to the hardware-backed Keystore.
+     *
+     * Throws [SecurityException] if the Keystore is unavailable —
+     * fail closed, same policy as [getOrCreate].
+     */
+    fun getOrCreateCoreKeystorePassphrase(): String {
+        val prefs = openEncryptedPrefs()
+            ?: throw SecurityException(
+                "Android Keystore unavailable; refusing to derive core keystore passphrase.",
+            )
+
+        val storedCiphertext = prefs.getString(KEY_CORE_PASS_CIPHERTEXT, null)
+        val storedIv = prefs.getString(KEY_CORE_PASS_IV, null)
+        if (storedCiphertext != null && storedIv != null) {
+            val raw = unwrap(decodeBase64(storedCiphertext), decodeBase64(storedIv))
+            return raw.toHex()
+        }
+
+        val raw = ByteArray(KEY_LENGTH_BYTES).also { SecureRandom().nextBytes(it) }
+        val (ciphertext, iv) = wrap(raw)
+        prefs.edit()
+            .putString(KEY_CORE_PASS_CIPHERTEXT, encodeBase64(ciphertext))
+            .putString(KEY_CORE_PASS_IV, encodeBase64(iv))
+            .apply()
+        return raw.toHex()
+    }
+
+    /**
+     * Drops the wrapped DB key, the wrapped core-keystore passphrase,
+     * and the underlying Keystore master key. Use after a "Reset
+     * identity" so the next launch generates fresh secrets (and the
+     * existing DB + keystore files should be deleted by the caller
+     * before that happens).
      */
     fun clear() {
         try {
@@ -93,7 +140,19 @@ class SqlCipherKeyProvider(private val context: Context) {
         openEncryptedPrefs()?.edit()
             ?.remove(KEY_DB_KEY_CIPHERTEXT)
             ?.remove(KEY_DB_KEY_IV)
+            ?.remove(KEY_CORE_PASS_CIPHERTEXT)
+            ?.remove(KEY_CORE_PASS_IV)
             ?.apply()
+    }
+
+    private fun ByteArray.toHex(): String {
+        val sb = StringBuilder(size * 2)
+        for (b in this) {
+            val v = b.toInt() and 0xFF
+            sb.append(HEX_DIGITS[v ushr 4])
+            sb.append(HEX_DIGITS[v and 0x0F])
+        }
+        return sb.toString()
     }
 
     /**
@@ -147,8 +206,29 @@ class SqlCipherKeyProvider(private val context: Context) {
     }
 
     private fun generateMasterKey(): SecretKey {
+        // Try a StrongBox-backed key first (dedicated hardware security
+        // module, API 28+). Many devices don't ship StrongBox; on those
+        // the init throws StrongBoxUnavailableException and we fall back
+        // to a TEE-backed key. Either way the key material never leaves
+        // secure hardware — this only affects *which* hardware.
+        return try {
+            generateMasterKeyInternal(strongBox = true)
+        } catch (e: android.security.keystore.StrongBoxUnavailableException) {
+            Timber.d("StrongBox unavailable; falling back to TEE-backed master key")
+            // The alias may have been partially created; clear it so the
+            // fallback generation under the same alias succeeds.
+            runCatching {
+                KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                    .takeIf { it.containsAlias(MASTER_KEY_ALIAS) }
+                    ?.deleteEntry(MASTER_KEY_ALIAS)
+            }
+            generateMasterKeyInternal(strongBox = false)
+        }
+    }
+
+    private fun generateMasterKeyInternal(strongBox: Boolean): SecretKey {
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
-        val spec = KeyGenParameterSpec.Builder(
+        val builder = KeyGenParameterSpec.Builder(
             MASTER_KEY_ALIAS,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
         )
@@ -174,8 +254,10 @@ class SqlCipherKeyProvider(private val context: Context) {
             // re-encrypts the in-memory DB key behind biometric
             // unlock is tracked as v0.2+ work.
             .setUserAuthenticationRequired(false)
-            .build()
-        generator.init(spec)
+        if (strongBox && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            builder.setIsStrongBoxBacked(true)
+        }
+        generator.init(builder.build())
         return generator.generateKey()
     }
 
@@ -191,11 +273,16 @@ class SqlCipherKeyProvider(private val context: Context) {
         private const val PREFS_NAME = "qubee_db_keys.enc"
         private const val KEY_DB_KEY_CIPHERTEXT = "db_key_ciphertext_v1"
         private const val KEY_DB_KEY_IV = "db_key_iv_v1"
+        // Separate slots for the Rust core keystore passphrase — an
+        // independent secret from the SQLCipher DB key (key separation).
+        private const val KEY_CORE_PASS_CIPHERTEXT = "core_pass_ciphertext_v1"
+        private const val KEY_CORE_PASS_IV = "core_pass_iv_v1"
         private const val AES_GCM_NO_PADDING = "AES/GCM/NoPadding"
         private const val GCM_TAG_BITS = 128
         private const val MASTER_KEY_SIZE_BITS = 256
         private const val KEY_LENGTH_BYTES = 32
         private const val LEGACY_PRE_ALPHA_PASSPHRASE =
             "qubee-pre-alpha-passphrase-not-secret"
+        private val HEX_DIGITS = "0123456789abcdef".toCharArray()
     }
 }

@@ -56,8 +56,8 @@
             android:theme="@style/Theme.AppCompat"
             android:windowSoftInputMode="stateAlwaysHidden" />
 
-        <!-- Pre-alpha placeholder verification UI. The fingerprint
-             tap-to-verify gesture lands post-alpha. -->
+        <!-- OOB identity verification: fingerprint compare, scan-peer-QR,
+             and SAS. Not exported — only launched from within the app. -->
         <activity
             android:name=".ui.contacts.verification.ContactVerificationActivity"
             android:exported="false"

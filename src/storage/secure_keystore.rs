@@ -21,7 +21,13 @@ use crate::security::secure_rng;
 /// E0119 conflict.
 pub struct SecureKeyStore {
     storage_path: PathBuf,
+    /// Data-encryption key: every stored key entry is sealed under
+    /// this with ChaCha20-Poly1305. Held only in memory.
     master_key: SecretBox<[u8; 32]>,
+    /// Passphrase-derived wrapping key used to seal `master_key` on
+    /// disk (`.master` file). Kept so `rotate_master_key` can re-persist
+    /// the rotated master key without re-threading the raw passphrase.
+    wrap_key: SecretBox<[u8; 32]>,
     keys: HashMap<String, EncryptedKeyEntry>,
 }
 
@@ -71,28 +77,46 @@ pub enum KeyUsage {
 }
 
 impl SecureKeyStore {
-    /// Create a new secure key store
-    pub fn new<P: AsRef<Path>>(storage_path: P) -> Result<Self> {
+    /// Create a new secure key store whose master key is wrapped under
+    /// the caller-supplied `passphrase`.
+    ///
+    /// **At-rest security depends entirely on this passphrase.** On
+    /// Android it must be a high-entropy secret fetched from the
+    /// hardware-backed Keystore (see `SqlCipherKeyProvider`), *not* a
+    /// hardcoded value. The previous implementation derived the
+    /// wrapping key from a hardcoded `"default_password"`, which made
+    /// the on-disk private keys recoverable by anyone with the
+    /// `.master` file — that hole is closed by requiring the passphrase
+    /// here.
+    ///
+    /// The passphrase is expected to already be full-entropy (≥ 256
+    /// bits of randomness). We therefore use BLAKE3's KDF mode
+    /// (`derive_key`) rather than a memory-hard password stretcher:
+    /// stretching only helps for low-entropy human passwords, and adds
+    /// nothing when the input is a random 256-bit key.
+    pub fn new<P: AsRef<Path>>(storage_path: P, passphrase: &[u8]) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
-        
+
         // Create storage directory if it doesn't exist
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent)
                 .context("Failed to create storage directory")?;
         }
-        
-        // Generate or load master key
-        let master_key = Self::load_or_generate_master_key(&storage_path)?;
-        
+
+        // Generate or load master key, wrapped under `passphrase`.
+        let master_key = Self::load_or_generate_master_key(&storage_path, passphrase)?;
+        let wrap_key = SecretBox::new(Box::new(Self::derive_key_from_passphrase(passphrase)));
+
         let mut keystore = SecureKeyStore {
             storage_path: storage_path.clone(),
             master_key,
+            wrap_key,
             keys: HashMap::new(),
         };
-        
+
         // Load existing keys
         keystore.load_keys()?;
-        
+
         Ok(keystore)
     }
     
@@ -248,89 +272,146 @@ impl SecureKeyStore {
         Ok(removed_count)
     }
     
-    fn load_or_generate_master_key(storage_path: &Path) -> Result<SecretBox<[u8; 32]>> {
+    fn load_or_generate_master_key(
+        storage_path: &Path,
+        passphrase: &[u8],
+    ) -> Result<SecretBox<[u8; 32]>> {
         let master_key_path = storage_path.with_extension("master");
-        
+
         if master_key_path.exists() {
-            Self::load_master_key(&master_key_path)
+            Self::load_master_key(&master_key_path, passphrase)
         } else {
             let master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
-            Self::save_master_key_to_path(&master_key, &master_key_path)?;
+            Self::save_master_key_to_path(&master_key, &master_key_path, passphrase)?;
             Ok(master_key)
         }
     }
-    
-    fn load_master_key(path: &Path) -> Result<SecretBox<[u8; 32]>> {
+
+    fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<SecretBox<[u8; 32]>> {
         let encrypted_data = fs::read(path)
             .context("Failed to read master key file")?;
-        
-        // For now, we'll use a simple key derivation from user password
-        // In a real implementation, this would use platform-specific secure storage
-        let password = Self::get_user_password()?;
-        let derived_key = Self::derive_key_from_password(&password)?;
-        
-        let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
+        if encrypted_data.len() < 12 {
+            return Err(anyhow::anyhow!("master key file too short"));
+        }
+
+        // Primary path: unwrap with the caller's (Keystore-derived)
+        // passphrase.
+        let derived = Self::derive_key_from_passphrase(passphrase);
+        if let Ok(key) = Self::try_decrypt_master(&encrypted_data, &derived) {
+            return Ok(key);
+        }
+
+        // Migration path: a `.master` written by a pre-this-change
+        // build was wrapped under a key derived from the hardcoded
+        // legacy passphrase (a *different* derivation construction).
+        // Detect that, and if it unwraps, transparently re-wrap under
+        // the real passphrase so the next launch uses the secure key.
+        // Non-destructive — existing identity material is preserved.
+        let legacy = Self::derive_key_legacy();
+        if let Ok(key) = Self::try_decrypt_master(&encrypted_data, &legacy) {
+            Self::save_master_key_to_path(&key, path, passphrase)
+                .context("re-wrapping legacy master key under Keystore passphrase")?;
+            return Ok(key);
+        }
+
+        Err(anyhow::anyhow!(
+            "Failed to decrypt master key (wrong passphrase or corrupt file)"
+        ))
+    }
+
+    /// Attempt to unwrap the master-key file with an already-derived
+    /// 32-byte wrapping key. Returns `Err` on AEAD failure (wrong key
+    /// / tampering) so callers can try a fallback.
+    fn try_decrypt_master(
+        encrypted_data: &[u8],
+        derived_key: &[u8; 32],
+    ) -> Result<SecretBox<[u8; 32]>> {
+        let cipher = ChaCha20Poly1305::new_from_slice(derived_key).expect("32-byte key");
         let nonce = Nonce::from_slice(&encrypted_data[..12]);
         let ciphertext = &encrypted_data[12..];
-        
+
         let decrypted = cipher
             .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {}", e))?;
-        
+
         if decrypted.len() != 32 {
             return Err(anyhow::anyhow!("Invalid master key size"));
         }
-        
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(&decrypted);
-        
         Ok(SecretBox::new(Box::new(key_array)))
     }
-    
+
+    /// Re-persist the in-memory `master_key` to disk, sealed under the
+    /// stored passphrase-derived `wrap_key`. Used after rotation.
     fn save_master_key(&self) -> Result<()> {
         let master_key_path = self.storage_path.with_extension("master");
-        Self::save_master_key_to_path(&self.master_key, &master_key_path)
+        Self::seal_master_key_to_path(
+            &self.master_key,
+            &master_key_path,
+            self.wrap_key.expose_secret(),
+        )
     }
-    
-    fn save_master_key_to_path(master_key: &SecretBox<[u8; 32]>, path: &Path) -> Result<()> {
-        let password = Self::get_user_password()?;
-        let derived_key = Self::derive_key_from_password(&password)?;
-        
-        let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
+
+    fn save_master_key_to_path(
+        master_key: &SecretBox<[u8; 32]>,
+        path: &Path,
+        passphrase: &[u8],
+    ) -> Result<()> {
+        let derived_key = Self::derive_key_from_passphrase(passphrase);
+        Self::seal_master_key_to_path(master_key, path, &derived_key)
+    }
+
+    fn seal_master_key_to_path(
+        master_key: &SecretBox<[u8; 32]>,
+        path: &Path,
+        wrap_key: &[u8; 32],
+    ) -> Result<()> {
+        let cipher = ChaCha20Poly1305::new_from_slice(wrap_key).expect("32-byte key");
         let nonce_bytes = secure_rng::random::array::<12>()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
+
         let encrypted = cipher
             .encrypt(nonce, master_key.expose_secret().as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
-        
+
         let mut file_data = Vec::with_capacity(12 + encrypted.len());
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
-        
+
         fs::write(path, file_data)
             .context("Failed to write master key file")?;
-        
+
         Ok(())
     }
-    
-    fn get_user_password() -> Result<String> {
-        // In a real implementation, this would prompt the user or use platform keyring
-        // For now, we'll use a simple environment variable
-        std::env::var("QUBEE_KEYSTORE_PASSWORD")
-            .or_else(|_| Ok("default_password".to_string()))
+
+    /// Derive the 32-byte master-key-wrapping key from the supplied
+    /// passphrase using BLAKE3's KDF mode. The context string is a
+    /// fixed domain separator; the passphrase is the keying material.
+    ///
+    /// No memory-hard stretching: the passphrase is expected to be a
+    /// full-entropy 256-bit secret from the platform Keystore, so a
+    /// single KDF derivation is sufficient. (Stretching exists to slow
+    /// brute force of *guessable* passwords; a random 256-bit key is
+    /// not guessable.)
+    fn derive_key_from_passphrase(passphrase: &[u8]) -> [u8; 32] {
+        blake3::derive_key("qubee secure_keystore master-wrap v1", passphrase)
     }
-    
-    fn derive_key_from_password(password: &str) -> Result<[u8; 32]> {
+
+    /// Reproduce the *exact* pre-this-change derivation
+    /// (`BLAKE3("default_password" || "qubee_keystore_salt")[..32]`) so
+    /// the migration path in [`load_master_key`] can unwrap a legacy
+    /// `.master` file. Used only for one-time migration; never for
+    /// writing. Once a legacy file is re-wrapped under the real
+    /// passphrase this code path is never hit again for that install.
+    fn derive_key_legacy() -> [u8; 32] {
         let mut hasher = Hasher::new();
-        hasher.update(password.as_bytes());
+        hasher.update(b"default_password");
         hasher.update(b"qubee_keystore_salt");
-        
         let hash = hasher.finalize();
         let mut key = [0u8; 32];
         key.copy_from_slice(&hash.as_bytes()[..32]);
-        
-        Ok(key)
+        key
     }
     
     fn load_keys(&mut self) -> Result<()> {
@@ -377,10 +458,112 @@ mod tests {
     fn create_test_keystore() -> (SecureKeyStore, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("test_keystore.db");
-        let keystore = SecureKeyStore::new(keystore_path).expect("Failed to create keystore");
+        let keystore = SecureKeyStore::new(keystore_path, b"test-keystore-passphrase").expect("Failed to create keystore");
         (keystore, temp_dir)
     }
     
+    #[test]
+    fn wrong_passphrase_cannot_open_keystore() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("ks.db");
+
+        // Create + store a key under passphrase A.
+        {
+            let mut ks = SecureKeyStore::new(&path, b"passphrase-A").unwrap();
+            ks.store_key(
+                "k",
+                b"super secret key material 0123456789",
+                KeyType::IdentityKey,
+                KeyMetadata {
+                    algorithm: "x".into(),
+                    key_size: 36,
+                    usage: vec![KeyUsage::Signing],
+                    expiry: None,
+                    tags: HashMap::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        // Opening with a different passphrase must fail — the on-disk
+        // master key won't unwrap. This is the property that makes the
+        // at-rest encryption real: without the Keystore-derived
+        // passphrase the private keys are unrecoverable.
+        let reopened = SecureKeyStore::new(&path, b"passphrase-B");
+        assert!(
+            reopened.is_err(),
+            "keystore opened under the wrong passphrase — at-rest encryption is broken",
+        );
+
+        // Sanity: the correct passphrase still opens it.
+        let ok = SecureKeyStore::new(&path, b"passphrase-A");
+        assert!(ok.is_ok(), "correct passphrase must still open");
+    }
+
+    #[test]
+    fn legacy_master_key_migrates_to_real_passphrase() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("ks.db");
+        let master_path = path.with_extension("master");
+
+        // Forge a legacy `.master` file: a random master key wrapped
+        // under the old hardcoded `default_password` derivation, exactly
+        // as the pre-this-change build would have written it.
+        let legacy_master = SecretBox::new(Box::new(secure_rng::random::array::<32>().unwrap()));
+        let legacy_wrap = SecureKeyStore::derive_key_legacy();
+        SecureKeyStore::seal_master_key_to_path(&legacy_master, &master_path, &legacy_wrap)
+            .unwrap();
+
+        // Also store a key entry sealed under that legacy master key so
+        // we can prove the migration preserves real data.
+        {
+            let cipher = ChaCha20Poly1305::new(legacy_master.expose_secret().into());
+            let nonce_bytes = secure_rng::random::array::<12>().unwrap();
+            let nonce = Nonce::from_slice(&nonce_bytes);
+            let ct = cipher.encrypt(nonce, b"legacy identity key".as_ref()).unwrap();
+            let mut keys = HashMap::new();
+            keys.insert(
+                "id".to_string(),
+                EncryptedKeyEntry {
+                    encrypted_data: ct,
+                    nonce: nonce_bytes,
+                    key_type: KeyType::IdentityKey,
+                    created_at: 0,
+                    last_accessed: 0,
+                    metadata: KeyMetadata {
+                        algorithm: "x".into(),
+                        key_size: 19,
+                        usage: vec![],
+                        expiry: None,
+                        tags: HashMap::new(),
+                    },
+                },
+            );
+            fs::write(&path, bincode::serialize(&keys).unwrap()).unwrap();
+        }
+
+        // Open under the REAL passphrase. The migration path detects the
+        // legacy wrapping, re-wraps under the real passphrase, and the
+        // stored key is still retrievable.
+        let mut ks = SecureKeyStore::new(&path, b"real-keystore-passphrase").unwrap();
+        let got = ks.retrieve_key("id").unwrap().expect("legacy key survived migration");
+        assert_eq!(got.expose_secret().as_slice(), b"legacy identity key");
+
+        // After migration the `.master` is re-wrapped: opening with the
+        // legacy passphrase derivation must NO LONGER work, and the real
+        // passphrase must.
+        drop(ks);
+        let legacy_reopen = {
+            let data = fs::read(&master_path).unwrap();
+            SecureKeyStore::try_decrypt_master(&data, &SecureKeyStore::derive_key_legacy())
+        };
+        assert!(
+            legacy_reopen.is_err(),
+            "after migration the master key must no longer unwrap under the legacy key",
+        );
+        assert!(SecureKeyStore::new(&path, b"real-keystore-passphrase").is_ok());
+    }
+
     #[test]
     fn test_store_and_retrieve_key() {
         let (mut keystore, _temp_dir) = create_test_keystore();

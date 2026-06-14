@@ -21,7 +21,7 @@ use tempfile::TempDir;
 fn fresh_device(label: &str) -> (TempDir, IdentityKeyPair, GroupManager) {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join(format!("{label}.db"));
-    let ks = SecureKeyStore::new(&path).expect("keystore");
+    let ks = SecureKeyStore::new(&path, b"test-keystore-passphrase").expect("keystore");
     let gm = GroupManager::new(ks).expect("group manager");
     let kp = IdentityKeyPair::generate().expect("identity");
     (dir, kp, gm)

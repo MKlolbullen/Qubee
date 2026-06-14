@@ -1595,7 +1595,7 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
         
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1623,7 +1623,7 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
         
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1685,7 +1685,7 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
         
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1751,7 +1751,7 @@ mod tests {
         let creator_id = creator_key.identity_id;
 
         let group_id = {
-            let keystore = SecureKeystore::new(&keystore_path).expect("keystore open");
+            let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore open");
             let mut gm = GroupManager::new(keystore).expect("gm");
             gm.create_group(
                 creator_id,
@@ -1767,7 +1767,7 @@ mod tests {
 
         // Reopen from the same on-disk path — same flow as the real
         // bootstrap (`nativeInitialize` → `load_groups_from_storage`).
-        let keystore = SecureKeystore::new(&keystore_path).expect("keystore reopen");
+        let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore reopen");
         let mut gm = GroupManager::new(keystore).expect("gm reopen");
         gm.load_groups_from_storage().expect("load_groups_from_storage");
 

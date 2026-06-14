@@ -97,16 +97,29 @@ why.
 These are known and are not vulnerabilities — they're the shape of
 the pre-alpha:
 
-- The Android Keystore master key that wraps the SQLCipher
-  passphrase is configured with `setUserAuthenticationRequired(false)`,
-  meaning the local DB decrypts on boot before the user unlocks the
-  device. Trade-off explicitly documented in
+- The Android Keystore master key that wraps both the SQLCipher
+  passphrase *and* the Rust core keystore passphrase is configured
+  with `setUserAuthenticationRequired(false)`, meaning local data
+  decrypts on boot before the user unlocks the device. Trade-off
+  explicitly documented in
   `app/src/main/java/com/qubee/messenger/security/SqlCipherKeyProvider.kt`;
   enables headless `MessageService` operation at the cost of no
-  per-DB-open biometric/PIN gate. A "lock-on-screen-off" mode is
-  v0.2+ work.
+  per-open biometric/PIN gate. The key is StrongBox-backed where
+  available (TEE-backed otherwise). A "lock-on-screen-off" mode that
+  re-gates behind biometric unlock is v0.2+ work.
+- The Rust core keystore (`qubee_keys.db` / `qubee_groups.db`, which
+  hold the Ed25519 + ML-DSA private identity keys) wraps its master
+  key under a 256-bit passphrase derived in the hardware Keystore and
+  passed in via `nativeInitialize`. **A `.master` file is useless
+  without that Keystore-bound passphrase.** Builds before this change
+  used a hardcoded `"default_password"`; those installs migrate
+  transparently to the real passphrase on first launch (the migration
+  is one-directional — it never re-exposes the keys under the old
+  derivation).
 - `MessageStatus.SENT` means "encrypted bytes left this device", not
-  "the peer acked". A real ack roundtrip is post-alpha.
+  "the peer acked". `DELIVERED` lands when the first signed
+  `MessageAck` arrives (delivery confirmation shipped in
+  `[Unreleased]`).
 - Local DB migrations are `fallbackToDestructiveMigration` on every
   schema bump until v0.2.0 ships the first stable schema. Pre-alpha
   data is not expected to survive minor-version upgrades; the README

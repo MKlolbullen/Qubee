@@ -7,9 +7,11 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.qubee.messenger.QubeeApplication
 import com.qubee.messenger.R
@@ -60,8 +62,24 @@ class MessageService : Service(), NetworkCallback {
     companion object {
         private const val NOTIFICATION_ID = 1001
 
+        /**
+         * Start the P2P foreground service. Must be called from a
+         * foreground context (Activity onStart/onResume) — on API 31+
+         * `startForegroundService` from the background throws
+         * `ForegroundServiceStartNotAllowedException`. We swallow that
+         * here so a mistimed call degrades to "service not started"
+         * rather than crashing the app; the service is retried on the
+         * next foreground entry.
+         */
         fun start(context: Context) {
-            ContextCompat.startForegroundService(context, Intent(context, MessageService::class.java))
+            try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, MessageService::class.java),
+                )
+            } catch (e: Exception) {
+                Timber.w(e, "Could not start MessageService (background start?)")
+            }
         }
 
         fun stop(context: Context) {
@@ -76,10 +94,38 @@ class MessageService : Service(), NetworkCallback {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!isRunning) {
-            startForeground(NOTIFICATION_ID, createServiceNotification())
-            startP2PNetwork()
-            isRunning = true
-            Timber.d("MessageService started")
+            try {
+                // Explicitly bind the foreground-service type. On API
+                // 34+ a `dataSync` FGS started without the matching
+                // type (or without the FOREGROUND_SERVICE_DATA_SYNC
+                // permission) is rejected; ServiceCompat picks the
+                // right startForeground overload per API level. The
+                // manifest also declares the type as a belt-and-braces.
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    createServiceNotification(),
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    } else {
+                        0
+                    },
+                )
+                startP2PNetwork()
+                isRunning = true
+                Timber.d("MessageService started")
+            } catch (e: Exception) {
+                // API 31+ throws ForegroundServiceStartNotAllowedException
+                // if we were started from the background without an
+                // exemption. Don't crash the process — stop cleanly;
+                // MainActivity restarts the service next time it's
+                // foregrounded. (Caught as Exception because the
+                // specific type is API-31-only and we compile against
+                // minSdk 24.)
+                Timber.e(e, "startForeground rejected; stopping service")
+                stopSelf()
+                return START_NOT_STICKY
+            }
         }
         return START_STICKY
     }

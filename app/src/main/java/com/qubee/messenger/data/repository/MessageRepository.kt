@@ -3,6 +3,7 @@ package com.qubee.messenger.data.repository
 import com.qubee.messenger.data.model.Message
 import com.qubee.messenger.data.model.MessageStatus
 import com.qubee.messenger.data.model.MessageWithSender
+import com.qubee.messenger.data.repository.database.dao.ApplyAckResult
 import com.qubee.messenger.data.repository.database.dao.ConversationDao
 import com.qubee.messenger.data.repository.database.dao.MessageDao
 import kotlinx.coroutines.flow.Flow
@@ -43,52 +44,25 @@ class MessageRepository @Inject constructor(
     }
 
     /**
-     * Stamp an outbound row with the canonical wire-level message
-     * id immediately after encryption succeeds. Inbound `MessageAck`
-     * frames look up by this id; rows without one stay
-     * uncorrelatable to acks (and `applyAck` returns false).
-     */
-    suspend fun updateWireId(messageId: String, wireId: String) {
-        val row = messageDao.getMessageById(messageId) ?: return
-        if (row.wireId == wireId) return
-        messageDao.updateMessage(row.copy(wireId = wireId))
-    }
-
-    /**
      * Apply an inbound `MessageAck` to the local outbound row.
      *
-     * Looks up the row by `wireId` (set at send time via
-     * `nativeExtractMessageId`). If we don't recognise the id —
-     * because the ack is for a message someone else sent, or
-     * because pre-this-feature rows lack a `wireId` — the call is
-     * a no-op.
+     * Delegates to [MessageDao.applyAckTransactional] so the
+     * read-modify-write happens inside one SQLite transaction.
+     * Two acks from different recipients arriving simultaneously
+     * can't lose one to a stale-read race; both end up in
+     * `deliveredAckers`.
      *
-     * Otherwise: dedupe the acker against the existing
-     * `deliveredAckers` list (set semantics — a recipient who
-     * resends an ack only counts once) and bump the row's status
-     * to `DELIVERED` on the first ack arrival. Late ack-after-read
-     * is ignored (status doesn't move backwards from `READ`).
-     *
-     * Returns `true` when the row was found and `false` otherwise,
-     * mostly so callers can log "ignored ack for unknown id" at
-     * debug level without surfacing it to the user.
+     * Returns `true` when the row was found (whether the ack was
+     * freshly applied or was an idempotent duplicate) and `false`
+     * when no row carried this `wireId` — caller logs the latter
+     * at debug level without surfacing to the user.
      */
-    suspend fun applyAck(wireId: String, ackerIdHex: String): Boolean {
-        val row = messageDao.getMessageByWireId(wireId) ?: return false
-        if (row.deliveredAckers.contains(ackerIdHex)) {
-            return true // idempotent — caller already accounted for
+    suspend fun applyAck(wireId: String, ackerIdHex: String): Boolean =
+        when (messageDao.applyAckTransactional(wireId, ackerIdHex)) {
+            is ApplyAckResult.NotFound -> false
+            is ApplyAckResult.AlreadyApplied,
+            is ApplyAckResult.Applied -> true
         }
-        val updated = row.copy(
-            deliveredAckers = row.deliveredAckers + ackerIdHex,
-            status = if (row.status == MessageStatus.READ) {
-                row.status
-            } else {
-                MessageStatus.DELIVERED
-            },
-        )
-        messageDao.updateMessage(updated)
-        return true
-    }
 
     suspend fun markAllMessagesAsRead(conversationId: String) {
         messageDao.markAllMessagesAsRead(conversationId)

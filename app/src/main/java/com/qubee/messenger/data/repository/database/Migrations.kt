@@ -18,9 +18,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  *   2. Add a new `MIGRATION_(N-1)_N` constant below with the
  *      `ALTER TABLE` / `CREATE TABLE` / etc. it needs.
  *   3. Add it to [ALL_MIGRATIONS] so it gets registered.
- *   4. Add a unit / instrumented test that exercises the path
- *      (open at version N-1, write some rows, run migration,
- *      verify rows survive + new columns default correctly).
+ *   4. When the second real migration lands, restore an
+ *      instrumented `MigrationTestHelper` test: this requires
+ *      committing the Room-generated schema JSON files under
+ *      `app/schemas/`, which today are .gitignored because the
+ *      single-migration case wasn't worth the snapshot churn.
  *
  * SQLCipher caveat: the underlying database is SQLCipher; Room's
  * `Migration` objects run with a SQLCipher connection just like

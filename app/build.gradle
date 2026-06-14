@@ -31,16 +31,6 @@ android {
         minSdk 24
         targetSdk 34
 
-        // Room schema snapshots — required for MigrationTestHelper
-        // to validate that `Migrations.kt` actually transitions the
-        // schema correctly. Snapshots are committed under
-        // `app/schemas/com.qubee.messenger.data.repository.database.QubeeDatabase/`
-        // and reviewed in PRs alongside any `version` bump.
-        kapt {
-            arguments {
-                arg('room.schemaLocation', "$projectDir/schemas")
-            }
-        }
         // versionName / versionCode default to a "0.1.0-alpha" pre-release
         // label. Override from the release workflow with
         //   ./gradlew assembleRelease \
@@ -62,9 +52,12 @@ android {
     sourceSets {
         // Rust .so libraries built by build_rust.sh / cargo-ndk land here.
         main.jniLibs.srcDirs = ['src/main/jniLibs']
-        // Surface Room schema snapshots to androidTest so
-        // MigrationTestHelper can find them at run time.
-        androidTest.assets.srcDirs += files("$projectDir/schemas")
+        // Surface Room schema snapshots (when kapt has run) to the
+        // androidTest classpath so a future MigrationTestHelper test
+        // can find them at run time. Pre-emptively wired but inert
+        // until both the schemas land on disk and the test that
+        // consumes them comes back.
+        androidTest.assets.srcDirs("$projectDir/schemas")
     }
 
     signingConfigs {
@@ -120,6 +113,17 @@ android {
     }
     // No externalNativeBuild — Rust shared libraries are built out of band
     // by build_rust.sh / cargo-ndk and copied into jniLibs.
+}
+
+// Top-level kapt block — Room reads `room.schemaLocation` from the
+// kapt plugin's argument map specifically (not from
+// `defaultConfig.javaCompileOptions`, which AGP plumbs to javac but
+// not to kapt). Schema JSON files land in `app/schemas/` and are
+// committed; `MigrationTestHelper` consumes them at test time.
+kapt {
+    arguments {
+        arg("room.schemaLocation", "$projectDir/schemas".toString())
+    }
 }
 
 dependencies {

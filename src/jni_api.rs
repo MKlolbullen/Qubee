@@ -1365,12 +1365,12 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             )?;
         }
         GroupHandshake::MessageAck { body, signature } => {
-            // Verify the ack is from an active member with a valid
-            // signature. Self-acks (acker == active identity) are
-            // dropped because we don't update our own outbound rows
-            // off our own ack — they're already SENT locally and
-            // the receive-side dispatch never fires for our own
-            // publishes.
+            // Drop acks we ourselves signed. Gossipsub doesn't echo
+            // a publisher's own messages back today, so this is
+            // belt-and-braces against a future libp2p change or a
+            // peer-relay topology that bounces our ack through a
+            // multi-hop loop — acking our own message is
+            // semantically nonsense (we already know what we sent).
             let active = active_identity()?;
             if let Some(ref identity) = active {
                 if identity.identity_id() == body.acker_id {

@@ -130,26 +130,35 @@ class ChatViewModel @Inject constructor(
         val payload = text.trim()
         if (payload.isEmpty() || conversationId.isEmpty()) return
         viewModelScope.launch {
+            val messageId = UUID.randomUUID().toString()
             val now = System.currentTimeMillis()
-            val message = Message(
-                id = UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
-                content = payload,
-                contentType = MessageType.TEXT,
-                timestamp = now,
-                status = MessageStatus.SENDING,
-                isFromMe = true,
-            )
-            messageRepository.saveMessage(message)
 
-            // Encrypt via the Rust JNI bridge. The session id is the
-            // hex-encoded GroupId — same value as conversationId per
-            // ConversationRepository.getOrCreateConversationId.
-            val encrypted = runCatching { qubeeManager.encryptMessage(conversationId, payload) }
-                .getOrNull()
+            // Encrypt first so the locally-saved row can carry the
+            // canonical wire id from the start. Otherwise a fast
+            // loopback peer could ack before we stamped the row
+            // and `applyAck` would miss it.
+            //
+            // Encryption is cheap (sub-millisecond on modern
+            // devices); the slight UI delay vs. saving a placeholder
+            // SENDING row first is well under perceptual.
+            val encrypted = runCatching {
+                qubeeManager.encryptMessage(conversationId, payload)
+            }.getOrNull()
             if (encrypted == null) {
-                messageRepository.updateMessageStatus(message.id, MessageStatus.FAILED)
+                // Persist a FAILED row so the UI still shows what
+                // the user typed and surfaces the error.
+                messageRepository.saveMessage(
+                    Message(
+                        id = messageId,
+                        conversationId = conversationId,
+                        senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
+                        content = payload,
+                        contentType = MessageType.TEXT,
+                        timestamp = now,
+                        status = MessageStatus.FAILED,
+                        isFromMe = true,
+                    ),
+                )
                 _events.emit(
                     ChatUiEvent.Notice(
                         "Encrypt failed — peer may not have accepted the group invite yet",
@@ -158,16 +167,28 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
 
-            // Stamp the row with the canonical wire-level message
-            // id so a later inbound `MessageAck` can find this row
-            // and bump its delivered-acker list. Best-effort —
-            // null happens for non-group wires (none today, but
-            // defensive) and is logged silently.
             val wire = encrypted.toBytes()
+            // Best-effort id extraction. Null for non-group wires
+            // (none today, defensive); row persists without a
+            // wireId in that case, meaning future acks for it
+            // won't correlate, which is acceptable on a non-group
+            // path that can't fire acks anyway.
             val wireId = qubeeManager.extractMessageId(wire)
-            if (wireId != null) {
-                messageRepository.updateWireId(message.id, wireId)
-            }
+
+            // Save the row with the wireId already present — no
+            // intermediate state visible to MessageService.applyAck.
+            val message = Message(
+                id = messageId,
+                conversationId = conversationId,
+                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
+                content = payload,
+                contentType = MessageType.TEXT,
+                timestamp = now,
+                status = MessageStatus.SENDING,
+                isFromMe = true,
+                wireId = wireId,
+            )
+            messageRepository.saveMessage(message)
 
             // Publish via libp2p. The "peer id" passed to
             // sendP2PMessage today is whatever the caller hands in;
@@ -182,7 +203,7 @@ class ChatViewModel @Inject constructor(
                 qubeeManager.sendP2PMessage(contactId, wire)
             }.getOrDefault(false)
             val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
-            messageRepository.updateMessageStatus(message.id, newStatus)
+            messageRepository.updateMessageStatus(messageId, newStatus)
             if (!sendOk) {
                 _events.emit(ChatUiEvent.Notice("P2P send failed"))
             }

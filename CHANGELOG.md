@@ -52,6 +52,33 @@ between minor versions.
   `tracing` calls (error / warn / info by signal class). The
   one secret-leak-risk line dropped its `{e:#}` interpolation.
 
+### Fixed
+
+- **Lost-update race in `MessageRepository.applyAck`** — two acks
+  from different recipients arriving simultaneously could lose
+  one to a stale-read race. The read-modify-write now happens
+  inside a single SQLite transaction via
+  `MessageDao.applyAckTransactional` (returns a typed
+  `ApplyAckResult` so the repo layer can branch without re-doing
+  the work).
+- **Send-path ordering** — `ChatViewModel.sendMessage` previously
+  saved the row with `wireId = null`, then encrypted, then
+  back-filled the `wireId`. A loopback-fast peer could ack
+  before the back-fill committed and `applyAck` would miss the
+  row. Encrypt now happens first; the row is saved with
+  `wireId` already populated.
+- **`kapt {}` block scope** — was nested inside
+  `defaultConfig {}` where AGP silently ignores it; moved to
+  the top level so `room.schemaLocation` actually takes effect.
+- **`androidTest.assets.srcDirs` syntax** — switched from `+=`
+  (relies on a groovy implicit-collection-add that's fragile
+  across AGP bumps) to the canonical `srcDirs(...)` call.
+- **Removed `MigrationsInstrumentedTest`** — depended on
+  committed Room schema JSON snapshots that aren't yet in the
+  tree. `MIGRATION_2_3` itself is reviewed by inspection until
+  the second real migration lands and we set up the snapshot
+  workflow. `app/schemas/` is gitignored in the meantime.
+
 ## [0.1.0-alpha] — 2026-05
 
 First public-installable cut. Research-grade pre-alpha — see

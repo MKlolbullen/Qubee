@@ -54,6 +54,22 @@ between minor versions.
 
 ### Added
 
+- **Double Ratchet + sender keys design.** New
+  `docs/double-ratchet-design.md` documents the target protocol
+  (PQXDH initial agreement reusing existing `DeviceKey` X25519 +
+  ML-KEM material; hybrid Double Ratchet with header encryption
+  for 1:1; sender keys for groups distributed over the 1:1
+  channel) and the four-stage migration plan from the current
+  symmetric-group-key model. Prekey scaffolding (`DeviceKey` /
+  `DevicePublicKey`) was already present from earlier identity
+  work; this document pins how it's used. The ratchet
+  implementation itself ships in a follow-on batch — landing it
+  in a single rushed session is the standard way DR
+  implementations have shipped CVEs (skip-window bugs, replay
+  acceptance, header-encryption derivation errors, unknown-key-
+  share attacks); the safe path is design first, port reference
+  code second, ship in carefully reviewed slices.
+
 - **Offline retry queue for outbound messages.** A peer offline at
   send-time used to lose the message — there was no store-and-forward
   layer. `ChatViewModel.sendMessage` now stamps the row with the

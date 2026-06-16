@@ -128,6 +128,12 @@ end in ~12-15 minutes:
 
 ### 4. Verify the released APK
 
+The APK posted to GitHub Releases should be byte-identical (modulo
+signing) to one produced by any third party rebuilding the same tag
+under the documented toolchain. See `docs/reproducible-builds.md`
+for the full verification procedure and the canonical comparison
+script.
+
 Once the workflow finishes:
 
 ```bash

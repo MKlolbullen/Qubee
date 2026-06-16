@@ -74,6 +74,11 @@ The releases are signed by the maintainer's release key
 (fingerprint published in `SECURITY.md`). Signature failures on
 install mean the APK has been tampered with — do not proceed.
 
+Want to verify the APK was built from the source it claims? See
+`docs/reproducible-builds.md` — the build is deterministic given the
+pinned toolchain, so anyone can rebuild the tagged commit and
+byte-compare against the released artifact (signing aside).
+
 Maintainers cutting a new release: see `RELEASE.md` for the
 keystore / GitHub Secrets / tag-push procedure.
 

@@ -52,6 +52,26 @@ between minor versions.
   `tracing` calls (error / warn / info by signal class). The
   one secret-leak-risk line dropped its `{e:#}` interpolation.
 
+### Build / tooling
+
+- **Reproducible-build procedure** pinned end-to-end. New
+  `docs/reproducible-builds.md` documents the inputs (toolchain,
+  NDK, JDK, Gradle, cargo-ndk, release profile) and the verification
+  recipe. Concrete pinning:
+  * `app/build.gradle` declares `ndkVersion '26.1.10909125'` (r26b)
+    in addition to the existing CI pin.
+  * `gradle/wrapper/gradle-wrapper.properties` adds
+    `distributionSha256Sum` so a hostile mirror can't substitute
+    a tampered Gradle.
+  * `Cargo.toml` adds an explicit `[profile.release]` with
+    `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`,
+    `panic = "abort"`, `incremental = false`.
+  * `build_rust.sh` rewritten to use `--locked`, apply
+    `--remap-path-prefix` for `$CARGO_HOME` and `$PWD`, set
+    `SOURCE_DATE_EPOCH=0`, and print the SHA-256 of each produced
+    `.so` for cross-machine comparison.
+  README + RELEASE.md cross-link to the new doc.
+
 ### Security
 
 - **Sealed outer envelope on group messages.** Pre-this-change, every

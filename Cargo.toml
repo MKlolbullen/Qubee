@@ -136,3 +136,33 @@ harness = false
 [[bench]]
 name = "group_encrypt_decrypt"
 harness = false
+
+# Reproducible release profile. The goal is byte-identical .so output
+# across machines given the pinned (toolchain, Cargo.lock, NDK, source)
+# tuple. Notes on each setting:
+#   - opt-level = 3            : default for release; pinned explicitly
+#                                so a workspace-level override can't
+#                                shift it.
+#   - lto = "thin"             : reproducible across machines; "fat" LTO
+#                                has historically been order-dependent.
+#   - codegen-units = 1        : `> 1` introduces non-determinism in
+#                                some rustc versions; serialising the
+#                                codegen costs build time but stabilises
+#                                output.
+#   - strip = "symbols"        : strips debug + symbol tables from the
+#                                shipped .so. Rebuild reproducibly via
+#                                the `--remap-path-prefix` flags applied
+#                                in build_rust.sh.
+#   - panic = "abort"          : avoids unwind tables in the .so, which
+#                                can carry symbol-table residuals.
+#   - incremental = false      : incremental caches embed timestamps.
+#   - debug = false            : already implied by `strip`, pinned for
+#                                clarity.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false
+debug = false

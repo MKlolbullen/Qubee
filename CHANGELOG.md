@@ -54,6 +54,21 @@ between minor versions.
 
 ### Security
 
+- **Sealed outer envelope on group messages.** Pre-this-change, every
+  group message put `sender_id`, `generation`, `timestamp`, the hybrid
+  signature, and the inner AEAD ciphertext on the wire as plaintext
+  bincode; anyone subscribed to the gossipsub topic could read sender
+  identity per message even without the group key. The wire format
+  bumped to `MAGIC_GROUP_MESSAGE \x02` and now wraps the existing
+  signed envelope in a second ChaCha20-Poly1305 layer keyed off
+  `BLAKE3::derive_key("qubee outer envelope v1", group_key)` with the
+  `group_id` as AEAD associated data. Only `group_id` (already
+  revealed by the topic name) and the outer nonce stay plaintext.
+  Inner signature verification + generation gate are unchanged. New
+  tests pin (a) sender_id is not byte-recoverable from the wire, (b)
+  any tampering past the magic prefix is rejected by the outer AEAD,
+  (c) the observer-without-key path returns Err.
+
 - **Private identity keys now genuinely encrypted at rest.** The Rust
   core keystore (`qubee_keys.db` / `qubee_groups.db`) previously
   wrapped its master key under a hardcoded `"default_password"`,

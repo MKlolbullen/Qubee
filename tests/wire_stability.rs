@@ -34,7 +34,11 @@ fn handshake_magic_is_pinned() {
 
 #[test]
 fn group_message_magic_is_pinned() {
-    assert_eq!(MAGIC_GROUP_MESSAGE, b"QUBEE_GMS\x01");
+    // `\x02` is the sealed-outer-envelope wire format. `\x01` was the
+    // pre-sealing format that left signed bodies plaintext on the
+    // wire; pinned here so a "let's bump the magic" change has to
+    // also bump this assertion (and the doc on `MAGIC_GROUP_MESSAGE`).
+    assert_eq!(MAGIC_GROUP_MESSAGE, b"QUBEE_GMS\x02");
 }
 
 #[test]
@@ -290,9 +294,25 @@ proptest! {
         let payload = canonical_group_message(&body);
         let signature = kp.sign(&payload).unwrap();
         let envelope = GroupMessageEnvelope { body: body.clone(), signature };
-        let wire = envelope.to_wire().expect("to_wire");
-        let decoded = GroupMessageEnvelope::from_wire(&wire)
-            .expect("from_wire on freshly-encoded envelope must succeed");
+
+        // Round-trip via the sealed outer envelope. The sealed wire is
+        // what actually rides on gossipsub; pinning the structure here
+        // catches anyone "simplifying" the seal/open path in a way
+        // that breaks bincode round-trips of the inner envelope.
+        let group_key = [0x5Au8; 32];
+        let inner = envelope.to_inner_bincode().expect("inner bincode");
+        let wire = qubee_crypto::groups::group_message::seal_outer_envelope(
+            &body.group_id, &group_key, &inner,
+        )
+        .expect("seal");
+        let (gid_out, inner_out) = qubee_crypto::groups::group_message::open_outer_envelope(
+            &wire,
+            |gid| if *gid == body.group_id { Some(group_key) } else { None },
+        )
+        .expect("open");
+        prop_assert_eq!(gid_out, body.group_id);
+        let decoded = GroupMessageEnvelope::from_inner_bincode(&inner_out)
+            .expect("from_inner_bincode on freshly-encoded inner envelope must succeed");
         prop_assert_eq!(decoded.body.group_id, body.group_id);
         prop_assert_eq!(decoded.body.sender_id, body.sender_id);
         prop_assert_eq!(decoded.body.generation, body.generation);

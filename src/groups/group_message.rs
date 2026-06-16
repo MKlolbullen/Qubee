@@ -23,11 +23,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::groups::group_manager::{GroupId, GroupManager};
 use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use crate::security::secure_rng;
 
-/// Magic prefix for a group-message frame. Distinct from the
-/// handshake magic so the dispatch loop can tell the two apart
-/// without a bincode round-trip.
-pub const MAGIC_GROUP_MESSAGE: &[u8] = b"QUBEE_GMS\x01";
+/// Magic prefix for a group-message frame.
+///
+/// `\x02` is the sealed-outer-envelope wire format: the only plaintext
+/// metadata on the wire is the group id (which is already revealed by
+/// the gossipsub topic name) and the outer AEAD nonce. Everything else
+/// — sender id, generation, timestamp, hybrid signature, the inner
+/// AEAD ciphertext — is encrypted under a key derived from the group
+/// key, so a passive observer subscribed to the topic learns nothing
+/// beyond "a member sent N bytes at some time".
+///
+/// `\x01` was the pre-sealing format that left the signed body
+/// bincoded in plaintext. We don't accept `\x01` on the receive path
+/// any more — pre-this-change builds have to upgrade. The pre-alpha
+/// posture in `SECURITY.md` already documents that minor-version
+/// upgrades may break in-flight messages.
+pub const MAGIC_GROUP_MESSAGE: &[u8] = b"QUBEE_GMS\x02";
+
+/// Domain-separation tag for the BLAKE3 KDF that turns the group key
+/// into the outer-envelope ChaCha20-Poly1305 key. Distinct from any
+/// other derivation in the protocol so a compromise of either layer's
+/// key reveals nothing about the other.
+const OUTER_ENVELOPE_KDF_CONTEXT: &str = "qubee outer envelope v1";
 
 /// Maximum age of a group message frame. Bounds the replay window
 /// for a captured frame. 5 minutes matches the rest of the protocol.
@@ -57,22 +80,120 @@ pub struct GroupMessageEnvelope {
 }
 
 impl GroupMessageEnvelope {
-    pub fn to_wire(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(MAGIC_GROUP_MESSAGE.len() + 256);
-        out.extend_from_slice(MAGIC_GROUP_MESSAGE);
-        out.extend_from_slice(&bincode::serialize(self).context("group message serialize")?);
-        Ok(out)
+    /// Bincode the signed envelope. The resulting bytes are NEVER
+    /// published as a standalone wire frame — real on-the-wire frames
+    /// are always wrapped by [`seal_outer_envelope`] so the metadata
+    /// stays encrypted. Exposed `pub` so the wire-stability proptest
+    /// can round-trip an envelope structure independently of the
+    /// outer-AEAD layer.
+    pub fn to_inner_bincode(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).context("group message serialize")
     }
 
-    pub fn from_wire(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < MAGIC_GROUP_MESSAGE.len() {
-            return None;
-        }
-        if &bytes[..MAGIC_GROUP_MESSAGE.len()] != MAGIC_GROUP_MESSAGE {
-            return None;
-        }
-        bincode::deserialize(&bytes[MAGIC_GROUP_MESSAGE.len()..]).ok()
+    pub fn from_inner_bincode(bytes: &[u8]) -> Result<Self> {
+        bincode::deserialize(bytes).context("group message deserialize")
     }
+}
+
+/// Returns `true` if `wire` carries the sealed-group-message magic
+/// prefix. Cheap O(1) check used by the inbound dispatcher to route
+/// frames without attempting a full AEAD decrypt.
+pub fn is_group_message_frame(wire: &[u8]) -> bool {
+    wire.len() >= MAGIC_GROUP_MESSAGE.len()
+        && &wire[..MAGIC_GROUP_MESSAGE.len()] == MAGIC_GROUP_MESSAGE
+}
+
+/// Group-key → outer-AEAD-key KDF. BLAKE3 `derive_key` with a fixed
+/// context string; the group key is the input keying material. The
+/// derivation is domain-separated from any other use of the group key
+/// (the inner AEAD uses the group key directly) so a vulnerability in
+/// one layer doesn't bleed into the other.
+fn derive_outer_envelope_key(group_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(OUTER_ENVELOPE_KDF_CONTEXT, group_key)
+}
+
+/// Wrap a bincoded signed envelope in the outer AEAD layer and return
+/// the wire-ready bytes ready for gossipsub publication. Only the
+/// `group_id` and the AEAD nonce are plaintext; everything else
+/// (sender id, generation, timestamp, signature, inner ciphertext) is
+/// sealed.
+pub fn seal_outer_envelope(
+    group_id: &GroupId,
+    group_key: &[u8; 32],
+    inner_bincoded: &[u8],
+) -> Result<Vec<u8>> {
+    let outer_key = derive_outer_envelope_key(group_key);
+    let cipher = ChaCha20Poly1305::new_from_slice(&outer_key)
+        .map_err(|_| anyhow!("invalid outer key length"))?;
+    let nonce_bytes = secure_rng::random::array::<12>()?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    // Bind the outer AEAD to the group_id by including it as
+    // associated data — prevents a captured ciphertext from being
+    // replayed onto a different group's topic.
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            chacha20poly1305::aead::Payload {
+                msg: inner_bincoded,
+                aad: group_id.as_ref(),
+            },
+        )
+        .map_err(|e| anyhow!("outer envelope seal: {e:?}"))?;
+
+    let mut out = Vec::with_capacity(MAGIC_GROUP_MESSAGE.len() + 32 + 12 + ciphertext.len());
+    out.extend_from_slice(MAGIC_GROUP_MESSAGE);
+    out.extend_from_slice(group_id.as_ref());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Strip the outer-envelope layer. Returns `(group_id, inner_bincoded)`
+/// on success.
+///
+/// `group_key_lookup` is a closure that takes the parsed `group_id`
+/// and returns the current 32-byte group key for it, or `None` if the
+/// receiver isn't a member. Two-stage because the wire carries
+/// `group_id` in the clear (it's identical to the gossipsub topic
+/// name), but the inner ciphertext can only be opened with the right
+/// group key — so the parser first reads `group_id`, asks the caller
+/// which key to use, then attempts AEAD.
+pub fn open_outer_envelope(
+    wire: &[u8],
+    group_key_lookup: impl FnOnce(&GroupId) -> Option<[u8; 32]>,
+) -> Result<(GroupId, Vec<u8>)> {
+    if wire.len() < MAGIC_GROUP_MESSAGE.len() + 32 + 12 {
+        return Err(anyhow!("outer envelope too short"));
+    }
+    if &wire[..MAGIC_GROUP_MESSAGE.len()] != MAGIC_GROUP_MESSAGE {
+        return Err(anyhow!("not a sealed group-message frame"));
+    }
+    let mut offset = MAGIC_GROUP_MESSAGE.len();
+
+    let mut group_id_bytes = [0u8; 32];
+    group_id_bytes.copy_from_slice(&wire[offset..offset + 32]);
+    let group_id = GroupId::from_bytes(group_id_bytes);
+    offset += 32;
+
+    let nonce = Nonce::from_slice(&wire[offset..offset + 12]);
+    offset += 12;
+    let ciphertext = &wire[offset..];
+
+    let group_key = group_key_lookup(&group_id)
+        .ok_or_else(|| anyhow!("outer envelope: unknown group / not a member"))?;
+    let outer_key = derive_outer_envelope_key(&group_key);
+    let cipher = ChaCha20Poly1305::new_from_slice(&outer_key)
+        .map_err(|_| anyhow!("invalid outer key length"))?;
+    let inner = cipher
+        .decrypt(
+            nonce,
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: group_id.as_ref(),
+            },
+        )
+        .map_err(|e| anyhow!("outer envelope open: {e:?}"))?;
+    Ok((group_id, inner))
 }
 
 /// Canonical bytes the sender's [`HybridSignature`] covers. Built by
@@ -117,13 +238,19 @@ pub fn group_message_id(body: &GroupMessageBody) -> [u8; 16] {
     out
 }
 
-/// Convenience: parse a wire envelope and extract its message id.
-/// Returns `None` if the bytes don't carry a `MAGIC_GROUP_MESSAGE`
-/// frame. Used by the JNI side so the Kotlin caller of
+/// Convenience: parse a sealed wire envelope and extract its message
+/// id. Used by the JNI side so the Kotlin caller of
 /// `nativeSendGroupMessage` can persist the id for the row it just
 /// wrote, without re-implementing the BLAKE3 in Kotlin.
-pub fn extract_message_id(wire: &[u8]) -> Option<[u8; 16]> {
-    let envelope = GroupMessageEnvelope::from_wire(wire)?;
+///
+/// Takes `&GroupManager` because the outer envelope is encrypted under
+/// a key derived from the group key — we have to unseal before we can
+/// compute the id from the inner body. Returns `None` if the bytes
+/// aren't a valid sealed frame for a group the receiver is a member
+/// of.
+pub fn extract_message_id(gm: &GroupManager, wire: &[u8]) -> Option<[u8; 16]> {
+    let (_, inner) = open_outer_envelope(wire, |gid| gm.export_group_key(gid)).ok()?;
+    let envelope = GroupMessageEnvelope::from_inner_bincode(&inner).ok()?;
     Some(group_message_id(&envelope.body))
 }
 
@@ -167,7 +294,16 @@ pub fn encrypt_group_message(
         .sign(&payload)
         .context("sign group message")?;
     let envelope = GroupMessageEnvelope { body, signature };
-    envelope.to_wire()
+    let inner_bincoded = envelope.to_inner_bincode()?;
+
+    // Seal under the outer-envelope key so passive observers on the
+    // gossipsub topic learn nothing beyond (group_id, message_size,
+    // timestamp-of-arrival). `sender_id`, `generation`, the signature,
+    // and the inner AEAD ciphertext are all encrypted by this layer.
+    let group_key = gm
+        .export_group_key(&group_id)
+        .ok_or_else(|| anyhow!("encrypt: no group key installed"))?;
+    seal_outer_envelope(&group_id, &group_key, &inner_bincoded)
 }
 
 /// Validate + decrypt a wire-format group-message frame.
@@ -185,9 +321,15 @@ pub fn encrypt_group_message(
 /// `process_key_rotation` flips the kicked member's status, so any
 /// later GroupMessage from them is rejected here on purely local
 /// state.
-pub fn decrypt_group_message(gm: &GroupManager, wire: &[u8]) -> Result<DecryptedGroupMessage> {
-    let envelope = GroupMessageEnvelope::from_wire(wire)
-        .ok_or_else(|| anyhow!("not a group message frame"))?;
+pub fn decrypt_group_message(
+    gm: &GroupManager,
+    wire: &[u8],
+) -> Result<DecryptedGroupMessage> {
+    // Strip the outer-envelope layer first. Failure here (wrong magic,
+    // wrong group, outer AEAD reject) means the frame either isn't ours
+    // or has been tampered with — bounce it before any signature work.
+    let (_outer_group_id, inner) = open_outer_envelope(wire, |gid| gm.export_group_key(gid))?;
+    let envelope = GroupMessageEnvelope::from_inner_bincode(&inner)?;
     let body = &envelope.body;
 
     let group = gm

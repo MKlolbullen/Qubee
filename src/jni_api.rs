@@ -18,15 +18,12 @@ use crate::groups::group_handshake::{
 };
 use crate::groups::group_permissions::Role;
 use crate::groups::group_message::{
-    decrypt_group_message, encrypt_group_message, extract_message_id, group_message_id,
-    GroupMessageEnvelope,
+    decrypt_group_message, encrypt_group_message, extract_message_id, is_group_message_frame,
 };
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
-use crate::groups::group_message::{
-    decrypt_group_message, encrypt_group_message, GroupMessageEnvelope,
-};
+use crate::groups::group_invite::InvitePayload;
 use crate::groups::handshake_handlers::{
     plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
@@ -337,8 +334,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                                         handle_inbound_handshake(handshake, sender.clone());
                                         continue;
                                     }
-                                    if let Some(envelope) = GroupMessageEnvelope::from_wire(data) {
-                                        handle_inbound_group_message(envelope);
+                                    if is_group_message_frame(data) {
+                                        handle_inbound_group_message(data.clone());
                                         continue;
                                     }
                                 }
@@ -394,27 +391,30 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
 }
 
 // --- Helper: Dispatch to Kotlin ---
-fn handle_inbound_group_message(envelope: GroupMessageEnvelope) {
+fn handle_inbound_group_message(wire: Vec<u8>) {
     let result: anyhow::Result<()> = (|| {
-        // Compute the canonical message id once, before the AEAD
-        // round-trip — both the auto-ack and the Kotlin dispatch
-        // need it. Hashing the body is cheap relative to the AEAD
-        // op so the up-front cost is negligible.
-        let message_id = group_message_id(&envelope.body);
-        let group_id = envelope.body.group_id;
-        let sender_id = envelope.body.sender_id;
-
-        let decrypted = {
+        // Open + decrypt under one lock acquisition. The decrypted
+        // shape gives us (group_id, sender_id, plaintext) for the
+        // Kotlin dispatch, plus we need the inner envelope's
+        // canonical body to compute the message id for the auto-ack.
+        let (decrypted, message_id) = {
             let mut gm_guard = GROUP_MANAGER.lock().unwrap();
             let gm = gm_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-            // Re-frame the envelope so the canonical decrypt helper can
-            // verify + AEAD-decrypt it. We have the envelope already, so
-            // we just need to feed wire bytes back in.
-            let wire = envelope.to_wire()?;
-            decrypt_group_message(gm, &wire)?
+            // `extract_message_id` re-opens the outer envelope (cheap
+            // AEAD; the alternative was to thread the id out of
+            // `decrypt_group_message` itself). The dispatcher uses
+            // the gm immutably for both — fine, the borrow checker
+            // sees the immutable extract finish before the
+            // mut-borrow for decrypt.
+            let mid = extract_message_id(gm, &wire)
+                .ok_or_else(|| anyhow::anyhow!("could not extract message id"))?;
+            let dec = decrypt_group_message(gm, &wire)?;
+            (dec, mid)
         };
+        let group_id = decrypted.group_id;
+        let sender_id = decrypted.sender_id;
 
         dispatch_group_message_to_kotlin(&decrypted);
 
@@ -1028,7 +1028,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtrac
             let bytes = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("convert_byte_array: {e}"))?;
-            let id = match extract_message_id(&bytes) {
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let id = match extract_message_id(gm, &bytes) {
                 Some(id) => id,
                 None => return Ok(std::ptr::null_mut()),
             };
@@ -2259,8 +2263,22 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
             let wire_bytes: Vec<u8> = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("invalid wire bytes: {e}"))?;
-            let envelope = GroupMessageEnvelope::from_wire(&wire_bytes)
-                .ok_or_else(|| anyhow::anyhow!("not a group message frame"))?;
+            // The sender id used to be plaintext on the wire; with
+            // sealed envelopes it's only accessible after opening the
+            // outer AEAD layer with the group key. So this helper now
+            // needs a GroupManager handle — which we have via the
+            // global. If the local user isn't a member of the group
+            // the lookup returns None and we surface a null senderId,
+            // same as for a wire that simply doesn't decrypt.
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let (_group_id, inner) = crate::groups::group_message::open_outer_envelope(
+                &wire_bytes,
+                |gid| gm.export_group_key(gid),
+            )?;
+            let envelope = crate::groups::group_message::GroupMessageEnvelope::from_inner_bincode(&inner)?;
             let hex_id = hex::encode(envelope.body.sender_id.as_ref() as &[u8]);
             let java_str = env
                 .new_string(hex_id)

@@ -57,10 +57,32 @@ val MIGRATION_2_3: Migration = object : Migration(2, 3) {
 }
 
 /**
+ * v3 → v4.
+ *
+ * Adds the three columns the offline-retry loop in `MessageService`
+ * needs:
+ *   * `wireBytes BLOB` — the encrypted bytes of the original send,
+ *     preserved so a retry re-publishes the *same* `wireId` and any
+ *     late-arriving ack still correlates.
+ *   * `retryAttempt INTEGER NOT NULL DEFAULT 0` — bounded retry
+ *     counter.
+ *   * `nextRetryAt INTEGER` — wall-clock millis the next retry
+ *     becomes eligible; NULL when no retry is pending.
+ */
+val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE messages ADD COLUMN wireBytes BLOB")
+        db.execSQL("ALTER TABLE messages ADD COLUMN retryAttempt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE messages ADD COLUMN nextRetryAt INTEGER")
+    }
+}
+
+/**
  * Full migration set, in lexical-version order. Registered with
  * Room via `Room.databaseBuilder(...).addMigrations(*ALL_MIGRATIONS)`
  * in [QubeeDatabase.build].
  */
 val ALL_MIGRATIONS: Array<Migration> = arrayOf(
     MIGRATION_2_3,
+    MIGRATION_3_4,
 )

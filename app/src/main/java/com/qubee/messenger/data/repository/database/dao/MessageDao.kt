@@ -65,6 +65,48 @@ abstract class MessageDao {
     @Query("SELECT * FROM messages WHERE wireId = :wireId LIMIT 1")
     abstract suspend fun getMessageByWireId(wireId: String): Message?
 
+    /// Outbound rows the offline-retry loop should re-publish: still
+    /// `SENT` (no ack yet — the `applyAckTransactional` path moves
+    /// the row to `DELIVERED` on first ack and `nextRetryAt` is
+    /// cleared then), carrying preserved `wireBytes`, with a retry
+    /// scheduled at-or-before `now`, and under the attempt budget.
+    @Query(
+        "SELECT * FROM messages " +
+            "WHERE isFromMe = 1 AND status = 'SENT' " +
+            "AND wireBytes IS NOT NULL " +
+            "AND nextRetryAt IS NOT NULL AND nextRetryAt <= :now " +
+            "AND retryAttempt < :maxAttempts " +
+            "ORDER BY timestamp ASC LIMIT :limit"
+    )
+    abstract suspend fun getRetryableOutbound(
+        now: Long,
+        maxAttempts: Int,
+        limit: Int,
+    ): List<Message>
+
+    /// Re-stamp a row after a retry attempt: bumps `retryAttempt` and
+    /// sets the next eligibility. Pass `nextRetryAt = null` to retire
+    /// the row from further retries (budget hit / final failure).
+    @Query(
+        "UPDATE messages SET retryAttempt = :attempt, nextRetryAt = :nextRetryAt " +
+            "WHERE id = :messageId"
+    )
+    abstract suspend fun updateRetrySchedule(
+        messageId: String,
+        attempt: Int,
+        nextRetryAt: Long?,
+    )
+
+    /// Clear retry state once the first `MessageAck` lands. Wired
+    /// into the same transaction as the `deliveredAckers` update so
+    /// a concurrent retry tick can't pick the row up between the
+    /// ack and the clear.
+    @Query(
+        "UPDATE messages SET wireBytes = NULL, nextRetryAt = NULL " +
+            "WHERE id = :messageId"
+    )
+    abstract suspend fun clearRetryState(messageId: String)
+
     /**
      * Atomically read + update the row matched by `wireId` to record
      * `ackerIdHex` as a recipient that ack'd this message. Runs the
@@ -102,6 +144,14 @@ abstract class MessageDao {
             } else {
                 MessageStatus.DELIVERED
             },
+            // First ack arrives — retire the row from the offline
+            // retry loop. Keeping `wireBytes` around past this point
+            // would let a stale loop re-publish bytes the peer has
+            // already seen + ack'd. Inside the same transaction so a
+            // concurrent retry tick can't observe the half-updated
+            // state.
+            wireBytes = null,
+            nextRetryAt = null,
         )
         updateMessage(updated)
         return ApplyAckResult.Applied

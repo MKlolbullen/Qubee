@@ -44,6 +44,26 @@ class MessageRepository @Inject constructor(
     }
 
     /**
+     * Return outbound rows whose retry timer has fired and whose
+     * budget hasn't been exhausted. Used by `MessageService`'s
+     * offline-retry loop.
+     */
+    suspend fun dueForRetry(now: Long, maxAttempts: Int, limit: Int): List<Message> =
+        messageDao.getRetryableOutbound(now = now, maxAttempts = maxAttempts, limit = limit)
+
+    /**
+     * Re-stamp a row after a retry tick. Pass `nextRetryAt = null`
+     * to retire the row (budget exhausted).
+     */
+    suspend fun scheduleNextRetry(
+        messageId: String,
+        attempt: Int,
+        nextRetryAt: Long?,
+    ) {
+        messageDao.updateRetrySchedule(messageId, attempt, nextRetryAt)
+    }
+
+    /**
      * Apply an inbound `MessageAck` to the local outbound row.
      *
      * Delegates to [MessageDao.applyAckTransactional] so the

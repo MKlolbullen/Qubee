@@ -155,6 +155,24 @@ data class Message(
     /// the same recipient (set semantics) and rendering the
     /// "delivered to N of M" hint on the chat row.
     val deliveredAckers: List<String> = emptyList(),
+    /// The raw wire bytes (sealed outer envelope) produced by the
+    /// first encrypt. Kept around so the offline-retry loop can
+    /// re-publish *the same bytes* — preserving the row's `wireId`
+    /// so any late-arriving `MessageAck` still correlates back to
+    /// this row. Cleared once the first ack arrives; null on rows
+    /// that don't need retry (DELIVERED / READ already, or the
+    /// retry budget is exhausted).
+    val wireBytes: ByteArray? = null,
+    /// Number of times the offline-retry loop has re-published
+    /// `wireBytes`. Bounded by `OFFLINE_RETRY_MAX_ATTEMPTS` (see
+    /// `MessageService`); after that the row is left alone and the
+    /// user can re-send manually.
+    val retryAttempt: Int = 0,
+    /// Wall-clock millis at which the next retry attempt becomes
+    /// eligible. Null means "no retry pending" — either the message
+    /// has been ack'd at least once, or the budget is exhausted, or
+    /// the row is inbound (never retried).
+    val nextRetryAt: Long? = null,
 )
 
 data class MessageWithSender(

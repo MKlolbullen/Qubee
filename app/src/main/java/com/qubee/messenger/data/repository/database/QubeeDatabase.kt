@@ -28,15 +28,15 @@ import timber.log.Timber
     ],
     // v2: Contact gained a `peerId` column (libp2p routing) and a
     //     matching index.
-    // v3: Message gained `wireId` (32-char hex of the canonical
-    //     group-message id, used to look up the row when an
-    //     `onMessageAcked` callback arrives) and `deliveredAckers`
-    //     (JSON-encoded list of acker `IdentityId` hex values).
+    // v3: Message gained `wireId` + `deliveredAckers`.
+    // v4: Message gained `wireBytes` / `retryAttempt` / `nextRetryAt`
+    //     so `MessageService`'s background retry loop can re-publish
+    //     bytes that didn't make it to a peer the first time.
     // exportSchema = true generates JSON snapshots into
     // `app/schemas/<version>.json` so MigrationTestHelper can
     // validate `Migrations.kt` actually moves the schema between
     // versions correctly.
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)

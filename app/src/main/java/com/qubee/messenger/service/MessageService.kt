@@ -30,6 +30,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.util.UUID
@@ -61,6 +62,20 @@ class MessageService : Service(), NetworkCallback {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
+        /// How often the retry loop wakes up to scan the DB. Cheap
+        /// query (indexed on `status` already, `nextRetryAt`
+        /// filtering is in-memory across the small SENT set); 30s
+        /// matches the shortest backoff so a freshly-scheduled
+        /// retry isn't slept past.
+        private const val RETRY_LOOP_INTERVAL_MS: Long = 30_000L
+        /// Bounded retry budget per outbound row. Five attempts
+        /// across the documented backoff schedule (30s, 2m, 10m,
+        /// 30m, 2h) = ~3 hours of attempts before the row is left
+        /// alone.
+        private const val OFFLINE_RETRY_MAX_ATTEMPTS: Int = 5
+        /// Soft cap on rows processed per tick to keep the DB scan
+        /// cheap even with a large backlog.
+        private const val RETRY_BATCH_LIMIT: Int = 32
 
         /**
          * Start the P2P foreground service. Must be called from a
@@ -112,6 +127,7 @@ class MessageService : Service(), NetworkCallback {
                     },
                 )
                 startP2PNetwork()
+                startOfflineRetryLoop()
                 isRunning = true
                 Timber.d("MessageService started")
             } catch (e: Exception) {
@@ -141,6 +157,72 @@ class MessageService : Service(), NetworkCallback {
                 }
             }
         }
+    }
+
+    /**
+     * Periodic re-publish of outbound messages whose recipients
+     * haven't yet ack'd. Re-uses the original `wireBytes` so the
+     * row's `wireId` stays stable and any late ack still correlates
+     * via `MessageRepository.applyAck`.
+     *
+     * Retry budget: [OFFLINE_RETRY_MAX_ATTEMPTS] attempts with the
+     * back-off schedule in [retryBackoffMs] (30s, 2m, 10m, 30m, 2h —
+     * roughly three hours total). After the budget is hit `nextRetryAt`
+     * is cleared, the row stays `SENT` indefinitely, and the user
+     * can manually resend.
+     *
+     * Group caveat: ack arrival flips status to `DELIVERED` on the
+     * FIRST ack. So a group with 4 active members but only one online
+     * is treated as delivered after the one online member acks — the
+     * other three are still missing. Tracking per-recipient delivery
+     * (and per-recipient retry) needs full membership awareness on
+     * the sender side, which is a separate batch. For v0.1.x the
+     * documented behaviour is "delivered once at least one peer
+     * acks".
+     */
+    private fun startOfflineRetryLoop() {
+        serviceScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(RETRY_LOOP_INTERVAL_MS)
+                try {
+                    runOfflineRetryTick()
+                } catch (e: Exception) {
+                    Timber.w(e, "offline retry tick failed")
+                }
+            }
+        }
+    }
+
+    private suspend fun runOfflineRetryTick() {
+        val now = System.currentTimeMillis()
+        val due = messageRepository.dueForRetry(now, OFFLINE_RETRY_MAX_ATTEMPTS, RETRY_BATCH_LIMIT)
+        if (due.isEmpty()) return
+        Timber.d("offline retry tick: %d row(s) due", due.size)
+        for (row in due) {
+            val wire = row.wireBytes ?: continue
+            val ok = runCatching { qubeeManager.sendP2PMessage(row.senderId, wire) }
+                .getOrDefault(false)
+            val nextAttempt = row.retryAttempt + 1
+            val nextRetry = if (!ok || nextAttempt < OFFLINE_RETRY_MAX_ATTEMPTS) {
+                now + retryBackoffMs(nextAttempt)
+            } else {
+                null // budget exhausted; stop retrying
+            }
+            messageRepository.scheduleNextRetry(row.id, nextAttempt, nextRetry)
+            Timber.d(
+                "retried %s (attempt %d, ok=%s, next=%s)",
+                row.id, nextAttempt, ok, nextRetry,
+            )
+        }
+    }
+
+    /** Exponential back-off in milliseconds, indexed by 1-based attempt. */
+    private fun retryBackoffMs(attempt: Int): Long = when (attempt) {
+        1 -> 30_000L         // 30s
+        2 -> 2L * 60_000L    // 2m
+        3 -> 10L * 60_000L   // 10m
+        4 -> 30L * 60_000L   // 30m
+        else -> 2L * 3_600_000L  // 2h thereafter (caller bounds to budget)
     }
 
     override fun onDestroy() {

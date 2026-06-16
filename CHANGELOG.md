@@ -52,6 +52,23 @@ between minor versions.
   `tracing` calls (error / warn / info by signal class). The
   one secret-leak-risk line dropped its `{e:#}` interpolation.
 
+### Added
+
+- **Offline retry queue for outbound messages.** A peer offline at
+  send-time used to lose the message — there was no store-and-forward
+  layer. `ChatViewModel.sendMessage` now stamps the row with the
+  exact encrypted wire bytes + initial retry schedule
+  (`wireBytes`, `retryAttempt`, `nextRetryAt`; v3 → v4 schema bump
+  via `MIGRATION_3_4`). `MessageService` runs a 30s-tick loop that
+  re-publishes due rows up to a five-attempt budget on a
+  30s/2m/10m/30m/2h backoff. The retry preserves the original
+  `wireId` so any late `MessageAck` still correlates back to the
+  same row. First ack clears the retry state inside the same
+  `applyAckTransactional` transaction. Documented group caveat: a
+  partially-online group is treated as delivered after the first
+  ack — per-recipient delivery tracking lands with the sender-keys
+  rewrite later.
+
 ### Build / tooling
 
 - **Reproducible-build procedure** pinned end-to-end. New

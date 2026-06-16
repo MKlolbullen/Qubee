@@ -175,8 +175,13 @@ class ChatViewModel @Inject constructor(
             // path that can't fire acks anyway.
             val wireId = qubeeManager.extractMessageId(wire)
 
-            // Save the row with the wireId already present — no
-            // intermediate state visible to MessageService.applyAck.
+            // Save the row with the wireId + retry payload already
+            // present. `wireBytes` lets `MessageService`'s background
+            // loop re-publish the *same* wire if the peer is offline
+            // — same wire = same wireId = late acks still correlate.
+            // First retry attempt scheduled `INITIAL_RETRY_DELAY_MS`
+            // out so the eager publish below isn't immediately
+            // shadowed.
             val message = Message(
                 id = messageId,
                 conversationId = conversationId,
@@ -187,6 +192,9 @@ class ChatViewModel @Inject constructor(
                 status = MessageStatus.SENDING,
                 isFromMe = true,
                 wireId = wireId,
+                wireBytes = wire,
+                retryAttempt = 0,
+                nextRetryAt = now + INITIAL_RETRY_DELAY_MS,
             )
             messageRepository.saveMessage(message)
 
@@ -205,7 +213,7 @@ class ChatViewModel @Inject constructor(
             val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
             messageRepository.updateMessageStatus(messageId, newStatus)
             if (!sendOk) {
-                _events.emit(ChatUiEvent.Notice("P2P send failed"))
+                _events.emit(ChatUiEvent.Notice("P2P send failed — will retry"))
             }
         }
     }
@@ -739,6 +747,11 @@ class ChatViewModel @Inject constructor(
         // resolved 64-char hex identity id — same shape as
         // `nativeInspectEnvelopeSender` returns for inbound rows.
         const val SELF_SENDER_ID_FALLBACK: String = "self"
+        // First retry of an unack'd outbound becomes eligible 30s
+        // after the initial send. `MessageService`'s retry loop
+        // picks rows up at-or-after this point; the backoff schedule
+        // is in `MessageService.retryBackoffMs`.
+        const val INITIAL_RETRY_DELAY_MS: Long = 30_000L
     }
 }
 

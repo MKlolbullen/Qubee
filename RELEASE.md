@@ -92,10 +92,24 @@ Cancel the run after the keystore step finishes.
 
 ### 1. Confirm the changelog
 
-`CHANGELOG.md` should already have a `## [<version>]` section for
-the version you're tagging. If not, add it as a separate commit
-*before* tagging. The release workflow extracts this section as the
-GitHub Release body.
+Rename the `## [Unreleased]` heading to `## [<version>] — <date>`
+in a commit *before* tagging. The release workflow's notes
+extraction (`grep "^## \[<version>\]"` + an awk slice to the next
+`## `) takes the **first** matching heading and prints to the next
+section break, so:
+
+- There must be **exactly one** `## [<version>]` heading. If a
+  prior draft section with the same version exists, merge or delete
+  it — two matching headings produce truncated or wrong release
+  notes.
+- The renamed section must be the comprehensive one (the former
+  `[Unreleased]`), not a stale stub.
+
+Verify before tagging:
+
+```bash
+grep -c "^## \[$version\]" CHANGELOG.md    # must print exactly 1
+```
 
 ### 2. Run the local sanity checks
 

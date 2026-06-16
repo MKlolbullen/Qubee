@@ -202,6 +202,18 @@ A copy-pasteable checklist for the final review before tagging:
 - [ ] `cargo test` passes locally
 - [ ] `cargo build --features _typecheck_jni` clean
 - [ ] `cargo audit --deny unsound --deny yanked` clean
+- [ ] **Release APK builds under R8**: the `android-smoke` workflow's
+      "Assemble release APK (unsigned, R8 dry-run)" step is green on
+      the tag commit. This is the ONLY automated check that exercises
+      `minifyEnabled true` — a green debug build does NOT imply a
+      working release APK (R8 can strip the JNI callbacks or break
+      Gson generics). If you can run it locally:
+      `./gradlew :app:assembleRelease` and confirm it produces
+      `app/build/outputs/apk/release/app-release-unsigned.apk`.
+- [ ] **Post-build sanity on the signed APK** (after the release
+      workflow runs): install it and confirm an inbound message
+      actually arrives — that proves the `NetworkCallback` methods
+      survived R8 (their loss is silent; no crash, just no messages).
 - [ ] `CHANGELOG.md` has a `## [<version>]` entry
 - [ ] `SECURITY.md` reflects current state
 - [ ] No uncommitted changes on the tag commit (`git status` clean)

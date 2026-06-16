@@ -147,6 +147,29 @@ between minor versions.
 
 ### Fixed
 
+- **Release-build R8 would have broken every inbound message.** The
+  Rust core invokes five `NetworkCallback` methods
+  (`onMessageReceived`, `onGroupMessageReceived`, `onMessageAcked`,
+  `onPeerLinked`, `onPeerDiscovered`) by name via JNI `call_method`,
+  but `proguard-rules.pro` only kept `QubeeManager`'s native methods,
+  not the callback interface or its `MessageService` implementor —
+  so a `minifyEnabled` release build would rename those overrides and
+  silently drop all inbound traffic (no crash, just no messages). A
+  second latent break: zero `-keepattributes`, so `Gson`'s
+  `TypeToken<List<…>>` / `TypeToken<Map<…>>` deserialisation (group
+  rosters, summaries, Room converters) would throw at runtime for
+  lack of the `Signature` attribute. Both fixed; rules also extended
+  to cover `data.model`/`identity` Gson packages, model enums,
+  SQLCipher native, and Room entities. None of this surfaced earlier
+  because debug builds and tests run un-minified.
+- **`android-smoke` CI now builds an unsigned release APK** in
+  addition to debug, so the full R8 pipeline runs on every PR — the
+  class of break above is caught pre-tag instead of at release time.
+  Needs no signing secrets (the `hasReleaseSigning` gate leaves it
+  unsigned but still shrunk/obfuscated). RELEASE.md checklist gains
+  the R8 dry-run + a post-install "did an inbound message actually
+  arrive" sanity step (the only way to confirm the callbacks
+  survived, since their loss is silent).
 - **Lost-update race in `MessageRepository.applyAck`** — two acks
   from different recipients arriving simultaneously could lose
   one to a stale-read race. The read-modify-write now happens

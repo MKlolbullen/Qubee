@@ -71,6 +71,18 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
+      - name: Assemble release APK (unsigned, R8 dry-run)
+        # The release variant has minifyEnabled=true, so this is the
+        # ONLY pre-tag check that exercises R8/ProGuard. Debug builds
+        # and unit tests run un-minified and would sail past an
+        # R8-stripped JNI callback or a Gson Signature-attribute
+        # break. No signing secrets needed: the `hasReleaseSigning`
+        # gate in app/build.gradle leaves the APK unsigned when the
+        # RELEASE_* env vars are absent, but still runs the full
+        # shrink/obfuscate pipeline. A failure here is a release
+        # blocker caught on the PR instead of at `git tag` time.
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
       - name: Lint debug
         # Non-fatal — lint catches a much broader surface than
         # build, but its baseline includes warnings inherited from
@@ -78,10 +90,12 @@ jobs:
         # visibility but don't gate the PR on it.
         run: ./gradlew :app:lintDebug --no-daemon || true
 
-      - name: Upload debug APK
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: qubee-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
+          name: qubee-apks-${{ github.sha }}
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
           retention-days: 7
           if-no-files-found: warn

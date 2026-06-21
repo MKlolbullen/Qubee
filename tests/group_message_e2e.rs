@@ -21,7 +21,7 @@ use tempfile::TempDir;
 fn fresh_device(label: &str) -> (TempDir, IdentityKeyPair, GroupManager) {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join(format!("{label}.db"));
-    let ks = SecureKeyStore::new(&path).expect("keystore");
+    let ks = SecureKeyStore::new(&path, b"test-keystore-passphrase").expect("keystore");
     let gm = GroupManager::new(ks).expect("group manager");
     let kp = IdentityKeyPair::generate().expect("identity");
     (dir, kp, gm)
@@ -214,7 +214,7 @@ fn forge_message_with_generation(
     generation: u64,
 ) -> Vec<u8> {
     use qubee_crypto::groups::group_message::{
-        canonical_group_message, GroupMessageBody, GroupMessageEnvelope,
+        canonical_group_message, seal_outer_envelope, GroupMessageBody, GroupMessageEnvelope,
     };
     let aead_payload = gm.encrypt_group_message(&group_id, plaintext).unwrap();
     let body = GroupMessageBody {
@@ -229,7 +229,12 @@ fn forge_message_with_generation(
     };
     let payload = canonical_group_message(&body);
     let signature = sender_kp.sign(&payload).unwrap();
-    GroupMessageEnvelope { body, signature }.to_wire().unwrap()
+    let envelope = GroupMessageEnvelope { body: body.clone(), signature };
+    let inner = envelope.to_inner_bincode().unwrap();
+    let group_key = gm
+        .export_group_key(&group_id)
+        .expect("group key installed");
+    seal_outer_envelope(&group_id, &group_key, &inner).unwrap()
 }
 
 #[test]
@@ -322,9 +327,11 @@ fn future_generation_is_rejected() {
 
 #[test]
 fn wire_format_magic_prefix_is_stable() {
-    // Stability check: a v1 GroupMessageEnvelope frame begins with
-    // exactly the bytes `QUBEE_GMS\x01`. Any change here is a wire
-    // break that needs a version bump and migration.
+    // Stability check: a sealed GroupMessageEnvelope frame begins with
+    // exactly the bytes `QUBEE_GMS\x02`. `\x01` was the pre-sealing
+    // format; any further change is a wire break needing a version
+    // bump and migration. The pinned-magic check in `wire_stability.rs`
+    // mirrors this assertion.
     let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
     let alice_id = alice_kp.identity_id();
     let group_id = alice_gm
@@ -340,7 +347,7 @@ fn wire_format_magic_prefix_is_stable() {
     alice_gm.ensure_group_key(group_id).unwrap();
 
     let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();
-    assert!(wire.starts_with(b"QUBEE_GMS\x01"));
+    assert!(wire.starts_with(b"QUBEE_GMS\x02"));
 }
 
 // ---------------------------------------------------------------------
@@ -707,7 +714,15 @@ fn message_older_than_max_age_is_rejected() {
     // `+ 60` to put us a clean minute past the cliff so we don't race
     // with the wall clock's second granularity.
     signature.timestamp = signature.timestamp - GROUP_MESSAGE_MAX_AGE_SECS - 60;
-    let wire = GroupMessageEnvelope { body, signature }.to_wire().unwrap();
+    let envelope = GroupMessageEnvelope { body: body.clone(), signature };
+    let inner = envelope.to_inner_bincode().unwrap();
+    let group_key = alice_gm
+        .export_group_key(&group_id)
+        .expect("alice has the group key");
+    let wire = qubee_crypto::groups::group_message::seal_outer_envelope(
+        &group_id, &group_key, &inner,
+    )
+    .unwrap();
 
     let result = decrypt_group_message(&bob_gm, &wire);
     assert!(
@@ -1018,4 +1033,474 @@ fn lagging_member_resyncs_after_missing_key_rotation() {
     let decrypted = decrypt_group_message(&bob_gm, &wire)
         .expect("Bob must decrypt Alice's post-rotation message after resync");
     assert_eq!(decrypted.plaintext, payload);
+}
+
+// ---------------------------------------------------------------------
+// 5d — transfer_ownership + OwnershipTransfer wire frame
+// ---------------------------------------------------------------------
+
+#[test]
+fn owner_can_transfer_ownership_to_existing_admin() {
+    use qubee_crypto::groups::group_handshake::{sign_ownership_transfer, GroupHandshake};
+    use qubee_crypto::groups::group_permissions::Role;
+    use qubee_crypto::groups::handshake_handlers::process_ownership_transfer;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Alice transfers ownership to Bob.
+    let body = alice_gm
+        .transfer_ownership(group_id, alice_id, bob_kp.identity_id())
+        .expect("owner may transfer ownership to an active member");
+    let signed = sign_ownership_transfer(&alice_kp, body.clone()).unwrap();
+    let (ot_body, ot_sig) = match signed {
+        GroupHandshake::OwnershipTransfer { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Alice's local view already reflects the swap.
+    let group = alice_gm.get_group(&group_id).unwrap();
+    assert_eq!(group.members.get(&alice_id).unwrap().role, Role::Admin);
+    assert_eq!(group.members.get(&bob_kp.identity_id()).unwrap().role, Role::Owner);
+
+    // Bob applies the broadcast and converges.
+    process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig)
+        .expect("Bob applies the ownership transfer");
+    let bob_group = bob_gm.get_group(&group_id).unwrap();
+    assert_eq!(bob_group.members.get(&alice_id).unwrap().role, Role::Admin);
+    assert_eq!(
+        bob_group.members.get(&bob_kp.identity_id()).unwrap().role,
+        Role::Owner,
+    );
+    assert_eq!(
+        bob_group.version,
+        alice_gm.get_group(&group_id).unwrap().version,
+        "post-transfer version must agree across devices",
+    );
+
+    // Group key is unchanged; encrypted round-trip still works.
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"after transfer").unwrap();
+    let decrypted =
+        decrypt_group_message(&bob_gm, &wire).expect("post-transfer decryption works");
+    assert_eq!(decrypted.plaintext, b"after transfer");
+}
+
+#[test]
+fn non_owner_cannot_transfer_ownership() {
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Bob is a Member; tries to transfer ownership to Alice. Must fail
+    // with the owner-only gate before any local mutation happens.
+    let before_alice_role = bob_gm
+        .get_group(&group_id)
+        .unwrap()
+        .members
+        .get(&alice_id)
+        .unwrap()
+        .role
+        .clone();
+    let result = bob_gm.transfer_ownership(group_id, bob_kp.identity_id(), alice_id);
+    assert!(
+        result.is_err(),
+        "non-owner must not be able to transfer ownership",
+    );
+    let after_alice_role = bob_gm
+        .get_group(&group_id)
+        .unwrap()
+        .members
+        .get(&alice_id)
+        .unwrap()
+        .role
+        .clone();
+    assert_eq!(
+        before_alice_role, after_alice_role,
+        "failed transfer must not mutate local view",
+    );
+}
+
+#[test]
+fn ownership_transfer_replays_idempotently() {
+    use qubee_crypto::groups::group_handshake::{sign_ownership_transfer, GroupHandshake};
+    use qubee_crypto::groups::group_permissions::Role;
+    use qubee_crypto::groups::handshake_handlers::process_ownership_transfer;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    let body = alice_gm
+        .transfer_ownership(group_id, alice_id, bob_kp.identity_id())
+        .unwrap();
+    let signed = sign_ownership_transfer(&alice_kp, body.clone()).unwrap();
+    let (ot_body, ot_sig) = match signed {
+        GroupHandshake::OwnershipTransfer { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Bob applies the transfer once...
+    process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig).expect("first apply ok");
+
+    // ...then replays. Donor is no longer Owner in Bob's view, so the
+    // re-application must Err — which is what protects against a
+    // forged "transfer back" signed under the now-Admin's key.
+    let replay = process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig);
+    assert!(
+        replay.is_err(),
+        "replaying an already-applied transfer must Err (donor isn't Owner anymore)",
+    );
+
+    // State is unchanged: bob is still Owner, alice still Admin.
+    let bob_group = bob_gm.get_group(&group_id).unwrap();
+    assert_eq!(bob_group.members.get(&alice_id).unwrap().role, Role::Admin);
+    assert_eq!(
+        bob_group.members.get(&bob_kp.identity_id()).unwrap().role,
+        Role::Owner,
+    );
+}
+
+// ---------------------------------------------------------------------
+// 5e — MessageAck wire frame (delivery confirmation)
+// ---------------------------------------------------------------------
+
+#[test]
+fn message_ack_round_trips_after_decrypt() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_message_ack, GroupHandshake, MessageAckBody,
+    };
+    use qubee_crypto::groups::group_message::extract_message_id;
+    use qubee_crypto::groups::handshake_handlers::process_message_ack;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Alice sends. Bob decrypts. Both compute the same message id.
+    let plaintext = b"hello with delivery receipts".as_slice();
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, plaintext).unwrap();
+    let alice_message_id =
+        extract_message_id(&alice_gm, &wire).expect("extract id from wire");
+    let decrypted = decrypt_group_message(&bob_gm, &wire).unwrap();
+
+    // Bob recomputes the id from his copy of the body. Should match
+    // exactly — that's how acks reference the same message without
+    // an explicit id field on the envelope.
+    let bob_message_id =
+        extract_message_id(&bob_gm, &wire).expect("bob can also extract id");
+    let _ = decrypted; // we just needed the side-effect of decrypt success
+    assert_eq!(alice_message_id, bob_message_id, "id is deterministic");
+
+    // Bob signs an ack and broadcasts. Alice processes it.
+    let ack_body = MessageAckBody {
+        group_id,
+        message_id: bob_message_id,
+        acker_id: bob_kp.identity_id(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let signed = sign_message_ack(&bob_kp, ack_body.clone()).unwrap();
+    let (ack_body, ack_sig) = match signed {
+        GroupHandshake::MessageAck { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Alice's view: Bob is an active member; signature verifies.
+    process_message_ack(&alice_gm, &ack_body, &ack_sig)
+        .expect("Alice accepts Bob's ack on her own outbound");
+    // The handler returns Ok(()) — there's no Rust-side ack store;
+    // the JNI layer dispatches the (message_id, acker_id) tuple to
+    // Kotlin and the Message DAO updates its delivered set.
+}
+
+#[test]
+fn message_ack_from_non_member_rejected() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_message_ack, GroupHandshake, MessageAckBody,
+    };
+    use qubee_crypto::groups::handshake_handlers::process_message_ack;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let (_eve_dir, eve_kp, _eve_gm) = fresh_device("eve");
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    // Eve, not a group member, attempts to ack a message in Alice's
+    // group. Even with a syntactically valid signature, the active-
+    // member gate must reject the ack.
+    let ack_body = MessageAckBody {
+        group_id,
+        message_id: [42u8; 16],
+        acker_id: eve_kp.identity_id(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let signed = sign_message_ack(&eve_kp, ack_body.clone()).unwrap();
+    let (ack_body, ack_sig) = match signed {
+        GroupHandshake::MessageAck { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    let result = process_message_ack(&alice_gm, &ack_body, &ack_sig);
+    assert!(result.is_err(), "non-member ack must be rejected");
+}
+
+#[test]
+fn message_ack_signature_forgery_rejected() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_message_ack, GroupHandshake, MessageAckBody,
+    };
+    use qubee_crypto::groups::handshake_handlers::process_message_ack;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, _bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invite.invitation_code,
+        invite.inviter_name,
+    );
+
+    // Sign as Alice but claim to be Bob — verifies against Bob's key
+    // (since the active-member gate matches `acker_id`); signature
+    // can't possibly verify because Alice doesn't have Bob's secret
+    // key.
+    let ack_body = MessageAckBody {
+        group_id,
+        message_id: [7u8; 16],
+        acker_id: bob_kp.identity_id(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    let signed = sign_message_ack(&alice_kp, ack_body.clone()).unwrap();
+    let (ack_body, ack_sig) = match signed {
+        GroupHandshake::MessageAck { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    let result = process_message_ack(&alice_gm, &ack_body, &ack_sig);
+    assert!(
+        result.is_err(),
+        "ack signed under wrong key must fail verification",
+    );
+}
+
+// ---------------------------------------------------------------------
+// 5f — Sealed outer envelope: sender metadata not on the wire
+// ---------------------------------------------------------------------
+
+/// Property the sealed outer envelope is supposed to guarantee: a
+/// passive observer who can see gossipsub topic traffic — but doesn't
+/// have the group key — must not be able to recover `sender_id`,
+/// `generation`, `timestamp`, or any other inner-envelope field. Only
+/// `group_id` (which is the topic name anyway) and the AEAD nonce
+/// stay plaintext.
+///
+/// We construct this by: encrypting a real message, deleting the
+/// group key from a fresh GroupManager, and then asserting that
+/// (a) decryption fails, (b) raw byte search for the sender id finds
+/// no match in the wire bytes.
+#[test]
+fn sealed_envelope_hides_sender_id_from_observer() {
+    use qubee_crypto::groups::group_message::open_outer_envelope;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"secret payload").unwrap();
+
+    // The plaintext sender id bytes must NOT appear anywhere in the
+    // wire. (32-byte search; if they do appear, sealing is broken.)
+    let sender_bytes: &[u8] = alice_id.as_ref();
+    let observed = wire
+        .windows(sender_bytes.len())
+        .any(|w| w == sender_bytes);
+    assert!(
+        !observed,
+        "sender_id bytes are recoverable from sealed wire — outer encryption is broken",
+    );
+
+    // The plaintext payload also must not appear on the wire.
+    assert!(
+        !wire
+            .windows(b"secret payload".len())
+            .any(|w| w == b"secret payload"),
+        "plaintext bytes are recoverable from sealed wire",
+    );
+
+    // An observer without the group key gets back None.
+    let observer_lookup = |_gid: &qubee_crypto::groups::group_manager::GroupId| -> Option<[u8; 32]> { None };
+    assert!(
+        open_outer_envelope(&wire, observer_lookup).is_err(),
+        "observer without group key must not be able to open outer envelope",
+    );
+
+    // The group_id stays on the wire (it's the topic name anyway, so
+    // this is by design — sealing it would require an additional
+    // routing layer and gain nothing privacy-wise).
+    assert!(
+        wire.windows(group_id.as_ref().len()).any(|w| w == group_id.as_ref()),
+        "group_id is expected to be in the clear (matches topic name)",
+    );
+}
+
+/// Tampering with any byte after the magic prefix must cause AEAD
+/// failure. The outer envelope's AEAD tag (Poly1305) catches the
+/// modification cryptographically; pinned here so a refactor that
+/// accidentally swaps to a non-AEAD construction breaks the test.
+#[test]
+fn sealed_envelope_tampering_is_detected() {
+    use qubee_crypto::groups::group_message::open_outer_envelope;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let group_key = alice_gm.export_group_key(&group_id).unwrap();
+    let lookup = |gid: &qubee_crypto::groups::group_manager::GroupId| {
+        if *gid == group_id { Some(group_key) } else { None }
+    };
+
+    let mut wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();
+    // Flip a bit deep in the ciphertext (past magic + group_id + nonce).
+    let target = wire.len() - 4;
+    wire[target] ^= 0x01;
+    assert!(
+        open_outer_envelope(&wire, lookup).is_err(),
+        "outer AEAD must reject single-bit ciphertext tampering",
+    );
 }

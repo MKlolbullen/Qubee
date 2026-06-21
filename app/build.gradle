@@ -25,11 +25,19 @@ def hasReleaseSigning = releaseKeystoreFile && file(releaseKeystoreFile).exists(
 android {
     namespace 'com.qubee.messenger'
     compileSdk 34
+    // NDK version is pinned in two places (here + the release/
+    // android-smoke CI workflows) because reproducible builds need
+    // the *same* toolchain everywhere — the NDK's libc++ and linker
+    // flags ship inside the .so files and become part of the byte
+    // identity of the release APK. Keep in lock-step with the
+    // `ndk-version` setting in `.github/workflows/*.yml`.
+    ndkVersion '26.1.10909125' // == r26b
 
     defaultConfig {
         applicationId 'com.qubee.messenger'
         minSdk 24
         targetSdk 34
+
         // versionName / versionCode default to a "0.1.0-alpha" pre-release
         // label. Override from the release workflow with
         //   ./gradlew assembleRelease \
@@ -51,6 +59,12 @@ android {
     sourceSets {
         // Rust .so libraries built by build_rust.sh / cargo-ndk land here.
         main.jniLibs.srcDirs = ['src/main/jniLibs']
+        // Surface Room schema snapshots (when kapt has run) to the
+        // androidTest classpath so a future MigrationTestHelper test
+        // can find them at run time. Pre-emptively wired but inert
+        // until both the schemas land on disk and the test that
+        // consumes them comes back.
+        androidTest.assets.srcDirs("$projectDir/schemas")
     }
 
     signingConfigs {
@@ -106,6 +120,17 @@ android {
     }
     // No externalNativeBuild — Rust shared libraries are built out of band
     // by build_rust.sh / cargo-ndk and copied into jniLibs.
+}
+
+// Top-level kapt block — Room reads `room.schemaLocation` from the
+// kapt plugin's argument map specifically (not from
+// `defaultConfig.javaCompileOptions`, which AGP plumbs to javac but
+// not to kapt). Schema JSON files land in `app/schemas/` and are
+// committed; `MigrationTestHelper` consumes them at test time.
+kapt {
+    arguments {
+        arg("room.schemaLocation", "$projectDir/schemas".toString())
+    }
 }
 
 dependencies {
@@ -200,6 +225,9 @@ dependencies {
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
     androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
+    // Room in-memory database support for instrumented DAO tests.
+    androidTestImplementation 'androidx.room:room-testing:2.6.0'
+    androidTestImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3'
 
     debugImplementation 'androidx.compose.ui:ui-tooling'
     debugImplementation 'androidx.compose.ui:ui-test-manifest'

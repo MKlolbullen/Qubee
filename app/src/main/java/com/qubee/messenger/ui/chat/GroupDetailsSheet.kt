@@ -76,6 +76,7 @@ fun GroupDetailsSheet(
     onAddMember: () -> Unit,
     onRemoveMember: (memberIdHex: String) -> Unit,
     onPromoteMember: (memberIdHex: String, newRole: String) -> Unit,
+    onTransferOwnership: (memberIdHex: String) -> Unit,
     onLeaveGroup: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -135,6 +136,7 @@ fun GroupDetailsSheet(
                     canPromote = isOwner,
                     onRemoveMember = onRemoveMember,
                     onPromoteMember = onPromoteMember,
+                    onTransferOwnership = onTransferOwnership,
                 )
             }
 
@@ -213,15 +215,14 @@ private fun MemberList(
     canPromote: Boolean,
     onRemoveMember: (String) -> Unit,
     onPromoteMember: (memberIdHex: String, newRole: String) -> Unit,
+    onTransferOwnership: (memberIdHex: String) -> Unit,
 ) {
     var pendingRemove by remember { mutableStateOf<GroupMemberInfo?>(null) }
     var pendingPromote by remember { mutableStateOf<GroupMemberInfo?>(null) }
+    var pendingTransfer by remember { mutableStateOf<GroupMemberInfo?>(null) }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         items(members, key = { it.identityIdHex }) { member ->
             val isSelf = myIdentityIdHex != null && member.identityIdHex == myIdentityIdHex
-            // Owner row never shows the role-picker — transferring
-            // ownership needs its own confirmed flow that this batch
-            // doesn't ship.
             val isMemberOwner = member.role == "Owner"
             MemberRow(
                 member = member,
@@ -264,6 +265,45 @@ private fun MemberList(
                 onPromoteMember(promoteTarget.identityIdHex, newRole)
                 pendingPromote = null
             },
+            onRequestTransferOwnership = {
+                // Hand off from role picker to the transfer
+                // confirmation. The transfer is asymmetric (the
+                // donor *also* changes role, irreversibly) so it
+                // gets its own confirm sheet rather than living
+                // in the role picker proper.
+                pendingPromote = null
+                pendingTransfer = promoteTarget
+            },
+        )
+    }
+    val transferTarget = pendingTransfer
+    if (transferTarget != null) {
+        AlertDialog(
+            onDismissRequest = { pendingTransfer = null },
+            title = {
+                Text(
+                    text = "Transfer ownership to ${transferTarget.displayName.ifBlank { "this member" }}?",
+                )
+            },
+            text = {
+                Text(
+                    "You'll lose Owner privileges and become Admin. " +
+                        "${transferTarget.displayName.ifBlank { "They" }} will become Owner. " +
+                        "The Rust core broadcasts a signed atomic role swap; remaining members " +
+                        "converge on the new view. The group key is not rotated, so you keep " +
+                        "full read access as Admin.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onTransferOwnership(transferTarget.identityIdHex)
+                    pendingTransfer = null
+                }) { Text("Transfer", color = QubeePalette.Cyan) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingTransfer = null }) { Text("Cancel") }
+            },
         )
     }
 }
@@ -284,6 +324,7 @@ private fun RolePickerDialog(
     member: GroupMemberInfo,
     onDismiss: () -> Unit,
     onPick: (newRole: String) -> Unit,
+    onRequestTransferOwnership: () -> Unit,
 ) {
     val roles = listOf("Admin", "Moderator", "Member", "Observer")
     AlertDialog(
@@ -307,6 +348,16 @@ private fun RolePickerDialog(
                             color = if (isCurrent) QubeeMutedColor else QubeePalette.Cyan,
                         )
                     }
+                }
+                Spacer(Modifier.height(8.dp))
+                TextButton(
+                    onClick = onRequestTransferOwnership,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = "Transfer ownership →",
+                        color = QubeePalette.Cyan,
+                    )
                 }
             }
         },

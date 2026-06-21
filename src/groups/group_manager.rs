@@ -527,6 +527,151 @@ impl GroupManager {
         Ok(())
     }
 
+    /// Owner-only ownership transfer. Atomically promotes
+    /// `new_owner_id` to `Owner` and demotes the donor (the
+    /// caller's identity) to `Admin`. Returns the
+    /// `OwnershipTransferBody` the caller signs + broadcasts via
+    /// `sign_ownership_transfer`.
+    ///
+    /// Errors:
+    /// * Donor isn't the current `Owner`.
+    /// * `new_owner_id` isn't an active member of the group.
+    /// * `new_owner_id == donor_id` (no-op transfer to self).
+    ///
+    /// On success the local view is updated *before* the body is
+    /// returned, so the caller's send-side already reflects the
+    /// post-transfer roles when it broadcasts. Failures leave the
+    /// local view unchanged.
+    pub fn transfer_ownership(
+        &mut self,
+        group_id: GroupId,
+        donor_id: IdentityId,
+        new_owner_id: IdentityId,
+    ) -> Result<crate::groups::group_handshake::OwnershipTransferBody> {
+        if donor_id == new_owner_id {
+            return Err(anyhow::anyhow!("cannot transfer ownership to self"));
+        }
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+
+        let donor = group
+            .members
+            .get(&donor_id)
+            .ok_or_else(|| anyhow::anyhow!("donor not in group"))?;
+        if donor.role != Role::Owner {
+            return Err(anyhow::anyhow!("only the group owner may transfer ownership"));
+        }
+        let new_owner = group
+            .members
+            .get(&new_owner_id)
+            .ok_or_else(|| anyhow::anyhow!("new owner not in group"))?;
+        if new_owner.member_status != MemberStatus::Active {
+            return Err(anyhow::anyhow!("new owner is not an active member"));
+        }
+
+        // Atomic swap. We don't go through `update_member_role`
+        // because that path's permission check would reject demoting
+        // the existing Owner (correctly, for the regular promote
+        // gesture); the transfer path bypasses by mutating both
+        // members in one borrow.
+        group
+            .members
+            .get_mut(&new_owner_id)
+            .ok_or_else(|| anyhow::anyhow!("new owner vanished mid-transfer"))?
+            .role = Role::Owner;
+        group
+            .members
+            .get_mut(&donor_id)
+            .ok_or_else(|| anyhow::anyhow!("donor vanished mid-transfer"))?
+            .role = Role::Admin;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        group.version = group.version.saturating_add(1);
+        group.last_updated = now;
+        let new_version = group.version;
+        self.log_group_event(
+            group_id,
+            donor_id,
+            GroupEventType::RoleChanged,
+            format!(
+                "Ownership transferred from {} to {}",
+                hex::encode(donor_id.as_ref() as &[u8]),
+                hex::encode(new_owner_id.as_ref() as &[u8]),
+            ),
+        )?;
+        self.store_group_securely(&group_id)?;
+
+        Ok(crate::groups::group_handshake::OwnershipTransferBody {
+            group_id,
+            donor_id,
+            new_owner_id,
+            new_version,
+            timestamp: now,
+        })
+    }
+
+    /// Receiver-side mutation for donor-broadcast `OwnershipTransfer`.
+    /// Used by `process_ownership_transfer` to apply the swap to the
+    /// local view + adopt the donor's post-transfer `group.version`.
+    ///
+    /// Idempotent: re-applying the same body is a no-op (donor is
+    /// already Admin, new_owner is already Owner, version doesn't
+    /// move backwards).
+    pub fn apply_ownership_transfer(
+        &mut self,
+        group_id: GroupId,
+        donor_id: IdentityId,
+        new_owner_id: IdentityId,
+        new_version: u64,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+
+        // Pre-conditions: donor must currently be Owner, new_owner
+        // must be a known active member. Fail loudly so a forged
+        // transfer doesn't silently succeed.
+        let donor = group
+            .members
+            .get(&donor_id)
+            .ok_or_else(|| anyhow::anyhow!("donor not in local view"))?;
+        if donor.role != Role::Owner {
+            return Err(anyhow::anyhow!(
+                "ownership transfer rejected: donor is not the current Owner",
+            ));
+        }
+        let new_owner = group
+            .members
+            .get(&new_owner_id)
+            .ok_or_else(|| anyhow::anyhow!("new owner not in local view"))?;
+        if new_owner.member_status != MemberStatus::Active {
+            return Err(anyhow::anyhow!(
+                "ownership transfer rejected: new owner is not an active member",
+            ));
+        }
+
+        group
+            .members
+            .get_mut(&new_owner_id)
+            .ok_or_else(|| anyhow::anyhow!("new owner vanished mid-apply"))?
+            .role = Role::Owner;
+        group
+            .members
+            .get_mut(&donor_id)
+            .ok_or_else(|| anyhow::anyhow!("donor vanished mid-apply"))?
+            .role = Role::Admin;
+
+        if new_version > group.version {
+            group.version = new_version;
+        }
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Build a `RequestStateSyncBody` for the local view of a group.
     /// Returns `None` if the local view doesn't contain the group.
     /// Caller signs + broadcasts the body via
@@ -1457,7 +1602,7 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
 
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1489,7 +1634,7 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
 
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1560,7 +1705,7 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path).expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
 
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1629,7 +1774,7 @@ mod tests {
         let creator_id = creator_key.identity_id;
 
         let group_id = {
-            let keystore = SecureKeystore::new(&keystore_path).expect("keystore open");
+            let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore open");
             let mut gm = GroupManager::new(keystore).expect("gm");
             gm.create_group(
                 creator_id,
@@ -1645,7 +1790,7 @@ mod tests {
 
         // Reopen from the same on-disk path — same flow as the real
         // bootstrap (`nativeInitialize` → `load_groups_from_storage`).
-        let keystore = SecureKeystore::new(&keystore_path).expect("keystore reopen");
+        let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore reopen");
         let mut gm = GroupManager::new(keystore).expect("gm reopen");
         gm.load_groups_from_storage()
             .expect("load_groups_from_storage");

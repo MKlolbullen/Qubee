@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import com.qubee.messenger.data.model.Message
 import com.qubee.messenger.data.model.MessageStatus
@@ -11,10 +12,10 @@ import com.qubee.messenger.data.model.MessageWithSender
 import kotlinx.coroutines.flow.Flow
 
 @Dao
-interface MessageDao {
+abstract class MessageDao {
 
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId AND isDeleted = 0 ORDER BY timestamp ASC")
-    fun getMessagesForConversation(conversationId: String): Flow<List<Message>>
+    abstract fun getMessagesForConversation(conversationId: String): Flow<List<Message>>
 
     // Joins the sender's display name out of `contacts` so the chat
     // surface doesn't need a per-row contact lookup.
@@ -28,53 +29,152 @@ interface MessageDao {
         ORDER BY m.timestamp ASC
         """
     )
-    fun getMessagesWithSenderForConversation(conversationId: String): Flow<List<MessageWithSender>>
+    abstract fun getMessagesWithSenderForConversation(conversationId: String): Flow<List<MessageWithSender>>
 
     @Query("SELECT * FROM messages WHERE id = :messageId")
-    suspend fun getMessageById(messageId: String): Message?
+    abstract suspend fun getMessageById(messageId: String): Message?
 
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY timestamp DESC LIMIT 1")
-    suspend fun getLastMessageForConversation(conversationId: String): Message?
+    abstract suspend fun getLastMessageForConversation(conversationId: String): Message?
 
     @Query("SELECT COUNT(*) FROM messages WHERE conversationId = :conversationId AND status != 'READ' AND isFromMe = 0")
-    suspend fun getUnreadMessageCount(conversationId: String): Int
+    abstract suspend fun getUnreadMessageCount(conversationId: String): Int
 
     @Query("SELECT COUNT(*) FROM messages WHERE status != 'READ' AND isFromMe = 0")
-    fun getTotalUnreadMessageCount(): Flow<Int>
+    abstract fun getTotalUnreadMessageCount(): Flow<Int>
 
     @Query("SELECT * FROM messages WHERE content LIKE '%' || :query || '%' AND isDeleted = 0 ORDER BY timestamp DESC")
-    suspend fun searchMessages(query: String): List<Message>
+    abstract suspend fun searchMessages(query: String): List<Message>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertMessage(message: Message)
+    abstract suspend fun insertMessage(message: Message)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertMessages(messages: List<Message>)
+    abstract suspend fun insertMessages(messages: List<Message>)
 
     @Update
-    suspend fun updateMessage(message: Message)
+    abstract suspend fun updateMessage(message: Message)
 
     @Query("UPDATE messages SET status = :status WHERE id = :messageId")
-    suspend fun updateMessageStatus(messageId: String, status: MessageStatus)
+    abstract suspend fun updateMessageStatus(messageId: String, status: MessageStatus)
+
+    /// Look up the outbound row a `MessageAck` refers to. Returns
+    /// `null` when no row carries this `wireId` — usually means the
+    /// ack landed for a message we didn't send (e.g. the local user
+    /// is a different group member, not the original sender).
+    @Query("SELECT * FROM messages WHERE wireId = :wireId LIMIT 1")
+    abstract suspend fun getMessageByWireId(wireId: String): Message?
+
+    /// Outbound rows the offline-retry loop should re-publish: still
+    /// `SENT` (no ack yet — the `applyAckTransactional` path moves
+    /// the row to `DELIVERED` on first ack and `nextRetryAt` is
+    /// cleared then), carrying preserved `wireBytes`, with a retry
+    /// scheduled at-or-before `now`, and under the attempt budget.
+    @Query(
+        "SELECT * FROM messages " +
+            "WHERE isFromMe = 1 AND status = 'SENT' " +
+            "AND wireBytes IS NOT NULL " +
+            "AND nextRetryAt IS NOT NULL AND nextRetryAt <= :now " +
+            "AND retryAttempt < :maxAttempts " +
+            "ORDER BY timestamp ASC LIMIT :limit"
+    )
+    abstract suspend fun getRetryableOutbound(
+        now: Long,
+        maxAttempts: Int,
+        limit: Int,
+    ): List<Message>
+
+    /// Re-stamp a row after a retry attempt: bumps `retryAttempt` and
+    /// sets the next eligibility. Pass `nextRetryAt = null` to retire
+    /// the row from further retries (budget hit / final failure).
+    @Query(
+        "UPDATE messages SET retryAttempt = :attempt, nextRetryAt = :nextRetryAt " +
+            "WHERE id = :messageId"
+    )
+    abstract suspend fun updateRetrySchedule(
+        messageId: String,
+        attempt: Int,
+        nextRetryAt: Long?,
+    )
+
+    /// Clear retry state once the first `MessageAck` lands. Wired
+    /// into the same transaction as the `deliveredAckers` update so
+    /// a concurrent retry tick can't pick the row up between the
+    /// ack and the clear.
+    @Query(
+        "UPDATE messages SET wireBytes = NULL, nextRetryAt = NULL " +
+            "WHERE id = :messageId"
+    )
+    abstract suspend fun clearRetryState(messageId: String)
+
+    /**
+     * Atomically read + update the row matched by `wireId` to record
+     * `ackerIdHex` as a recipient that ack'd this message. Runs the
+     * read and the write inside a single SQLite transaction so two
+     * acks arriving simultaneously can't lose one to a last-write-
+     * wins race against a stale read.
+     *
+     * Returns:
+     *  * `Result.NotFound` — no row matches this `wireId`
+     *    (`applyAck` returns false; caller logs at debug)
+     *  * `Result.AlreadyApplied` — `ackerIdHex` was already in
+     *    `deliveredAckers` (idempotent re-delivery)
+     *  * `Result.Applied` — the row was updated; status moved to
+     *    DELIVERED unless it was already READ
+     *
+     * Implemented as an open `@Transaction` method because Room's
+     * code generator wraps it in `beginTransaction()` /
+     * `endTransaction()` automatically — the abstract-class +
+     * non-abstract-method pattern is the only way to compose
+     * multiple DAO operations inside one transaction.
+     */
+    @Transaction
+    open suspend fun applyAckTransactional(
+        wireId: String,
+        ackerIdHex: String,
+    ): ApplyAckResult {
+        val row = getMessageByWireId(wireId) ?: return ApplyAckResult.NotFound
+        if (row.deliveredAckers.contains(ackerIdHex)) {
+            return ApplyAckResult.AlreadyApplied
+        }
+        val updated = row.copy(
+            deliveredAckers = row.deliveredAckers + ackerIdHex,
+            status = if (row.status == MessageStatus.READ) {
+                row.status
+            } else {
+                MessageStatus.DELIVERED
+            },
+            // First ack arrives — retire the row from the offline
+            // retry loop. Keeping `wireBytes` around past this point
+            // would let a stale loop re-publish bytes the peer has
+            // already seen + ack'd. Inside the same transaction so a
+            // concurrent retry tick can't observe the half-updated
+            // state.
+            wireBytes = null,
+            nextRetryAt = null,
+        )
+        updateMessage(updated)
+        return ApplyAckResult.Applied
+    }
 
     @Query("UPDATE messages SET status = 'READ' WHERE conversationId = :conversationId AND isFromMe = 0")
-    suspend fun markAllMessagesAsRead(conversationId: String)
+    abstract suspend fun markAllMessagesAsRead(conversationId: String)
 
     @Query("UPDATE messages SET isDeleted = 1, deletedAt = :deletedAt WHERE id = :messageId")
-    suspend fun markMessageAsDeleted(messageId: String, deletedAt: Long)
+    abstract suspend fun markMessageAsDeleted(messageId: String, deletedAt: Long)
 
     @Query("DELETE FROM messages WHERE id = :messageId")
-    suspend fun deleteMessageById(messageId: String)
+    abstract suspend fun deleteMessageById(messageId: String)
 
     @Query("DELETE FROM messages WHERE conversationId = :conversationId")
-    suspend fun deleteAllMessagesForConversation(conversationId: String)
+    abstract suspend fun deleteAllMessagesForConversation(conversationId: String)
 
     // Disappearing-message cleanup. Run periodically from
     // `MessageRepository.cleanupExpiredMessages` (called by
     // `MessageService`'s background loop).
     @Query("DELETE FROM messages WHERE disappearsAt IS NOT NULL AND disappearsAt < :nowSeconds")
-    suspend fun deleteExpiredMessages(nowSeconds: Long): Int
+    abstract suspend fun deleteExpiredMessages(nowSeconds: Long): Int
 
     @Query("SELECT COUNT(*) FROM messages WHERE conversationId = :conversationId")
-    suspend fun getMessageCountForConversation(conversationId: String): Int
+    abstract suspend fun getMessageCountForConversation(conversationId: String): Int
 }

@@ -130,26 +130,35 @@ class ChatViewModel @Inject constructor(
         val payload = text.trim()
         if (payload.isEmpty() || conversationId.isEmpty()) return
         viewModelScope.launch {
+            val messageId = UUID.randomUUID().toString()
             val now = System.currentTimeMillis()
-            val message = Message(
-                id = UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
-                content = payload,
-                contentType = MessageType.TEXT,
-                timestamp = now,
-                status = MessageStatus.SENDING,
-                isFromMe = true,
-            )
-            messageRepository.saveMessage(message)
 
-            // Encrypt via the Rust JNI bridge. The session id is the
-            // hex-encoded GroupId — same value as conversationId per
-            // ConversationRepository.getOrCreateConversationId.
-            val encrypted = runCatching { qubeeManager.encryptMessage(conversationId, payload) }
-                .getOrNull()
+            // Encrypt first so the locally-saved row can carry the
+            // canonical wire id from the start. Otherwise a fast
+            // loopback peer could ack before we stamped the row
+            // and `applyAck` would miss it.
+            //
+            // Encryption is cheap (sub-millisecond on modern
+            // devices); the slight UI delay vs. saving a placeholder
+            // SENDING row first is well under perceptual.
+            val encrypted = runCatching {
+                qubeeManager.encryptMessage(conversationId, payload)
+            }.getOrNull()
             if (encrypted == null) {
-                messageRepository.updateMessageStatus(message.id, MessageStatus.FAILED)
+                // Persist a FAILED row so the UI still shows what
+                // the user typed and surfaces the error.
+                messageRepository.saveMessage(
+                    Message(
+                        id = messageId,
+                        conversationId = conversationId,
+                        senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
+                        content = payload,
+                        contentType = MessageType.TEXT,
+                        timestamp = now,
+                        status = MessageStatus.FAILED,
+                        isFromMe = true,
+                    ),
+                )
                 _events.emit(
                     ChatUiEvent.Notice(
                         "Encrypt failed — peer may not have accepted the group invite yet",
@@ -158,22 +167,53 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
 
+            val wire = encrypted.toBytes()
+            // Best-effort id extraction. Null for non-group wires
+            // (none today, defensive); row persists without a
+            // wireId in that case, meaning future acks for it
+            // won't correlate, which is acceptable on a non-group
+            // path that can't fire acks anyway.
+            val wireId = qubeeManager.extractMessageId(wire)
+
+            // Save the row with the wireId + retry payload already
+            // present. `wireBytes` lets `MessageService`'s background
+            // loop re-publish the *same* wire if the peer is offline
+            // — same wire = same wireId = late acks still correlate.
+            // First retry attempt scheduled `INITIAL_RETRY_DELAY_MS`
+            // out so the eager publish below isn't immediately
+            // shadowed.
+            val message = Message(
+                id = messageId,
+                conversationId = conversationId,
+                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
+                content = payload,
+                contentType = MessageType.TEXT,
+                timestamp = now,
+                status = MessageStatus.SENDING,
+                isFromMe = true,
+                wireId = wireId,
+                wireBytes = wire,
+                retryAttempt = 0,
+                nextRetryAt = now + INITIAL_RETRY_DELAY_MS,
+            )
+            messageRepository.saveMessage(message)
+
             // Publish via libp2p. The "peer id" passed to
             // sendP2PMessage today is whatever the caller hands in;
             // we forward the application-level contactId (the same
             // string ChatFragment received as a nav arg). The Rust
             // side resolves it; if libp2p doesn't have a route the
             // command is queued, not actually delivered. Status =
-            // SENT here means "encrypted bytes left this device",
-            // not "peer ack". Real delivery confirmation is a
-            // post-alpha hook.
+            // SENT here means "encrypted bytes left this device".
+            // The DELIVERED transition lands later when the first
+            // `MessageAck` arrives via `MessageService.onMessageAcked`.
             val sendOk = runCatching {
-                qubeeManager.sendP2PMessage(contactId, encrypted.toBytes())
+                qubeeManager.sendP2PMessage(contactId, wire)
             }.getOrDefault(false)
             val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
-            messageRepository.updateMessageStatus(message.id, newStatus)
+            messageRepository.updateMessageStatus(messageId, newStatus)
             if (!sendOk) {
-                _events.emit(ChatUiEvent.Notice("P2P send failed"))
+                _events.emit(ChatUiEvent.Notice("P2P send failed — will retry"))
             }
         }
     }
@@ -612,6 +652,37 @@ class ChatViewModel @Inject constructor(
     }
 
     /**
+     * Owner-only ownership transfer. Atomically promotes the
+     * target member to `Owner` and demotes the local user (donor)
+     * to `Admin`. The group key isn't rotated; the donor keeps
+     * full read access as Admin.
+     *
+     * Owner-only Rust-side; non-owner callers see "Failed to
+     * transfer ownership" via the null-mapped JNI return. The
+     * caller (the role-picker dialog) is responsible for the
+     * confirmation prompt — once this method fires, the transfer
+     * is irreversible from this side.
+     */
+    fun transferOwnership(memberIdHex: String) {
+        if (!_uiState.value.isGroup || conversationId.isEmpty()) return
+        viewModelScope.launch {
+            val ok = runCatching {
+                groupRepository.transferOwnership(conversationId, memberIdHex)
+            }.getOrNull() != null
+            if (ok) {
+                _events.emit(ChatUiEvent.Notice("Ownership transferred"))
+                loadGroupMembers()
+            } else {
+                _events.emit(
+                    ChatUiEvent.Notice(
+                        "Failed to transfer ownership (owner only, target must be active member)",
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
      * Leave the current group. Routes through the existing
      * `removeMember` JNI export — the Rust side accepts
      * "remove yourself" the same way it accepts an owner removing
@@ -676,6 +747,11 @@ class ChatViewModel @Inject constructor(
         // resolved 64-char hex identity id — same shape as
         // `nativeInspectEnvelopeSender` returns for inbound rows.
         const val SELF_SENDER_ID_FALLBACK: String = "self"
+        // First retry of an unack'd outbound becomes eligible 30s
+        // after the initial send. `MessageService`'s retry loop
+        // picks rows up at-or-after this point; the backoff schedule
+        // is in `MessageService.retryBackoffMs`.
+        const val INITIAL_RETRY_DELAY_MS: Long = 30_000L
     }
 }
 

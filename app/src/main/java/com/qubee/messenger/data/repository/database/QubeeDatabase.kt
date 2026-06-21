@@ -27,11 +27,17 @@ import timber.log.Timber
         CryptoKey::class,
     ],
     // v2: Contact gained a `peerId` column (libp2p routing) and a
-    // matching index. fallbackToDestructiveMigration recreates the
-    // DB on the bump; pre-alpha data isn't yet meant to survive
-    // schema changes.
-    version = 2,
-    exportSchema = false,
+    //     matching index.
+    // v3: Message gained `wireId` + `deliveredAckers`.
+    // v4: Message gained `wireBytes` / `retryAttempt` / `nextRetryAt`
+    //     so `MessageService`'s background retry loop can re-publish
+    //     bytes that didn't make it to a peer the first time.
+    // exportSchema = true generates JSON snapshots into
+    // `app/schemas/<version>.json` so MigrationTestHelper can
+    // validate `Migrations.kt` actually moves the schema between
+    // versions correctly.
+    version = 4,
+    exportSchema = true,
 )
 @TypeConverters(Converters::class)
 abstract class QubeeDatabase : RoomDatabase() {
@@ -78,8 +84,14 @@ abstract class QubeeDatabase : RoomDatabase() {
                 DATABASE_NAME,
             )
                 .openHelperFactory(factory)
-                // Pre-alpha: hard reset on schema change. Real
-                // migrations are post-alpha.
+                // Real migrations land in `Migrations.kt` as
+                // schema bumps happen. The destructive fallback
+                // stays as a safety net: any version pair
+                // [ALL_MIGRATIONS] doesn't cover (e.g. someone
+                // installed a debug build, force-set
+                // `version = 99`, then back to current) hard-
+                // resets rather than corrupting the schema.
+                .addMigrations(*ALL_MIGRATIONS)
                 .fallbackToDestructiveMigration()
                 // Canary: SQLCipher v4 defaults (cipher_compatibility = 4,
                 // cipher_page_size = 4096, HMAC-SHA512, 256k KDF iter)

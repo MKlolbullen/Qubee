@@ -2,6 +2,7 @@ package com.qubee.messenger.crypto
 
 import android.content.Context
 import com.qubee.messenger.network.NetworkCallback
+import com.qubee.messenger.security.SqlCipherKeyProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -21,7 +22,20 @@ class QubeeManager @Inject constructor(
             if (isInitialized) return@withContext true
             System.loadLibrary("qubee_crypto")
 
-            val result = nativeInitialize(context.filesDir.absolutePath)
+            // Fetch the hardware-Keystore-derived passphrase that
+            // protects the Rust core's on-disk private identity keys.
+            // Fail closed: if the Keystore is unavailable we refuse to
+            // initialise rather than fall back to an unprotected
+            // keystore. (Pre-this-change the Rust side used a hardcoded
+            // passphrase; that hole is now closed.)
+            val passphrase = try {
+                SqlCipherKeyProvider(context).getOrCreateCoreKeystorePassphrase()
+            } catch (e: SecurityException) {
+                Timber.e(e, "Keystore passphrase unavailable; refusing to init core")
+                return@withContext false
+            }
+
+            val result = nativeInitialize(context.filesDir.absolutePath, passphrase)
             if (result) {
                 isInitialized = true
                 Timber.d("Qubee initialized at %s", context.filesDir.absolutePath)
@@ -348,6 +362,56 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Owner-only ownership transfer. Atomically promotes
+     * `newOwnerIdHex` to `Owner` and demotes the active identity
+     * (the donor) to `Admin` in one signed wire frame. Returns the
+     * JSON envelope from `nativeTransferOwnership` on success, null
+     * if the JNI call rejected the request (donor isn't the
+     * current Owner, target isn't an active member, transferring
+     * to self, …).
+     */
+    suspend fun transferOwnership(
+        groupIdHex: String,
+        newOwnerIdHex: String,
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeTransferOwnership(groupIdHex, newOwnerIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust transfer-ownership JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust transfer-ownership failed")
+            null
+        }
+    }
+
+    /**
+     * Extract the canonical 16-byte BLAKE3 message id from a
+     * fresh group-message wire envelope (output of
+     * `encryptGroupMessage`) as a 32-char lowercase hex string.
+     * Used at send time to stamp the local Message row's `wireId`
+     * column so a later inbound `onMessageAcked` can look up the
+     * row and bump its delivered-ack list.
+     *
+     * Returns null when the bytes don't carry a group-message
+     * frame (e.g. the wire is from the direct P2P path) — caller
+     * persists the row without a wireId.
+     */
+    suspend fun extractMessageId(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeExtractMessageId(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust extract-message-id JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust extract-message-id failed")
+            null
+        }
+    }
+
+    /**
      * List the active members of a group, as returned by the Rust
      * core. JSON shape is an array of
      * `{identity_id_hex, display_name, role, is_active, joined_at}`
@@ -446,7 +510,7 @@ class QubeeManager @Inject constructor(
         nativeListAcceptedInvites()
     }
 
-    private external fun nativeInitialize(dataDir: String): Boolean
+    private external fun nativeInitialize(dataDir: String, keystorePassphrase: String): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
     private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean
@@ -492,6 +556,11 @@ class QubeeManager @Inject constructor(
         memberIdHex: String,
         newRole: String,
     ): String?
+    private external fun nativeTransferOwnership(
+        groupIdHex: String,
+        newOwnerIdHex: String,
+    ): String?
+    private external fun nativeExtractMessageId(wire: ByteArray): String?
     private external fun nativeSendGroupMessage(
         groupIdHex: String,
         plaintext: ByteArray,

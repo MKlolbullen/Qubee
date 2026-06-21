@@ -4,6 +4,9 @@
 > Built with **Android (Kotlin + Compose)** and **Rust** for maximum security and performance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml)
+[![Android](https://github.com/MKlolbullen/Qubee/actions/workflows/android-smoke.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/android-smoke.yml)
+[![Release](https://img.shields.io/github/v/release/MKlolbullen/Qubee?include_prereleases&label=release)](https://github.com/MKlolbullen/Qubee/releases)
 ![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)
 ![Status](https://img.shields.io/badge/status-pre--alpha-red)
 
@@ -70,6 +73,14 @@ all live.
 The releases are signed by the maintainer's release key
 (fingerprint published in `SECURITY.md`). Signature failures on
 install mean the APK has been tampered with — do not proceed.
+
+Want to verify the APK was built from the source it claims? See
+`docs/reproducible-builds.md` — the build is deterministic given the
+pinned toolchain, so anyone can rebuild the tagged commit and
+byte-compare against the released artifact (signing aside).
+
+Maintainers cutting a new release: see `RELEASE.md` for the
+keystore / GitHub Secrets / tag-push procedure.
 
 Pre-alpha caveats apply (see `SECURITY.md`): no Play Store yet,
 no migrations between minor versions (DB resets), no instrumented
@@ -248,11 +259,26 @@ Paparazzi JVM screenshot tests run without an emulator:
 ```bash
 ./gradlew test
 ```
-There are **no Android instrumented tests yet** — see the Roadmap.
+Android instrumented tests live in `app/src/androidTest/`. They
+need an emulator or device:
+```bash
+./gradlew :app:connectedDebugAndroidTest
+```
+CI runs them automatically on PRs targeting `main` and on push to
+`main` via `.github/workflows/instrumented-tests.yml` (uses
+`reactivecircus/android-emulator-runner@v2` with API 34 / x86_64
++ KVM acceleration).
 
 ### CI
-GitHub Actions runs `cargo test --locked` and `cargo audit` on
-every PR (`.github/workflows/ci.yml`).
+GitHub Actions runs:
+* `ci.yml` — `cargo test`, `cargo audit`, JNI typecheck, bench
+  compile-only on every PR.
+* `jni-contracts.yml` — Kotlin ↔ Rust JNI contract scripts.
+* `android-smoke.yml` — `:app:assembleDebug` on every PR (catches
+  Kotlin compile / Hilt / manifest regressions).
+* `instrumented-tests.yml` — `:app:connectedDebugAndroidTest` on
+  PRs to `main` (heavyweight; API 34 emulator).
+* `release.yml` — signed APK build on tag push.
 
 ## Roadmap
 
@@ -295,17 +321,14 @@ Already shipped (cleaned out of the list below):
   `tests/wire_stability.rs`.
 
 Pre-alpha → alpha (still open):
-* Android instrumented tests (`app/src/androidTest/`) covering
-  `nativeStartNetwork` on a real device + a Compose UI test for
-  create-group → invite-QR → scan-QR. Blocked here on emulator
-  access; the test surface is documented in
-  `docs/two-device-walkthrough.md` and the JNI side is
-  type-checked on the host CI via `cargo build --features
-  _typecheck_jni`. A first instrumented test for
-  `SqlCipherKeyProvider` is already checked in at
-  `app/src/androidTest/java/com/qubee/messenger/security/SqlCipherKeyProviderTest.kt`
-  and runs on a real device once the emulator-access blocker
-  resolves.
+* Compose UI instrumented tests for create-group → invite-QR →
+  scan-QR + a `nativeStartNetwork` smoke check on a real device.
+  The CI emulator workflow (`instrumented-tests.yml`) is now
+  green on a Room DAO test for delivery-confirmation persistence
+  (`app/src/androidTest/java/.../MessageDaoInstrumentedTest.kt`)
+  + the SqlCipherKeyProvider Keystore round-trip; the missing
+  pieces are the higher-level UX paths (Compose `onNodeWithText`
+  drives + ZXing scan results).
 * Port the legacy modules (`hybrid_ratchet`, `secure_message`,
   `file_transfer`, `audio`, `sas`, `oob_secrets`) to the current
   dependency versions — currently feature-gated behind `legacy`

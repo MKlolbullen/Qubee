@@ -3,6 +3,7 @@ package com.qubee.messenger.data.repository
 import com.qubee.messenger.data.model.Message
 import com.qubee.messenger.data.model.MessageStatus
 import com.qubee.messenger.data.model.MessageWithSender
+import com.qubee.messenger.data.repository.database.dao.ApplyAckResult
 import com.qubee.messenger.data.repository.database.dao.ConversationDao
 import com.qubee.messenger.data.repository.database.dao.MessageDao
 import kotlinx.coroutines.flow.Flow
@@ -41,6 +42,47 @@ class MessageRepository @Inject constructor(
     suspend fun updateMessageStatus(messageId: String, status: MessageStatus) {
         messageDao.updateMessageStatus(messageId, status)
     }
+
+    /**
+     * Return outbound rows whose retry timer has fired and whose
+     * budget hasn't been exhausted. Used by `MessageService`'s
+     * offline-retry loop.
+     */
+    suspend fun dueForRetry(now: Long, maxAttempts: Int, limit: Int): List<Message> =
+        messageDao.getRetryableOutbound(now = now, maxAttempts = maxAttempts, limit = limit)
+
+    /**
+     * Re-stamp a row after a retry tick. Pass `nextRetryAt = null`
+     * to retire the row (budget exhausted).
+     */
+    suspend fun scheduleNextRetry(
+        messageId: String,
+        attempt: Int,
+        nextRetryAt: Long?,
+    ) {
+        messageDao.updateRetrySchedule(messageId, attempt, nextRetryAt)
+    }
+
+    /**
+     * Apply an inbound `MessageAck` to the local outbound row.
+     *
+     * Delegates to [MessageDao.applyAckTransactional] so the
+     * read-modify-write happens inside one SQLite transaction.
+     * Two acks from different recipients arriving simultaneously
+     * can't lose one to a stale-read race; both end up in
+     * `deliveredAckers`.
+     *
+     * Returns `true` when the row was found (whether the ack was
+     * freshly applied or was an idempotent duplicate) and `false`
+     * when no row carried this `wireId` — caller logs the latter
+     * at debug level without surfacing to the user.
+     */
+    suspend fun applyAck(wireId: String, ackerIdHex: String): Boolean =
+        when (messageDao.applyAckTransactional(wireId, ackerIdHex)) {
+            is ApplyAckResult.NotFound -> false
+            is ApplyAckResult.AlreadyApplied,
+            is ApplyAckResult.Applied -> true
+        }
 
     suspend fun markAllMessagesAsRead(conversationId: String) {
         messageDao.markAllMessagesAsRead(conversationId)

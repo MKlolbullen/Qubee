@@ -97,15 +97,37 @@ why.
 These are known and are not vulnerabilities — they're the shape of
 the pre-alpha:
 
-- The Android `QubeeDatabase` SQLCipher passphrase is hardcoded in
-  current `main`. This is being replaced with a Keystore-derived key
-  in the next release; see `app/src/main/java/com/qubee/messenger/data/repository/database/QubeeDatabase.kt`
-  and the project plan for "Real SQLCipher passphrase derivation".
+- The Android Keystore master key that wraps both the SQLCipher
+  passphrase *and* the Rust core keystore passphrase is configured
+  with `setUserAuthenticationRequired(false)`, meaning local data
+  decrypts on boot before the user unlocks the device. Trade-off
+  explicitly documented in
+  `app/src/main/java/com/qubee/messenger/security/SqlCipherKeyProvider.kt`;
+  enables headless `MessageService` operation at the cost of no
+  per-open biometric/PIN gate. The key is StrongBox-backed where
+  available (TEE-backed otherwise). A "lock-on-screen-off" mode that
+  re-gates behind biometric unlock is v0.2+ work.
+- The Rust core keystore (`qubee_keys.db` / `qubee_groups.db`, which
+  hold the Ed25519 + ML-DSA private identity keys) wraps its master
+  key under a 256-bit passphrase derived in the hardware Keystore and
+  passed in via `nativeInitialize`. **A `.master` file is useless
+  without that Keystore-bound passphrase.** Builds before this change
+  used a hardcoded `"default_password"`; those installs migrate
+  transparently to the real passphrase on first launch (the migration
+  is one-directional — it never re-exposes the keys under the old
+  derivation).
 - `MessageStatus.SENT` means "encrypted bytes left this device", not
-  "the peer acked". A real ack roundtrip is post-alpha.
-- Snapshot resync after extended offline still bounces a member who
-  missed a `KeyRotation` while offline. The
-  `RequestStateSync` / `StateSyncResponse` extension is in flight.
+  "the peer acked". `DELIVERED` lands when the first signed
+  `MessageAck` arrives (delivery confirmation shipped in
+  `[Unreleased]`).
+- Local DB migrations are `fallbackToDestructiveMigration` on every
+  schema bump until v0.2.0 ships the first stable schema. Pre-alpha
+  data is not expected to survive minor-version upgrades; the README
+  says so.
+- The legacy modules listed below (`hybrid_ratchet`, etc.) are
+  feature-gated and not built in default releases. They contain known
+  pre-NIST-standardisation crypto and are tracked for removal /
+  rewrite, not fixes in place.
 
 ## Disclosure policy
 

@@ -13,16 +13,17 @@ use tokio::runtime::Runtime;
 
 // Core modules
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_request_join, sign_role_change, GroupHandshake,
-    KeyRotationBody, RequestJoinBody,
+    generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_request_join,
+    sign_role_change, GroupHandshake, KeyRotationBody, MessageAckBody, RequestJoinBody,
 };
-use crate::groups::group_invite::InvitePayload;
+use crate::groups::group_permissions::Role;
+use crate::groups::group_message::{
+    decrypt_group_message, encrypt_group_message, extract_message_id, is_group_message_frame,
+};
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
-use crate::groups::group_message::{
-    decrypt_group_message, encrypt_group_message, GroupMessageEnvelope,
-};
+use crate::groups::group_invite::InvitePayload;
 use crate::groups::handshake_handlers::{
     plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
@@ -156,12 +157,22 @@ fn jni_catch_jbytearray(f: impl FnOnce() -> jbyteArray) -> jbyteArray {
 
 /// Bootstrap the Rust core. Kotlin must pass `context.filesDir.absolutePath`
 /// as `data_dir` so the encrypted keystore lands inside the app's
-/// private storage. Idempotent.
+/// private storage, and a `keystore_passphrase` hex string fetched from
+/// the Android hardware Keystore (`SqlCipherKeyProvider`).
+///
+/// **Security:** the passphrase is the only thing protecting the
+/// on-disk identity private keys at rest. It MUST be a high-entropy
+/// secret from the platform Keystore — never a constant. A `.master`
+/// file written by an older build (wrapped under the former hardcoded
+/// passphrase) is transparently re-wrapped under this passphrase on
+/// first open, so existing installs migrate without losing their
+/// identity. Idempotent.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitialize(
     mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
+    keystore_passphrase: JString,
 ) -> jboolean {
     let result = jni_catch_or(|| -> anyhow::Result<()> {
         let mut init = INITIALIZED.lock().unwrap();
@@ -174,19 +185,30 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
             .map_err(|e| anyhow::anyhow!("invalid data_dir: {e}"))?
             .into();
 
+        let passphrase: String = env
+            .get_string(&keystore_passphrase)
+            .map_err(|e| anyhow::anyhow!("invalid keystore_passphrase: {e}"))?
+            .into();
+        if passphrase.is_empty() {
+            return Err(anyhow::anyhow!(
+                "empty keystore passphrase; refusing to open keystore under no protection"
+            ));
+        }
+        let passphrase_bytes = passphrase.as_bytes();
+
         if let Ok(vm) = env.get_java_vm() {
             *JVM.lock().unwrap() = Some(vm);
         }
 
         let mut id_path = PathBuf::from(&dir);
         id_path.push("qubee_keys.db");
-        let id_keystore = SecureKeyStore::new(&id_path)
+        let id_keystore = SecureKeyStore::new(&id_path, passphrase_bytes)
             .map_err(|e| anyhow::anyhow!("identity keystore open failed: {e}"))?;
         *KEYSTORE.lock().unwrap() = Some(id_keystore);
 
         let mut groups_path = PathBuf::from(&dir);
         groups_path.push("qubee_groups.db");
-        let groups_keystore = SecureKeyStore::new(&groups_path)
+        let groups_keystore = SecureKeyStore::new(&groups_path, passphrase_bytes)
             .map_err(|e| anyhow::anyhow!("groups keystore open failed: {e}"))?;
         let mut group_mgr = GroupManager::new(groups_keystore)
             .map_err(|e| anyhow::anyhow!("group manager init failed: {e}"))?;
@@ -202,7 +224,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
         Ok(())
     });
     if result.is_err() {
-        eprintln!("Rust: nativeInitialize failed");
+        tracing::error!("nativeInitialize failed");
         return 0;
     }
     1
@@ -312,8 +334,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                                         handle_inbound_handshake(handshake, sender.clone());
                                         continue;
                                     }
-                                    if let Some(envelope) = GroupMessageEnvelope::from_wire(data) {
-                                        handle_inbound_group_message(envelope);
+                                    if is_group_message_frame(data) {
+                                        handle_inbound_group_message(data.clone());
                                         continue;
                                     }
                                 }
@@ -324,7 +346,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         node.run(tx_event).await;
                     }
                     Err(e) => {
-                        eprintln!("Rust: Failed to start P2P node: {}", e);
+                        tracing::error!(error = %e, "Failed to start P2P node");
                     }
                 }
             });
@@ -357,38 +379,147 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
             match commander.try_send(cmd) {
                 Ok(_) => 1,
                 Err(e) => {
-                    eprintln!("Rust: Failed to send P2P command: {}", e);
+                    tracing::warn!(error = %e, "Failed to send P2P command");
                     0
                 }
             }
         } else {
-            eprintln!("Rust: P2P Commander not initialized");
+            tracing::warn!("P2P Commander not initialized");
             0
         }
     })
 }
 
 // --- Helper: Dispatch to Kotlin ---
-fn handle_inbound_group_message(envelope: GroupMessageEnvelope) {
+fn handle_inbound_group_message(wire: Vec<u8>) {
     let result: anyhow::Result<()> = (|| {
-        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-        let gm = gm_guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-
-        // Re-frame the envelope so the canonical decrypt helper can
-        // verify + AEAD-decrypt it. We have the envelope already, so
-        // we just need to feed wire bytes back in.
-        let wire = envelope.to_wire()?;
-        let decrypted = decrypt_group_message(gm, &wire)?;
-        drop(gm_guard);
+        // Open + decrypt under one lock acquisition. The decrypted
+        // shape gives us (group_id, sender_id, plaintext) for the
+        // Kotlin dispatch, plus we need the inner envelope's
+        // canonical body to compute the message id for the auto-ack.
+        let (decrypted, message_id) = {
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            // `extract_message_id` re-opens the outer envelope (cheap
+            // AEAD; the alternative was to thread the id out of
+            // `decrypt_group_message` itself). The dispatcher uses
+            // the gm immutably for both — fine, the borrow checker
+            // sees the immutable extract finish before the
+            // mut-borrow for decrypt.
+            let mid = extract_message_id(gm, &wire)
+                .ok_or_else(|| anyhow::anyhow!("could not extract message id"))?;
+            let dec = decrypt_group_message(gm, &wire)?;
+            (dec, mid)
+        };
+        let group_id = decrypted.group_id;
+        let sender_id = decrypted.sender_id;
 
         dispatch_group_message_to_kotlin(&decrypted);
+
+        // Auto-ack the message back to the group's gossipsub
+        // topic. Self-acks are filtered: we don't ack our own
+        // outbound (we're not going to receive them anyway since
+        // gossipsub doesn't loop a publisher's own packets, but
+        // be defensive in case a future libp2p update changes
+        // that). Best-effort — a failed ack just leaves the
+        // sender's `MessageStatus` at `SENT`, which is the
+        // pre-this-feature default behaviour.
+        if let Some(identity) = active_identity().ok().flatten() {
+            if identity.identity_id() != sender_id {
+                if let Err(e) = publish_message_ack(
+                    identity.as_ref(),
+                    group_id,
+                    message_id,
+                    identity.identity_id(),
+                ) {
+                    tracing::warn!(error = ?e, "auto-ack publish failed");
+                }
+            }
+        }
+
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("Rust: group message dropped: {e:#}");
+        tracing::warn!(error = ?e, "group message dropped");
     }
+}
+
+/// Build, sign, and publish a `MessageAck` for the given decrypted
+/// message. Best-effort: returns `Ok` on a successful enqueue,
+/// `Err` on missing dependencies (no active identity, P2P down).
+/// The caller surfaces failures through tracing rather than
+/// retrying — a missing ack just leaves the sender's
+/// `MessageStatus` at `SENT`.
+fn publish_message_ack(
+    identity: &crate::identity::identity_key::IdentityKeyPair,
+    group_id: GroupId,
+    message_id: [u8; 16],
+    acker_id: crate::identity::identity_key::IdentityId,
+) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let body = MessageAckBody {
+        group_id,
+        message_id,
+        acker_id,
+        timestamp: now,
+    };
+    let signed = sign_message_ack(identity, body)?;
+    let topic = group_topic(&hex::encode(group_id.as_ref()));
+    let wire = signed.to_wire()?;
+    let _ = publish_to_topic(topic, wire);
+    Ok(())
+}
+
+/// Fire the Kotlin-side
+/// `onMessageAcked(group_hex, message_id_hex, acker_hex,
+/// timestamp_seconds)` callback. Best-effort — if the callback
+/// isn't registered yet (e.g. during early boot) the linkage just
+/// isn't fired and the sender's local Message row stays at
+/// `MessageStatus.SENT` until a future ack arrives.
+fn dispatch_message_acked_to_kotlin(body: &MessageAckBody) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let callback_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match callback_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let group_hex = match env.new_string(hex::encode(body.group_id.as_ref())) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let message_id_hex = match env.new_string(hex::encode(body.message_id)) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let acker_hex = match env.new_string(hex::encode(body.acker_id.as_ref() as &[u8])) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let _ = env.call_method(
+        callback_obj,
+        "onMessageAcked",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V",
+        &[
+            JValue::Object(&group_hex),
+            JValue::Object(&message_id_hex),
+            JValue::Object(&acker_hex),
+            JValue::Long(body.timestamp as i64),
+        ],
+    );
 }
 
 fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::DecryptedGroupMessage) {
@@ -807,6 +938,113 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePromot
     })
 }
 
+/// Owner-only ownership transfer. Atomically promotes
+/// `new_owner_id_hex` to `Owner` and demotes the donor (active
+/// identity) to `Admin`. Mirrors the rev-2 5c `RoleChange` path
+/// but uses a single signed wire frame so the swap arrives
+/// atomically — receivers never see two owners or zero owners.
+///
+/// Owner-only Rust-side; non-owner callers get an `Err` from
+/// `GroupManager::transfer_ownership`, which surfaces here as a
+/// null return.
+///
+/// Returns JSON `{group_id_hex, donor_id_hex, new_owner_id_hex,
+/// new_version, network_published}` on success.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeTransferOwnership(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    new_owner_id_hex: JString,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let new_owner_id_hex: String = match env.get_string(&new_owner_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+            let new_owner_id =
+                IdentityId::from(parse_hex32(Some(new_owner_id_hex.as_str()))?);
+
+            let signed = {
+                let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                let body = gm.transfer_ownership(
+                    group_id,
+                    identity.identity_id(),
+                    new_owner_id,
+                )?;
+                sign_ownership_transfer(identity.as_ref(), body)?
+            };
+
+            let new_version = match &signed {
+                GroupHandshake::OwnershipTransfer { body, .. } => body.new_version,
+                _ => 0u64,
+            };
+            let topic = group_topic(&hex::encode(group_id.as_ref()));
+            let wire = signed.to_wire()?;
+            let published = publish_to_topic(topic, wire);
+
+            Ok(json!({
+                "group_id_hex": hex::encode(group_id.as_ref()),
+                "donor_id_hex": hex::encode(identity.identity_id().as_ref() as &[u8]),
+                "new_owner_id_hex": hex::encode(new_owner_id.as_ref() as &[u8]),
+                "new_version": new_version,
+                "network_published": published,
+            }))
+        })();
+
+        ok_or_null(env, result)
+    })
+}
+
+/// Extract the canonical 16-byte message id from a wire-format
+/// group-message envelope as a 32-char lowercase hex string.
+///
+/// Used by `ChatViewModel.sendMessage` to stamp the locally-saved
+/// `Message.wireId` column at send time so a later inbound
+/// `onMessageAcked` can look up the row and bump its delivered
+/// count. Returns `null` when the bytes don't carry a
+/// `MAGIC_GROUP_MESSAGE` frame (e.g. the wire is from a P2P
+/// direct path, not a group).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtractMessageId(
+    env: JNIEnv,
+    _class: JClass,
+    wire: jni::objects::JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("convert_byte_array: {e}"))?;
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let id = match extract_message_id(gm, &bytes) {
+                Some(id) => id,
+                None => return Ok(std::ptr::null_mut()),
+            };
+            let java_str = env
+                .new_string(hex::encode(id))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Render a `Role` back to the canonical wire string used by
 /// `nativePromoteMember` and `nativeListGroupMembers`. The roundtrip
 /// stays in lock-step with the small vocabulary the JNI accepts so
@@ -860,7 +1098,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
 
             // Best-effort network publication.
             let network_published = publish_request_join(&payload).unwrap_or_else(|e| {
-                eprintln!("Rust: publish_request_join failed: {e:#}");
+                tracing::warn!(error = ?e, "publish_request_join failed");
                 false
             });
 
@@ -1029,7 +1267,7 @@ fn active_display_name() -> anyhow::Result<String> {
 fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
     let extracted_identity = extract_peer_identity_hex(&frame);
     if let Err(e) = process_handshake(frame) {
-        eprintln!("Rust: handshake rejected: {e:#}");
+        tracing::info!(error = ?e, "handshake rejected");
         return;
     }
     if let Some(identity_hex) = extracted_identity {
@@ -1050,6 +1288,8 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
         GroupHandshake::KeyRotation { body, .. } => body.rotator_id,
         GroupHandshake::MemberAdded { body, .. } => body.adder_id,
         GroupHandshake::RoleChange { body, .. } => body.promoter_id,
+        GroupHandshake::OwnershipTransfer { body, .. } => body.donor_id,
+        GroupHandshake::MessageAck { body, .. } => body.acker_id,
         GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
         GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
         GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
@@ -1111,9 +1351,10 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             if let Some(mut secret) = take_pending_kyber_secret(&body.invitation_code) {
                 secret.zeroize();
             }
-            eprintln!(
-                "Rust: invite to group {} rejected: {}",
-                body.group_id, body.reason
+            tracing::info!(
+                group_id = %body.group_id,
+                reason = %body.reason,
+                "invite to group rejected",
             );
         }
         GroupHandshake::KeyRotation { body, signature } => {
@@ -1137,6 +1378,39 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             crate::groups::handshake_handlers::process_role_change(gm, &body, &signature)?;
+        }
+        GroupHandshake::OwnershipTransfer { body, signature } => {
+            let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            crate::groups::handshake_handlers::process_ownership_transfer(
+                gm, &body, &signature,
+            )?;
+        }
+        GroupHandshake::MessageAck { body, signature } => {
+            // Drop acks we ourselves signed. Gossipsub doesn't echo
+            // a publisher's own messages back today, so this is
+            // belt-and-braces against a future libp2p change or a
+            // peer-relay topology that bounces our ack through a
+            // multi-hop loop — acking our own message is
+            // semantically nonsense (we already know what we sent).
+            let active = active_identity()?;
+            if let Some(ref identity) = active {
+                if identity.identity_id() == body.acker_id {
+                    return Ok(());
+                }
+            }
+            {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                crate::groups::handshake_handlers::process_message_ack(
+                    gm, &body, &signature,
+                )?;
+            }
+            dispatch_message_acked_to_kotlin(&body);
         }
         GroupHandshake::RequestStateSync { body, signature } => {
             // Responder side. Build + sign a snapshot reply and
@@ -1400,7 +1674,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
             let p = path.join(name);
             if let Err(e) = std::fs::remove_file(&p) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("Rust: reset failed to delete {p:?}: {e}");
+                    tracing::warn!(path = ?p, error = %e, "reset failed to delete file");
                 }
             }
         }
@@ -1432,7 +1706,7 @@ fn ok_or_null(env: JNIEnv, result: anyhow::Result<serde_json::Value>) -> jstring
     match result {
         Ok(v) => json_to_jstring(env, v),
         Err(e) => {
-            eprintln!("Rust: JNI op failed: {:#}", e);
+            tracing::warn!(error = ?e, "JNI op failed");
             std::ptr::null_mut()
         }
     }
@@ -1517,7 +1791,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
                 // No-identity is the *expected* state on first launch —
                 // treat it as null rather than a hard error so the
                 // Kotlin caller can branch cleanly.
-                eprintln!("Rust: nativeLoadOnboardingBundle: {e:#}");
+                tracing::warn!(error = ?e, "nativeLoadOnboardingBundle failed");
                 std::ptr::null_mut()
             }
         }
@@ -1989,8 +2263,22 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
             let wire_bytes: Vec<u8> = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("invalid wire bytes: {e}"))?;
-            let envelope = GroupMessageEnvelope::from_wire(&wire_bytes)
-                .ok_or_else(|| anyhow::anyhow!("not a group message frame"))?;
+            // The sender id used to be plaintext on the wire; with
+            // sealed envelopes it's only accessible after opening the
+            // outer AEAD layer with the group key. So this helper now
+            // needs a GroupManager handle — which we have via the
+            // global. If the local user isn't a member of the group
+            // the lookup returns None and we surface a null senderId,
+            // same as for a wire that simply doesn't decrypt.
+            let gm_guard = GROUP_MANAGER.lock().unwrap();
+            let gm = gm_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+            let (_group_id, inner) = crate::groups::group_message::open_outer_envelope(
+                &wire_bytes,
+                |gid| gm.export_group_key(gid),
+            )?;
+            let envelope = crate::groups::group_message::GroupMessageEnvelope::from_inner_bincode(&inner)?;
             let hex_id = hex::encode(envelope.body.sender_id.as_ref() as &[u8]);
             let java_str = env
                 .new_string(hex_id)

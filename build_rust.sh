@@ -1,32 +1,54 @@
 #!/bin/bash
-set -e # Avbryt om något kommando misslyckas
+# Build the Rust shared library for all four Android ABIs we ship.
+#
+# Reproducible-build inputs (must stay in sync with the values
+# documented in `docs/reproducible-builds.md`):
+#   - Rust toolchain: pinned in `rust-toolchain.toml` (1.86.0)
+#   - Cargo.lock: committed; `--locked` enforces it
+#   - NDK: r26b (`ndkVersion` in `app/build.gradle`, `ndk-version`
+#     in the GitHub Actions workflows)
+#   - cargo-ndk: ^3 (CI installs with --locked)
+#
+# Path remapping: any absolute path baked into debug info (e.g. the
+# user's $HOME for the registry) is rewritten to a stable token so
+# two machines produce byte-identical .so files. Applied to:
+#   - $CARGO_HOME (typically ~/.cargo) → /__cargo
+#   - $PWD (the source tree)             → /__src
+#
+# This isn't perfect — `strip = true` in the release profile already
+# removes most debug info — but the remap makes the few remaining
+# embedded strings deterministic.
+set -euo pipefail
 
-# 1. Ställ in sökvägar
-# Ändra denna om din app-mapp heter något annat
 ANDROID_JNI_DIR="app/src/main/jniLibs"
 
-# 2. Skapa mappar för arkitekturerna i Android-projektet
 mkdir -p "$ANDROID_JNI_DIR/arm64-v8a"
 mkdir -p "$ANDROID_JNI_DIR/armeabi-v7a"
 mkdir -p "$ANDROID_JNI_DIR/x86"
 mkdir -p "$ANDROID_JNI_DIR/x86_64"
 
-echo "Bygger Rust-bibliotek för Android..."
+CARGO_HOME_REMAP="${CARGO_HOME:-$HOME/.cargo}"
+SRC_REMAP="$(pwd)"
+export RUSTFLAGS="${RUSTFLAGS:-} \
+  --remap-path-prefix=$CARGO_HOME_REMAP=/__cargo \
+  --remap-path-prefix=$SRC_REMAP=/__src"
 
-# 3. Kompilera för varje arkitektur och kopiera .so-filen
-# Vi döper om filen till libqubee_crypto.so om den inte redan heter det
-# (Cargo skapar lib[name].so baserat på namnet i Cargo.toml)
+# Disable timestamp metadata in the .rmeta files so an otherwise
+# identical compile produces byte-identical bytes.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 
-# ARM64 (Moderna telefoner)
-cargo ndk -t arm64-v8a -o "$ANDROID_JNI_DIR" build --release
+echo "Building Rust shared library for Android (release, --locked) ..."
+for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+    echo "  → $abi"
+    cargo ndk -t "$abi" -o "$ANDROID_JNI_DIR" build --release --locked
+done
 
-# ARMv7 (Äldre telefoner)
-cargo ndk -t armeabi-v7a -o "$ANDROID_JNI_DIR" build --release
+echo
+echo "Built libraries:"
+find "$ANDROID_JNI_DIR" -name '*.so' -printf '  %p (%s bytes)\n'
 
-# x86_64 (Emulator)
-cargo ndk -t x86_64 -o "$ANDROID_JNI_DIR" build --release
-
-# x86 (Äldre emulatorer - valfritt)
-cargo ndk -t x86 -o "$ANDROID_JNI_DIR" build --release
-
-echo "Klart! Biblioteken ligger nu i $ANDROID_JNI_DIR"
+if command -v sha256sum >/dev/null 2>&1; then
+    echo
+    echo "SHA-256 of each .so (compare across machines to verify reproducibility):"
+    find "$ANDROID_JNI_DIR" -name '*.so' -print0 | sort -z | xargs -0 sha256sum
+fi

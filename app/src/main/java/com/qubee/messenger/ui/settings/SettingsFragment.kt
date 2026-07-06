@@ -22,7 +22,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -83,7 +83,7 @@ private fun SettingsContent(
     onResetComplete: () -> Unit,
 ) {
     QubeeTheme {
-        val state by viewModel.state.collectAsState()
+        val state by viewModel.state.collectAsStateWithLifecycle()
         var confirmOpen by remember { mutableStateOf(false) }
 
         LaunchedEffect(state) {
@@ -210,7 +210,7 @@ private fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
  */
 @Composable
 private fun MyIdentityPanel(viewModel: SettingsViewModel) {
-    val identity by viewModel.identity.collectAsState()
+    val identity by viewModel.identity.collectAsStateWithLifecycle()
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     val context = androidx.compose.ui.platform.LocalContext.current
 

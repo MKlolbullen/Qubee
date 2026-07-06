@@ -1363,7 +1363,11 @@ fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
         Some(v) => v,
         None => return,
     };
-    let mut env = match jvm.attach_current_thread_permanently() {
+    // Transient attach, consistent with the other dispatchers. The
+    // previous `attach_current_thread_permanently` pinned a JNIEnv for
+    // the lifetime of the (long-lived libp2p worker) calling thread,
+    // leaking the attachment.
+    let mut env = match jvm.attach_current_thread() {
         Ok(e) => e,
         Err(_) => return,
     };

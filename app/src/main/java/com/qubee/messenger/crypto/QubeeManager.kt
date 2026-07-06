@@ -15,6 +15,11 @@ class QubeeManager @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
 
+    // @Volatile: read/written from Dispatchers.IO by concurrent
+    // initialize() callers. The Rust INITIALIZED mutex already makes
+    // native init idempotent; this just keeps the Kotlin-side flag's
+    // visibility correct across threads.
+    @Volatile
     private var isInitialized = false
 
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {

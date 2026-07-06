@@ -25,6 +25,12 @@ use crate::groups::group_permissions::{Permission, Role};
 use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
 
 /// What the inviter wants to publish back after handling a `RequestJoin`.
+///
+/// `Accept` is materially larger than the other variants, but this is a
+/// short-lived value built once and immediately consumed by the caller,
+/// so boxing to equalise variant size would only add indirection at
+/// every match site for no real benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum HandshakeOutcome {
     /// Joiner enrolled successfully. The caller should publish:
@@ -80,12 +86,12 @@ pub fn process_request_join(
     let now = now_secs();
     if let Some(exp) = invitation.expires_at {
         if now > exp {
-            return Ok(reject(inviter_identity, body, "invitation expired")?);
+            return reject(inviter_identity, body, "invitation expired");
         }
     }
     if let Some(max) = invitation.max_uses {
         if invitation.current_uses >= max {
-            return Ok(reject(inviter_identity, body, "invitation exhausted")?);
+            return reject(inviter_identity, body, "invitation exhausted");
         }
     }
 
@@ -99,7 +105,7 @@ pub fn process_request_join(
         Role::Member,
     ) {
         let reason = format!("{e}");
-        return Ok(reject(inviter_identity, body, &reason)?);
+        return reject(inviter_identity, body, &reason);
     }
     // Stamp the joiner's long-lived Kyber pubkey on their member
     // record so future key rotations can wrap to them without

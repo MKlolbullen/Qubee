@@ -270,7 +270,7 @@ impl SecureKeyStore {
 
         Ok(removed_count)
     }
-    
+
     fn load_or_generate_master_key(
         storage_path: &Path,
         passphrase: &[u8],
@@ -287,8 +287,7 @@ impl SecureKeyStore {
     }
 
     fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<SecretBox<[u8; 32]>> {
-        let encrypted_data = fs::read(path)
-            .context("Failed to read master key file")?;
+        let encrypted_data = fs::read(path).context("Failed to read master key file")?;
         if encrypted_data.len() < 12 {
             return Err(anyhow::anyhow!("master key file too short"));
         }
@@ -378,8 +377,7 @@ impl SecureKeyStore {
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
 
-        fs::write(path, file_data)
-            .context("Failed to write master key file")?;
+        fs::write(path, file_data).context("Failed to write master key file")?;
 
         Ok(())
     }
@@ -453,7 +451,8 @@ mod tests {
     fn create_test_keystore() -> (SecureKeyStore, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("test_keystore.db");
-        let keystore = SecureKeyStore::new(keystore_path, b"test-keystore-passphrase").expect("Failed to create keystore");
+        let keystore = SecureKeyStore::new(keystore_path, b"test-keystore-passphrase")
+            .expect("Failed to create keystore");
         (keystore, temp_dir)
     }
 
@@ -515,7 +514,9 @@ mod tests {
             let cipher = ChaCha20Poly1305::new(legacy_master.expose_secret().into());
             let nonce_bytes = secure_rng::random::array::<12>().unwrap();
             let nonce = Nonce::from_slice(&nonce_bytes);
-            let ct = cipher.encrypt(nonce, b"legacy identity key".as_ref()).unwrap();
+            let ct = cipher
+                .encrypt(nonce, b"legacy identity key".as_ref())
+                .unwrap();
             let mut keys = HashMap::new();
             keys.insert(
                 "id".to_string(),
@@ -541,7 +542,10 @@ mod tests {
         // legacy wrapping, re-wraps under the real passphrase, and the
         // stored key is still retrievable.
         let mut ks = SecureKeyStore::new(&path, b"real-keystore-passphrase").unwrap();
-        let got = ks.retrieve_key("id").unwrap().expect("legacy key survived migration");
+        let got = ks
+            .retrieve_key("id")
+            .unwrap()
+            .expect("legacy key survived migration");
         assert_eq!(got.expose_secret().as_slice(), b"legacy identity key");
 
         // After migration the `.master` is re-wrapped: opening with the

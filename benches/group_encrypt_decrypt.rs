@@ -22,7 +22,7 @@ use qubee_crypto::storage::secure_keystore::SecureKeystore;
 fn bench_encrypt(c: &mut Criterion) {
     let tmp = tempfile::TempDir::new().unwrap();
     let ks_path = tmp.path().join("bench_enc.db");
-    let ks = SecureKeystore::new(&ks_path).unwrap();
+    let ks = SecureKeystore::new(&ks_path, b"bench-passphrase").unwrap();
     let mut gm = GroupManager::new(ks).unwrap();
     let kp = IdentityKeyPair::generate().unwrap();
     let group_id = gm
@@ -56,7 +56,7 @@ fn bench_encrypt(c: &mut Criterion) {
 fn bench_decrypt(c: &mut Criterion) {
     let tmp = tempfile::TempDir::new().unwrap();
     let ks_path = tmp.path().join("bench_dec.db");
-    let ks = SecureKeystore::new(&ks_path).unwrap();
+    let ks = SecureKeystore::new(&ks_path, b"bench-passphrase").unwrap();
     let mut gm = GroupManager::new(ks).unwrap();
     let kp = IdentityKeyPair::generate().unwrap();
     let group_id = gm

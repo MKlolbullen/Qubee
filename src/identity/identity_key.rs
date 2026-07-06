@@ -195,7 +195,7 @@ impl IdentityKeyPair {
     pub fn public_key(&self) -> IdentityKey {
         IdentityKey {
             classical_public: self.classical_public,
-            pq_public: self.pq_public.clone(),
+            pq_public: self.pq_public,
             identity_id: self.identity_id,
             created_at: self.created_at,
         }
@@ -534,7 +534,7 @@ impl DeviceKey {
     pub fn public_key(&self) -> DevicePublicKey {
         DevicePublicKey {
             x25519_public: self.x25519_public,
-            kyber_public: self.kyber_public.clone(),
+            kyber_public: self.kyber_public,
             device_id: self.device_id,
             identity_id: self.identity_id,
             created_at: self.created_at,

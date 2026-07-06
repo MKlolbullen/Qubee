@@ -49,6 +49,15 @@ struct PersistedActiveIdentity {
 }
 
 // --- Global State ---
+
+/// Replay cache backing store: a membership `HashSet` for O(1) lookups
+/// paired with a FIFO `VecDeque` for bounded eviction. See
+/// [`SEEN_MESSAGE_IDS`].
+type ReplayCache = (
+    std::collections::HashSet<[u8; 16]>,
+    std::collections::VecDeque<[u8; 16]>,
+);
+
 lazy_static! {
     static ref INITIALIZED: Mutex<bool> = Mutex::new(false);
 
@@ -92,7 +101,7 @@ lazy_static! {
     /// dispatch AND a duplicate auto-ack. This dedupes both. `set` is
     /// the membership index; `order` is the FIFO eviction queue capped
     /// at REPLAY_CACHE_CAP.
-    static ref SEEN_MESSAGE_IDS: Mutex<(std::collections::HashSet<[u8; 16]>, std::collections::VecDeque<[u8; 16]>)> =
+    static ref SEEN_MESSAGE_IDS: Mutex<ReplayCache> =
         Mutex::new((std::collections::HashSet::new(), std::collections::VecDeque::new()));
 }
 

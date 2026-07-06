@@ -118,7 +118,7 @@ pub struct GroupSettings {
 }
 
 /// Group metadata
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct GroupMetadata {
     pub avatar_hash: Option<String>,
     pub tags: Vec<String>,
@@ -238,7 +238,7 @@ impl GroupManager {
         self.groups.insert(group_id, group);
         self.member_groups
             .entry(creator_id)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(group_id);
 
         // Persist the owner's Kyber secret so KeyRotation broadcasts
@@ -318,7 +318,7 @@ impl GroupManager {
         // Update member groups mapping
         self.member_groups
             .entry(new_member_id)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(group_id);
 
         // NOTE: We deliberately do NOT rotate the group key here. The
@@ -393,7 +393,7 @@ impl GroupManager {
         group.version = new_version;
         self.member_groups
             .entry(new_member_id)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(group_id);
         self.store_group_securely(&group_id)?;
         Ok(())
@@ -561,7 +561,9 @@ impl GroupManager {
             .get(&donor_id)
             .ok_or_else(|| anyhow::anyhow!("donor not in group"))?;
         if donor.role != Role::Owner {
-            return Err(anyhow::anyhow!("only the group owner may transfer ownership"));
+            return Err(anyhow::anyhow!(
+                "only the group owner may transfer ownership"
+            ));
         }
         let new_owner = group
             .members
@@ -761,7 +763,7 @@ impl GroupManager {
                     );
                     self.member_groups
                         .entry(summary.identity_id)
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(group_id);
                 }
             }
@@ -1156,7 +1158,7 @@ impl GroupManager {
         for member_id in members.keys() {
             self.member_groups
                 .entry(*member_id)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(group_id);
         }
 
@@ -1560,7 +1562,7 @@ impl GroupManager {
                     for member_id in group.members.keys() {
                         self.member_groups
                             .entry(*member_id)
-                            .or_insert_with(HashSet::new)
+                            .or_default()
                             .insert(group_id);
                     }
                     self.groups.insert(group_id, group);
@@ -1582,7 +1584,13 @@ impl GroupId {
         &self.0
     }
 
-    /// Get a reference to the underlying bytes
+    /// Get a reference to the underlying bytes.
+    ///
+    /// Deliberately an inherent method rather than an `AsRef<[u8]>` impl:
+    /// call sites across the crate (and the JNI layer) rely on
+    /// `group_id.as_ref()` resolving here without an explicit trait
+    /// bound in scope.
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &[u8] {
         &self.0
     }
@@ -1618,18 +1626,6 @@ impl Default for GroupSettings {
     }
 }
 
-impl Default for GroupMetadata {
-    fn default() -> Self {
-        GroupMetadata {
-            avatar_hash: None,
-            tags: Vec::new(),
-            category: None,
-            external_links: Vec::new(),
-            custom_fields: HashMap::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,7 +1637,8 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase")
+            .expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
 
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1673,7 +1670,8 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase")
+            .expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
 
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1744,7 +1742,8 @@ mod tests {
         // Create a temporary keystore for testing
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("group_keystore.db");
-        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase").expect("Should create keystore");
+        let keystore = SecureKeystore::new(keystore_path, b"test-keystore-passphrase")
+            .expect("Should create keystore");
         let mut group_manager = GroupManager::new(keystore).expect("Should create group manager");
 
         let creator_keypair = IdentityKeyPair::generate().expect("Should generate keypair");
@@ -1813,7 +1812,8 @@ mod tests {
         let creator_id = creator_key.identity_id;
 
         let group_id = {
-            let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore open");
+            let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase")
+                .expect("keystore open");
             let mut gm = GroupManager::new(keystore).expect("gm");
             gm.create_group(
                 creator_id,
@@ -1829,7 +1829,8 @@ mod tests {
 
         // Reopen from the same on-disk path — same flow as the real
         // bootstrap (`nativeInitialize` → `load_groups_from_storage`).
-        let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase").expect("keystore reopen");
+        let keystore = SecureKeystore::new(&keystore_path, b"test-keystore-passphrase")
+            .expect("keystore reopen");
         let mut gm = GroupManager::new(keystore).expect("gm reopen");
         gm.load_groups_from_storage()
             .expect("load_groups_from_storage");

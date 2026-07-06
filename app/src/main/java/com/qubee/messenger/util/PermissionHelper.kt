@@ -19,7 +19,12 @@ object PermissionHelper {
         permissions.add(Manifest.permission.INTERNET)
         permissions.add(Manifest.permission.ACCESS_NETWORK_STATE)
         permissions.add(Manifest.permission.CAMERA)
-        permissions.add(Manifest.permission.RECORD_AUDIO)
+        // RECORD_AUDIO intentionally not requested — the audio-note
+        // feature isn't implemented and the manifest no longer declares
+        // the permission. (TODO: this helper still lists several other
+        // permissions the manifest doesn't declare; requesting an
+        // undeclared permission is a silent no-op. Prune to the
+        // declared set in a follow-up.)
         permissions.add(Manifest.permission.READ_CONTACTS)
         permissions.add(Manifest.permission.VIBRATE)
         
@@ -53,8 +58,7 @@ object PermissionHelper {
         return listOf(
             Manifest.permission.INTERNET,
             Manifest.permission.ACCESS_NETWORK_STATE,
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
+            Manifest.permission.CAMERA
         )
     }
 

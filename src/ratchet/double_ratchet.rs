@@ -39,6 +39,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -146,7 +147,85 @@ impl Drop for DoubleRatchet {
     }
 }
 
+/// Serialisable shadow of [`DoubleRatchet`]. X25519 `StaticSecret` and
+/// the raw chain keys don't implement serde, so persistence round-trips
+/// through this byte-array mirror. `dhs_public` is omitted — it is
+/// recomputed from `dhs_secret` on load. Holds live message-key material
+/// (chain keys + skipped keys), so its bytes must only ever live inside
+/// the encrypted keystore, never on the wire.
+#[derive(Serialize, Deserialize)]
+struct WireRatchetState {
+    dhs_secret: [u8; 32],
+    dhr: Option<[u8; 32]>,
+    rk: [u8; 32],
+    cks: Option<[u8; 32]>,
+    ckr: Option<[u8; 32]>,
+    ns: u32,
+    nr: u32,
+    pn: u32,
+    /// `(their_dh, n) -> message_key`, flattened in `skipped_order` order
+    /// so the FIFO eviction queue is preserved exactly across reloads.
+    skipped: Vec<([u8; 32], u32, [u8; 32])>,
+}
+
 impl DoubleRatchet {
+    /// Serialise the full ratchet state for encrypted-at-rest
+    /// persistence. The output contains live key material and must be
+    /// stored only in the [`crate::storage::secure_keystore::SecureKeyStore`].
+    pub fn serialize_state(&self) -> Result<Vec<u8>> {
+        // Preserve the exact FIFO order of `skipped_order` so eviction
+        // behaviour is identical after a reload.
+        let skipped = self
+            .skipped_order
+            .iter()
+            .filter_map(|k| self.skipped.get(k).map(|mk| (k.0, k.1, *mk)))
+            .collect();
+        let wire = WireRatchetState {
+            dhs_secret: self.dhs_secret.to_bytes(),
+            dhr: self.dhr.map(|p| *p.as_bytes()),
+            rk: self.rk,
+            cks: self.cks,
+            ckr: self.ckr,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            skipped,
+        };
+        bincode::serialize(&wire).map_err(|e| anyhow!("serialize ratchet state: {e}"))
+    }
+
+    /// Reconstruct a ratchet from [`serialize_state`] output. The
+    /// resulting session continues exactly where the serialised one left
+    /// off — message numbers, chain keys, and skipped keys are restored,
+    /// so no message key is ever reused.
+    pub fn deserialize_state(bytes: &[u8]) -> Result<Self> {
+        let wire: WireRatchetState =
+            bincode::deserialize(bytes).map_err(|e| anyhow!("deserialize ratchet state: {e}"))?;
+        let dhs_secret = StaticSecret::from(wire.dhs_secret);
+        let dhs_public = PublicKey::from(&dhs_secret);
+        let mut skipped = HashMap::with_capacity(wire.skipped.len());
+        let mut skipped_order = Vec::with_capacity(wire.skipped.len());
+        for (dh, n, mk) in wire.skipped {
+            let key = (dh, n);
+            if skipped.insert(key, mk).is_none() {
+                skipped_order.push(key);
+            }
+        }
+        Ok(DoubleRatchet {
+            dhs_secret,
+            dhs_public,
+            dhr: wire.dhr.map(PublicKey::from),
+            rk: wire.rk,
+            cks: wire.cks,
+            ckr: wire.ckr,
+            ns: wire.ns,
+            nr: wire.nr,
+            pn: wire.pn,
+            skipped,
+            skipped_order,
+        })
+    }
+
     /// Initialise the *initiator* (Alice) side after the PQXDH shared
     /// secret `sk` has been established. `bob_dh_public` is Bob's
     /// signed-prekey ratchet public.
@@ -586,6 +665,55 @@ mod tests {
         let back = MessageHeader::from_bytes(&h.to_bytes()).unwrap();
         assert_eq!(h, back);
         assert!(MessageHeader::from_bytes(&[0u8; 39]).is_err());
+    }
+
+    #[test]
+    fn serialized_ratchet_resumes_mid_conversation() {
+        let (mut alice, mut bob) = pair();
+
+        // Exchange a few messages, then persist both sides mid-stream.
+        let (h1, c1) = alice.encrypt(b"a-1", AD).unwrap();
+        assert_eq!(bob.decrypt(&h1, &c1, AD).unwrap(), b"a-1");
+        let (h2, c2) = bob.encrypt(b"b-1", AD).unwrap();
+        assert_eq!(alice.decrypt(&h2, &c2, AD).unwrap(), b"b-1");
+
+        let alice_bytes = alice.serialize_state().unwrap();
+        let bob_bytes = bob.serialize_state().unwrap();
+        drop(alice);
+        drop(bob);
+
+        // Reload from disk-shaped bytes and keep going — no key reuse,
+        // conversation continues transparently across the restart.
+        let mut alice = DoubleRatchet::deserialize_state(&alice_bytes).unwrap();
+        let mut bob = DoubleRatchet::deserialize_state(&bob_bytes).unwrap();
+        let (h3, c3) = alice.encrypt(b"a-2 after reload", AD).unwrap();
+        assert_eq!(bob.decrypt(&h3, &c3, AD).unwrap(), b"a-2 after reload");
+        let (h4, c4) = bob.encrypt(b"b-2 after reload", AD).unwrap();
+        assert_eq!(alice.decrypt(&h4, &c4, AD).unwrap(), b"b-2 after reload");
+    }
+
+    #[test]
+    fn serialized_ratchet_preserves_pending_skipped_keys() {
+        let (mut alice, mut bob) = pair();
+        // Alice sends three; Bob decrypts only the third, stashing skipped
+        // keys for m1 + m2. Persist Bob mid-gap.
+        let (h1, c1) = alice.encrypt(b"m1", AD).unwrap();
+        let (h2, c2) = alice.encrypt(b"m2", AD).unwrap();
+        let (h3, c3) = alice.encrypt(b"m3", AD).unwrap();
+        assert_eq!(bob.decrypt(&h3, &c3, AD).unwrap(), b"m3");
+
+        let bob_bytes = bob.serialize_state().unwrap();
+        drop(bob);
+        let mut bob = DoubleRatchet::deserialize_state(&bob_bytes).unwrap();
+
+        // The straggler keys survived the round-trip: out-of-order m1 + m2
+        // still decrypt, and each remains single-use (replay fails).
+        assert_eq!(bob.decrypt(&h1, &c1, AD).unwrap(), b"m1");
+        assert_eq!(bob.decrypt(&h2, &c2, AD).unwrap(), b"m2");
+        assert!(
+            bob.decrypt(&h1, &c1, AD).is_err(),
+            "skipped key is single-use"
+        );
     }
 
     #[test]

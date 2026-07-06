@@ -297,10 +297,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
     bootstrap_nodes: JString,
 ) -> jboolean {
     catch_unwind_result(|| {
-        let _bootstrap_str: String = env
-            .get_string(&bootstrap_nodes)
-            .expect("Invalid string")
-            .into();
+        // Read (currently unused) bootstrap list defensively: a
+        // malformed JString must not panic the process. Fail closed
+        // (return 0 = network not started) instead.
+        let _bootstrap_str: String = match env.get_string(&bootstrap_nodes) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
 
         std::thread::spawn(|| {
             let rt = Runtime::new().unwrap();
@@ -365,8 +368,16 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
     data: JByteArray,
 ) -> jboolean {
     catch_unwind_result(|| {
-        let peer_id_str: String = env.get_string(&peer_id).expect("Invalid peer_id").into();
-        let data_vec = env.convert_byte_array(&data).expect("Invalid data");
+        // Untrusted JNI input: never `.expect()` here. A malformed
+        // peer_id or byte array must fail closed (return 0), not panic.
+        let peer_id_str: String = match env.get_string(&peer_id) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let data_vec = match env.convert_byte_array(&data) {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
 
         let commander_lock = P2P_COMMANDER.lock().unwrap();
 

@@ -82,6 +82,40 @@ lazy_static! {
     // joiner's ephemeral secret resident indefinitely.
     static ref PENDING_JOIN_KEMS: Mutex<HashMap<String, (Vec<u8>, std::time::SystemTime)>> =
         Mutex::new(HashMap::new());
+
+    /// Bounded replay cache of recently-delivered group-message ids.
+    /// A passive gossipsub subscriber can re-publish a captured sealed
+    /// frame verbatim; within the same generation + freshness window it
+    /// re-opens, re-verifies and re-decrypts, causing a duplicate
+    /// dispatch AND a duplicate auto-ack. This dedupes both. `set` is
+    /// the membership index; `order` is the FIFO eviction queue capped
+    /// at REPLAY_CACHE_CAP.
+    static ref SEEN_MESSAGE_IDS: Mutex<(std::collections::HashSet<[u8; 16]>, std::collections::VecDeque<[u8; 16]>)> =
+        Mutex::new((std::collections::HashSet::new(), std::collections::VecDeque::new()));
+}
+
+/// Max entries retained in [`SEEN_MESSAGE_IDS`]. Bounds memory; oldest
+/// ids are evicted FIFO. 4096 covers a busy multi-group window far
+/// beyond the 5-minute freshness horizon that already limits replay.
+const REPLAY_CACHE_CAP: usize = 4096;
+
+/// Returns `true` if `mid` was already delivered (i.e. this is a
+/// replay and should be dropped). Otherwise records it and returns
+/// `false`. FIFO-evicts the oldest id when the cache is full.
+fn is_replay_or_record(mid: [u8; 16]) -> bool {
+    let mut guard = SEEN_MESSAGE_IDS.lock().unwrap();
+    let (set, order) = &mut *guard;
+    if set.contains(&mid) {
+        return true;
+    }
+    set.insert(mid);
+    order.push_back(mid);
+    if order.len() > REPLAY_CACHE_CAP {
+        if let Some(old) = order.pop_front() {
+            set.remove(&old);
+        }
+    }
+    false
 }
 
 /// Maximum lifetime of an entry in [`PENDING_JOIN_KEMS`]. Beyond this
@@ -426,6 +460,16 @@ fn handle_inbound_group_message(wire: Vec<u8>) {
         };
         let group_id = decrypted.group_id;
         let sender_id = decrypted.sender_id;
+
+        // Replay guard: a captured sealed frame re-published on the
+        // topic would otherwise be re-delivered and re-acked. Drop it
+        // if we've already delivered this message id. (Kotlin also
+        // dedupes the row by wireId, but this stops the wasted decrypt
+        // work and the duplicate auto-ack at the source.)
+        if is_replay_or_record(message_id) {
+            tracing::debug!("dropping replayed group message");
+            return Ok(());
+        }
 
         dispatch_group_message_to_kotlin(&decrypted);
 
@@ -1667,6 +1711,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
                 secret.zeroize();
             }
             pending.clear();
+        }
+        {
+            // Drop the replay cache — a fresh identity shouldn't
+            // inherit the previous one's delivered-message set.
+            let mut seen = SEEN_MESSAGE_IDS.lock().unwrap();
+            seen.0.clear();
+            seen.1.clear();
         }
         *INITIALIZED.lock().unwrap() = false;
 

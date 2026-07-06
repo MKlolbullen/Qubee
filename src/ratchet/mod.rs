@@ -23,6 +23,7 @@
 pub mod double_ratchet;
 pub mod pqxdh;
 pub mod prekey_store;
+pub mod session;
 
 pub use double_ratchet::{DoubleRatchet, MessageHeader, MAX_SKIP};
 pub use pqxdh::{PqxdhInitiatorResult, PrekeyBundlePublic, PrekeyBundleSecret};

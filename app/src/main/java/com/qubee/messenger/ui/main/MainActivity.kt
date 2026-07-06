@@ -23,7 +23,6 @@ import com.qubee.messenger.R
 import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.databinding.ActivityMainBinding
 import com.qubee.messenger.service.MessageService
-import com.qubee.messenger.ui.settings.SettingsActivity
 import com.qubee.messenger.util.PermissionHelper
 import javax.inject.Inject
 import dagger.hilt.android.AndroidEntryPoint
@@ -175,7 +174,10 @@ class MainActivity : AppCompatActivity() {
                         navController.navigate(R.id.chatFragment, bundle)
                     }
                     is MainViewModel.NavigationEvent.OpenSettings -> {
-                        startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
+                        // Navigate to the real Settings fragment (bottom-nav
+                        // destination). The old placeholder SettingsActivity
+                        // is gone.
+                        navController.navigate(R.id.navigation_settings)
                     }
                     is MainViewModel.NavigationEvent.OpenContactSelection -> {
                         navController.navigate(R.id.contactSelectionFragment)
@@ -288,7 +290,7 @@ class MainActivity : AppCompatActivity() {
                 true
             }
             R.id.action_settings -> {
-                startActivity(Intent(this, SettingsActivity::class.java))
+                navController.navigate(R.id.navigation_settings)
                 true
             }
             else -> super.onOptionsItemSelected(item)

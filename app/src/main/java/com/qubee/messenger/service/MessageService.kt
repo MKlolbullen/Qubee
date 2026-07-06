@@ -111,17 +111,24 @@ class MessageService : Service(), NetworkCallback {
         if (!isRunning) {
             try {
                 // Explicitly bind the foreground-service type. On API
-                // 34+ a `dataSync` FGS started without the matching
-                // type (or without the FOREGROUND_SERVICE_DATA_SYNC
+                // 34+ a FGS started without the matching type (or
+                // without the FOREGROUND_SERVICE_CONNECTED_DEVICE
                 // permission) is rejected; ServiceCompat picks the
                 // right startForeground overload per API level. The
                 // manifest also declares the type as a belt-and-braces.
+                // NOTE: a network-only connectedDevice FGS needs
+                // on-device validation (some OEMs expect a companion-
+                // device association); confirm start on API 34 during
+                // the two-device hardware test.
                 ServiceCompat.startForeground(
                     this,
                     NOTIFICATION_ID,
                     createServiceNotification(),
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                        // connectedDevice: a long-lived P2P link, not a
+                        // time-boxed sync. Avoids the Android-14 dataSync
+                        // ~6h/day cap that would force-stop the node.
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                     } else {
                         0
                     },

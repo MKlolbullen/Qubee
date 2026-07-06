@@ -111,8 +111,13 @@ impl SecureRng {
     fn should_reseed(&self) -> Result<bool> {
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
+        // `saturating_sub`: if the wall clock steps backward
+        // (`current_time < last_reseed`), a plain subtraction would
+        // underflow (panic in debug). Saturate to 0 — a backward clock
+        // just means "not time-based due yet", and the counter path
+        // still forces a reseed.
         Ok(self.reseed_counter >= Self::RESEED_THRESHOLD
-            || current_time - self.last_reseed >= Self::RESEED_TIME_THRESHOLD)
+            || current_time.saturating_sub(self.last_reseed) >= Self::RESEED_TIME_THRESHOLD)
     }
 
     /// Collect high-quality entropy from multiple sources

@@ -61,7 +61,16 @@
     <fragment
         android:id="@+id/contactSelectionFragment"
         android:name="com.qubee.messenger.ui.contacts.ContactSelectionFragment"
-        android:label="Choose contact" />
+        android:label="Choose contact">
+        <action
+            android:id="@+id/action_selection_to_chat"
+            app:destination="@id/chatFragment"
+            app:popUpTo="@id/contactSelectionFragment"
+            app:popUpToInclusive="true" />
+        <action
+            android:id="@+id/action_selection_to_add_contact"
+            app:destination="@id/addContactFragment" />
+    </fragment>
 
     <!-- Group invite / scan flow. The {token} placeholder lets Navigation
          match the full `qubee://invite/<token>` URI; the fragment reads

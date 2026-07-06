@@ -16,9 +16,10 @@
 
 use qubee_crypto::groups::group_handshake::{
     canonical_join_accepted, canonical_join_rejected, canonical_key_rotation,
-    canonical_member_added, canonical_request_join, canonical_role_change,
+    canonical_member_added, canonical_prekey_bundle, canonical_request_join, canonical_role_change,
     generate_ephemeral_kyber, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
-    KeyRotationBody, MemberAddedBody, RequestJoinBody, RoleChangeBody, HANDSHAKE_MAGIC,
+    KeyRotationBody, MemberAddedBody, PrekeyBundleBody, RequestJoinBody, RoleChangeBody,
+    HANDSHAKE_MAGIC,
 };
 use qubee_crypto::groups::group_manager::GroupId;
 use qubee_crypto::groups::group_message::{
@@ -101,6 +102,27 @@ fn canonical_key_rotation_starts_with_versioned_tag() {
     };
     let canonical = canonical_key_rotation(&body).unwrap();
     assert!(canonical.starts_with(b"qubee_handshake_key_rotation_v1"));
+}
+
+#[test]
+fn canonical_prekey_bundle_starts_with_versioned_tag() {
+    let kp = IdentityKeyPair::generate().unwrap();
+    let body = PrekeyBundleBody {
+        publisher: kp.public_key(),
+        identity_x25519: [1u8; 32],
+        signed_prekey: [2u8; 32],
+        one_time_prekey: Some([3u8; 32]),
+        kem_public: vec![4u8; 1184],
+        timestamp: 0,
+    };
+    let canonical = canonical_prekey_bundle(&body);
+    assert!(canonical.starts_with(b"qubee_handshake_prekey_bundle_v1"));
+    // Explicit length-prefixed layout, not bincode: the publisher's raw
+    // identity id must appear verbatim right after the tag + separator,
+    // which a bincode framing would not reproduce.
+    assert!(canonical
+        .windows(32)
+        .any(|w| w == kp.identity_id().as_ref() as &[u8]));
 }
 
 #[test]

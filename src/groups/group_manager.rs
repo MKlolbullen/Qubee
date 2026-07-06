@@ -966,6 +966,26 @@ impl GroupManager {
     /// field existed) are skipped — they'll need to re-join to get the
     /// new key. The owner's own copy is installed in-place and
     /// persisted; they don't need a wrapped delivery.
+    /// Bump the group generation counter for a **proactive** key
+    /// rotation (one not tied to a member removal). The removal path
+    /// already advances `version` inside `remove_member`, so this is
+    /// used only when `plan_key_rotation` is called with no target —
+    /// without it the rotation carries an unchanged generation and
+    /// every receiver's strict `generation > version` gate rejects it,
+    /// stranding the initiator on a key nobody adopts. Returns the new
+    /// version.
+    pub fn bump_version_for_rotation(&mut self, group_id: GroupId) -> Result<u64> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        group.version = group.version.saturating_add(1);
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let new_version = group.version;
+        self.store_group_securely(&group_id)?;
+        Ok(new_version)
+    }
+
     pub fn rotate_group_key_after_removal(
         &mut self,
         group_id: GroupId,
@@ -1162,6 +1182,25 @@ impl GroupManager {
     pub fn install_group_key(&mut self, group_id: GroupId, key_bytes: &[u8; 32]) -> Result<()> {
         self.group_crypto.set_group_key(group_id, *key_bytes);
         self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
+    /// Receiver-side: adopt the sender's post-rotation generation so
+    /// our `group.version` tracks theirs. Only advances (never moves
+    /// the counter backward), so an out-of-order or replayed frame
+    /// can't rewind us. Needed for proactive rotations, where — unlike
+    /// removal-driven rotations — there is no mirrored `remove_member`
+    /// on the receiver to bump the version.
+    pub fn adopt_group_version(&mut self, group_id: GroupId, version: u64) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        if version > group.version {
+            group.version = version;
+            group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            self.store_group_securely(&group_id)?;
+        }
         Ok(())
     }
 

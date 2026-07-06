@@ -7,6 +7,7 @@ pub mod identity;
 pub mod logging;
 pub mod network;
 pub mod onboarding;
+pub mod ratchet;
 pub mod security;
 pub mod storage;
 

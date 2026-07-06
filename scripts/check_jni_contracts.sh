@@ -87,3 +87,101 @@ if failed:
 
 print("\nOK: Kotlin/Rust JNI native symbol sets match.")
 PY
+
+# ---------------------------------------------------------------------
+# Reverse callbacks: Rust -> Kotlin.
+#
+# The Rust core invokes NetworkCallback methods by name + hand-written
+# JNI descriptor via `env.call_method(obj, "onX", "(...)V", ...)`. A
+# descriptor that drifts from the Kotlin signature fails silently at
+# runtime (the call_method result is discarded), dropping messages.
+# Verify each Rust descriptor matches the Kotlin method's signature.
+# ---------------------------------------------------------------------
+CALLBACK_FILE="${ROOT_DIR}/app/src/main/java/com/qubee/messenger/network/NetworkCallback.kt"
+if [[ ! -f "${CALLBACK_FILE}" ]]; then
+  echo "error: NetworkCallback not found: ${CALLBACK_FILE}" >&2
+  exit 2
+fi
+
+python3 - "${CALLBACK_FILE}" "${RUST_FILE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+callback = Path(sys.argv[1]).read_text(encoding="utf-8")
+rust = Path(sys.argv[2]).read_text(encoding="utf-8")
+
+def strip_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//.*", "", text)
+    return text
+
+callback = strip_comments(callback)
+rust = strip_comments(rust)
+
+# Kotlin type -> JNI descriptor fragment.
+KT2JNI = {
+    "String": "Ljava/lang/String;",
+    "ByteArray": "[B",
+    "Long": "J",
+    "Int": "I",
+    "Boolean": "Z",
+    "Float": "F",
+    "Double": "D",
+    "Short": "S",
+    "Byte": "B",
+    "Char": "C",
+}
+
+# Parse Kotlin: fun onX(a: T, b: U): all callbacks return Unit -> ")V".
+kotlin_desc = {}
+for m in re.finditer(r"\bfun\s+(on[A-Za-z0-9_]+)\s*\((.*?)\)", callback, flags=re.S):
+    name = m.group(1)
+    params = m.group(2).strip()
+    frags = []
+    ok = True
+    if params:
+        for part in params.split(","):
+            part = part.strip()
+            if not part:
+                continue  # trailing comma in multi-line signatures
+            # "ident: Type" (ignore default values / nullability marks)
+            t = part.split(":", 1)[1].strip().rstrip("?").split("=")[0].strip() if ":" in part else ""
+            if t not in KT2JNI:
+                ok = False
+                break
+            frags.append(KT2JNI[t])
+    if ok:
+        kotlin_desc[name] = "(" + "".join(frags) + ")V"
+
+# Parse Rust: call_method(obj, "onX", "(...)V", ...) — name + descriptor
+# may be on adjacent lines, so scan a small window after each name.
+rust_desc = {}
+for m in re.finditer(r'"(on[A-Za-z0-9_]+)"\s*,', rust):
+    name = m.group(1)
+    window = rust[m.end():m.end() + 200]
+    d = re.search(r'"(\([^"]*\)V)"', window)
+    if d:
+        rust_desc[name] = d.group(1)
+
+print("\nReverse-callback contract check (Rust call_method -> NetworkCallback)")
+failed = False
+for name, rdesc in sorted(rust_desc.items()):
+    kdesc = kotlin_desc.get(name)
+    if kdesc is None:
+        failed = True
+        print(f"  ERROR: Rust calls '{name}' but NetworkCallback has no such method", file=sys.stderr)
+    elif kdesc != rdesc:
+        failed = True
+        print(f"  ERROR: '{name}' descriptor mismatch: Rust={rdesc} Kotlin={kdesc}", file=sys.stderr)
+    else:
+        print(f"  - {name}: {rdesc} OK")
+
+if not rust_desc:
+    failed = True
+    print("  ERROR: no Rust call_method descriptors found; parser drift", file=sys.stderr)
+
+if failed:
+    sys.exit(1)
+print("OK: reverse-callback descriptors match NetworkCallback.")
+PY

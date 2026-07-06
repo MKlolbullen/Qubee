@@ -634,6 +634,14 @@ pub fn plan_key_rotation(
     if let Some(target) = removed_member {
         gm.remove_member(group_id, rotator_id, target, reason.to_string())
             .context("remove_member during rotation")?;
+    } else {
+        // Proactive rotation (no removal): `remove_member` didn't run,
+        // so nothing advanced the generation. Bump it explicitly, or
+        // the KeyRotation carries an unchanged generation and every
+        // receiver rejects it — the initiator would self-partition
+        // onto a key nobody adopts.
+        gm.bump_version_for_rotation(group_id)
+            .context("bump version for proactive rotation")?;
     }
 
     let recipients = gm.rotate_group_key_after_removal(group_id, rotator_id)?;
@@ -759,5 +767,12 @@ pub fn process_key_rotation(
 
     gm.install_group_key(body.group_id, &new_key)?;
     new_key.zeroize();
+
+    // Adopt the rotator's generation so our `group.version` tracks
+    // theirs. For removal-driven rotations the mirrored `remove_member`
+    // above already advanced us to the same value (this is then a
+    // no-op); for proactive rotations it's the only thing that keeps
+    // sender and receiver on the same generation.
+    gm.adopt_group_version(body.group_id, body.generation)?;
     Ok(())
 }

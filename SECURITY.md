@@ -97,6 +97,29 @@ why.
 These are known and are not vulnerabilities — they're the shape of
 the pre-alpha:
 
+- **No forward secrecy or post-compromise security at the message
+  layer (yet).** Group and 1:1 messaging use a single per-group
+  symmetric key, rotated only on membership change (or a proactive
+  rotation). Compromise of a member's device therefore exposes the
+  group's message history back to the last key rotation. A hybrid
+  Double Ratchet (1:1) + sender keys (groups) is designed in
+  `docs/double-ratchet-design.md` and is the highest-priority
+  cryptographic work; until it lands, treat message confidentiality
+  as "secure against a network adversary, not against later device
+  compromise."
+- **Messages are cryptographically non-repudiable, by design.** Every
+  wire frame carries a hybrid Ed25519 + ML-DSA-44 signature over the
+  long-term identity keys, so a recipient (or anyone who captures the
+  frame + the signer's public key) can *prove* who authored it. This
+  is the opposite of Signal's deniability-by-MAC, and is a deliberate
+  choice for the research/evidence use case. If you need deniability,
+  Qubee is not currently the right tool.
+- **Network metadata / IP exposure.** The libp2p transport uses direct
+  TCP (+ Noise), so every peer you connect to or gossip with learns
+  your IP address. There is no onion routing or mixnet. Traffic
+  timing and (padded-only-at-the-envelope) message sizes are also
+  observable to a network adversary. An optional Tor transport is
+  roadmap, not shipped.
 - The Android Keystore master key that wraps both the SQLCipher
   passphrase *and* the Rust core keystore passphrase is configured
   with `setUserAuthenticationRequired(false)`, meaning local data
@@ -120,10 +143,11 @@ the pre-alpha:
   "the peer acked". `DELIVERED` lands when the first signed
   `MessageAck` arrives (delivery confirmation shipped in
   `[Unreleased]`).
-- Local DB migrations are `fallbackToDestructiveMigration` on every
-  schema bump until v0.2.0 ships the first stable schema. Pre-alpha
-  data is not expected to survive minor-version upgrades; the README
-  says so.
+- Local DB migrations run through a real `MIGRATION_*` chain
+  (`Migrations.kt`); `fallbackToDestructiveMigration` is retained only
+  as the safety net for version pairs the chain doesn't cover. Until
+  v0.2.0 ships the first stable schema, treat cross-version data
+  survival as best-effort, not guaranteed.
 - The legacy modules listed below (`hybrid_ratchet`, etc.) are
   feature-gated and not built in default releases. They contain known
   pre-NIST-standardisation crypto and are tracked for removal /

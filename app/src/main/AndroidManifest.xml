@@ -9,11 +9,18 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- The P2P node is a long-lived connection to peer devices, not a
+         time-boxed data transfer. `dataSync` is force-stopped after
+         ~6h/24h on Android 14, which would kill background delivery;
+         `connectedDevice` matches an ongoing peer connection and isn't
+         timeout-capped. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
+    <!-- CAMERA backs the QR scanner. RECORD_AUDIO was requested for an
+         audio-note feature that isn't implemented; dropped until it
+         ships (over-broad permissions are a review/privacy flag). -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    
+
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -67,7 +74,7 @@
             android:name=".service.MessageService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="connectedDevice" />
 
     </application>
 

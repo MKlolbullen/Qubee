@@ -152,9 +152,21 @@ harness = false
 #   - strip = "symbols"        : strips debug + symbol tables from the
 #                                shipped .so. Rebuild reproducibly via
 #                                the `--remap-path-prefix` flags applied
-#                                in build_rust.sh.
-#   - panic = "abort"          : avoids unwind tables in the .so, which
-#                                can carry symbol-table residuals.
+#                                in build_rust.sh; this already removes
+#                                the unwind-table symbol residuals that
+#                                were the reason we briefly used
+#                                `panic = "abort"`.
+#   - panic: LEFT AT DEFAULT ("unwind"). We do NOT set `panic = "abort"`
+#                                here: the JNI layer relies on
+#                                `catch_unwind` (jni_api.rs jni_catch_*)
+#                                to turn a Rust panic on malformed
+#                                untrusted input into a JNI fallback
+#                                rather than a whole-process abort.
+#                                Under `abort` those guards are dead
+#                                code and any `.expect()` on JNI input
+#                                becomes a remote DoS. Determinism does
+#                                not require abort; `strip` covers the
+#                                symbol concern.
 #   - incremental = false      : incremental caches embed timestamps.
 #   - debug = false            : already implied by `strip`, pinned for
 #                                clarity.
@@ -163,6 +175,5 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
 incremental = false
 debug = false

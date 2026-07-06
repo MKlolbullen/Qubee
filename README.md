@@ -1,7 +1,9 @@
 # Qubee
 
-> **Post-quantum, peer-to-peer messaging, audio/video calls & file-sharing.**
-> Built with **Android (Kotlin + Compose)** and **Rust** for maximum security and performance.
+> **Post-quantum, peer-to-peer messaging.**
+> Built with **Android (Kotlin + Compose)** and **Rust**.
+> (Audio/video calls and file-sharing are on the roadmap, not yet
+> implemented — see [Roadmap](#roadmap).)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml)
@@ -30,11 +32,11 @@ via JNI.
 | Category | Qubee |
 |----------|-------|
 | **Post-quantum** | ML-KEM-768 (FIPS 203) + ML-DSA-44 (FIPS 204), with hybrid Ed25519+ML-DSA-44 signing on every onboarding bundle, invite, group handshake, key rotation, and message envelope. |
-| **P2P transport** | libp2p 0.55 (TCP + DNS + Yamux + Noise XX + gossipsub + Kademlia + mDNS), no central server. |
+| **P2P transport** | libp2p 0.55 (TCP + WebSocket + DNS + Yamux + Noise XX + gossipsub + Kademlia + mDNS), no central server. |
 | **Group messaging** | ChaCha20-Poly1305 under a per-group symmetric key, plus per-message hybrid signature. Strict generation-counter gate on receive. |
 | **Membership** | Up to 16 members, role-based (Owner / Admin / Moderator / Member / Observer), signed `MemberAdded` / `RoleChange` / `KeyRotation` broadcasts so existing devices stay convergent. |
 | **Identity** | 8-byte BLAKE3 fingerprint of `(classical_pub \|\| pq_pub)`, rendered in onboarding + add-contact UI for out-of-band comparison. |
-| **Storage** | EncryptedSharedPreferences (Android Keystore-backed) for the onboarding bundle; local Rust keystore (XChaCha20-Poly1305 + BLAKE3 integrity) for group keys, per-group Kyber secrets, and pending invitations. |
+| **Storage** | Room + SQLCipher (AES-256) for the local message/contact/conversation database, with the DB key wrapped under a hardware Android-Keystore master key; the Rust core keystore (ChaCha20-Poly1305, master key wrapped under a Keystore-derived passphrase) holds identity/group keys, per-group Kyber secrets, and pending invitations. |
 | **Memory** | Sensitive material wrapped in `secrecy::SecretBox` with `Zeroize` on drop; `mlock`/`munlock` on Unix. |
 
 ## Tech stack
@@ -44,9 +46,12 @@ via JNI.
 * **UI:** Jetpack Compose (Material3) + a small set of Fragment + View
   shells for nav-graph integration.
 * **Architecture:** MVVM, Hilt (DI), Coroutines/Flow.
-* **Storage:** EncryptedSharedPreferences. (Room is **not** wired up
-  today — the half-built data layer was replaced with compile-clean
-  no-op stubs as part of the pre-alpha cleanup; see the Roadmap below.)
+* **Storage:** Room + SQLCipher (encrypted SQLite) for messages,
+  contacts, and conversations, with the passphrase derived per-install
+  from the Android Keystore (`SqlCipherKeyProvider`);
+  EncryptedSharedPreferences backs the wrapped key material. Schema
+  migrations run via a real `MIGRATION_*` chain (destructive fallback
+  only for unknown version pairs).
 * **Networking:** libp2p P2P node runs in Rust; Android receives
   callbacks via JNI.
 
@@ -145,6 +150,8 @@ Qubee/
 │   │                             # parsing
 │   ├── storage/                  # SecureKeyStore (encrypted)
 │   ├── security/                 # secure_memory, secure_rng
+│   ├── calling/                  # WebRTC calling (feature-gated,
+│   │                             # not built by default)
 │   ├── jni_api.rs                # JNI bridge (Android-only)
 │   └── lib.rs                    # Module wiring + feature gates
 ├── tests/                        # Rust integration tests
@@ -242,17 +249,22 @@ gives.
 ```bash
 cargo test --locked
 ```
-Currently **60 tests green** across:
-* `lib` unit tests (33)
-* `tests/group_handshake_e2e.rs` (5)
-* `tests/group_message_e2e.rs` (10) — including the strict
-  generation-counter gate, the A1/A2 regressions (promoted-admin
-  rotation, late-joiner kem_pub plumbing, MemberAdded broadcast
-  convergence), and the `promote_member` + `RoleChange` round-trip.
-* `tests/p2p_two_node_e2e.rs` (2) — full libp2p between two
-  in-process `P2PNode` instances over loopback TCP.
-* `tests/wire_stability.rs` (10) — pinned canonical wire-format
-  vectors for every signed payload.
+The Rust suite (`cargo test`) is green and covers, among others:
+* the crypto core (hybrid signature both-components-required,
+  future-dated-signature rejection, AEAD round-trips) — `lib` unit
+  tests;
+* group protocol e2e — strict generation-counter gate, the A1/A2
+  regressions (promoted-admin rotation, late-joiner kem_pub plumbing,
+  MemberAdded convergence), `promote_member` / `RoleChange` /
+  ownership-transfer round-trips, proactive-rotation propagation, and
+  sealed-envelope metadata privacy (`tests/group_message_e2e.rs`);
+* real libp2p between two in-process `P2PNode` instances over loopback
+  (`tests/p2p_two_node_e2e.rs`);
+* pinned canonical wire-format vectors for every signed payload
+  (`tests/wire_stability.rs`), plus a bounded-decode DoS guard.
+
+(Exact counts drift with every change; run `cargo test` for the
+current number rather than trusting a figure here.)
 
 ### Android
 Paparazzi JVM screenshot tests run without an emulator:
@@ -314,11 +326,12 @@ Already shipped (cleaned out of the list below):
 * Real SQLCipher passphrase derivation via Android Keystore
   (`security/SqlCipherKeyProvider.kt`); legacy hardcoded-passphrase
   databases are wiped on first run after upgrade.
-* `SECURITY.md` (responsible disclosure), threat model in
-  `docs/security/`, fuzz target plan in `docs/security/fuzzing.md`,
-  perf baseline in `docs/perf/baseline.md`, criterion benchmarks
-  for the crypto hot paths, proptest round-trip cases in
-  `tests/wire_stability.rs`.
+* `SECURITY.md` (responsible disclosure + threat model / acknowledged
+  limitations), perf baseline in `docs/perf/baseline.md`, criterion
+  benchmarks for the crypto hot paths (`benches/`), and proptest
+  round-trip cases in `tests/wire_stability.rs`. (A dedicated
+  `docs/security/` threat-model + fuzzing plan is still to be written —
+  it is listed under "still open" below, not shipped.)
 
 Pre-alpha → alpha (still open):
 * Compose UI instrumented tests for create-group → invite-QR →

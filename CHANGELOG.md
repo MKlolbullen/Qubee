@@ -11,6 +11,32 @@ between minor versions.
 
 ### Added
 
+- **Forward secrecy + deniability core (Double Ratchet + PQXDH),
+  Stage 1.** New `src/ratchet/` module — the cryptographic foundation
+  that replaces "sign every message with the long-term identity key"
+  (which gave neither forward secrecy nor deniability):
+  - `double_ratchet.rs` — a faithful Signal Double Ratchet on Qubee's
+    primitives (X25519 DH ratchet, HKDF-SHA256 root KDF, BLAKE3 chain
+    KDF, ChaCha20-Poly1305 message AEAD with the header bound as AAD).
+    Per-message forward secrecy, post-compromise security each
+    round-trip, bounded out-of-order/skipped-key handling
+    (`MAX_SKIP`), replay rejection, key zeroization. **Deniable by
+    construction** — messages are authenticated only by the Poly1305
+    tag under a key both parties derive; no signatures.
+  - `pqxdh.rs` — the PQXDH initial agreement: X3DH-style X25519 DHs
+    (deniable) + ML-KEM-768 encapsulation (post-quantum
+    harvest-now-decrypt-later resistance), producing the shared secret
+    that seeds the ratchet.
+  - 13 tests: full-duplex ping-pong across ratchet steps, out-of-order
+    within/across chains, tamper/wrong-AD/replay rejection, MAX_SKIP
+    enforcement, PQXDH agreement, and the end-to-end PQXDH→ratchet
+    handshake.
+  Self-contained: does not yet touch the wire format, session store,
+  JNI, or the group layer — those are the staged follow-on
+  (`docs/double-ratchet-design.md`). **Decision recorded:** Qubee
+  moves to the full-deniability model; per-message identity signatures
+  will be dropped from the message path (retained only for prekey
+  bundles) at cutover.
 - **Ownership transfer** — owner-only atomic role swap that
   promotes an existing active member to `Owner` and demotes the
   current owner to `Admin` in a single signed wire frame
@@ -35,24 +61,15 @@ between minor versions.
   (`.github/workflows/instrumented-tests.yml`) running on PRs to
   `main` and push to `main`. First DAO test
   (`MessageDaoInstrumentedTest`) validates the wireId lookup +
-  deliveredAckers persistence path. First migration test
-  (`MigrationsInstrumentedTest`) validates that v2→v3 preserves
-  existing message rows.
+  deliveredAckers persistence path. (A migration instrumented test
+  is deferred until the committed-schema-snapshot workflow lands —
+  see the Fixed entry below.)
 - **Schema migrations** — real `MIGRATION_2_3` in
   `Migrations.kt` adds `wireId` + `deliveredAckers` columns to
   the existing `messages` table without dropping data.
   `fallbackToDestructiveMigration` retained as a safety net for
   unknown version pairs. `exportSchema = true` so future
   migrations can be schema-validated by `MigrationTestHelper`.
-
-### Changed
-
-- `eprintln!` / `println!` debug log lines in `src/jni_api.rs`
-  + `src/groups/handshake_handlers.rs` converted to structured
-  `tracing` calls (error / warn / info by signal class). The
-  one secret-leak-risk line dropped its `{e:#}` interpolation.
-
-### Added
 
 - **Double Ratchet + sender keys design.** New
   `docs/double-ratchet-design.md` documents the target protocol
@@ -84,6 +101,17 @@ between minor versions.
   partially-online group is treated as delivered after the first
   ack — per-recipient delivery tracking lands with the sender-keys
   rewrite later.
+
+### Changed
+
+- `eprintln!` / `println!` debug log lines in `src/jni_api.rs`
+  + `src/groups/handshake_handlers.rs` converted to structured
+  `tracing` calls (error / warn / info by signal class). The
+  one secret-leak-risk line dropped its `{e:#}` interpolation.
+- Foreground service type switched from `dataSync` to
+  `connectedDevice` so the always-on libp2p node isn't force-stopped
+  by Android 14's ~6h/day `dataSync` cap. Dropped the unused
+  `RECORD_AUDIO` permission.
 
 ### Build / tooling
 
@@ -147,6 +175,27 @@ between minor versions.
 
 ### Fixed
 
+- **Audit remediation (Phase 0/1).** A full-codebase review turned up
+  several correctness issues, all fixed:
+  - `panic = "abort"` in the release profile silently defeated the JNI
+    `catch_unwind` guards, turning malformed untrusted input into a
+    whole-process abort (DoS). Reverted to `unwind`; hardened the
+    `.expect()` calls on JNI-untrusted paths to fail closed.
+  - `verify_with_max_age` accepted future-dated signatures (a
+    saturating age check let a post-dated timestamp stay "fresh"
+    forever). Added a clock-skew upper bound.
+  - Proactive key rotation (rotate-without-removal) never advanced the
+    generation, so receivers rejected it and the initiator
+    self-partitioned. Two-sided fix (sender bumps, receiver adopts the
+    generation).
+  - Unbounded bincode decode on the pre-auth gossip path → bounded
+    (512 KiB, encoding-aware).
+  - No Rust-side replay dedup → bounded FIFO seen-id cache drops
+    replayed frames before re-dispatch/re-ack.
+  - Dead Settings screen (an unregistered placeholder activity that
+    would have crashed with ActivityNotFoundException) and dead
+    "new chat" contact picker — both now route to / render the real
+    surfaces.
 - **Release-build R8 would have broken every inbound message.** The
   Rust core invokes five `NetworkCallback` methods
   (`onMessageReceived`, `onGroupMessageReceived`, `onMessageAcked`,
@@ -207,7 +256,7 @@ time per `RELEASE.md`.)
 - Cryptography: ML-KEM-768 (FIPS 203, `pqcrypto-mlkem`) + ML-DSA-44
   (FIPS 204, `pqcrypto-mldsa`); hybrid Ed25519 ⊕ ML-DSA-44 signature
   on every signed wire frame; ChaCha20-Poly1305 AEAD, BLAKE3,
-  HKDF/SHA-512; libp2p Noise XX transport (libp2p 0.55). Pinned wire
+  HKDF-SHA-256; libp2p Noise XX transport (libp2p 0.55). Pinned wire
   vectors in `tests/wire_stability.rs`.
 - Group messaging: owner-only invite minting + QR
   (`qubee://invite/<token>`); per-member ML-KEM keys in

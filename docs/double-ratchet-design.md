@@ -48,10 +48,26 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     produces the signed wire frame for the Android side to publish.
   Bundles are **published + cached but not consumed** by send/receive —
   the current v2 symmetric-group path is unchanged.
-* **Stages 3–5 — pending** (see the migration plan). The remaining
-  work wires the core into a persistent session store + the live PQXDH →
-  Double Ratchet 1:1 session, then the group sender-keys layer, then
-  cuts over from the v2 symmetric-group-key format.
+* **Stage 3 — IN PROGRESS.** The 1:1 session layer + wire frame are
+  landed in Rust; the live JNI cutover (3d) is the remaining piece.
+  * *Foundation* — `DoubleRatchet::serialize_state` / `deserialize_state`
+    so a session survives an app restart without reusing a message key.
+  * *3b* — `src/ratchet/session.rs`: a `Session` ties PQXDH + the Double
+    Ratchet + `prekey_store` into one conversation keyed by peer
+    `IdentityId`, with `establish_initiator` / `establish_responder` /
+    `encrypt` / `decrypt` and keystore persistence. A deterministic
+    per-conversation AD (blake3 over the sorted id pair) binds every
+    frame to its pair.
+  * *3c* — `src/ratchet/direct_message.rs`: the `DirectMessage`
+    (`QUBEE_DMS\x01`) wire frame carrying the optional PQXDH
+    `InitialMessage` (first message only), the ratchet header, and the
+    ciphertext. Unsigned (deniable); bounded decode on the unauth path.
+  * *3d — pending*: route live 1:1 send/receive through sessions over
+    JNI, with per-session replay windows. Behaviour-changing; needs a
+    two-device test.
+* **Stages 4–5 — pending** (see the migration plan): the group
+  sender-keys layer, then the cutover from the v2 symmetric-group-key
+  format.
 
 ## What's currently broken
 
@@ -174,11 +190,13 @@ hybrid identity key. Receivers verify (`verify_prekey_bundle`) and cache
 peer bundles in the keystore (`ratchet::prekey_store`). No live DR yet —
 bundles are cached but not consumed.
 
-**Stage 3 (~2 weeks):** PQXDH initial agreement + DR per-1:1
-session. New wire `MAGIC_DIRECT_MESSAGE \x01`. Sender + receiver
-state persistence in a new `RatchetStateDao`. Out-of-order skip
-windows, replay protection (recently-used `(chain_idx, msg_idx)`
-tuples per session).
+**Stage 3 (in progress):** PQXDH initial agreement + DR per-1:1
+session. The Rust core is landed — ratchet-state serialisation, the
+`Session` manager (`src/ratchet/session.rs`) persisting per-peer state to
+the encrypted keystore, and the `MAGIC_DIRECT_MESSAGE \x01` wire frame
+(`src/ratchet/direct_message.rs`). The remaining piece (3d) routes the
+live 1:1 send/receive path through sessions over JNI, with per-session
+replay protection (recently-used `(chain_idx, msg_idx)` tuples).
 
 **Stage 4 (~1 week):** sender-keys group messaging on top of DR.
 New wire `MAGIC_GROUP_MESSAGE \x03`. Migration: existing groups

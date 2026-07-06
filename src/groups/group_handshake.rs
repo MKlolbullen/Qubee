@@ -430,8 +430,35 @@ impl GroupHandshake {
         if &bytes[..HANDSHAKE_MAGIC.len()] != HANDSHAKE_MAGIC {
             return None;
         }
-        bincode::deserialize(&bytes[HANDSHAKE_MAGIC.len()..]).ok()
+        // Bounded decode: this runs on unauthenticated gossip bytes,
+        // *before* any signature check, so a crafted length prefix must
+        // not drive an oversized allocation.
+        bounded_bincode_deserialize(&bytes[HANDSHAKE_MAGIC.len()..]).ok()
     }
+}
+
+/// Upper bound on a single decoded wire frame. Comfortably above the
+/// largest legitimate handshake (a `JoinAccepted` / `StateSyncResponse`
+/// snapshotting up to `QUBEE_MAX_GROUP_MEMBERS` members — each with an
+/// ML-DSA-44 pubkey ~1312 B + ML-KEM-768 pubkey ~1184 B — plus a
+/// wrapped group key), and far below any allocation that would matter
+/// as a DoS. libp2p's gossipsub `max_transmit_size` is the outer bound;
+/// this is the inner, encoding-aware one.
+pub(crate) const MAX_WIRE_FRAME_BYTES: u64 = 512 * 1024;
+
+/// `bincode::deserialize` with a size limit, matching the fixint /
+/// little-endian / reject-trailing config the top-level
+/// `bincode::serialize` uses to *write* these frames (so encoding
+/// stays byte-compatible) while capping the maximum allocation.
+pub(crate) fn bounded_bincode_deserialize<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_WIRE_FRAME_BYTES)
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("bounded bincode decode: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -963,5 +990,28 @@ mod tests {
         assert!(GroupHandshake::from_wire(b"random gossip").is_none());
         assert!(GroupHandshake::from_wire(b"").is_none());
         assert!(GroupHandshake::from_wire(b"QUBEE_BAD\x01extra").is_none());
+    }
+
+    #[test]
+    fn oversized_length_prefix_is_rejected_not_allocated() {
+        // A fixint-bincode `Vec<u8>` starts with an 8-byte length. Craft
+        // a frame claiming u64::MAX elements: the bounded decoder must
+        // reject on the size limit rather than attempt a ~16 EB
+        // allocation. (Unbounded `bincode::deserialize` would try.)
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&u64::MAX.to_le_bytes()); // claimed length
+        // no payload follows
+        let decoded: Result<Vec<u8>> = bounded_bincode_deserialize(&evil);
+        assert!(
+            decoded.is_err(),
+            "a frame with an oversized length prefix must be rejected",
+        );
+
+        // Sanity: a legitimately-sized value still round-trips through
+        // the bounded decoder.
+        let ok: Vec<u8> = vec![1, 2, 3, 4, 5];
+        let bytes = bincode::serialize(&ok).unwrap();
+        let back: Vec<u8> = bounded_bincode_deserialize(&bytes).unwrap();
+        assert_eq!(ok, back);
     }
 }

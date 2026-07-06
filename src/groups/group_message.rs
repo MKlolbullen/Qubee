@@ -91,7 +91,12 @@ impl GroupMessageEnvelope {
     }
 
     pub fn from_inner_bincode(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes).context("group message deserialize")
+        // These bytes come out of the outer AEAD decrypt (so already
+        // authenticated + length-bounded by the transmitted frame),
+        // but bound the decode anyway for defence-in-depth and to keep
+        // one decoding path across the crate.
+        crate::groups::group_handshake::bounded_bincode_deserialize(bytes)
+            .context("group message deserialize")
     }
 }
 

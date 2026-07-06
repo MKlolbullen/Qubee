@@ -65,7 +65,7 @@ const CHAIN_CK_TAG: &[u8] = &[0x02];
 /// Per-message header sent in the clear alongside the ciphertext. It is
 /// also bound as AEAD associated data, so tampering with any field
 /// fails decryption.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageHeader {
     /// Sender's current ratchet public key.
     pub dh: [u8; 32],

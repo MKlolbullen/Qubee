@@ -6,11 +6,36 @@ forward secrecy and post-compromise security. This document proposes
 the protocol Qubee should adopt and the staged plan to land it
 without an unsafe rushed implementation.
 
-**Status:** design pinned; prekey scaffolding lives in
-`src/identity/identity_key.rs` (the `DeviceKey` / `DevicePublicKey`
-types already carry X25519 + ML-KEM-768 prekey material). The
-ratchet implementation itself has not yet shipped; see the staged
-plan below.
+**Decision (locked):** Qubee moves to the **full-deniability** model.
+Per-message long-term-key signatures are **removed**; messages are
+authenticated only by the AEAD/MAC under the ratchet keys (both parties
+derive them, so a transcript proves nothing about authorship). Identity
+keys sign only the *prekey bundle* (binding the keys to an identity),
+never messages. This reverses the earlier "keep non-repudiation" note
+below — the research/evidence use case is dropped in favour of the
+privacy-messenger default (Signal / SimpleX / Session all do this).
+
+**Status:**
+* **Stage 1 — LANDED.** The cryptographic core is implemented + tested
+  in `src/ratchet/`:
+  * `src/ratchet/double_ratchet.rs` — the Double Ratchet (X25519 DH
+    ratchet, HKDF-SHA256 root KDF, BLAKE3 chain KDF, ChaCha20-Poly1305
+    message AEAD with the header bound as AAD), out-of-order + skipped
+    keys (bounded by `MAX_SKIP`), replay rejection, zeroization.
+    Deniable by construction (no signatures; auth is the Poly1305 tag).
+  * `src/ratchet/pqxdh.rs` — the PQXDH initial agreement (X3DH-style
+    X25519 DHs + ML-KEM-768 encapsulation → shared secret). Deniable
+    (DH-based) + post-quantum (KEM folded into the KDF).
+  * 13 tests: full-duplex ping-pong across multiple ratchet steps,
+    out-of-order within/across chains, tamper + wrong-AD + replay
+    rejection, MAX_SKIP enforcement, PQXDH agreement (with/without
+    one-time prekey), and the end-to-end PQXDH→ratchet handshake.
+  This is a self-contained module — it does not yet touch the wire
+  format, session store, JNI, or the group layer.
+* **Stages 2–5 — pending** (see the migration plan). The remaining
+  work wires the core into a persistent session store, the wire
+  format, the JNI/Kotlin bridge, and the group sender-keys layer, then
+  cuts over from the v2 symmetric-group-key format.
 
 ## What's currently broken
 
@@ -122,16 +147,18 @@ bounds blast radius the same way the per-message ratchet does on
 
 ## Migration plan (staged)
 
-**Stage 1 (this batch — landed):** prekey scaffolding pinned.
-`DeviceKey` already carries the X25519 + ML-KEM material. No new
-wire format yet.
+**Stage 1 (LANDED):** the Double Ratchet + PQXDH core, implemented and
+exhaustively tested in `src/ratchet/` (`double_ratchet.rs`,
+`pqxdh.rs`). Pure module; no wire format, session store, or JNI yet.
 
-**Stage 2 (next, ~1 week):** publish + fetch signed prekey bundles.
-New `GroupHandshake::PrekeyBundle` wire variant. Receivers store
-peer bundles in the keystore. Functions:
-  - `IdentityKeyPair::sign_prekey_bundle(device_key, signing_key)`
-  - `verify_prekey_bundle(bundle)`
-No DR yet — these get cached but not used by send/receive.
+**Stage 2 (next):** publish + fetch signed prekey bundles. A new
+`PrekeyBundle` wire frame carrying the X25519 identity/signed-prekey/
+one-time-prekey publics + the ML-KEM prekey public, signed by the
+hybrid identity key. Receivers cache peer bundles in the keystore.
+Reuse `pqxdh::PrekeyBundleSecret::generate_bundle` +
+`IdentityKeyPair::sign` for the bundle signature; add
+`verify_prekey_bundle`. No live DR yet — bundles are cached but not
+consumed.
 
 **Stage 3 (~2 weeks):** PQXDH initial agreement + DR per-1:1
 session. New wire `MAGIC_DIRECT_MESSAGE \x01`. Sender + receiver
@@ -162,18 +189,31 @@ symmetric-group-key path entirely.
 * Two-device end-to-end manual test against the staged wire
   formats.
 
-## What this proposal does NOT change
+## What changes vs. stays
 
-* The hybrid Ed25519+ML-DSA-44 signature on every message stays.
-  That's Qubee's differentiator vs. Signal (Signal uses MACs and
-  gets deniability; we want non-repudiation for the
-  research-evidence use case — see `SECURITY.md`).
-* The `IdentityKey` shape stays. Existing identities migrate by
-  adding a fresh `DeviceKey` for the prekey material; the long-term
-  identity stays bound to the current Ed25519+ML-DSA-44 pair.
+* **Per-message signatures: REMOVED.** This is the deliberate reversal
+  of the earlier design. Messages are authenticated only by the
+  ratchet AEAD (a MAC both parties can compute) → deniable. The
+  hybrid Ed25519+ML-DSA-44 identity signature is retained **only** for
+  signing prekey bundles (and onboarding/invite frames), where
+  attesting "I published these keys" is correct and does not make
+  messages non-repudiable.
+* The `IdentityKey` shape stays as the signing identity. A parallel
+  X25519 identity key (for the deniable DH handshake) comes from the
+  existing `DeviceKey`; a new signed-prekey + one-time-prekey +
+  ML-KEM-prekey bundle is published per identity.
 * Sealed outer envelope stays (it lives below the wire-format
-  layer and applies to either the v2 symmetric or v3 sender-keys
-  format).
+  layer and applies to either the v2 symmetric or v3 ratchet format).
+
+## Separate track: IP-exposure / Tor transport
+
+Chosen: an **optional, off-by-default** Tor transport (SOCKS5 to a
+bundled/`arti` Tor, or an onion-address listener via `libp2p`), toggled
+in Settings. Off by default because always-on onion routing adds
+latency that hurts the live-P2P UX for users not under a hostile
+network. This is independent of the ratchet work and lands as its own
+batch (`src/network/p2p_node.rs` transport config + a Kotlin toggle);
+it does not touch the crypto core.
 
 ## Risks + open questions
 

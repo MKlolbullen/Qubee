@@ -11,6 +11,32 @@ between minor versions.
 
 ### Added
 
+- **Forward secrecy + deniability core (Double Ratchet + PQXDH),
+  Stage 1.** New `src/ratchet/` module — the cryptographic foundation
+  that replaces "sign every message with the long-term identity key"
+  (which gave neither forward secrecy nor deniability):
+  - `double_ratchet.rs` — a faithful Signal Double Ratchet on Qubee's
+    primitives (X25519 DH ratchet, HKDF-SHA256 root KDF, BLAKE3 chain
+    KDF, ChaCha20-Poly1305 message AEAD with the header bound as AAD).
+    Per-message forward secrecy, post-compromise security each
+    round-trip, bounded out-of-order/skipped-key handling
+    (`MAX_SKIP`), replay rejection, key zeroization. **Deniable by
+    construction** — messages are authenticated only by the Poly1305
+    tag under a key both parties derive; no signatures.
+  - `pqxdh.rs` — the PQXDH initial agreement: X3DH-style X25519 DHs
+    (deniable) + ML-KEM-768 encapsulation (post-quantum
+    harvest-now-decrypt-later resistance), producing the shared secret
+    that seeds the ratchet.
+  - 13 tests: full-duplex ping-pong across ratchet steps, out-of-order
+    within/across chains, tamper/wrong-AD/replay rejection, MAX_SKIP
+    enforcement, PQXDH agreement, and the end-to-end PQXDH→ratchet
+    handshake.
+  Self-contained: does not yet touch the wire format, session store,
+  JNI, or the group layer — those are the staged follow-on
+  (`docs/double-ratchet-design.md`). **Decision recorded:** Qubee
+  moves to the full-deniability model; per-message identity signatures
+  will be dropped from the message path (retained only for prekey
+  bundles) at cutover.
 - **Ownership transfer** — owner-only atomic role swap that
   promotes an existing active member to `Owner` and demotes the
   current owner to `Admin` in a single signed wire frame

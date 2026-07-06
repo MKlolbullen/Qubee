@@ -418,6 +418,81 @@ fn newly_joined_member_can_rotate_key_to_inviter() {
 }
 
 #[test]
+fn proactive_rotation_propagates_and_is_accepted() {
+    // Regression for the proactive-rotation bug: a rotation with no
+    // removed member (the "rotate after suspected compromise" path)
+    // must advance the generation so receivers accept it. Before the
+    // fix, the KeyRotation carried an unchanged generation, every
+    // receiver's strict `generation > version` gate rejected it, and
+    // the initiator self-partitioned onto a key nobody else adopted.
+    use qubee_crypto::groups::group_handshake::GroupHandshake;
+    use qubee_crypto::groups::handshake_handlers::{plan_key_rotation, process_key_rotation};
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invitation = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invitation.invitation_code,
+        invitation.inviter_name,
+    );
+
+    let version_before = alice_gm.get_group(&group_id).unwrap().version;
+
+    // Alice proactively rotates (no removed member).
+    let signed = plan_key_rotation(&mut alice_gm, &alice_kp, group_id, None, "compromise drill")
+        .expect("proactive rotation should plan");
+    let (body, sig) = match signed {
+        GroupHandshake::KeyRotation { body, signature } => (body, signature),
+        _ => unreachable!("plan_key_rotation returns KeyRotation"),
+    };
+
+    // The generation must have advanced past Alice's pre-rotation
+    // version (this is exactly what was broken).
+    assert!(
+        body.generation > version_before,
+        "proactive rotation must advance the generation (was {}, got {})",
+        version_before,
+        body.generation,
+    );
+
+    // Bob applies it and converges — no generation-gate rejection.
+    process_key_rotation(&mut bob_gm, bob_kp.identity_id(), &body, &sig)
+        .expect("Bob must accept the proactive rotation");
+
+    assert_eq!(
+        alice_gm.get_group(&group_id).unwrap().version,
+        bob_gm.get_group(&group_id).unwrap().version,
+        "post-rotation versions must agree",
+    );
+    assert_eq!(
+        alice_gm.export_group_key(&group_id).unwrap(),
+        bob_gm.export_group_key(&group_id).unwrap(),
+        "both members must hold the same rotated key",
+    );
+
+    // And a fresh message round-trips under the new key.
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"post-rotation").unwrap();
+    let decrypted = decrypt_group_message(&bob_gm, &wire).expect("decrypt under rotated key");
+    assert_eq!(decrypted.plaintext, b"post-rotation");
+}
+
+#[test]
 fn late_joiner_can_rotate_key_to_all_existing_members() {
     // Owner + Bob + Carol where Carol joins last. Today, Carol's
     // local snapshot of Owner and Bob both have empty Kyber pubkeys

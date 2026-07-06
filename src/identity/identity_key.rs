@@ -206,7 +206,14 @@ impl IdentityKeyPair {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        self.sign_with_timestamp(data, timestamp)
+    }
 
+    /// Sign `data` binding an explicit `timestamp`. Production code
+    /// uses [`sign`] (wall-clock now); this variant exists so tests
+    /// can construct stale / future-dated frames to exercise the
+    /// freshness gate in [`IdentityKey::verify_with_max_age`].
+    pub fn sign_with_timestamp(&self, data: &[u8], timestamp: u64) -> Result<HybridSignature> {
         let mut message = Vec::with_capacity(data.len() + 8 + 32);
         message.extend_from_slice(data);
         message.extend_from_slice(&timestamp.to_le_bytes());
@@ -322,6 +329,12 @@ impl IdentityKey {
     /// flows that need a longer window.
     const DEFAULT_MAX_SIGNATURE_AGE_SECS: u64 = 300;
 
+    /// Maximum tolerated forward clock skew for a peer's signature
+    /// timestamp. Frames dated further into the future than this are
+    /// rejected (see the future-dated-signature note in
+    /// [`verify_with_max_age`]).
+    const MAX_CLOCK_SKEW_SECS: u64 = 60;
+
     /// Verify a hybrid signature with the default 5-minute freshness window.
     pub fn verify(&self, data: &[u8], signature: &HybridSignature) -> Result<bool> {
         self.verify_with_max_age(data, signature, Self::DEFAULT_MAX_SIGNATURE_AGE_SECS)
@@ -340,7 +353,17 @@ impl IdentityKey {
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        // Reject too-old frames (replay window).
         if current_time.saturating_sub(signature.timestamp) > max_age_secs {
+            return Ok(false);
+        }
+        // Reject too-far-future frames. Without this, a future-dated
+        // timestamp saturates the age check to 0 and stays "fresh"
+        // forever — so a compromised/malicious member could mint a
+        // message post-dated years ahead and have it (and any captured
+        // copy) pass the freshness gate indefinitely. Allow a small
+        // clock-skew margin for honest peers.
+        if signature.timestamp.saturating_sub(current_time) > Self::MAX_CLOCK_SKEW_SECS {
             return Ok(false);
         }
 
@@ -640,5 +663,41 @@ mod tests {
         let kp = IdentityKeyPair::generate().unwrap();
         let fp = kp.public_key().fingerprint();
         assert_eq!(fp.len(), 19); // "XXXX XXXX XXXX XXXX"
+    }
+
+    #[test]
+    fn future_dated_signature_is_rejected() {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let pk = kp.public_key();
+        let msg = b"payload";
+
+        // A normal signature verifies.
+        let sig = kp.sign(msg).unwrap();
+        assert!(pk.verify(msg, &sig).unwrap());
+
+        // Post-date it far into the future. Because the timestamp is
+        // part of the signed message, we must re-sign the mutated
+        // payload for the crypto to pass — this simulates a
+        // malicious/compromised signer who legitimately mints a
+        // future-dated frame. The freshness gate must still reject it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let far_future = now + 10 * 365 * 24 * 3600; // ~10 years ahead
+        let forged = kp.sign_with_timestamp(msg, far_future).unwrap();
+        assert!(
+            !pk.verify(msg, &forged).unwrap(),
+            "future-dated signature must fail the freshness gate",
+        );
+
+        // A timestamp within the allowed skew still verifies.
+        let within_skew = kp
+            .sign_with_timestamp(msg, now + IdentityKey::MAX_CLOCK_SKEW_SECS - 1)
+            .unwrap();
+        assert!(
+            pk.verify(msg, &within_skew).unwrap(),
+            "a within-skew future timestamp should still verify",
+        );
     }
 }

@@ -139,7 +139,9 @@ pub fn initiate(
     let ephemeral_public = PublicKey::from(&ephemeral);
 
     // DH1 = DH(IK_A, SPK_B); DH2 = DH(EK_A, IK_B); DH3 = DH(EK_A, SPK_B)
-    let dh1 = alice_identity.diffie_hellman(&bundle.signed_prekey).to_bytes();
+    let dh1 = alice_identity
+        .diffie_hellman(&bundle.signed_prekey)
+        .to_bytes();
     let dh2 = ephemeral.diffie_hellman(&bundle.identity).to_bytes();
     let dh3 = ephemeral.diffie_hellman(&bundle.signed_prekey).to_bytes();
     // DH4 = DH(EK_A, OPK_B) if a one-time prekey is present.
@@ -174,9 +176,18 @@ pub fn respond(
     initial: &InitialMessage,
 ) -> Result<([u8; 32], StaticSecret)> {
     // Mirror Alice's DHs with the private key of each pair swapped in.
-    let dh1 = bundle.signed_prekey.diffie_hellman(&initial.identity).to_bytes();
-    let dh2 = bundle.identity.diffie_hellman(&initial.ephemeral).to_bytes();
-    let dh3 = bundle.signed_prekey.diffie_hellman(&initial.ephemeral).to_bytes();
+    let dh1 = bundle
+        .signed_prekey
+        .diffie_hellman(&initial.identity)
+        .to_bytes();
+    let dh2 = bundle
+        .identity
+        .diffie_hellman(&initial.ephemeral)
+        .to_bytes();
+    let dh3 = bundle
+        .signed_prekey
+        .diffie_hellman(&initial.ephemeral)
+        .to_bytes();
     let dh4 = if initial.used_one_time_prekey {
         let opk = bundle
             .one_time_prekey
@@ -289,7 +300,9 @@ mod tests {
             DoubleRatchet::init_alice(init.shared_secret, init.bob_ratchet_public).unwrap();
         let mut bob = DoubleRatchet::init_bob(bob_sk, bob_ratchet_secret);
 
-        let (h, c) = alice.encrypt(b"first post-quantum deniable message", b"cid").unwrap();
+        let (h, c) = alice
+            .encrypt(b"first post-quantum deniable message", b"cid")
+            .unwrap();
         assert_eq!(
             bob.decrypt(&h, &c, b"cid").unwrap(),
             b"first post-quantum deniable message",

@@ -13,17 +13,18 @@ use tokio::runtime::Runtime;
 
 // Core modules
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_request_join,
-    sign_role_change, GroupHandshake, KeyRotationBody, MessageAckBody, RequestJoinBody,
+    generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_prekey_bundle,
+    sign_request_join, sign_role_change, verify_prekey_bundle, GroupHandshake, KeyRotationBody,
+    MessageAckBody, RequestJoinBody,
 };
-use crate::groups::group_permissions::Role;
-use crate::groups::group_message::{
-    decrypt_group_message, encrypt_group_message, extract_message_id, is_group_message_frame,
-};
+use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_manager::{
     GroupId, GroupInvitation, GroupManager, GroupSettings, GroupType, QUBEE_MAX_GROUP_MEMBERS,
 };
-use crate::groups::group_invite::InvitePayload;
+use crate::groups::group_message::{
+    decrypt_group_message, encrypt_group_message, extract_message_id, is_group_message_frame,
+};
+use crate::groups::group_permissions::Role;
 use crate::groups::handshake_handlers::{
     plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
     HandshakeOutcome,
@@ -31,6 +32,7 @@ use crate::groups::handshake_handlers::{
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
+use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
 use std::collections::HashMap;
@@ -128,9 +130,7 @@ const PENDING_JOIN_KEM_TTL: std::time::Duration = std::time::Duration::from_secs
 
 /// Evict + zeroise pending Kyber secrets older than [`PENDING_JOIN_KEM_TTL`].
 /// Must be called while holding the `PENDING_JOIN_KEMS` mutex.
-fn prune_pending_kems(
-    pending: &mut HashMap<String, (Vec<u8>, std::time::SystemTime)>,
-) {
+fn prune_pending_kems(pending: &mut HashMap<String, (Vec<u8>, std::time::SystemTime)>) {
     let now = std::time::SystemTime::now();
     pending.retain(|_code, (secret, inserted_at)| {
         match now.duration_since(*inserted_at) {
@@ -946,8 +946,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePromot
         };
 
         let result: anyhow::Result<serde_json::Value> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
             let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
             let member_id = IdentityId::from(parse_hex32(Some(member_id_hex.as_str()))?);
             let role = match new_role.to_ascii_lowercase().as_str() {
@@ -964,15 +964,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePromot
                 let gm = gm_guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                let body = gm.promote_member(group_id, identity.identity_id(), member_id, role.clone())?;
+                let body =
+                    gm.promote_member(group_id, identity.identity_id(), member_id, role.clone())?;
                 sign_role_change(identity.as_ref(), body)?
             };
 
             let (new_version, role_str) = match &signed {
-                GroupHandshake::RoleChange { body, .. } => (
-                    body.new_version,
-                    role_to_str(&body.new_role).to_string(),
-                ),
+                GroupHandshake::RoleChange { body, .. } => {
+                    (body.new_version, role_to_str(&body.new_role).to_string())
+                }
                 _ => (0u64, new_role.clone()),
             };
 
@@ -1023,22 +1023,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeTransf
         };
 
         let result: anyhow::Result<serde_json::Value> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("onboarding required"))?;
             let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
-            let new_owner_id =
-                IdentityId::from(parse_hex32(Some(new_owner_id_hex.as_str()))?);
+            let new_owner_id = IdentityId::from(parse_hex32(Some(new_owner_id_hex.as_str()))?);
 
             let signed = {
                 let mut gm_guard = GROUP_MANAGER.lock().unwrap();
                 let gm = gm_guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                let body = gm.transfer_ownership(
-                    group_id,
-                    identity.identity_id(),
-                    new_owner_id,
-                )?;
+                let body = gm.transfer_ownership(group_id, identity.identity_id(), new_owner_id)?;
                 sign_ownership_transfer(identity.as_ref(), body)?
             };
 
@@ -1347,6 +1342,7 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
         GroupHandshake::MessageAck { body, .. } => body.acker_id,
         GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
         GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
+        GroupHandshake::PrekeyBundle { body, .. } => body.publisher.identity_id,
         GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
     };
     Some(hex::encode(id.as_ref() as &[u8]))
@@ -1443,9 +1439,7 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
             let gm = gm_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-            crate::groups::handshake_handlers::process_ownership_transfer(
-                gm, &body, &signature,
-            )?;
+            crate::groups::handshake_handlers::process_ownership_transfer(gm, &body, &signature)?;
         }
         GroupHandshake::MessageAck { body, signature } => {
             // Drop acks we ourselves signed. Gossipsub doesn't echo
@@ -1465,9 +1459,7 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
                 let gm = gm_guard
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                crate::groups::handshake_handlers::process_message_ack(
-                    gm, &body, &signature,
-                )?;
+                crate::groups::handshake_handlers::process_message_ack(gm, &body, &signature)?;
             }
             dispatch_message_acked_to_kotlin(&body);
         }
@@ -1513,6 +1505,32 @@ fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
                 &body,
                 &signature,
             )?;
+        }
+        GroupHandshake::PrekeyBundle { body, signature } => {
+            // Stage 2: verify + cache a peer's published prekey bundle.
+            // Not yet consumed by send/receive (that's Stage 3) — this
+            // only proves out the infrastructure by persisting a
+            // verified bundle keyed by the publisher's identity.
+            if let Some(identity) = active_identity()? {
+                if identity.identity_id() == body.publisher.identity_id {
+                    // Our own bundle bounced back through fan-out; ignore.
+                    return Ok(());
+                }
+            }
+            // Fail closed: an unauthenticated or expired bundle is
+            // dropped silently rather than cached.
+            if !verify_prekey_bundle(&body, &signature)? {
+                tracing::debug!(
+                    publisher = %hex::encode(body.publisher.identity_id.as_ref() as &[u8]),
+                    "dropping prekey bundle with invalid or expired signature",
+                );
+                return Ok(());
+            }
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            store_peer_bundle(ks, &body)?;
         }
     }
     Ok(())
@@ -2168,6 +2186,41 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
+/// Build + sign the local device's prekey bundle (Ratchet Stage 2),
+/// generating and persisting fresh X25519/ML-KEM prekey material on the
+/// first call and reloading it thereafter. Returns the signed
+/// `GroupHandshake::PrekeyBundle` wire frame as a Java `byte[]` for the
+/// caller to publish on a group topic. Returns `null` when there's no
+/// active identity or the keystore isn't open.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildLocalPrekeyBundle(
+    env: JNIEnv,
+    _class: JClass,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let now = now_secs();
+            let (secret, kem_public) = {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                get_or_create_local_bundle(ks, now)?
+            };
+            let body = build_body(&secret, &kem_public, identity.public_key(), now);
+            let signed = sign_prekey_bundle(identity.as_ref(), body)?;
+            let wire = signed.to_wire()?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Decrypt a wire envelope produced by `nativeEncryptMessage` (or
 /// any peer's `encrypt_group_message`) back into a UTF-8
 /// plaintext string. Returns `null` if decryption fails OR if the
@@ -2340,11 +2393,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
             let gm = gm_guard
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-            let (_group_id, inner) = crate::groups::group_message::open_outer_envelope(
-                &wire_bytes,
-                |gid| gm.export_group_key(gid),
-            )?;
-            let envelope = crate::groups::group_message::GroupMessageEnvelope::from_inner_bincode(&inner)?;
+            let (_group_id, inner) =
+                crate::groups::group_message::open_outer_envelope(&wire_bytes, |gid| {
+                    gm.export_group_key(gid)
+                })?;
+            let envelope =
+                crate::groups::group_message::GroupMessageEnvelope::from_inner_bincode(&inner)?;
             let hex_id = hex::encode(envelope.body.sender_id.as_ref() as &[u8]);
             let java_str = env
                 .new_string(hex_id)
@@ -2565,8 +2619,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
 ) -> jstring {
     jni_catch_jstring(|| {
         let result: anyhow::Result<jstring> = (|| {
-            let identity = active_identity()?
-                .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let my_id = identity.identity_id();
 
             let gm_guard = GROUP_MANAGER.lock().unwrap();
@@ -2586,10 +2640,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
                     let active_count = group
                         .members
                         .values()
-                        .filter(|m| matches!(
-                            m.member_status,
-                            crate::groups::group_manager::MemberStatus::Active,
-                        ))
+                        .filter(|m| {
+                            matches!(
+                                m.member_status,
+                                crate::groups::group_manager::MemberStatus::Active,
+                            )
+                        })
                         .count();
                     serde_json::json!({
                         "group_id_hex": hex::encode(group.id.as_ref() as &[u8]),

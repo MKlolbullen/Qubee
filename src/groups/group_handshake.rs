@@ -304,6 +304,33 @@ pub struct MessageAckBody {
     pub timestamp: u64,
 }
 
+/// Public prekey bundle for the 1:1 ratchet, self-signed by the
+/// publisher's hybrid identity key. The signature (over
+/// [`canonical_prekey_bundle`]) attests "the holder of `publisher`
+/// published these prekeys" — it binds the ephemeral prekeys to the
+/// long-term identity **without** making any later message
+/// non-repudiable (messages are authenticated by the ratchet, not by
+/// this key).
+///
+/// The `publisher` field carries the full `IdentityKey` so a receiver
+/// can verify the signature standalone (trust in the identity itself
+/// still comes from the normal contact/verification flow).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrekeyBundleBody {
+    pub publisher: IdentityKey,
+    /// X25519 identity DH public (deniable handshake; distinct from the
+    /// Ed25519/ML-DSA signing identity in `publisher`).
+    pub identity_x25519: [u8; 32],
+    /// X25519 signed prekey public (also the initial ratchet public).
+    pub signed_prekey: [u8; 32],
+    /// Optional one-time prekey public (single-use forward secrecy for
+    /// the very first message).
+    pub one_time_prekey: Option<[u8; 32]>,
+    /// ML-KEM-768 prekey public bytes.
+    pub kem_public: Vec<u8>,
+    pub timestamp: u64,
+}
+
 /// Body of a `RequestStateSync` payload. A member who's been offline
 /// through one or more `MemberAdded` / `RoleChange` broadcasts uses
 /// this to ask any current member of the group for the latest
@@ -406,6 +433,15 @@ pub enum GroupHandshake {
         body: MessageAckBody,
         signature: HybridSignature,
     },
+    /// Identity-level (not group-level) frame: a peer's published
+    /// prekey bundle for the forward-secret/deniable 1:1 ratchet
+    /// (Stage 2). Published on the global topic, self-signed by the
+    /// publisher's hybrid identity key; receivers verify + cache it.
+    /// Not consumed by send/receive yet.
+    PrekeyBundle {
+        body: PrekeyBundleBody,
+        signature: HybridSignature,
+    },
 }
 
 impl GroupHandshake {
@@ -481,6 +517,13 @@ const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
 const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
 const OWNERSHIP_TRANSFER_TAG: &[u8] = b"qubee_handshake_ownership_transfer_v1";
 const MESSAGE_ACK_TAG: &[u8] = b"qubee_handshake_message_ack_v1";
+const PREKEY_BUNDLE_TAG: &[u8] = b"qubee_handshake_prekey_bundle_v1";
+
+/// Validity window for a published prekey bundle. Generous (30 days)
+/// because a bundle is meant to be reused across many handshakes until
+/// the publisher rotates it — unlike the 5-minute handshake window,
+/// freshness here is enforced by rotation, not by the signature age.
+pub const PREKEY_BUNDLE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const REQUEST_STATE_SYNC_TAG: &[u8] = b"qubee_handshake_request_state_sync_v1";
 // _v2: the body grew an `Option<WrappedGroupKey>` for KeyRotation
 // re-send (extends the rev-4 P1 resync flow to also recover the
@@ -817,10 +860,7 @@ pub fn sign_role_change(keypair: &IdentityKeyPair, body: RoleChangeBody) -> Resu
 /// by every receiver immediately after a successful
 /// `decrypt_group_message`; the sender + every other group member
 /// see it on the group's gossipsub topic.
-pub fn sign_message_ack(
-    keypair: &IdentityKeyPair,
-    body: MessageAckBody,
-) -> Result<GroupHandshake> {
+pub fn sign_message_ack(keypair: &IdentityKeyPair, body: MessageAckBody) -> Result<GroupHandshake> {
     let payload = canonical_message_ack(&body);
     let signature = keypair.sign(&payload)?;
     Ok(GroupHandshake::MessageAck { body, signature })
@@ -837,6 +877,54 @@ pub fn verify_message_ack(
 ) -> Result<bool> {
     let payload = canonical_message_ack(body);
     expected_acker.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Canonical signing bytes for a prekey bundle. Length-prefixed +
+/// domain-tagged so the signature is unambiguous.
+pub fn canonical_prekey_bundle(body: &PrekeyBundleBody) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256 + body.kem_public.len());
+    out.extend_from_slice(PREKEY_BUNDLE_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.publisher.identity_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&body.identity_x25519);
+    out.push(0u8);
+    out.extend_from_slice(&body.signed_prekey);
+    out.push(0u8);
+    // one_time_prekey: 1-byte present flag then (optional) 32 bytes.
+    match &body.one_time_prekey {
+        Some(otp) => {
+            out.push(1u8);
+            out.extend_from_slice(otp);
+        }
+        None => out.push(0u8),
+    }
+    out.push(0u8);
+    out.extend_from_slice(&(body.kem_public.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body.kem_public);
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    out
+}
+
+/// Sign a prekey bundle with the publisher's hybrid identity keypair.
+/// The `body.publisher` must be the public half of `keypair`.
+pub fn sign_prekey_bundle(
+    keypair: &IdentityKeyPair,
+    body: PrekeyBundleBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_prekey_bundle(&body);
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::PrekeyBundle { body, signature })
+}
+
+/// Verify a prekey bundle: the signature must be by `body.publisher`
+/// and within [`PREKEY_BUNDLE_MAX_AGE_SECS`]. Returns `true` on a valid,
+/// fresh, self-consistent bundle.
+pub fn verify_prekey_bundle(body: &PrekeyBundleBody, signature: &HybridSignature) -> Result<bool> {
+    let payload = canonical_prekey_bundle(body);
+    body.publisher
+        .verify_with_max_age(&payload, signature, PREKEY_BUNDLE_MAX_AGE_SECS)
 }
 
 /// Sign an `OwnershipTransfer` payload with the donor's keypair.
@@ -1000,7 +1088,7 @@ mod tests {
         // allocation. (Unbounded `bincode::deserialize` would try.)
         let mut evil = Vec::new();
         evil.extend_from_slice(&u64::MAX.to_le_bytes()); // claimed length
-        // no payload follows
+                                                         // no payload follows
         let decoded: Result<Vec<u8>> = bounded_bincode_deserialize(&evil);
         assert!(
             decoded.is_err(),

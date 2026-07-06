@@ -408,7 +408,13 @@ fn aead_encrypt(mk: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> 
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
     key.zeroize();
     cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| anyhow!("ratchet AEAD encrypt: {e:?}"))
 }
 
@@ -419,7 +425,13 @@ fn aead_decrypt(mk: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> Option<Vec<u8>>
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
     key.zeroize();
     cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .ok()
 }
 
@@ -520,7 +532,10 @@ mod tests {
         let (h2, c2) = alice.encrypt(b"secret2", AD).unwrap();
         let mut bad = h2.clone();
         bad.n ^= 0x01;
-        assert!(bob.decrypt(&bad, &c2, AD).is_err(), "header is authenticated");
+        assert!(
+            bob.decrypt(&bad, &c2, AD).is_err(),
+            "header is authenticated"
+        );
     }
 
     #[test]
@@ -563,7 +578,11 @@ mod tests {
 
     #[test]
     fn header_round_trips() {
-        let h = MessageHeader { dh: [7u8; 32], pn: 42, n: 9 };
+        let h = MessageHeader {
+            dh: [7u8; 32],
+            pn: 42,
+            n: 9,
+        };
         let back = MessageHeader::from_bytes(&h.to_bytes()).unwrap();
         assert_eq!(h, back);
         assert!(MessageHeader::from_bytes(&[0u8; 39]).is_err());

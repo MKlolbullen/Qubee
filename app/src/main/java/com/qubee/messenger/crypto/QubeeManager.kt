@@ -94,6 +94,26 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    /**
+     * Build the local device's signed prekey bundle (Ratchet Stage 2).
+     * Rust generates and persists fresh X25519/ML-KEM prekey material on
+     * first call and returns the signed PrekeyBundle wire frame, which
+     * the caller publishes on the group topic. Bundles are cached by
+     * receivers but not yet consumed by send/receive (Stage 3).
+     */
+    suspend fun buildLocalPrekeyBundle(): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeBuildLocalPrekeyBundle()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust prekey-bundle JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust prekey-bundle build failed")
+            null
+        }
+    }
+
     suspend fun decryptMessage(sessionId: String, encryptedMessage: EncryptedMessage): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         try {
@@ -522,6 +542,7 @@ class QubeeManager @Inject constructor(
 
     // Direct-message/session JNI owned by Rust.
     private external fun nativeEncryptMessage(sessionId: String, plaintext: String): ByteArray?
+    private external fun nativeBuildLocalPrekeyBundle(): ByteArray?
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?
     private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?

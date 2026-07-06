@@ -32,9 +32,25 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     one-time prekey), and the end-to-end PQXDH→ratchet handshake.
   This is a self-contained module — it does not yet touch the wire
   format, session store, JNI, or the group layer.
-* **Stages 2–5 — pending** (see the migration plan). The remaining
-  work wires the core into a persistent session store, the wire
-  format, the JNI/Kotlin bridge, and the group sender-keys layer, then
+* **Stage 2 — LANDED.** The prekey infrastructure is wired into the
+  wire format, encrypted keystore, and JNI bridge:
+  * `src/groups/group_handshake.rs` — the `GroupHandshake::PrekeyBundle`
+    frame (`PrekeyBundleBody` + hybrid identity signature),
+    `canonical_prekey_bundle` (tag `qubee_handshake_prekey_bundle_v1`),
+    `sign_prekey_bundle` / `verify_prekey_bundle` (30-day validity via
+    `PREKEY_BUNDLE_MAX_AGE_SECS`).
+  * `src/ratchet/prekey_store.rs` — persistence + conversion between the
+    live PQXDH secret bundle, the signed publishable body, and an
+    encrypted on-disk form; caches verified peer bundles keyed by
+    `IdentityId`.
+  * `src/jni_api.rs` — `process_handshake` verifies + caches inbound
+    bundles (fail-closed, self-filtered); `nativeBuildLocalPrekeyBundle`
+    produces the signed wire frame for the Android side to publish.
+  Bundles are **published + cached but not consumed** by send/receive —
+  the current v2 symmetric-group path is unchanged.
+* **Stages 3–5 — pending** (see the migration plan). The remaining
+  work wires the core into a persistent session store + the live PQXDH →
+  Double Ratchet 1:1 session, then the group sender-keys layer, then
   cuts over from the v2 symmetric-group-key format.
 
 ## What's currently broken
@@ -151,14 +167,12 @@ bounds blast radius the same way the per-message ratchet does on
 exhaustively tested in `src/ratchet/` (`double_ratchet.rs`,
 `pqxdh.rs`). Pure module; no wire format, session store, or JNI yet.
 
-**Stage 2 (next):** publish + fetch signed prekey bundles. A new
-`PrekeyBundle` wire frame carrying the X25519 identity/signed-prekey/
+**Stage 2 (LANDED):** publish + fetch signed prekey bundles. The
+`PrekeyBundle` wire frame carries the X25519 identity/signed-prekey/
 one-time-prekey publics + the ML-KEM prekey public, signed by the
-hybrid identity key. Receivers cache peer bundles in the keystore.
-Reuse `pqxdh::PrekeyBundleSecret::generate_bundle` +
-`IdentityKeyPair::sign` for the bundle signature; add
-`verify_prekey_bundle`. No live DR yet — bundles are cached but not
-consumed.
+hybrid identity key. Receivers verify (`verify_prekey_bundle`) and cache
+peer bundles in the keystore (`ratchet::prekey_store`). No live DR yet —
+bundles are cached but not consumed.
 
 **Stage 3 (~2 weeks):** PQXDH initial agreement + DR per-1:1
 session. New wire `MAGIC_DIRECT_MESSAGE \x01`. Sender + receiver

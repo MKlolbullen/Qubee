@@ -195,6 +195,86 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    /**
+     * Create (or reload) this device's sender key for a group (Ratchet
+     * Stage 4) and return the distribution payload. The payload contains
+     * the live chain key — deliver it ONLY via [encryptDirectMessage],
+     * one copy per member, never on a plaintext or group topic.
+     */
+    suspend fun createSenderKeyDistribution(groupIdHex: String): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeCreateSenderKeyDistribution(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust sender-key-create JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust sender-key distribution create failed")
+            null
+        }
+    }
+
+    /**
+     * Install a member's sender key distribution (Ratchet Stage 4).
+     * [authenticatedSenderHex] must be the sender identity proven by the
+     * 1:1 channel that delivered the bytes (the id from
+     * [inspectDirectMessageSender] whose [decryptDirectMessage]
+     * succeeded) — Rust enforces it matches both the distribution's
+     * claim and the group membership list. Returns the group id hex.
+     */
+    suspend fun installSenderKeyDistribution(authenticatedSenderHex: String, distribution: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeInstallSenderKeyDistribution(authenticatedSenderHex, distribution)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust sender-key-install JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust sender-key distribution install failed")
+                null
+            }
+        }
+
+    /**
+     * Encrypt a group message over the v3 sender-keys format (Ratchet
+     * Stage 4): per-sender forward secrecy instead of the v2 shared
+     * symmetric key. Dark-launched — live group traffic still rides
+     * [nativeSendGroupMessage]'s v2 path until the cutover.
+     */
+    suspend fun encryptGroupMessageV3(groupIdHex: String, plaintext: String): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeEncryptGroupMessageV3(groupIdHex, plaintext)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust group-v3-encrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust group v3 encryption failed")
+            null
+        }
+    }
+
+    /**
+     * Decrypt an inbound v3 group frame (Ratchet Stage 4). Returns a
+     * JSON string `{"groupId": hex, "senderId": hex, "plaintext": str}`
+     * — the sender is authenticated by their ephemeral group signing
+     * key, so members cannot impersonate each other. Null on unknown
+     * group, missing distribution, forgery, or replay.
+     */
+    suspend fun decryptGroupMessageV3(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeDecryptGroupMessageV3(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust group-v3-decrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust group v3 decryption failed")
+            null
+        }
+    }
+
     suspend fun decryptMessage(sessionId: String, encryptedMessage: EncryptedMessage): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         try {
@@ -628,6 +708,10 @@ class QubeeManager @Inject constructor(
     private external fun nativeEncryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray?
     private external fun nativeDecryptDirectMessage(wire: ByteArray): String?
     private external fun nativeInspectDirectMessageSender(wire: ByteArray): String?
+    private external fun nativeCreateSenderKeyDistribution(groupIdHex: String): ByteArray?
+    private external fun nativeInstallSenderKeyDistribution(authenticatedSenderHex: String, distribution: ByteArray): String?
+    private external fun nativeEncryptGroupMessageV3(groupIdHex: String, plaintext: String): ByteArray?
+    private external fun nativeDecryptGroupMessageV3(wire: ByteArray): String?
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?
     private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?

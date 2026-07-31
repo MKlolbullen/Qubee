@@ -62,6 +62,30 @@ fn direct_message_round_trips_through_wire() {
 }
 
 #[test]
+fn group_message_v3_magic_is_pinned() {
+    use qubee_crypto::ratchet::sender_keys::MAGIC_GROUP_MESSAGE_V3;
+    // `\x03` is the sender-keys wire format (Ratchet Stage 4). It
+    // coexists with `\x02` through the migration window; a bump here is
+    // a deliberate version change with a migration path.
+    assert_eq!(MAGIC_GROUP_MESSAGE_V3, b"QUBEE_GMS\x03");
+}
+
+#[test]
+fn sender_key_distribution_round_trips() {
+    use qubee_crypto::groups::group_manager::GroupId;
+    use qubee_crypto::ratchet::sender_keys::SenderKeyDistribution;
+    let d = SenderKeyDistribution {
+        group_id: GroupId::from_bytes([7u8; 32]),
+        sender_id: IdentityId::from([8u8; 32]),
+        iteration: 42,
+        chain_key: [9u8; 32],
+        signing_pub: [10u8; 32],
+    };
+    let bytes = d.to_bytes().unwrap();
+    assert_eq!(SenderKeyDistribution::from_bytes(&bytes).unwrap(), d);
+}
+
+#[test]
 fn group_message_magic_is_pinned() {
     // `\x02` is the sealed-outer-envelope wire format. `\x01` was the
     // pre-sealing format that left signed bodies plaintext on the

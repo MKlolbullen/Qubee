@@ -25,6 +25,7 @@ pub mod direct_message;
 pub mod double_ratchet;
 pub mod pqxdh;
 pub mod prekey_store;
+pub mod sender_keys;
 pub mod session;
 
 pub use double_ratchet::{DoubleRatchet, MessageHeader, MAX_SKIP};

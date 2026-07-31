@@ -32,6 +32,9 @@ use crate::groups::handshake_handlers::{
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
+use crate::ratchet::direct::{
+    decrypt_direct, encrypt_direct, inspect_direct_sender, install_peer_bundle,
+};
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
@@ -2225,6 +2228,140 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildL
                 .byte_array_from_slice(&wire)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
             Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Verify + cache a peer's signed prekey bundle wire frame (Ratchet
+/// Stage 3d). Returns the publisher's identity id as a 64-char hex
+/// string, or `null` when the frame is malformed or its hybrid
+/// signature doesn't verify. Installing a bundle is the precondition
+/// for both initiating to that peer (`nativeEncryptDirectMessage`) and
+/// accepting a first message *from* them (identity binding).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInstallPeerPrekeyBundle(
+    env: JNIEnv,
+    _class: JClass,
+    bundle_wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire = env
+                .convert_byte_array(&bundle_wire)
+                .map_err(|e| anyhow::anyhow!("invalid bundle_wire: {e}"))?;
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let id = install_peer_bundle(ks, &wire)?;
+            let java_str = env
+                .new_string(hex::encode(id.as_ref() as &[u8]))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Encrypt a UTF-8 plaintext for a single peer over the PQXDH + Double
+/// Ratchet session (Ratchet Stage 3d), establishing the session from
+/// the peer's installed prekey bundle on first use. Returns the
+/// `QUBEE_DMS\x01` wire frame, or `null` on failure (no identity, no
+/// keystore, no bundle installed for the peer). Dark-launched: nothing
+/// routes live 1:1 traffic through this yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptDirectMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    plaintext: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_hex: String = env
+                .get_string(&peer_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+                .into();
+            let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+            let plaintext_str: String = env
+                .get_string(&plaintext)
+                .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?
+                .into();
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let wire = encrypt_direct(ks, local_id, peer_id, plaintext_str.as_bytes(), now_secs())?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Decrypt an inbound `QUBEE_DMS\x01` frame (Ratchet Stage 3d) back to
+/// its UTF-8 plaintext, establishing the responder side of the session
+/// on a conversation's first message. The sender is recovered with
+/// `nativeInspectDirectMessageSender`. Returns `null` on any failure —
+/// wrong frame type, no session and no (bound) initial, replay, or
+/// tampering.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptDirectMessage(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire_bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let (_sender, plaintext) = decrypt_direct(ks, local_id, &wire_bytes, now_secs())?;
+            let plaintext = String::from_utf8(plaintext)
+                .map_err(|e| anyhow::anyhow!("plaintext is not UTF-8: {e}"))?;
+            let java_str = env
+                .new_string(plaintext)
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Cheap dispatcher probe: if `wire` is a `QUBEE_DMS\x01` frame, return
+/// the claimed sender's identity id as a 64-char hex string without
+/// touching session state; `null` otherwise. The claim is only
+/// authenticated once `nativeDecryptDirectMessage` succeeds.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspectDirectMessageSender(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire_bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let sender = inspect_direct_sender(&wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("not a direct message frame"))?;
+            let java_str = env
+                .new_string(hex::encode(sender.as_ref() as &[u8]))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
         })();
         result.unwrap_or(std::ptr::null_mut())
     })

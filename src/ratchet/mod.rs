@@ -20,6 +20,7 @@
 //! subsequent, separately-reviewed stages (see
 //! `docs/double-ratchet-design.md`).
 
+pub mod direct;
 pub mod direct_message;
 pub mod double_ratchet;
 pub mod pqxdh;

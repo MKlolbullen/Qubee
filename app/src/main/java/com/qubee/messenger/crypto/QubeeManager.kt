@@ -114,6 +114,87 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    /**
+     * Verify + cache a peer's signed prekey bundle (Ratchet Stage 3d).
+     * Returns the publisher's identity id as a 64-char hex string, or
+     * null when the frame is malformed or its signature doesn't verify.
+     * Installing a bundle is the precondition for both initiating a
+     * ratchet session to that peer and accepting their first message.
+     */
+    suspend fun installPeerPrekeyBundle(bundleWire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeInstallPeerPrekeyBundle(bundleWire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust prekey-bundle-install JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust prekey-bundle install failed")
+            null
+        }
+    }
+
+    /**
+     * Encrypt a plaintext for one peer over the forward-secret PQXDH +
+     * Double Ratchet session (Ratchet Stage 3d), establishing the
+     * session from the peer's installed prekey bundle on first use.
+     * Returns the QUBEE_DMS wire frame. Dark-launched: MessageService
+     * still routes live 1:1 traffic through the legacy envelope; this
+     * path activates only when the ratchet rollout flag flips.
+     */
+    suspend fun encryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeEncryptDirectMessage(peerIdHex, plaintext)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust ratchet-encrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust ratchet encryption failed")
+            null
+        }
+    }
+
+    /**
+     * Decrypt an inbound QUBEE_DMS frame (Ratchet Stage 3d) back to its
+     * plaintext, establishing the responder side of the session on a
+     * conversation's first message. Null on wrong frame type, missing
+     * session/bundle, replay, or tampering. The (authenticated-once-
+     * decryption-succeeds) sender comes from [inspectDirectMessageSender].
+     */
+    suspend fun decryptDirectMessage(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeDecryptDirectMessage(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust ratchet-decrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust ratchet decryption failed")
+            null
+        }
+    }
+
+    /**
+     * If `wire` is a QUBEE_DMS frame, return the claimed sender's
+     * identity id as a 64-char hex string without touching session
+     * state; null otherwise. The claim is unauthenticated until
+     * [decryptDirectMessage] succeeds — treat it as routing metadata
+     * only, mirroring [inspectEnvelopeSender].
+     */
+    suspend fun inspectDirectMessageSender(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeInspectDirectMessageSender(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust direct-inspect JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Direct message inspection failed")
+            null
+        }
+    }
+
     suspend fun decryptMessage(sessionId: String, encryptedMessage: EncryptedMessage): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
         try {
@@ -543,6 +624,10 @@ class QubeeManager @Inject constructor(
     // Direct-message/session JNI owned by Rust.
     private external fun nativeEncryptMessage(sessionId: String, plaintext: String): ByteArray?
     private external fun nativeBuildLocalPrekeyBundle(): ByteArray?
+    private external fun nativeInstallPeerPrekeyBundle(bundleWire: ByteArray): String?
+    private external fun nativeEncryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray?
+    private external fun nativeDecryptDirectMessage(wire: ByteArray): String?
+    private external fun nativeInspectDirectMessageSender(wire: ByteArray): String?
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?
     private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?

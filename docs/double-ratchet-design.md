@@ -48,8 +48,10 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     produces the signed wire frame for the Android side to publish.
   Bundles are **published + cached but not consumed** by send/receive —
   the current v2 symmetric-group path is unchanged.
-* **Stage 3 — IN PROGRESS.** The 1:1 session layer + wire frame are
-  landed in Rust; the live JNI cutover (3d) is the remaining piece.
+* **Stage 3 — DONE (dark-launched).** The full 1:1 path is implemented
+  and callable over JNI, but MessageService still routes live traffic
+  through the legacy envelope; the default flips only after the
+  two-device checklist (`docs/two-device-walkthrough.md`) passes.
   * *Foundation* — `DoubleRatchet::serialize_state` / `deserialize_state`
     so a session survives an app restart without reusing a message key.
   * *3b* — `src/ratchet/session.rs`: a `Session` ties PQXDH + the Double
@@ -60,11 +62,19 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     frame to its pair.
   * *3c* — `src/ratchet/direct_message.rs`: the `DirectMessage`
     (`QUBEE_DMS\x01`) wire frame carrying the optional PQXDH
-    `InitialMessage` (first message only), the ratchet header, and the
-    ciphertext. Unsigned (deniable); bounded decode on the unauth path.
-  * *3d — pending*: route live 1:1 send/receive through sessions over
-    JNI, with per-session replay windows. Behaviour-changing; needs a
-    two-device test.
+    `InitialMessage`, the ratchet header, and the ciphertext. Unsigned
+    (deniable); bounded decode on the unauth path.
+  * *3d* — `src/ratchet/direct.rs` + four JNI symbols
+    (`nativeInstallPeerPrekeyBundle`, `nativeEncryptDirectMessage`,
+    `nativeDecryptDirectMessage`, `nativeInspectDirectMessageSender`).
+    Session state persists only after a successful operation (garbage
+    frames can't corrupt the stored ratchet); replays die on consumed
+    message keys plus an accepted-initial hash record; responder
+    establishment requires the initial's X25519 identity to match the
+    sender's cached *verified* bundle (fail closed); simultaneous-open
+    resolves byte-wise-smaller-id-wins. Known limitation: a peer who
+    wipes state and re-initiates is only accepted if they win the
+    id tie-break — a session-reset JNI hook is follow-up work.
 * **Stages 4–5 — pending** (see the migration plan): the group
   sender-keys layer, then the cutover from the v2 symmetric-group-key
   format.
@@ -190,13 +200,15 @@ hybrid identity key. Receivers verify (`verify_prekey_bundle`) and cache
 peer bundles in the keystore (`ratchet::prekey_store`). No live DR yet —
 bundles are cached but not consumed.
 
-**Stage 3 (in progress):** PQXDH initial agreement + DR per-1:1
-session. The Rust core is landed — ratchet-state serialisation, the
-`Session` manager (`src/ratchet/session.rs`) persisting per-peer state to
-the encrypted keystore, and the `MAGIC_DIRECT_MESSAGE \x01` wire frame
-(`src/ratchet/direct_message.rs`). The remaining piece (3d) routes the
-live 1:1 send/receive path through sessions over JNI, with per-session
-replay protection (recently-used `(chain_idx, msg_idx)` tuples).
+**Stage 3 (LANDED, dark):** PQXDH initial agreement + DR per-1:1
+session, end to end — ratchet-state serialisation, the `Session`
+manager (`src/ratchet/session.rs`), the `MAGIC_DIRECT_MESSAGE \x01`
+wire frame (`src/ratchet/direct_message.rs`), and the live orchestration
++ JNI bridge (`src/ratchet/direct.rs`, four `nativeDirect*`/bundle
+symbols). Replay protection comes from consumed message keys plus an
+accepted-initial hash record — a dedicated `(chain_idx, msg_idx)` window
+proved unnecessary. The path is dark: MessageService still sends 1:1
+over the legacy envelope until the two-device checklist passes.
 
 **Stage 4 (~1 week):** sender-keys group messaging on top of DR.
 New wire `MAGIC_GROUP_MESSAGE \x03`. Migration: existing groups

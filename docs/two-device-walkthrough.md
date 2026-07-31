@@ -287,6 +287,41 @@ useful when running the walkthrough against an older build.)
   shared library didn't link the Rust bridge — check the build
   output of `build_rust.sh` for the target ABIs your device uses.
 
+## Ratchet cutover checklist (Stage 3d validation)
+
+The PQXDH + Double Ratchet 1:1 path is fully implemented and exposed
+over JNI (`installPeerPrekeyBundle` / `encryptDirectMessage` /
+`decryptDirectMessage` / `inspectDirectMessageSender` on
+`QubeeManager`), but **dark**: `MessageService` still routes live 1:1
+traffic through the legacy envelope. Before flipping the default,
+validate on two devices:
+
+1. **Bundle exchange.** A and B each call `buildLocalPrekeyBundle` and
+   deliver the frame to the other device (over the group topic or any
+   authenticated channel); `installPeerPrekeyBundle` must return the
+   peer's identity id hex on both sides. Without this, both directions
+   fail closed by design.
+2. **First contact.** A sends via `encryptDirectMessage(bIdHex, …)`;
+   B routes the received bytes (recognised via
+   `inspectDirectMessageSender != null`) into `decryptDirectMessage`
+   and sees the plaintext. Repeat B→A.
+3. **Restart persistence.** Force-stop both apps, reopen, exchange
+   another pair of messages — sessions must resume from the keystore
+   with no re-handshake.
+4. **Lossy first message.** Clear app data on B only, re-exchange
+   bundles, have A send *two* messages, deliver only the second — it
+   must still decrypt (the initial rides every frame until A first
+   hears back).
+5. **Replay.** Re-deliver an already-decrypted frame — must return
+   null, and the next fresh message must still decrypt.
+6. **Simultaneous open.** Both devices send their first message before
+   either receives. The byte-wise-smaller identity id wins the
+   initiator role; the other side's first send is dropped (expected —
+   note it in the test log) and everything after converges.
+
+Only after all six pass does the send path in `MessageService` switch
+from the legacy envelope to `encryptDirectMessage`.
+
 ## Build commands
 
 ```bash

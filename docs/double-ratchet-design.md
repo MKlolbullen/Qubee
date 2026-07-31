@@ -75,9 +75,20 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     resolves byte-wise-smaller-id-wins. Known limitation: a peer who
     wipes state and re-initiates is only accepted if they win the
     id tie-break — a session-reset JNI hook is follow-up work.
-* **Stages 4–5 — pending** (see the migration plan): the group
-  sender-keys layer, then the cutover from the v2 symmetric-group-key
-  format.
+* **Stage 4 — DONE (dark-launched).** `src/ratchet/sender_keys.rs` +
+  four JNI symbols (`nativeCreateSenderKeyDistribution`,
+  `nativeInstallSenderKeyDistribution`, `nativeEncryptGroupMessageV3`,
+  `nativeDecryptGroupMessageV3`). Per-sender BLAKE3 hash chains
+  (`QUBEE_GMS\x03`) give in-group forward secrecy; a per-group
+  *ephemeral* Ed25519 signing key — distributed only over the encrypted
+  1:1 sessions — authenticates senders inside the group without
+  reintroducing identity signatures, so transcripts stay deniable to
+  outsiders. The v2 sealed outer envelope is retained (new KDF
+  context). Live group traffic still rides v2; membership changes must
+  call `reset_group_sender_state` + redistribute at cutover.
+* **Stage 5 — pending**: cut group traffic over to v3, wire
+  distribution exchange + membership-change rekey into MessageService,
+  then drop the v2 symmetric path after the deprecation window.
 
 ## What's currently broken
 
@@ -210,11 +221,12 @@ accepted-initial hash record — a dedicated `(chain_idx, msg_idx)` window
 proved unnecessary. The path is dark: MessageService still sends 1:1
 over the legacy envelope until the two-device checklist passes.
 
-**Stage 4 (~1 week):** sender-keys group messaging on top of DR.
-New wire `MAGIC_GROUP_MESSAGE \x03`. Migration: existing groups
-keep the v2 symmetric key for one release; new groups (and any
-group after a member-add / member-remove) start on v3. Cleanup
-batch removes v2 support after a deprecation window.
+**Stage 4 (LANDED, dark):** sender-keys group messaging on top of DR —
+`src/ratchet/sender_keys.rs`, wire `QUBEE_GMS\x03`, JNI dark-launched.
+Migration plan unchanged: existing groups keep the v2 symmetric key for
+one release; new groups (and any group after a member-add /
+member-remove) start on v3. Cleanup batch removes v2 support after a
+deprecation window.
 
 **Stage 5:** drop v2 group-message wire format. Remove the
 symmetric-group-key path entirely.

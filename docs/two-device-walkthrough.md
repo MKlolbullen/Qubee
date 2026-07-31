@@ -322,6 +322,35 @@ validate on two devices:
 Only after all six pass does the send path in `MessageService` switch
 from the legacy envelope to `encryptDirectMessage`.
 
+## Group sender-keys checklist (Stage 4 validation)
+
+The v3 group format (`createSenderKeyDistribution` /
+`installSenderKeyDistribution` / `encryptGroupMessageV3` /
+`decryptGroupMessageV3` on `QubeeManager`) is likewise dark. It
+depends on the 1:1 ratchet path above — distributions travel inside
+`encryptDirectMessage` frames. Validate with three devices in one
+group (A owner, B, C members), after the 1:1 checklist passes between
+every pair:
+
+1. **Distribution fan-out.** Each device calls
+   `createSenderKeyDistribution(groupIdHex)` and sends the bytes to
+   each other member via `encryptDirectMessage`. On receipt:
+   `decryptDirectMessage` → the payload is a distribution →
+   `installSenderKeyDistribution(authenticatedSenderHex, bytes)` using
+   the sender id the 1:1 decrypt proved. All six installs must return
+   the group id hex.
+2. **Group round-trip.** A sends via `encryptGroupMessageV3`; B and C
+   both decrypt and see `senderId == A` in the returned JSON. Repeat
+   from B and C.
+3. **Out-of-order + replay.** Hold back one of A's frames, deliver a
+   later one first, then the held frame — both decrypt. Re-deliver
+   either — must return null.
+4. **Member removal rekey.** Remove C; every remaining device must
+   call `reset_group_sender_state` (via the cutover wiring) and re-run
+   step 1 among A+B. Frames from before the rekey must no longer be
+   decryptable by C (rotated group key seals the outer envelope), and
+   A↔B traffic must resume on fresh chains.
+
 ## Build commands
 
 ```bash

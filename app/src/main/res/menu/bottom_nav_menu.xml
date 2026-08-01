@@ -7,7 +7,7 @@
         
     <item
         android:id="@+id/navigation_contacts"
-        android:icon="@android:drawable/ic_menu_my_places"
+        android:icon="@drawable/ic_contacts"
         android:title="Kontakter" />
 
     <item

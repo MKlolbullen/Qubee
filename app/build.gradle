@@ -121,12 +121,14 @@ android {
     }
 
     composeOptions {
-        // Paired with Kotlin 1.9.22 (forced in settings.gradle
-        // pluginManagement). Compose compiler 1.5.4 was for Kotlin
-        // 1.9.20 and mismatched the pinned 1.9.22; 1.5.8 is the
-        // 1.9.22-compatible release per the AndroidX Compose-Kotlin
-        // compatibility map. Bump both together.
-        kotlinCompilerExtensionVersion '1.5.8'
+        // Paired with Kotlin 1.9.24. The Kotlin plugin is declared at
+        // 1.9.24 (build.gradle) — pinned plugins (Hilt / Paparazzi /
+        // safeargs) transitively require 1.9.24 on the compiler
+        // classpath, so that is the effective compiler version and the
+        // declaration matches it. 1.5.14 is the 1.9.24-compatible
+        // Compose compiler per the AndroidX Compose-Kotlin map. Bump
+        // both together.
+        kotlinCompilerExtensionVersion '1.5.14'
     }
     // No externalNativeBuild — Rust shared libraries are built out of band
     // by build_rust.sh / cargo-ndk and copied into jniLibs.

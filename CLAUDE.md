@@ -110,7 +110,7 @@ PeerId ↔ IdentityId linkage has two population paths: handshake-time (`Network
 
 The Rust dependency set has been deliberately pinned to keep `rand_core 0.6` consistent across `chacha20poly1305 0.10`, `rand_chacha 0.3`, and `ed25519-dalek 2.x`. Bumping `rand` to 0.9 (or `secrecy` away from 0.10, or `pqcrypto-{mlkem,mldsa}` to a non-0.1 line) cascades into trait-bound mismatches across half the crate. `Cargo.toml` has inline comments explaining each pin. Don't bump these without a reason called out in the PR.
 
-The Android side similarly pins AGP 8.4 / Kotlin 1.9.22 / Hilt 2.48 / Compose BOM 2023.10.01 / Paparazzi 1.3.4 / SQLCipher 4.6.0. Same rule.
+The Android side similarly pins AGP 8.4 / Kotlin 1.9.24 / Hilt 2.48 / Compose BOM 2023.10.01 / Paparazzi 1.3.4 / SQLCipher 4.6.0. Same rule.
 
 ## Conventions that bite if you don't know them
 

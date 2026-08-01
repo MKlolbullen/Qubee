@@ -106,7 +106,7 @@ object TrustStatePolicy {
      *   so the caller can decide whether to clear the COMPROMISED
      *   flag through a separate explicit action.
      * - All other trust levels: stamp the observed key, set
-     *   [TrustLevel.VERIFIED] + [ContactVerificationStatus.VERIFIED].
+     *   [TrustLevel.VERIFIED] + [ContactVerificationStatus.VERIFIED_ONCE].
      */
     fun applyOutOfBandVerification(
         contact: Contact,
@@ -117,7 +117,7 @@ object TrustStatePolicy {
         return contact.copy(
             identityKey = observedIdentityKey.copyOf(),
             trustLevel = TrustLevel.VERIFIED,
-            verificationStatus = ContactVerificationStatus.VERIFIED,
+            verificationStatus = ContactVerificationStatus.VERIFIED_ONCE,
             updatedAt = nowMillis,
         )
     }

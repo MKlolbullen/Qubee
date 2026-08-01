@@ -146,7 +146,7 @@ class ContactVerificationViewModel @Inject constructor(
 
     private suspend fun persistVerified(target: Contact) {
         contactRepository.updateTrustLevel(target.id, TrustLevel.VERIFIED)
-        contactRepository.updateVerificationStatus(target.id, ContactVerificationStatus.VERIFIED)
+        contactRepository.updateVerificationStatus(target.id, ContactVerificationStatus.VERIFIED_ONCE)
         _uiState.value = _uiState.value.copy(alreadyVerified = true)
     }
 }

@@ -237,6 +237,36 @@ class ContactRepository @Inject constructor(
     }
 
     /**
+     * Record an out-of-band verification the user attested to directly
+     * (a visual SAS match, or a fingerprint the Rust core already
+     * confirmed), routing it through
+     * [TrustStatePolicy.applyOutOfBandVerification] so the same
+     * COMPROMISED-stickiness / changed-key rules that guard
+     * [verifyIdentityKey] apply here too. The observed key is the
+     * contact's own stored `identityKey` — the ceremony attests that
+     * *that* key is the peer's real one.
+     *
+     * Returns `false` (persisting nothing) when the contact is unknown,
+     * has no stored identity key, or the policy declines the upgrade
+     * (e.g. a sticky COMPROMISED contact); `true` only when the trust
+     * transition actually landed. This is the SAS/attestation
+     * counterpart to [verifyIdentityKey], which additionally runs the
+     * JNI signature check — the attestation flows have no such payload.
+     */
+    suspend fun markVerifiedOutOfBand(contactId: String): Boolean {
+        val existing = contactDao.getContactById(contactId) ?: return false
+        val observedKey = existing.identityKey ?: return false
+        val verified = TrustStatePolicy.applyOutOfBandVerification(
+            contact = existing,
+            observedIdentityKey = observedKey,
+            nowMillis = System.currentTimeMillis(),
+        )
+        if (verified === existing) return false
+        contactDao.updateContact(verified)
+        return true
+    }
+
+    /**
      * Compute the Short Authentication String for a contact by routing
      * their stored `identityKey` through `QubeeManager.generateSASForContact`.
      * Returns the empty string when the contact is unknown, has no

@@ -333,23 +333,24 @@ group (A owner, B, C members), after the 1:1 checklist passes between
 every pair:
 
 1. **Distribution fan-out.** Each device calls
-   `createSenderKeyDistribution(groupIdHex)` and sends the bytes to
-   each other member via `encryptDirectMessage`. On receipt:
-   `decryptDirectMessage` → the payload is a distribution →
-   `installSenderKeyDistribution(authenticatedSenderHex, bytes)` using
-   the sender id the 1:1 decrypt proved. All six installs must return
-   the group id hex.
+   `createDirectDistributionMessage(peerIdHex, groupIdHex)` once per
+   other member and sends the frames over the P2P transport. On
+   receipt, `decryptDirectMessage` returns
+   `{"kind": "senderKeyDistribution", "groupId": …}` — Rust has
+   already membership-checked and installed it. All six deliveries
+   must return that JSON shape.
 2. **Group round-trip.** A sends via `encryptGroupMessageV3`; B and C
    both decrypt and see `senderId == A` in the returned JSON. Repeat
    from B and C.
 3. **Out-of-order + replay.** Hold back one of A's frames, deliver a
    later one first, then the held frame — both decrypt. Re-deliver
    either — must return null.
-4. **Member removal rekey.** Remove C; every remaining device must
-   call `reset_group_sender_state` (via the cutover wiring) and re-run
-   step 1 among A+B. Frames from before the rekey must no longer be
-   decryptable by C (rotated group key seals the outer envelope), and
-   A↔B traffic must resume on fresh chains.
+4. **Member removal rekey.** Remove C via the existing flow. The
+   rotation wipes sender chains automatically on every device that
+   processes it (verify `resetGroupSenderState` returns 0 afterwards —
+   nothing left to delete). Re-run step 1 among A+B; A↔B traffic must
+   resume on fresh chains, and C must decrypt nothing sent after the
+   rotation.
 
 ## Build commands
 

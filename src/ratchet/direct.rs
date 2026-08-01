@@ -239,8 +239,8 @@ pub fn inspect_direct_sender(wire: &[u8]) -> Option<IdentityId> {
 // compatibility surface between app versions, so the tag values are
 // pinned in `tests/wire_stability.rs` like any other format byte.
 
-const PAYLOAD_TAG_TEXT: u8 = 0x01;
-const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
+pub const PAYLOAD_TAG_TEXT: u8 = 0x01;
+pub const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
 
 /// A decoded 1:1 plaintext.
 #[derive(Debug, PartialEq, Eq)]

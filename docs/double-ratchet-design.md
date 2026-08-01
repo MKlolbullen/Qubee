@@ -86,9 +86,20 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
   outsiders. The v2 sealed outer envelope is retained (new KDF
   context). Live group traffic still rides v2; membership changes must
   call `reset_group_sender_state` + redistribute at cutover.
-* **Stage 5 — pending**: cut group traffic over to v3, wire
-  distribution exchange + membership-change rekey into MessageService,
-  then drop the v2 symmetric path after the deprecation window.
+* **Stage 5 — plumbing LANDED (dark); flag-flip pending.** The 1:1
+  plaintext is now a tagged payload (0x01 text / 0x02 sender-key
+  distribution, pinned in wire-stability): distributions ride the
+  encrypted 1:1 sessions via `nativeCreateDirectDistributionMessage`,
+  and `nativeDecryptDirectMessage` returns typed JSON and auto-installs
+  inbound distributions after checking the channel-authenticated sender
+  against group membership. Rekey is automatic: member removal
+  (`nativeRemoveMember`) and verified inbound `KeyRotation` frames both
+  wipe the group's sender chains (`nativeResetGroupSenderState` exists
+  for manual rekeys). What remains is Kotlin-side only: MessageService
+  routing behind a rollout flag (send 1:1 via `encryptDirectMessage`,
+  groups via `encryptGroupMessageV3`, distribution fan-out on group
+  join/rekey), gated on the device checklists — then dropping v2 after
+  the deprecation window.
 
 ## What's currently broken
 

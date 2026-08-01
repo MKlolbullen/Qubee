@@ -62,6 +62,16 @@ fn direct_message_round_trips_through_wire() {
 }
 
 #[test]
+fn direct_payload_tags_are_pinned() {
+    use qubee_crypto::ratchet::direct::{PAYLOAD_TAG_SENDER_KEY_DIST, PAYLOAD_TAG_TEXT};
+    // These sit inside the 1:1 ratchet plaintext but are still a
+    // cross-version compatibility surface: an old app receiving an
+    // unknown tag drops the message.
+    assert_eq!(PAYLOAD_TAG_TEXT, 0x01);
+    assert_eq!(PAYLOAD_TAG_SENDER_KEY_DIST, 0x02);
+}
+
+#[test]
 fn group_message_v3_magic_is_pinned() {
     use qubee_crypto::ratchet::sender_keys::MAGIC_GROUP_MESSAGE_V3;
     // `\x03` is the sender-keys wire format (Ratchet Stage 4). It

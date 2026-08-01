@@ -140,7 +140,10 @@ the pre-alpha:
   defence-in-depth even though the Android passphrase is full-entropy,
   since nothing at the Rust boundary enforces entropy for other
   callers. Plaintext key material and derived wrap keys are zeroised
-  (`zeroize`/`SecretBox`) before buffers are released. Builds before
+  (`zeroize`/`SecretBox`) before buffers are released. The passphrase
+  crosses JNI as a `byte[]` (never a Java `String`, which would pin
+  the secret in the immutable-string heap); both sides zero their
+  copies after the keystores open. Builds before
   the passphrase change used a hardcoded `"default_password"`, and
   builds before the Argon2id change used an unsalted single BLAKE3
   derivation; both migrate transparently to the salted Argon2id layout

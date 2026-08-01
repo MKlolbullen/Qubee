@@ -31,8 +31,10 @@ class QubeeManager @Inject constructor(
             // protects the Rust core's on-disk private identity keys.
             // Fail closed: if the Keystore is unavailable we refuse to
             // initialise rather than fall back to an unprotected
-            // keystore. (Pre-this-change the Rust side used a hardcoded
-            // passphrase; that hole is now closed.)
+            // keystore. Carried as a ByteArray end-to-end (never a
+            // String) so it can be zeroed after the native call — JVM
+            // strings are immutable and would pin the secret in the
+            // heap until GC, or forever if interned.
             val passphrase = try {
                 SqlCipherKeyProvider(context).getOrCreateCoreKeystorePassphrase()
             } catch (e: SecurityException) {
@@ -40,7 +42,11 @@ class QubeeManager @Inject constructor(
                 return@withContext false
             }
 
-            val result = nativeInitialize(context.filesDir.absolutePath, passphrase)
+            val result = try {
+                nativeInitialize(context.filesDir.absolutePath, passphrase)
+            } finally {
+                passphrase.fill(0)
+            }
             if (result) {
                 isInitialized = true
                 Timber.d("Qubee initialized at %s", context.filesDir.absolutePath)
@@ -762,7 +768,7 @@ class QubeeManager @Inject constructor(
         nativeListAcceptedInvites()
     }
 
-    private external fun nativeInitialize(dataDir: String, keystorePassphrase: String): Boolean
+    private external fun nativeInitialize(dataDir: String, keystorePassphrase: ByteArray): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
     private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean

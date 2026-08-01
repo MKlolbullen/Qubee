@@ -44,7 +44,7 @@ use crate::ratchet::sender_keys::{
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
 use std::collections::HashMap;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const ACTIVE_IDENTITY_KEY: &str = "active_identity";
 
@@ -223,7 +223,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
-    keystore_passphrase: JString,
+    keystore_passphrase: JByteArray,
 ) -> jboolean {
     let result = jni_catch_or(|| -> anyhow::Result<()> {
         let mut init = INITIALIZED.lock().unwrap();
@@ -236,16 +236,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
             .map_err(|e| anyhow::anyhow!("invalid data_dir: {e}"))?
             .into();
 
-        let passphrase: String = env
-            .get_string(&keystore_passphrase)
-            .map_err(|e| anyhow::anyhow!("invalid keystore_passphrase: {e}"))?
-            .into();
+        // byte[] rather than String on the Java side so the caller can
+        // zero its copy after this call; ours is zeroised on every exit
+        // path by the Zeroizing wrapper.
+        let passphrase = Zeroizing::new(
+            env.convert_byte_array(&keystore_passphrase)
+                .map_err(|e| anyhow::anyhow!("invalid keystore_passphrase: {e}"))?,
+        );
         if passphrase.is_empty() {
             return Err(anyhow::anyhow!(
                 "empty keystore passphrase; refusing to open keystore under no protection"
             ));
         }
-        let passphrase_bytes = passphrase.as_bytes();
+        let passphrase_bytes: &[u8] = &passphrase;
 
         if let Ok(vm) = env.get_java_vm() {
             *JVM.lock().unwrap() = Some(vm);

@@ -71,6 +71,11 @@ pub enum NodeEvent {
 pub struct P2PNodeConfig {
     pub enable_mdns: bool,
     pub listen_addr: Multiaddr,
+    /// Optional QUIC (UDP) listen address, bound *in addition to*
+    /// `listen_addr` (TCP). `None` disables QUIC listening. QUIC dials
+    /// out regardless once the transport is built; listening lets peers
+    /// reach us over QUIC too.
+    pub quic_listen_addr: Option<Multiaddr>,
     pub gossipsub_heartbeat: Duration,
     pub gossipsub_validation_mode: gossipsub::ValidationMode,
     pub idle_connection_timeout: Duration,
@@ -81,6 +86,11 @@ impl Default for P2PNodeConfig {
         Self {
             enable_mdns: true,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
+            quic_listen_addr: Some(
+                "/ip4/0.0.0.0/udp/0/quic-v1"
+                    .parse()
+                    .expect("hardcoded multiaddr"),
+            ),
             gossipsub_heartbeat: Duration::from_secs(10),
             gossipsub_validation_mode: gossipsub::ValidationMode::Strict,
             idle_connection_timeout: Duration::from_secs(60),
@@ -95,6 +105,11 @@ impl P2PNodeConfig {
         Self {
             enable_mdns: false,
             listen_addr: "/ip4/127.0.0.1/tcp/0".parse().expect("hardcoded multiaddr"),
+            quic_listen_addr: Some(
+                "/ip4/127.0.0.1/udp/0/quic-v1"
+                    .parse()
+                    .expect("hardcoded multiaddr"),
+            ),
             gossipsub_heartbeat: Duration::from_millis(100),
             gossipsub_validation_mode: gossipsub::ValidationMode::Strict,
             idle_connection_timeout: Duration::from_secs(60),
@@ -147,6 +162,7 @@ impl P2PNode {
                 yamux::Config::default,
             )
             .map_err(|e| anyhow!("tcp transport: {e}"))?
+            .with_quic()
             .with_behaviour(|key| {
                 let peer_id = PeerId::from(key.public());
 
@@ -186,6 +202,9 @@ impl P2PNode {
             .build();
 
         swarm.listen_on(config.listen_addr.clone())?;
+        if let Some(quic_addr) = &config.quic_listen_addr {
+            swarm.listen_on(quic_addr.clone())?;
+        }
 
         Ok(Self {
             swarm,

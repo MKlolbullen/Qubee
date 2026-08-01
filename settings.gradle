@@ -4,6 +4,23 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
+    // Force the Kotlin plugin classpath to the pinned 1.9.22. Without
+    // this, transitive plugin deps (Hilt / Paparazzi / safeargs) drag
+    // the Kotlin compiler on the classpath up to 1.9.24 — Gradle
+    // resolves the plugin classpath to the *highest* version — which
+    // then mismatches the Compose compiler and fails compileDebugKotlin
+    // ("Compose Compiler requires Kotlin 1.9.20 but you appear to be
+    // using 1.9.24"). Pinning here keeps the effective Kotlin equal to
+    // the declared plugin version, so the Compose-compiler pairing
+    // (kotlinCompilerExtensionVersion in app/build.gradle) is
+    // deterministic.
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id.startsWith('org.jetbrains.kotlin')) {
+                useVersion('1.9.22')
+            }
+        }
+    }
 }
 
 dependencyResolutionManagement {

@@ -118,6 +118,9 @@ android {
     buildFeatures {
         viewBinding true
         compose true
+        // Generate BuildConfig (AGP 8.x defaults this off). QubeeApplication
+        // reads BuildConfig.DEBUG to gate Timber's debug logging.
+        buildConfig true
     }
 
     composeOptions {

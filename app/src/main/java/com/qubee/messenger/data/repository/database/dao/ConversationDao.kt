@@ -28,23 +28,8 @@ interface ConversationDao {
     @Query(
         """
         SELECT c.*,
-               m.id as lastMsg_id,
-               m.conversationId as lastMsg_conversationId,
-               m.senderId as lastMsg_senderId,
                m.content as lastMsg_content,
-               m.contentType as lastMsg_contentType,
                m.timestamp as lastMsg_timestamp,
-               m.status as lastMsg_status,
-               m.isFromMe as lastMsg_isFromMe,
-               m.replyToMessageId as lastMsg_replyToMessageId,
-               m.attachmentPath as lastMsg_attachmentPath,
-               m.attachmentMimeType as lastMsg_attachmentMimeType,
-               m.attachmentSize as lastMsg_attachmentSize,
-               m.reactions as lastMsg_reactions,
-               m.isDeleted as lastMsg_isDeleted,
-               m.deletedAt as lastMsg_deletedAt,
-               m.editedAt as lastMsg_editedAt,
-               m.disappearsAt as lastMsg_disappearsAt,
                (SELECT COUNT(*) FROM messages
                 WHERE conversationId = c.id
                   AND status != 'READ'

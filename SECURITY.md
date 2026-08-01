@@ -134,11 +134,18 @@ the pre-alpha:
   hold the Ed25519 + ML-DSA private identity keys) wraps its master
   key under a 256-bit passphrase derived in the hardware Keystore and
   passed in via `nativeInitialize`. **A `.master` file is useless
-  without that Keystore-bound passphrase.** Builds before this change
-  used a hardcoded `"default_password"`; those installs migrate
-  transparently to the real passphrase on first launch (the migration
-  is one-directional — it never re-exposes the keys under the old
-  derivation).
+  without that Keystore-bound passphrase.** The wrapping key is
+  derived with **Argon2id** (19 MiB / t=2 / p=1) over a per-install
+  random salt stored in the `.master` header — memory-hard
+  defence-in-depth even though the Android passphrase is full-entropy,
+  since nothing at the Rust boundary enforces entropy for other
+  callers. Plaintext key material and derived wrap keys are zeroised
+  (`zeroize`/`SecretBox`) before buffers are released. Builds before
+  the passphrase change used a hardcoded `"default_password"`, and
+  builds before the Argon2id change used an unsalted single BLAKE3
+  derivation; both migrate transparently to the salted Argon2id layout
+  on first launch (one-directional — keys are never re-exposed under
+  an old derivation).
 - `MessageStatus.SENT` means "encrypted bytes left this device", not
   "the peer acked". `DELIVERED` lands when the first signed
   `MessageAck` arrives (delivery confirmation shipped in

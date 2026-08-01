@@ -36,6 +36,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand_chacha = "0.3"
 getrandom = "0.2"
 secrecy = "0.10"
+# Memory-hard KDF for the keystore master-key wrap (defence-in-depth:
+# the Android passphrase is full-entropy, but nothing at this boundary
+# enforces that for other callers). default-features off: we only need
+# raw hash_password_into, not the PHC-string machinery.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 thiserror = "1.0"
 blake3 = "1.4"
 hkdf = "0.12"

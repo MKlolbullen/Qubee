@@ -96,11 +96,17 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
   against group membership. Rekey is automatic: member removal
   (`nativeRemoveMember`) and verified inbound `KeyRotation` frames both
   wipe the group's sender chains (`nativeResetGroupSenderState` exists
-  for manual rekeys). What remains is Kotlin-side only: MessageService
-  routing behind a rollout flag (send 1:1 via `encryptDirectMessage`,
-  groups via `encryptGroupMessageV3`, distribution fan-out on group
-  join/rekey), gated on the device checklists — then dropping v2 after
-  the deprecation window.
+  for manual rekeys). **Receive side is live**:
+  `MessageService.handleRatchetFrame` recognises
+  `QUBEE_DMS`/`QUBEE_GMS\x03` frames unconditionally (receivers must
+  understand v3 before any sender emits it), routes 1:1 text through
+  the same peer↔identity trust observation as the legacy path, and
+  persists v3 group messages through the shared handler. The send side
+  stays legacy behind `PreferenceRepository.ratchetSendEnabled`
+  (default off). What remains: the send-path flip (1:1 via
+  `encryptDirectMessage`, groups via `encryptGroupMessageV3`,
+  distribution fan-out on group join/rekey) once the device checklists
+  pass — then dropping v2 after the deprecation window.
 
 ## What's currently broken
 

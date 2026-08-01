@@ -32,6 +32,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import timber.log.Timber
 import java.util.UUID
 import javax.inject.Inject
@@ -62,6 +63,11 @@ class MessageService : Service(), NetworkCallback {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
+        /// "QUBEE_GMS\x03" — the Stage 4 sender-keys group frame magic.
+        /// Kept in sync with MAGIC_GROUP_MESSAGE_V3 in
+        /// src/ratchet/sender_keys.rs (pinned in wire_stability).
+        private val GROUP_V3_MAGIC: ByteArray =
+            "QUBEE_GMS".toByteArray(Charsets.US_ASCII) + byteArrayOf(0x03)
         /// How often the retry loop wakes up to scan the DB. Cheap
         /// query (indexed on `status` already, `nextRetryAt`
         /// filtering is in-memory across the small SENT set); 30s
@@ -245,6 +251,15 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Encrypted message received from %s (%d bytes)", senderId, data.size)
         serviceScope.launch {
             try {
+                // Ratchet wire formats first (Stage 5 receive side).
+                // Receivers must understand the new frames before any
+                // sender starts emitting them, so this runs regardless
+                // of the send-side rollout flag; until peers upgrade
+                // and flip their flag, no frame matches and the legacy
+                // path below is untouched.
+                if (handleRatchetFrame(senderId, data)) {
+                    return@launch
+                }
                 // Resolve the application-level contact id, if any,
                 // by libp2p PeerId. If the lookup misses,
                 // `populateContactPeerId` below tries to link the
@@ -352,44 +367,12 @@ class MessageService : Service(), NetworkCallback {
         )
         serviceScope.launch {
             try {
-                val existing = conversationRepository.getConversationById(groupIdHex)
-                if (existing == null) {
-                    // Hydration hasn't caught up yet (or this is a
-                    // group we just got state-sync'd into). Mint a
-                    // placeholder row so the message lands; the
-                    // next hydration pass will refresh `name` if
-                    // it's blank.
-                    conversationRepository.upsertConversation(
-                        com.qubee.messenger.data.model.Conversation(
-                            id = groupIdHex,
-                            type = com.qubee.messenger.data.model.ConversationType.GROUP,
-                            name = "",
-                            participants = emptyList(),
-                            createdAt = System.currentTimeMillis(),
-                            updatedAt = System.currentTimeMillis(),
-                        ),
-                    )
-                }
-                val matched = contactRepository.getContactByIdentityId(senderIdHex)
-                val resolvedSenderId = matched?.id ?: senderIdHex
-                val msg = Message(
-                    id = UUID.randomUUID().toString(),
-                    conversationId = groupIdHex,
-                    senderId = resolvedSenderId,
+                persistInboundGroupMessage(
+                    groupIdHex = groupIdHex,
+                    senderIdHex = senderIdHex,
                     content = plaintext.toString(Charsets.UTF_8),
-                    contentType = MessageType.TEXT,
-                    timestamp = timestampSeconds * 1_000L,
-                    status = MessageStatus.DELIVERED,
-                    isFromMe = false,
+                    timestampMillis = timestampSeconds * 1_000L,
                 )
-                messageRepository.saveMessage(msg)
-                if (matched != null) {
-                    contactRepository.updateOnlineStatus(
-                        matched.id,
-                        true,
-                        System.currentTimeMillis(),
-                    )
-                }
             } catch (e: Exception) {
                 Timber.e(
                     e,
@@ -399,6 +382,144 @@ class MessageService : Service(), NetworkCallback {
                 )
             }
         }
+    }
+
+    /**
+     * Shared persistence for inbound group messages — used by both the
+     * v2 callback above and the v3 sender-keys receive path. Mints a
+     * placeholder Conversation row when hydration hasn't caught up,
+     * mirrors the sender mapping of the direct path.
+     */
+    private suspend fun persistInboundGroupMessage(
+        groupIdHex: String,
+        senderIdHex: String,
+        content: String,
+        timestampMillis: Long,
+    ) {
+        val existing = conversationRepository.getConversationById(groupIdHex)
+        if (existing == null) {
+            conversationRepository.upsertConversation(
+                com.qubee.messenger.data.model.Conversation(
+                    id = groupIdHex,
+                    type = com.qubee.messenger.data.model.ConversationType.GROUP,
+                    name = "",
+                    participants = emptyList(),
+                    createdAt = System.currentTimeMillis(),
+                    updatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+        val matched = contactRepository.getContactByIdentityId(senderIdHex)
+        val resolvedSenderId = matched?.id ?: senderIdHex
+        val msg = Message(
+            id = UUID.randomUUID().toString(),
+            conversationId = groupIdHex,
+            senderId = resolvedSenderId,
+            content = content,
+            contentType = MessageType.TEXT,
+            timestamp = timestampMillis,
+            status = MessageStatus.DELIVERED,
+            isFromMe = false,
+        )
+        messageRepository.saveMessage(msg)
+        if (matched != null) {
+            contactRepository.updateOnlineStatus(matched.id, true, System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * Recognise + process the Stage 5 ratchet wire formats. Returns
+     * true when the frame was a ratchet frame (handled or dropped),
+     * false to fall through to the legacy path.
+     *
+     * Decrypt failures return true with a log — a frame carrying a
+     * ratchet magic must never fall into the legacy decrypt, where a
+     * misleading failure would surface.
+     */
+    private suspend fun handleRatchetFrame(peerId: String, data: ByteArray): Boolean {
+        // 1:1 PQXDH + Double Ratchet frame (QUBEE_DMS).
+        if (qubeeManager.inspectDirectMessageSender(data) != null) {
+            val resultJson = qubeeManager.decryptDirectMessage(data)
+            if (resultJson == null) {
+                Timber.w("Ratchet 1:1 decrypt failed from %s", peerId)
+                return true
+            }
+            val result = JSONObject(resultJson)
+            val senderIdentityHex = result.optString("senderId")
+            when (result.optString("kind")) {
+                "text" -> {
+                    // Same peer↔identity linkage as the legacy path,
+                    // but from the channel-authenticated sender rather
+                    // than an envelope field — the trust policy still
+                    // sees every (peerId, identityId) observation.
+                    val contact =
+                        contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
+                    val routedSenderId = contact?.id ?: senderIdentityHex
+                    val conversationId =
+                        conversationRepository.getOrCreateConversationId(routedSenderId)
+                    if (conversationId.isEmpty()) {
+                        Timber.w("Cannot route ratchet 1:1 from %s", senderIdentityHex)
+                        return true
+                    }
+                    messageRepository.saveMessage(
+                        Message(
+                            id = UUID.randomUUID().toString(),
+                            conversationId = conversationId,
+                            senderId = routedSenderId,
+                            content = result.optString("text"),
+                            contentType = MessageType.TEXT,
+                            timestamp = System.currentTimeMillis(),
+                            status = MessageStatus.DELIVERED,
+                            isFromMe = false,
+                        ),
+                    )
+                    if (contact != null) {
+                        contactRepository.updateOnlineStatus(
+                            contact.id,
+                            true,
+                            System.currentTimeMillis(),
+                        )
+                    }
+                }
+                "senderKeyDistribution" -> {
+                    // Rust has already membership-checked + installed it.
+                    Timber.i(
+                        "Installed sender key for group %s from %s",
+                        result.optString("groupId"),
+                        senderIdentityHex,
+                    )
+                }
+                else -> Timber.w("Unknown ratchet payload kind from %s", senderIdentityHex)
+            }
+            return true
+        }
+
+        // v3 sender-keys group frame (QUBEE_GMS\x03).
+        if (isGroupV3Frame(data)) {
+            val resultJson = qubeeManager.decryptGroupMessageV3(data)
+            if (resultJson == null) {
+                Timber.w("Ratchet group decrypt failed (peer %s)", peerId)
+                return true
+            }
+            val result = JSONObject(resultJson)
+            persistInboundGroupMessage(
+                groupIdHex = result.optString("groupId"),
+                senderIdHex = result.optString("senderId"),
+                content = result.optString("plaintext"),
+                timestampMillis = System.currentTimeMillis(),
+            )
+            return true
+        }
+
+        return false
+    }
+
+    private fun isGroupV3Frame(data: ByteArray): Boolean {
+        if (data.size < GROUP_V3_MAGIC.size) return false
+        for (i in GROUP_V3_MAGIC.indices) {
+            if (data[i] != GROUP_V3_MAGIC[i]) return false
+        }
+        return true
     }
 
     /**

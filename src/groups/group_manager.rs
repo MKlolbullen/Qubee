@@ -704,16 +704,55 @@ impl GroupManager {
     ///
     /// This is intentionally idempotent: applying the same snapshot
     /// twice leaves state unchanged.
+    /// Merge a peer-supplied roster snapshot into the local group view.
+    ///
+    /// `responder_role` is the role the snapshot's author holds in *our*
+    /// local view, and it bounds how much authority the snapshot carries.
+    /// State-sync is a recovery convenience, not an authoritative
+    /// role-assignment channel (those are the individually-signed
+    /// `MemberAdded` / `RoleChange` / `OwnershipTransfer` frames), so a
+    /// non-`Owner` responder is not allowed to redefine who holds
+    /// `Owner`: the owner set in the applied result must match what we
+    /// already had. Without this a plain member's forged snapshot could
+    /// promote themselves to `Owner` and demote the real one — full
+    /// group takeover. Ownership only ever moves through a
+    /// `OwnershipTransfer` signed by the current owner (or an `Owner`
+    /// responder's own snapshot). The empty-local-owner case (a group
+    /// view with no owner yet, only reachable via corruption or a
+    /// pre-owner bootstrap) is left permissive because there is no
+    /// authority to protect.
     pub fn apply_state_sync(
         &mut self,
         group_id: GroupId,
         snapshot: &[crate::groups::group_handshake::GroupMemberSummary],
         snapshot_version: u64,
+        responder_role: &Role,
     ) -> Result<()> {
         let group = self
             .groups
             .get_mut(&group_id)
             .ok_or_else(|| anyhow::anyhow!("apply_state_sync: group not found"))?;
+
+        if *responder_role != Role::Owner {
+            let local_owners: HashSet<IdentityId> = group
+                .members
+                .values()
+                .filter(|m| m.role == Role::Owner && m.member_status == MemberStatus::Active)
+                .map(|m| m.identity_id)
+                .collect();
+            if !local_owners.is_empty() {
+                let snapshot_owners: HashSet<IdentityId> = snapshot
+                    .iter()
+                    .filter(|m| m.role == Role::Owner)
+                    .map(|m| m.identity_id)
+                    .collect();
+                if snapshot_owners != local_owners {
+                    return Err(anyhow::anyhow!(
+                        "apply_state_sync: non-owner responder may not change the group owner"
+                    ));
+                }
+            }
+        }
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let snapshot_ids: HashSet<IdentityId> = snapshot.iter().map(|m| m.identity_id).collect();

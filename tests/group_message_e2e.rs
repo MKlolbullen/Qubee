@@ -1215,10 +1215,11 @@ fn state_sync_from_non_privileged_member_is_rejected() {
     };
 
     // Carol must reject it — Bob is only a Member in her view.
-    let result = process_state_sync_response(&mut carol_gm, carol_id, &forged_body, &forged_sig);
+    let err = process_state_sync_response(&mut carol_gm, carol_id, &forged_body, &forged_sig)
+        .expect_err("Carol must reject a roster snapshot from a non-privileged responder");
     assert!(
-        result.is_err(),
-        "Carol must reject a roster snapshot from a non-privileged responder",
+        err.to_string().contains("lacks authority to define roster"),
+        "rejection must come from the authority gate, got: {err:#}",
     );
 
     // Carol's roster is untouched: Alice is still Owner, Bob still Member.

@@ -576,17 +576,24 @@ impl SecureKeyStore {
                 ));
             }
             let wrap_key = Self::derive_wrap_key_v2(passphrase, &wrap_salt)?;
-            let mut candidates = Vec::with_capacity(count);
-            for i in 0..count {
+            let block_at = |i: usize| {
                 let off = v3_header + i * MASTER_WRAP_BLOCK_LEN;
-                let block = &encrypted_data[off..off + MASTER_WRAP_BLOCK_LEN];
-                candidates.push(Self::try_decrypt_master(block, wrap_key.expose_secret())?);
-            }
-            let mut it = candidates.into_iter();
-            let master_key = it.next().expect("count >= 1");
+                &encrypted_data[off..off + MASTER_WRAP_BLOCK_LEN]
+            };
+            // Candidate 0 is the primary key and is required. Candidate 1
+            // exists only as a rotation-crash fallback, so a damaged
+            // block there must not refuse the open when the primary key
+            // unwraps cleanly — that would defeat the recovery the QKM3
+            // layout is here to provide.
+            let master_key = Self::try_decrypt_master(block_at(0), wrap_key.expose_secret())?;
+            let alt_master_key = if count > 1 {
+                Self::try_decrypt_master(block_at(1), wrap_key.expose_secret()).ok()
+            } else {
+                None
+            };
             return Ok(UnwrappedMaster {
                 master_key,
-                alt_master_key: it.next(),
+                alt_master_key,
                 wrap_key,
                 wrap_salt,
             });

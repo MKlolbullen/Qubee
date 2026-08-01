@@ -156,11 +156,16 @@ class QubeeManager @Inject constructor(
     }
 
     /**
-     * Decrypt an inbound QUBEE_DMS frame (Ratchet Stage 3d) back to its
-     * plaintext, establishing the responder side of the session on a
-     * conversation's first message. Null on wrong frame type, missing
-     * session/bundle, replay, or tampering. The (authenticated-once-
-     * decryption-succeeds) sender comes from [inspectDirectMessageSender].
+     * Decrypt an inbound QUBEE_DMS frame (Ratchet Stage 3d/5),
+     * establishing the responder side of the session on a
+     * conversation's first message, and decode its tagged payload.
+     * Returns a JSON string:
+     * `{"senderId": hex, "kind": "text", "text": str}` for chat, or
+     * `{"senderId": hex, "kind": "senderKeyDistribution", "groupId":
+     * hex}` for a Stage 4 sender key that Rust has already
+     * membership-checked and installed. Null on wrong frame type,
+     * missing session/bundle, replay, tampering, or a distribution
+     * from a non-member.
      */
     suspend fun decryptDirectMessage(wire: ByteArray): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
@@ -172,6 +177,46 @@ class QubeeManager @Inject constructor(
         } catch (e: Exception) {
             Timber.e(e, "Rust ratchet decryption failed")
             null
+        }
+    }
+
+    /**
+     * Encrypt this device's sender key for a group to one peer over the
+     * 1:1 ratchet session (Ratchet Stage 5 plumbing). Call once per
+     * group member when (re)distributing; the receiving side installs
+     * automatically inside [decryptDirectMessage]. Returns the
+     * QUBEE_DMS wire frame to send to that peer.
+     */
+    suspend fun createDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeCreateDirectDistributionMessage(peerIdHex, groupIdHex)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust distribution-message JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust distribution message create failed")
+                null
+            }
+        }
+
+    /**
+     * Wipe all Stage 4 sender-key state for a group, forcing fresh
+     * distributions. Rust triggers this automatically on member
+     * removal / key rotation; exposed for manual rekeys. Returns the
+     * number of states deleted, or -1 on failure.
+     */
+    suspend fun resetGroupSenderState(groupIdHex: String): Int = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext -1
+        try {
+            nativeResetGroupSenderState(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust sender-state-reset JNI is not linked")
+            -1
+        } catch (e: Exception) {
+            Timber.e(e, "Rust sender-state reset failed")
+            -1
         }
     }
 
@@ -712,6 +757,8 @@ class QubeeManager @Inject constructor(
     private external fun nativeInstallSenderKeyDistribution(authenticatedSenderHex: String, distribution: ByteArray): String?
     private external fun nativeEncryptGroupMessageV3(groupIdHex: String, plaintext: String): ByteArray?
     private external fun nativeDecryptGroupMessageV3(wire: ByteArray): String?
+    private external fun nativeCreateDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray?
+    private external fun nativeResetGroupSenderState(groupIdHex: String): Int
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?
     private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?

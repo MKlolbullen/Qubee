@@ -50,6 +50,7 @@ use crate::ratchet::pqxdh::WireInitialMessage;
 use crate::ratchet::prekey_store::{
     body_to_public, get_or_create_local_bundle, get_peer_bundle, store_peer_bundle,
 };
+use crate::ratchet::sender_keys::SenderKeyDistribution;
 use crate::ratchet::session::{load_session, store_session, Session};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 
@@ -224,6 +225,104 @@ pub fn decrypt_direct(
 /// message frame.
 pub fn inspect_direct_sender(wire: &[u8]) -> Option<IdentityId> {
     DirectMessage::from_wire(wire).map(|dm| dm.sender_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tagged payloads (Stage 5 cutover plumbing)
+// ---------------------------------------------------------------------------
+//
+// The 1:1 channel carries more than chat text: sender-key
+// distributions for the v3 group format ride it too (it is the only
+// channel confidential enough for them). A one-byte tag in front of
+// the ratchet plaintext distinguishes the kinds. The tag sits *inside*
+// the encryption, so it leaks nothing on the wire; it is still a
+// compatibility surface between app versions, so the tag values are
+// pinned in `tests/wire_stability.rs` like any other format byte.
+
+const PAYLOAD_TAG_TEXT: u8 = 0x01;
+const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
+
+/// A decoded 1:1 plaintext.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DirectPayload {
+    /// A chat message.
+    Text(String),
+    /// A sender-key distribution for a group the peer shares with us.
+    /// The caller must pass the *channel-authenticated* sender id to
+    /// [`crate::ratchet::sender_keys::install_sender_key`] — never the
+    /// distribution's own claim.
+    SenderKeyDistribution(SenderKeyDistribution),
+}
+
+fn encode_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
+    match payload {
+        DirectPayload::Text(text) => {
+            let mut out = Vec::with_capacity(1 + text.len());
+            out.push(PAYLOAD_TAG_TEXT);
+            out.extend_from_slice(text.as_bytes());
+            Ok(out)
+        }
+        DirectPayload::SenderKeyDistribution(dist) => {
+            let body = dist.to_bytes()?;
+            let mut out = Vec::with_capacity(1 + body.len());
+            out.push(PAYLOAD_TAG_SENDER_KEY_DIST);
+            out.extend_from_slice(&body);
+            Ok(out)
+        }
+    }
+}
+
+fn decode_payload(bytes: &[u8]) -> Result<DirectPayload> {
+    let (tag, body) = bytes
+        .split_first()
+        .ok_or_else(|| anyhow!("empty direct payload"))?;
+    match *tag {
+        PAYLOAD_TAG_TEXT => Ok(DirectPayload::Text(
+            String::from_utf8(body.to_vec()).map_err(|e| anyhow!("text payload not UTF-8: {e}"))?,
+        )),
+        PAYLOAD_TAG_SENDER_KEY_DIST => Ok(DirectPayload::SenderKeyDistribution(
+            SenderKeyDistribution::from_bytes(body)?,
+        )),
+        other => bail!("unknown direct payload tag {other:#04x}"),
+    }
+}
+
+/// Encrypt a chat text for `peer_id` (tagged-payload flavour of
+/// [`encrypt_direct`] — what the JNI send path uses).
+pub fn encrypt_direct_text(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    text: &str,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload = encode_payload(&DirectPayload::Text(text.to_string()))?;
+    encrypt_direct(ks, local_id, peer_id, &payload, now)
+}
+
+/// Encrypt a sender-key distribution for `peer_id`. The confidential
+/// transport for Stage 4 group rekeys — one call per member.
+pub fn encrypt_direct_distribution(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    dist: &SenderKeyDistribution,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload = encode_payload(&DirectPayload::SenderKeyDistribution(dist.clone()))?;
+    encrypt_direct(ks, local_id, peer_id, &payload, now)
+}
+
+/// Decrypt an inbound frame and decode its tagged payload. Returns the
+/// channel-authenticated sender and the payload kind.
+pub fn decrypt_direct_payload(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    wire: &[u8],
+    now: u64,
+) -> Result<(IdentityId, DirectPayload)> {
+    let (sender, plaintext) = decrypt_direct(ks, local_id, wire, now)?;
+    Ok((sender, decode_payload(&plaintext)?))
 }
 
 #[cfg(test)]
@@ -445,5 +544,65 @@ mod tests {
     fn non_direct_frames_are_not_dispatched() {
         assert!(inspect_direct_sender(b"QUBEE_GMS\x01whatever").is_none());
         assert!(inspect_direct_sender(&[]).is_none());
+    }
+
+    #[test]
+    fn payload_tags_are_pinned() {
+        assert_eq!(PAYLOAD_TAG_TEXT, 0x01);
+        assert_eq!(PAYLOAD_TAG_SENDER_KEY_DIST, 0x02);
+    }
+
+    #[test]
+    fn text_payload_round_trips_over_the_channel() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+
+        let w = encrypt_direct_text(&mut a.ks, aid, bid, "tagged hello", 1).unwrap();
+        let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &w, 1).unwrap();
+        assert_eq!(sender, aid);
+        assert_eq!(payload, DirectPayload::Text("tagged hello".to_string()));
+    }
+
+    #[test]
+    fn unknown_and_empty_payload_tags_are_rejected() {
+        assert!(decode_payload(&[]).is_err());
+        assert!(decode_payload(&[0x7F, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn distribution_rides_the_channel_into_a_working_group_decrypt() {
+        use crate::groups::group_manager::GroupId;
+        use crate::ratchet::sender_keys::{
+            create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
+            install_sender_key,
+        };
+
+        // Full Stage 3 → Stage 4 integration: Alice sends Bob her
+        // sender key over the 1:1 ratchet, Bob installs it under the
+        // channel-authenticated sender id, and Alice's next v3 group
+        // frame decrypts on Bob's side.
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let group = GroupId::from_bytes([0xEE; 32]);
+        let group_key = [0x55u8; 32];
+
+        let dist = create_or_get_own_sender_key(&mut a.ks, &group, aid).unwrap();
+        let w = encrypt_direct_distribution(&mut a.ks, aid, bid, &dist, 1).unwrap();
+
+        let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &w, 1).unwrap();
+        assert_eq!(sender, aid);
+        let received = match payload {
+            DirectPayload::SenderKeyDistribution(d) => d,
+            other => panic!("expected distribution, got {other:?}"),
+        };
+        install_sender_key(&mut b.ks, sender, &received).unwrap();
+
+        let frame =
+            encrypt_sender_key_message(&mut a.ks, &group, &group_key, aid, b"group hello").unwrap();
+        let (gid, from, pt) = decrypt_sender_key_message(&mut b.ks, &group_key, &frame).unwrap();
+        assert_eq!(
+            (gid, from, pt.as_slice()),
+            (group, aid, b"group hello".as_slice())
+        );
     }
 }

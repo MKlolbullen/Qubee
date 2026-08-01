@@ -291,8 +291,7 @@ impl GroupManager {
             .unwrap_or(QUBEE_MAX_GROUP_MEMBERS);
         if group.members.len() >= effective_cap {
             return Err(anyhow::anyhow!(
-                "Group member limit reached (max {} members)",
-                effective_cap
+                "Group member limit reached (max {effective_cap} members)"
             ));
         }
 
@@ -334,7 +333,7 @@ impl GroupManager {
             group_id,
             admin_id,
             GroupEventType::MemberAdded,
-            format!("Member {} added to group", new_member_id),
+            format!("Member {new_member_id} added to group"),
         )?;
 
         self.store_group_securely(&group_id)?;
@@ -382,8 +381,7 @@ impl GroupManager {
             .unwrap_or(QUBEE_MAX_GROUP_MEMBERS);
         if group.members.len() >= effective_cap {
             return Err(anyhow::anyhow!(
-                "Group member limit reached (max {} members)",
-                effective_cap,
+                "Group member limit reached (max {effective_cap} members)",
             ));
         }
         group.members.insert(new_member_id, new_member);
@@ -446,7 +444,7 @@ impl GroupManager {
             group_id,
             admin_id,
             GroupEventType::MemberRemoved,
-            format!("Member {} removed: {}", member_id, reason),
+            format!("Member {member_id} removed: {reason}"),
         )?;
 
         self.store_group_securely(&group_id)?;
@@ -808,8 +806,7 @@ impl GroupManager {
                 let old_role = member.role.clone();
                 member.role = new_role.clone();
                 Some(format!(
-                    "Member {} role changed from {:?} to {:?}",
-                    member_id, old_role, new_role
+                    "Member {member_id} role changed from {old_role:?} to {new_role:?}"
                 ))
             } else {
                 None
@@ -1037,7 +1034,7 @@ impl GroupManager {
         member_key: IdentityKey,
         display_name: String,
     ) -> Result<GroupId> {
-        let invitation_key = format!("invitation_{}", invitation_code);
+        let invitation_key = format!("invitation_{invitation_code}");
         let secret = self
             .keystore
             .retrieve_key(&invitation_key)?
@@ -1088,7 +1085,7 @@ impl GroupManager {
     /// the network handshake handler to verify that a `RequestJoin`
     /// matches a real, unexpired invitation we know about.
     pub fn get_invitation(&mut self, invitation_code: &str) -> Result<Option<GroupInvitation>> {
-        let key = format!("invitation_{}", invitation_code);
+        let key = format!("invitation_{invitation_code}");
         let secret = match self.keystore.retrieve_key(&key)? {
             Some(s) => s,
             None => return Ok(None),
@@ -1099,7 +1096,7 @@ impl GroupManager {
 
     /// Bump an invitation's `current_uses` after a successful enrolment.
     pub fn mark_invitation_used(&mut self, invitation_code: &str) -> Result<()> {
-        let key = format!("invitation_{}", invitation_code);
+        let key = format!("invitation_{invitation_code}");
         let mut invitation = match self.get_invitation(invitation_code)? {
             Some(i) => i,
             None => return Ok(()),
@@ -1312,7 +1309,7 @@ impl GroupManager {
             group_id,
             member_id,
             GroupEventType::MemberLeft,
-            format!("Member {} left the group", member_id),
+            format!("Member {member_id} left the group"),
         )?;
 
         self.store_group_securely(&group_id)?;

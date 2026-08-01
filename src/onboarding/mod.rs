@@ -62,12 +62,12 @@ impl OnboardingBundle {
     pub fn to_share_link(&self) -> Result<String> {
         let bytes = bincode::serialize(self).context("onboarding serialize failed")?;
         let token = URL_SAFE_NO_PAD.encode(bytes);
-        Ok(format!("qubee://{}/{}", QUBEE_IDENTITY_HOST, token))
+        Ok(format!("qubee://{QUBEE_IDENTITY_HOST}/{token}"))
     }
 
     /// Parse and cryptographically verify a previously generated share link.
     pub fn from_share_link(link: &str) -> Result<Self> {
-        let prefix = format!("qubee://{}/", QUBEE_IDENTITY_HOST);
+        let prefix = format!("qubee://{QUBEE_IDENTITY_HOST}/");
         let token = link
             .strip_prefix(&prefix)
             .ok_or_else(|| anyhow!("not a qubee identity link"))?;

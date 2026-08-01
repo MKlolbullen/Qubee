@@ -179,7 +179,7 @@ impl SecureKeyStore {
         let cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
         let encrypted_data = cipher
             .encrypt(nonce, key_data)
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
 
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -218,7 +218,7 @@ impl SecureKeyStore {
 
         let decrypted_data = cipher
             .decrypt(nonce, entry.encrypted_data.as_ref())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?;
 
         Ok(Some(SecretBox::new(Box::new(decrypted_data))))
     }
@@ -264,7 +264,7 @@ impl SecureKeyStore {
             let decrypted_data = Zeroizing::new(
                 old_cipher
                     .decrypt(old_nonce, entry.encrypted_data.as_ref())
-                    .map_err(|e| anyhow::anyhow!("Failed to decrypt during rotation: {}", e))?,
+                    .map_err(|e| anyhow::anyhow!("Failed to decrypt during rotation: {e}"))?,
             );
 
             // Generate new nonce and encrypt with new key
@@ -273,7 +273,7 @@ impl SecureKeyStore {
 
             let new_encrypted_data = new_cipher
                 .encrypt(new_nonce, decrypted_data.as_slice())
-                .map_err(|e| anyhow::anyhow!("Failed to encrypt during rotation: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt during rotation: {e}"))?;
 
             entry.encrypted_data = new_encrypted_data;
             entry.nonce = new_nonce_bytes;
@@ -409,7 +409,7 @@ impl SecureKeyStore {
 
         let mut decrypted = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {e}"))?;
 
         if decrypted.len() != 32 {
             decrypted.zeroize();
@@ -451,7 +451,7 @@ impl SecureKeyStore {
 
         let encrypted = cipher
             .encrypt(nonce, master_key.expose_secret().as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {e}"))?;
 
         let mut file_data =
             Vec::with_capacity(MASTER_V2_MAGIC.len() + WRAP_SALT_LEN + 12 + encrypted.len());
@@ -478,7 +478,7 @@ impl SecureKeyStore {
         let nonce = Nonce::from_slice(&nonce_bytes);
         let encrypted = cipher
             .encrypt(nonce, master_key.expose_secret().as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {e}"))?;
         let mut file_data = Vec::with_capacity(12 + encrypted.len());
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);

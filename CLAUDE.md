@@ -114,7 +114,7 @@ The Android side similarly pins AGP 8.4 / Kotlin 1.9.22 / Hilt 2.48 / Compose BO
 
 ## Conventions that bite if you don't know them
 
-- **`rust-toolchain.toml` pins 1.86.** Run `rustup show` from the repo root once; that's all you need.
+- **`rust-toolchain.toml` pins 1.88.** Run `rustup show` from the repo root once; that's all you need.
 - **Default to writing no comments.** Names are documentation. Comments are for the *why*: a hidden invariant, a workaround, surprising behavior. Don't restate what the code does. `CONTRIBUTING.md` is explicit about this; the rev-3 cleanup paid off a year of accreted-fiction comments and the project actively avoids reopening that account.
 - **No half-finished implementations.** If you're scaffolding, say so explicitly with a TODO + tracking issue rather than letting a silent stub merge.
 - **No new dependencies for trivia.** A 30 MB transitive tree to format a string is not worth it.

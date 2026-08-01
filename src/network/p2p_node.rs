@@ -41,7 +41,7 @@ pub enum P2PCommand {
 /// Public helper so callers (JNI, tests) build the per-group topic
 /// name in exactly one place.
 pub fn group_topic(group_id_hex: &str) -> String {
-    format!("qubee-group-{}", group_id_hex)
+    format!("qubee-group-{group_id_hex}")
 }
 
 /// Events sent from Rust -> Android (Kotlin)
@@ -154,12 +154,12 @@ impl P2PNode {
                     .heartbeat_interval(cfg_for_behaviour.gossipsub_heartbeat)
                     .validation_mode(cfg_for_behaviour.gossipsub_validation_mode.clone())
                     .build()
-                    .map_err(|s| std::io::Error::new(std::io::ErrorKind::Other, s))?;
+                    .map_err(std::io::Error::other)?;
                 let gossipsub = gossipsub::Behaviour::new(
                     gossipsub::MessageAuthenticity::Signed(key.clone()),
                     gossipsub_cfg,
                 )
-                .map_err(|s| std::io::Error::new(std::io::ErrorKind::Other, s))?;
+                .map_err(std::io::Error::other)?;
 
                 let kad_store = kad::store::MemoryStore::new(peer_id);
                 let mut kademlia = kad::Behaviour::new(peer_id, kad_store);

@@ -34,7 +34,7 @@ use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text,
-    inspect_direct_sender, install_peer_bundle, DirectPayload,
+    inspect_direct_sender, install_peer_bundle, reset_direct_session, DirectPayload,
 };
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
@@ -2662,6 +2662,40 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
         })();
         ok_or_null(env, result)
     })
+}
+
+/// Tear down the 1:1 ratchet session with a peer (session state,
+/// pending initial, replay marker). The recovery lever for a peer who
+/// wiped their device and re-initiated but loses the simultaneous-open
+/// tie-break — after the reset, their next inbound initial
+/// re-establishes. Trigger from a user action or trust-state event
+/// only; in-flight messages on the old session are lost. Returns the
+/// number of keystore entries removed, or `-1` on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetDirectSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+) -> jni::sys::jint {
+    let result: anyhow::Result<usize> = (|| {
+        let peer_hex: String = env
+            .get_string(&peer_id_hex)
+            .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+            .into();
+        let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        reset_direct_session(ks, &peer_id)
+    })();
+    match result {
+        Ok(n) => n as jni::sys::jint,
+        Err(e) => {
+            tracing::warn!(error = ?e, "direct session reset failed");
+            -1
+        }
+    }
 }
 
 /// Wipe all Stage 4 sender-key state for a group (own chain + every

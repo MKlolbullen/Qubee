@@ -202,6 +202,27 @@ class QubeeManager @Inject constructor(
         }
 
     /**
+     * Tear down the 1:1 ratchet session with a peer. Recovery lever for
+     * a peer who reinstalled and whose fresh handshake is refused while
+     * we hold the old session — after the reset their next message
+     * re-establishes. Trigger only from a user action or a trust-state
+     * event; in-flight messages on the old session are lost. Returns
+     * the number of state entries removed, or -1 on failure.
+     */
+    suspend fun resetDirectSession(peerIdHex: String): Int = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext -1
+        try {
+            nativeResetDirectSession(peerIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust direct-session-reset JNI is not linked")
+            -1
+        } catch (e: Exception) {
+            Timber.e(e, "Rust direct-session reset failed")
+            -1
+        }
+    }
+
+    /**
      * Wipe all Stage 4 sender-key state for a group, forcing fresh
      * distributions. Rust triggers this automatically on member
      * removal / key rotation; exposed for manual rekeys. Returns the
@@ -759,6 +780,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeDecryptGroupMessageV3(wire: ByteArray): String?
     private external fun nativeCreateDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray?
     private external fun nativeResetGroupSenderState(groupIdHex: String): Int
+    private external fun nativeResetDirectSession(peerIdHex: String): Int
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?
     private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?

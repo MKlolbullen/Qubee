@@ -227,6 +227,34 @@ pub fn inspect_direct_sender(wire: &[u8]) -> Option<IdentityId> {
     DirectMessage::from_wire(wire).map(|dm| dm.sender_id)
 }
 
+/// Tear down the 1:1 session with a peer: the session itself, our
+/// pending outgoing initial, and the accepted-initial replay marker.
+/// Returns how many keystore entries were removed (0 = nothing existed).
+///
+/// This is the recovery path for a peer who wiped their device and
+/// re-initiated but loses the simultaneous-open tie-break: their fresh
+/// initial is refused while we still hold the old session, so the app
+/// layer (on user action or a trust-state event) resets and lets the
+/// next inbound initial re-establish. Resetting mid-conversation only
+/// costs in-flight messages — the next exchange re-handshakes — but
+/// don't call it casually: an attacker who can trick the app into
+/// resetting gains nothing cryptographically (establishment still
+/// requires the peer's verified bundle identity), it's purely a
+/// liveness lever.
+pub fn reset_direct_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Result<usize> {
+    let mut deleted = 0;
+    for key in [
+        crate::ratchet::session::session_key_id(peer),
+        pending_initial_key(peer),
+        accepted_initial_key(peer),
+    ] {
+        if ks.delete_key(&key)? {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 // ---------------------------------------------------------------------------
 // Tagged payloads (Stage 5 cutover plumbing)
 // ---------------------------------------------------------------------------
@@ -567,6 +595,60 @@ mod tests {
     fn unknown_and_empty_payload_tags_are_rejected() {
         assert!(decode_payload(&[]).is_err());
         assert!(decode_payload(&[0x7F, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn reset_unbricks_a_reinstalled_peer_that_loses_the_tiebreak() {
+        let (a, b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+
+        // The peer with the byte-wise LARGER id loses the tie-break —
+        // make that the one who wipes, so the brick actually occurs.
+        let (mut survivor, mut wiped) = if aid.as_ref() < bid.as_ref() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let (sid, wid) = (survivor.kp.identity_id(), wiped.kp.identity_id());
+
+        // Established conversation.
+        let w = encrypt_direct(&mut survivor.ks, sid, wid, b"hello", 1).unwrap();
+        decrypt_direct(&mut wiped.ks, wid, &w, 1).unwrap();
+        let w = encrypt_direct(&mut wiped.ks, wid, sid, b"ack", 1).unwrap();
+        decrypt_direct(&mut survivor.ks, sid, &w, 1).unwrap();
+
+        // Device wipe with identity restored from backup: same keypair,
+        // empty keystore (sessions + prekey secrets gone).
+        let dir = TempDir::new().unwrap();
+        wiped.ks = SecureKeyStore::new(dir.path().join("ks2.db"), b"test-direct").unwrap();
+        wiped._dir = dir;
+
+        // Fresh bundles exchanged both ways (the wiped device generated
+        // new prekeys; the survivor's cache entry is overwritten).
+        let new_bundle = wiped.signed_bundle_wire();
+        install_peer_bundle(&mut survivor.ks, &new_bundle).unwrap();
+        let survivor_bundle = survivor.signed_bundle_wire();
+        install_peer_bundle(&mut wiped.ks, &survivor_bundle).unwrap();
+
+        // The wiped device re-initiates — and is bricked: the survivor
+        // still holds the old session, and the wiped peer loses the
+        // tie-break, so its fresh initial is refused.
+        let w1 = encrypt_direct(&mut wiped.ks, wid, sid, b"i am back", 2).unwrap();
+        assert!(decrypt_direct(&mut survivor.ks, sid, &w1, 2).is_err());
+
+        // Recovery: the survivor resets the session (user action /
+        // trust-state event), after which the same frame establishes
+        // through the fresh initial and decrypts.
+        assert!(reset_direct_session(&mut survivor.ks, &wid).unwrap() >= 1);
+        let (from, pt) = decrypt_direct(&mut survivor.ks, sid, &w1, 2).unwrap();
+        assert_eq!((from, pt.as_slice()), (wid, b"i am back".as_slice()));
+
+        // And the conversation continues both ways on the new session.
+        let w2 = encrypt_direct(&mut survivor.ks, sid, wid, b"welcome back", 3).unwrap();
+        assert_eq!(
+            decrypt_direct(&mut wiped.ks, wid, &w2, 3).unwrap().1,
+            b"welcome back"
+        );
     }
 
     #[test]

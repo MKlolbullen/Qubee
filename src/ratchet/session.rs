@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 const SESSION_AD_TAG: &[u8] = b"qubee_session_ad_v1";
 
-fn session_key_id(peer: &IdentityId) -> String {
+pub(crate) fn session_key_id(peer: &IdentityId) -> String {
     format!("ratchet_session_{}", hex::encode(peer.as_ref()))
 }
 

@@ -72,9 +72,10 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     message keys plus an accepted-initial hash record; responder
     establishment requires the initial's X25519 identity to match the
     sender's cached *verified* bundle (fail closed); simultaneous-open
-    resolves byte-wise-smaller-id-wins. Known limitation: a peer who
-    wipes state and re-initiates is only accepted if they win the
-    id tie-break — a session-reset JNI hook is follow-up work.
+    resolves byte-wise-smaller-id-wins. A peer who wipes state and
+    re-initiates but loses the tie-break is unblocked via
+    `nativeResetDirectSession` (user action / trust-state event), after
+    which their next inbound initial re-establishes.
 * **Stage 4 — DONE (dark-launched).** `src/ratchet/sender_keys.rs` +
   four JNI symbols (`nativeCreateSenderKeyDistribution`,
   `nativeInstallSenderKeyDistribution`, `nativeEncryptGroupMessageV3`,

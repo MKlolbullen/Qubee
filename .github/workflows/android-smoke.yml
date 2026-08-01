@@ -56,7 +56,11 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
-          local-cache: true
+          # local-cache restores the NDK from the Actions cache, but the
+          # restore drops the clang symlinks, so every cache-HIT run dies
+          # in cc-rs with "failed to find tool .../bin/clang". A fresh
+          # download (~1 min) every run is the reliable trade.
+          local-cache: false
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked --version ^3

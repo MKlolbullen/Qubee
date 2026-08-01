@@ -48,10 +48,65 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     produces the signed wire frame for the Android side to publish.
   Bundles are **published + cached but not consumed** by send/receive —
   the current v2 symmetric-group path is unchanged.
-* **Stages 3–5 — pending** (see the migration plan). The remaining
-  work wires the core into a persistent session store + the live PQXDH →
-  Double Ratchet 1:1 session, then the group sender-keys layer, then
-  cuts over from the v2 symmetric-group-key format.
+* **Stage 3 — DONE (dark-launched).** The full 1:1 path is implemented
+  and callable over JNI, but MessageService still routes live traffic
+  through the legacy envelope; the default flips only after the
+  two-device checklist (`docs/two-device-walkthrough.md`) passes.
+  * *Foundation* — `DoubleRatchet::serialize_state` / `deserialize_state`
+    so a session survives an app restart without reusing a message key.
+  * *3b* — `src/ratchet/session.rs`: a `Session` ties PQXDH + the Double
+    Ratchet + `prekey_store` into one conversation keyed by peer
+    `IdentityId`, with `establish_initiator` / `establish_responder` /
+    `encrypt` / `decrypt` and keystore persistence. A deterministic
+    per-conversation AD (blake3 over the sorted id pair) binds every
+    frame to its pair.
+  * *3c* — `src/ratchet/direct_message.rs`: the `DirectMessage`
+    (`QUBEE_DMS\x01`) wire frame carrying the optional PQXDH
+    `InitialMessage`, the ratchet header, and the ciphertext. Unsigned
+    (deniable); bounded decode on the unauth path.
+  * *3d* — `src/ratchet/direct.rs` + four JNI symbols
+    (`nativeInstallPeerPrekeyBundle`, `nativeEncryptDirectMessage`,
+    `nativeDecryptDirectMessage`, `nativeInspectDirectMessageSender`).
+    Session state persists only after a successful operation (garbage
+    frames can't corrupt the stored ratchet); replays die on consumed
+    message keys plus an accepted-initial hash record; responder
+    establishment requires the initial's X25519 identity to match the
+    sender's cached *verified* bundle (fail closed); simultaneous-open
+    resolves byte-wise-smaller-id-wins. A peer who wipes state and
+    re-initiates but loses the tie-break is unblocked via
+    `nativeResetDirectSession` (user action / trust-state event), after
+    which their next inbound initial re-establishes.
+* **Stage 4 — DONE (dark-launched).** `src/ratchet/sender_keys.rs` +
+  four JNI symbols (`nativeCreateSenderKeyDistribution`,
+  `nativeInstallSenderKeyDistribution`, `nativeEncryptGroupMessageV3`,
+  `nativeDecryptGroupMessageV3`). Per-sender BLAKE3 hash chains
+  (`QUBEE_GMS\x03`) give in-group forward secrecy; a per-group
+  *ephemeral* Ed25519 signing key — distributed only over the encrypted
+  1:1 sessions — authenticates senders inside the group without
+  reintroducing identity signatures, so transcripts stay deniable to
+  outsiders. The v2 sealed outer envelope is retained (new KDF
+  context). Live group traffic still rides v2; membership changes must
+  call `reset_group_sender_state` + redistribute at cutover.
+* **Stage 5 — plumbing LANDED (dark); flag-flip pending.** The 1:1
+  plaintext is now a tagged payload (0x01 text / 0x02 sender-key
+  distribution, pinned in wire-stability): distributions ride the
+  encrypted 1:1 sessions via `nativeCreateDirectDistributionMessage`,
+  and `nativeDecryptDirectMessage` returns typed JSON and auto-installs
+  inbound distributions after checking the channel-authenticated sender
+  against group membership. Rekey is automatic: member removal
+  (`nativeRemoveMember`) and verified inbound `KeyRotation` frames both
+  wipe the group's sender chains (`nativeResetGroupSenderState` exists
+  for manual rekeys). **Receive side is live**:
+  `MessageService.handleRatchetFrame` recognises
+  `QUBEE_DMS`/`QUBEE_GMS\x03` frames unconditionally (receivers must
+  understand v3 before any sender emits it), routes 1:1 text through
+  the same peer↔identity trust observation as the legacy path, and
+  persists v3 group messages through the shared handler. The send side
+  stays legacy behind `PreferenceRepository.ratchetSendEnabled`
+  (default off). What remains: the send-path flip (1:1 via
+  `encryptDirectMessage`, groups via `encryptGroupMessageV3`,
+  distribution fan-out on group join/rekey) once the device checklists
+  pass — then dropping v2 after the deprecation window.
 
 ## What's currently broken
 
@@ -174,17 +229,22 @@ hybrid identity key. Receivers verify (`verify_prekey_bundle`) and cache
 peer bundles in the keystore (`ratchet::prekey_store`). No live DR yet —
 bundles are cached but not consumed.
 
-**Stage 3 (~2 weeks):** PQXDH initial agreement + DR per-1:1
-session. New wire `MAGIC_DIRECT_MESSAGE \x01`. Sender + receiver
-state persistence in a new `RatchetStateDao`. Out-of-order skip
-windows, replay protection (recently-used `(chain_idx, msg_idx)`
-tuples per session).
+**Stage 3 (LANDED, dark):** PQXDH initial agreement + DR per-1:1
+session, end to end — ratchet-state serialisation, the `Session`
+manager (`src/ratchet/session.rs`), the `MAGIC_DIRECT_MESSAGE \x01`
+wire frame (`src/ratchet/direct_message.rs`), and the live orchestration
++ JNI bridge (`src/ratchet/direct.rs`, four `nativeDirect*`/bundle
+symbols). Replay protection comes from consumed message keys plus an
+accepted-initial hash record — a dedicated `(chain_idx, msg_idx)` window
+proved unnecessary. The path is dark: MessageService still sends 1:1
+over the legacy envelope until the two-device checklist passes.
 
-**Stage 4 (~1 week):** sender-keys group messaging on top of DR.
-New wire `MAGIC_GROUP_MESSAGE \x03`. Migration: existing groups
-keep the v2 symmetric key for one release; new groups (and any
-group after a member-add / member-remove) start on v3. Cleanup
-batch removes v2 support after a deprecation window.
+**Stage 4 (LANDED, dark):** sender-keys group messaging on top of DR —
+`src/ratchet/sender_keys.rs`, wire `QUBEE_GMS\x03`, JNI dark-launched.
+Migration plan unchanged: existing groups keep the v2 symmetric key for
+one release; new groups (and any group after a member-add /
+member-remove) start on v3. Cleanup batch removes v2 support after a
+deprecation window.
 
 **Stage 5:** drop v2 group-message wire format. Remove the
 symmetric-group-key path entirely.

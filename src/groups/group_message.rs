@@ -23,11 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::groups::group_manager::{GroupId, GroupManager};
 use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
+use crate::security::secure_rng;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
-use crate::security::secure_rng;
 
 /// Magic prefix for a group-message frame.
 ///
@@ -326,10 +326,7 @@ pub fn encrypt_group_message(
 /// `process_key_rotation` flips the kicked member's status, so any
 /// later GroupMessage from them is rejected here on purely local
 /// state.
-pub fn decrypt_group_message(
-    gm: &GroupManager,
-    wire: &[u8],
-) -> Result<DecryptedGroupMessage> {
+pub fn decrypt_group_message(gm: &GroupManager, wire: &[u8]) -> Result<DecryptedGroupMessage> {
     // Strip the outer-envelope layer first. Failure here (wrong magic,
     // wrong group, outer AEAD reject) means the frame either isn't ours
     // or has been tampered with — bounce it before any signature work.

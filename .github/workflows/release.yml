@@ -71,6 +71,14 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
+      - name: Add Android targets to the pinned toolchain
+        # rust-toolchain.toml pins the compiler; rustup resolves it the
+        # first time cargo/rustup runs in the repo, and the targets the
+        # dtolnay step installed above only landed on the runner's
+        # stable. Adding them here (cwd = repo root) attaches them to
+        # the PINNED toolchain, which is the one build_rust.sh uses.
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:

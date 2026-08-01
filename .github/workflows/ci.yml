@@ -86,7 +86,10 @@ jobs:
           shared-key: rust-audit
 
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+        # 0.22.1 is the last release that supports the repo's pinned
+        # rustc 1.86 (0.22.2 requires 1.88). Bump together with
+        # rust-toolchain.toml.
+        run: cargo install --locked cargo-audit --version 0.22.1
       - name: Audit Cargo.lock
         # Treat actual vulnerabilities as failures. Unmaintained-crate
         # warnings (`-D warnings` style) are known and tracked in the

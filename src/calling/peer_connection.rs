@@ -474,7 +474,10 @@ impl PeerConnection {
     /// expected to forward to the remote peer over the signalling
     /// channel.
     pub async fn create_offer(&self) -> Result<String> {
-        let offer = self.webrtc_pc.create_offer(None).await
+        let offer = self
+            .webrtc_pc
+            .create_offer(None)
+            .await
             .context("Failed to create SDP offer")?;
         self.webrtc_pc
             .set_local_description(offer.clone())

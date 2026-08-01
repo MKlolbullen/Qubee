@@ -54,6 +54,12 @@ pub struct ContactManager {
     keystore: Option<Arc<Mutex<SecureKeystore>>>,
 }
 
+impl Default for ContactManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContactManager {
     /// Create a new contact manager with no contacts.
     pub fn new() -> Self {

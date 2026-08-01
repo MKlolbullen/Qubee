@@ -229,11 +229,12 @@ fn forge_message_with_generation(
     };
     let payload = canonical_group_message(&body);
     let signature = sender_kp.sign(&payload).unwrap();
-    let envelope = GroupMessageEnvelope { body: body.clone(), signature };
+    let envelope = GroupMessageEnvelope {
+        body: body.clone(),
+        signature,
+    };
     let inner = envelope.to_inner_bincode().unwrap();
-    let group_key = gm
-        .export_group_key(&group_id)
-        .expect("group key installed");
+    let group_key = gm.export_group_key(&group_id).expect("group key installed");
     seal_outer_envelope(&group_id, &group_key, &inner).unwrap()
 }
 
@@ -789,15 +790,17 @@ fn message_older_than_max_age_is_rejected() {
     // `+ 60` to put us a clean minute past the cliff so we don't race
     // with the wall clock's second granularity.
     signature.timestamp = signature.timestamp - GROUP_MESSAGE_MAX_AGE_SECS - 60;
-    let envelope = GroupMessageEnvelope { body: body.clone(), signature };
+    let envelope = GroupMessageEnvelope {
+        body: body.clone(),
+        signature,
+    };
     let inner = envelope.to_inner_bincode().unwrap();
     let group_key = alice_gm
         .export_group_key(&group_id)
         .expect("alice has the group key");
-    let wire = qubee_crypto::groups::group_message::seal_outer_envelope(
-        &group_id, &group_key, &inner,
-    )
-    .unwrap();
+    let wire =
+        qubee_crypto::groups::group_message::seal_outer_envelope(&group_id, &group_key, &inner)
+            .unwrap();
 
     let result = decrypt_group_message(&bob_gm, &wire);
     assert!(
@@ -1157,7 +1160,10 @@ fn owner_can_transfer_ownership_to_existing_admin() {
     // Alice's local view already reflects the swap.
     let group = alice_gm.get_group(&group_id).unwrap();
     assert_eq!(group.members.get(&alice_id).unwrap().role, Role::Admin);
-    assert_eq!(group.members.get(&bob_kp.identity_id()).unwrap().role, Role::Owner);
+    assert_eq!(
+        group.members.get(&bob_kp.identity_id()).unwrap().role,
+        Role::Owner
+    );
 
     // Bob applies the broadcast and converges.
     process_ownership_transfer(&mut bob_gm, &ot_body, &ot_sig)
@@ -1176,8 +1182,7 @@ fn owner_can_transfer_ownership_to_existing_admin() {
 
     // Group key is unchanged; encrypted round-trip still works.
     let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"after transfer").unwrap();
-    let decrypted =
-        decrypt_group_message(&bob_gm, &wire).expect("post-transfer decryption works");
+    let decrypted = decrypt_group_message(&bob_gm, &wire).expect("post-transfer decryption works");
     assert_eq!(decrypted.plaintext, b"after transfer");
 }
 
@@ -1302,9 +1307,7 @@ fn ownership_transfer_replays_idempotently() {
 
 #[test]
 fn message_ack_round_trips_after_decrypt() {
-    use qubee_crypto::groups::group_handshake::{
-        sign_message_ack, GroupHandshake, MessageAckBody,
-    };
+    use qubee_crypto::groups::group_handshake::{sign_message_ack, GroupHandshake, MessageAckBody};
     use qubee_crypto::groups::group_message::extract_message_id;
     use qubee_crypto::groups::handshake_handlers::process_message_ack;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1325,7 +1328,7 @@ fn message_ack_round_trips_after_decrypt() {
     let invite = alice_gm
         .create_invitation(group_id, alice_id, None, None)
         .unwrap();
-    let (_bob_dir, bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+    let (_bob_dir, bob_kp, bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
         &alice_kp,
         &mut alice_gm,
         group_id,
@@ -1336,15 +1339,13 @@ fn message_ack_round_trips_after_decrypt() {
     // Alice sends. Bob decrypts. Both compute the same message id.
     let plaintext = b"hello with delivery receipts".as_slice();
     let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, plaintext).unwrap();
-    let alice_message_id =
-        extract_message_id(&alice_gm, &wire).expect("extract id from wire");
+    let alice_message_id = extract_message_id(&alice_gm, &wire).expect("extract id from wire");
     let decrypted = decrypt_group_message(&bob_gm, &wire).unwrap();
 
     // Bob recomputes the id from his copy of the body. Should match
     // exactly — that's how acks reference the same message without
     // an explicit id field on the envelope.
-    let bob_message_id =
-        extract_message_id(&bob_gm, &wire).expect("bob can also extract id");
+    let bob_message_id = extract_message_id(&bob_gm, &wire).expect("bob can also extract id");
     let _ = decrypted; // we just needed the side-effect of decrypt success
     assert_eq!(alice_message_id, bob_message_id, "id is deterministic");
 
@@ -1374,9 +1375,7 @@ fn message_ack_round_trips_after_decrypt() {
 
 #[test]
 fn message_ack_from_non_member_rejected() {
-    use qubee_crypto::groups::group_handshake::{
-        sign_message_ack, GroupHandshake, MessageAckBody,
-    };
+    use qubee_crypto::groups::group_handshake::{sign_message_ack, GroupHandshake, MessageAckBody};
     use qubee_crypto::groups::handshake_handlers::process_message_ack;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1418,9 +1417,7 @@ fn message_ack_from_non_member_rejected() {
 
 #[test]
 fn message_ack_signature_forgery_rejected() {
-    use qubee_crypto::groups::group_handshake::{
-        sign_message_ack, GroupHandshake, MessageAckBody,
-    };
+    use qubee_crypto::groups::group_handshake::{sign_message_ack, GroupHandshake, MessageAckBody};
     use qubee_crypto::groups::handshake_handlers::process_message_ack;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1512,9 +1509,7 @@ fn sealed_envelope_hides_sender_id_from_observer() {
     // The plaintext sender id bytes must NOT appear anywhere in the
     // wire. (32-byte search; if they do appear, sealing is broken.)
     let sender_bytes: &[u8] = alice_id.as_ref();
-    let observed = wire
-        .windows(sender_bytes.len())
-        .any(|w| w == sender_bytes);
+    let observed = wire.windows(sender_bytes.len()).any(|w| w == sender_bytes);
     assert!(
         !observed,
         "sender_id bytes are recoverable from sealed wire — outer encryption is broken",
@@ -1529,7 +1524,8 @@ fn sealed_envelope_hides_sender_id_from_observer() {
     );
 
     // An observer without the group key gets back None.
-    let observer_lookup = |_gid: &qubee_crypto::groups::group_manager::GroupId| -> Option<[u8; 32]> { None };
+    let observer_lookup =
+        |_gid: &qubee_crypto::groups::group_manager::GroupId| -> Option<[u8; 32]> { None };
     assert!(
         open_outer_envelope(&wire, observer_lookup).is_err(),
         "observer without group key must not be able to open outer envelope",
@@ -1539,7 +1535,8 @@ fn sealed_envelope_hides_sender_id_from_observer() {
     // this is by design — sealing it would require an additional
     // routing layer and gain nothing privacy-wise).
     assert!(
-        wire.windows(group_id.as_ref().len()).any(|w| w == group_id.as_ref()),
+        wire.windows(group_id.as_ref().len())
+            .any(|w| w == group_id.as_ref()),
         "group_id is expected to be in the clear (matches topic name)",
     );
 }
@@ -1567,7 +1564,11 @@ fn sealed_envelope_tampering_is_detected() {
     alice_gm.ensure_group_key(group_id).unwrap();
     let group_key = alice_gm.export_group_key(&group_id).unwrap();
     let lookup = |gid: &qubee_crypto::groups::group_manager::GroupId| {
-        if *gid == group_id { Some(group_key) } else { None }
+        if *gid == group_id {
+            Some(group_key)
+        } else {
+            None
+        }
     };
 
     let mut wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();

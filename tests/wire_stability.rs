@@ -34,6 +34,68 @@ fn handshake_magic_is_pinned() {
 }
 
 #[test]
+fn direct_message_magic_is_pinned() {
+    use qubee_crypto::ratchet::direct_message::MAGIC_DIRECT_MESSAGE;
+    // `\x01` is the first PQXDH + Double Ratchet 1:1 wire version. A bump
+    // here means old devices silently drop new-format direct messages, so
+    // it must be a deliberate version change with a migration path.
+    assert_eq!(MAGIC_DIRECT_MESSAGE, b"QUBEE_DMS\x01");
+}
+
+#[test]
+fn direct_message_round_trips_through_wire() {
+    use qubee_crypto::ratchet::direct_message::DirectMessage;
+    use qubee_crypto::ratchet::double_ratchet::MessageHeader;
+    let dm = DirectMessage {
+        sender_id: IdentityId::from([3u8; 32]),
+        initial: None,
+        header: MessageHeader {
+            dh: [8u8; 32],
+            pn: 1,
+            n: 2,
+        },
+        ciphertext: vec![0x11, 0x22, 0x33],
+    };
+    let wire = dm.to_wire().unwrap();
+    assert!(wire.starts_with(b"QUBEE_DMS\x01"));
+    assert_eq!(DirectMessage::from_wire(&wire).unwrap(), dm);
+}
+
+#[test]
+fn direct_payload_tags_are_pinned() {
+    use qubee_crypto::ratchet::direct::{PAYLOAD_TAG_SENDER_KEY_DIST, PAYLOAD_TAG_TEXT};
+    // These sit inside the 1:1 ratchet plaintext but are still a
+    // cross-version compatibility surface: an old app receiving an
+    // unknown tag drops the message.
+    assert_eq!(PAYLOAD_TAG_TEXT, 0x01);
+    assert_eq!(PAYLOAD_TAG_SENDER_KEY_DIST, 0x02);
+}
+
+#[test]
+fn group_message_v3_magic_is_pinned() {
+    use qubee_crypto::ratchet::sender_keys::MAGIC_GROUP_MESSAGE_V3;
+    // `\x03` is the sender-keys wire format (Ratchet Stage 4). It
+    // coexists with `\x02` through the migration window; a bump here is
+    // a deliberate version change with a migration path.
+    assert_eq!(MAGIC_GROUP_MESSAGE_V3, b"QUBEE_GMS\x03");
+}
+
+#[test]
+fn sender_key_distribution_round_trips() {
+    use qubee_crypto::groups::group_manager::GroupId;
+    use qubee_crypto::ratchet::sender_keys::SenderKeyDistribution;
+    let d = SenderKeyDistribution {
+        group_id: GroupId::from_bytes([7u8; 32]),
+        sender_id: IdentityId::from([8u8; 32]),
+        iteration: 42,
+        chain_key: [9u8; 32],
+        signing_pub: [10u8; 32],
+    };
+    let bytes = d.to_bytes().unwrap();
+    assert_eq!(SenderKeyDistribution::from_bytes(&bytes).unwrap(), d);
+}
+
+#[test]
 fn group_message_magic_is_pinned() {
     // `\x02` is the sealed-outer-envelope wire format. `\x01` was the
     // pre-sealing format that left signed bodies plaintext on the

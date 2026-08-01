@@ -31,8 +31,10 @@ class QubeeManager @Inject constructor(
             // protects the Rust core's on-disk private identity keys.
             // Fail closed: if the Keystore is unavailable we refuse to
             // initialise rather than fall back to an unprotected
-            // keystore. (Pre-this-change the Rust side used a hardcoded
-            // passphrase; that hole is now closed.)
+            // keystore. Carried as a ByteArray end-to-end (never a
+            // String) so it can be zeroed after the native call — JVM
+            // strings are immutable and would pin the secret in the
+            // heap until GC, or forever if interned.
             val passphrase = try {
                 SqlCipherKeyProvider(context).getOrCreateCoreKeystorePassphrase()
             } catch (e: SecurityException) {
@@ -40,7 +42,11 @@ class QubeeManager @Inject constructor(
                 return@withContext false
             }
 
-            val result = nativeInitialize(context.filesDir.absolutePath, passphrase)
+            val result = try {
+                nativeInitialize(context.filesDir.absolutePath, passphrase)
+            } finally {
+                passphrase.fill(0)
+            }
             if (result) {
                 isInitialized = true
                 Timber.d("Qubee initialized at %s", context.filesDir.absolutePath)
@@ -110,6 +116,233 @@ class QubeeManager @Inject constructor(
             null
         } catch (e: Exception) {
             Timber.e(e, "Rust prekey-bundle build failed")
+            null
+        }
+    }
+
+    /**
+     * Verify + cache a peer's signed prekey bundle (Ratchet Stage 3d).
+     * Returns the publisher's identity id as a 64-char hex string, or
+     * null when the frame is malformed or its signature doesn't verify.
+     * Installing a bundle is the precondition for both initiating a
+     * ratchet session to that peer and accepting their first message.
+     */
+    suspend fun installPeerPrekeyBundle(bundleWire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeInstallPeerPrekeyBundle(bundleWire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust prekey-bundle-install JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust prekey-bundle install failed")
+            null
+        }
+    }
+
+    /**
+     * Encrypt a plaintext for one peer over the forward-secret PQXDH +
+     * Double Ratchet session (Ratchet Stage 3d), establishing the
+     * session from the peer's installed prekey bundle on first use.
+     * Returns the QUBEE_DMS wire frame. Dark-launched: MessageService
+     * still routes live 1:1 traffic through the legacy envelope; this
+     * path activates only when the ratchet rollout flag flips.
+     */
+    suspend fun encryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeEncryptDirectMessage(peerIdHex, plaintext)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust ratchet-encrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust ratchet encryption failed")
+            null
+        }
+    }
+
+    /**
+     * Decrypt an inbound QUBEE_DMS frame (Ratchet Stage 3d/5),
+     * establishing the responder side of the session on a
+     * conversation's first message, and decode its tagged payload.
+     * Returns a JSON string:
+     * `{"senderId": hex, "kind": "text", "text": str}` for chat, or
+     * `{"senderId": hex, "kind": "senderKeyDistribution", "groupId":
+     * hex}` for a Stage 4 sender key that Rust has already
+     * membership-checked and installed. Null on wrong frame type,
+     * missing session/bundle, replay, tampering, or a distribution
+     * from a non-member.
+     */
+    suspend fun decryptDirectMessage(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeDecryptDirectMessage(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust ratchet-decrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust ratchet decryption failed")
+            null
+        }
+    }
+
+    /**
+     * Encrypt this device's sender key for a group to one peer over the
+     * 1:1 ratchet session (Ratchet Stage 5 plumbing). Call once per
+     * group member when (re)distributing; the receiving side installs
+     * automatically inside [decryptDirectMessage]. Returns the
+     * QUBEE_DMS wire frame to send to that peer.
+     */
+    suspend fun createDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeCreateDirectDistributionMessage(peerIdHex, groupIdHex)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust distribution-message JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust distribution message create failed")
+                null
+            }
+        }
+
+    /**
+     * Tear down the 1:1 ratchet session with a peer. Recovery lever for
+     * a peer who reinstalled and whose fresh handshake is refused while
+     * we hold the old session — after the reset their next message
+     * re-establishes. Trigger only from a user action or a trust-state
+     * event; in-flight messages on the old session are lost. Returns
+     * the number of state entries removed, or -1 on failure.
+     */
+    suspend fun resetDirectSession(peerIdHex: String): Int = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext -1
+        try {
+            nativeResetDirectSession(peerIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust direct-session-reset JNI is not linked")
+            -1
+        } catch (e: Exception) {
+            Timber.e(e, "Rust direct-session reset failed")
+            -1
+        }
+    }
+
+    /**
+     * Wipe all Stage 4 sender-key state for a group, forcing fresh
+     * distributions. Rust triggers this automatically on member
+     * removal / key rotation; exposed for manual rekeys. Returns the
+     * number of states deleted, or -1 on failure.
+     */
+    suspend fun resetGroupSenderState(groupIdHex: String): Int = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext -1
+        try {
+            nativeResetGroupSenderState(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust sender-state-reset JNI is not linked")
+            -1
+        } catch (e: Exception) {
+            Timber.e(e, "Rust sender-state reset failed")
+            -1
+        }
+    }
+
+    /**
+     * If `wire` is a QUBEE_DMS frame, return the claimed sender's
+     * identity id as a 64-char hex string without touching session
+     * state; null otherwise. The claim is unauthenticated until
+     * [decryptDirectMessage] succeeds — treat it as routing metadata
+     * only, mirroring [inspectEnvelopeSender].
+     */
+    suspend fun inspectDirectMessageSender(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeInspectDirectMessageSender(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust direct-inspect JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Direct message inspection failed")
+            null
+        }
+    }
+
+    /**
+     * Create (or reload) this device's sender key for a group (Ratchet
+     * Stage 4) and return the distribution payload. The payload contains
+     * the live chain key — deliver it ONLY via [encryptDirectMessage],
+     * one copy per member, never on a plaintext or group topic.
+     */
+    suspend fun createSenderKeyDistribution(groupIdHex: String): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeCreateSenderKeyDistribution(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust sender-key-create JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust sender-key distribution create failed")
+            null
+        }
+    }
+
+    /**
+     * Install a member's sender key distribution (Ratchet Stage 4).
+     * [authenticatedSenderHex] must be the sender identity proven by the
+     * 1:1 channel that delivered the bytes (the id from
+     * [inspectDirectMessageSender] whose [decryptDirectMessage]
+     * succeeded) — Rust enforces it matches both the distribution's
+     * claim and the group membership list. Returns the group id hex.
+     */
+    suspend fun installSenderKeyDistribution(authenticatedSenderHex: String, distribution: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeInstallSenderKeyDistribution(authenticatedSenderHex, distribution)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust sender-key-install JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Rust sender-key distribution install failed")
+                null
+            }
+        }
+
+    /**
+     * Encrypt a group message over the v3 sender-keys format (Ratchet
+     * Stage 4): per-sender forward secrecy instead of the v2 shared
+     * symmetric key. Dark-launched — live group traffic still rides
+     * [nativeSendGroupMessage]'s v2 path until the cutover.
+     */
+    suspend fun encryptGroupMessageV3(groupIdHex: String, plaintext: String): ByteArray? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeEncryptGroupMessageV3(groupIdHex, plaintext)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust group-v3-encrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust group v3 encryption failed")
+            null
+        }
+    }
+
+    /**
+     * Decrypt an inbound v3 group frame (Ratchet Stage 4). Returns a
+     * JSON string `{"groupId": hex, "senderId": hex, "plaintext": str}`
+     * — the sender is authenticated by their ephemeral group signing
+     * key, so members cannot impersonate each other. Null on unknown
+     * group, missing distribution, forgery, or replay.
+     */
+    suspend fun decryptGroupMessageV3(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeDecryptGroupMessageV3(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust group-v3-decrypt JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust group v3 decryption failed")
             null
         }
     }
@@ -535,7 +768,7 @@ class QubeeManager @Inject constructor(
         nativeListAcceptedInvites()
     }
 
-    private external fun nativeInitialize(dataDir: String, keystorePassphrase: String): Boolean
+    private external fun nativeInitialize(dataDir: String, keystorePassphrase: ByteArray): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
     private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
     private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean
@@ -543,6 +776,17 @@ class QubeeManager @Inject constructor(
     // Direct-message/session JNI owned by Rust.
     private external fun nativeEncryptMessage(sessionId: String, plaintext: String): ByteArray?
     private external fun nativeBuildLocalPrekeyBundle(): ByteArray?
+    private external fun nativeInstallPeerPrekeyBundle(bundleWire: ByteArray): String?
+    private external fun nativeEncryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray?
+    private external fun nativeDecryptDirectMessage(wire: ByteArray): String?
+    private external fun nativeInspectDirectMessageSender(wire: ByteArray): String?
+    private external fun nativeCreateSenderKeyDistribution(groupIdHex: String): ByteArray?
+    private external fun nativeInstallSenderKeyDistribution(authenticatedSenderHex: String, distribution: ByteArray): String?
+    private external fun nativeEncryptGroupMessageV3(groupIdHex: String, plaintext: String): ByteArray?
+    private external fun nativeDecryptGroupMessageV3(wire: ByteArray): String?
+    private external fun nativeCreateDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray?
+    private external fun nativeResetGroupSenderState(groupIdHex: String): Int
+    private external fun nativeResetDirectSession(peerIdHex: String): Int
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?
     private external fun nativeEncryptFile(sessionId: String, fileData: ByteArray): ByteArray?
     private external fun nativeDecryptFile(sessionId: String, encryptedEnvelope: ByteArray): ByteArray?

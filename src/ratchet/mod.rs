@@ -20,9 +20,13 @@
 //! subsequent, separately-reviewed stages (see
 //! `docs/double-ratchet-design.md`).
 
+pub mod direct;
+pub mod direct_message;
 pub mod double_ratchet;
 pub mod pqxdh;
 pub mod prekey_store;
+pub mod sender_keys;
+pub mod session;
 
 pub use double_ratchet::{DoubleRatchet, MessageHeader, MAX_SKIP};
 pub use pqxdh::{PqxdhInitiatorResult, PrekeyBundlePublic, PrekeyBundleSecret};

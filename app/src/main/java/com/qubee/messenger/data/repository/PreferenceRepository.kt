@@ -116,6 +116,20 @@ class PreferenceRepository @Inject constructor(
 
     fun isOnboarded(): Boolean = prefs.getBoolean(KEY_ONBOARDED, false)
 
+    /**
+     * Stage 5 rollout flag: when true, outbound 1:1 and group traffic
+     * uses the PQXDH + Double Ratchet / sender-keys wire formats
+     * instead of the legacy envelope. Receive-side support is always
+     * on (MessageService recognises the new frames unconditionally);
+     * this only gates what WE emit. Default off until the device
+     * checklists in docs/two-device-walkthrough.md pass.
+     */
+    fun ratchetSendEnabled(): Boolean = prefs.getBoolean(KEY_RATCHET_SEND, false)
+
+    fun setRatchetSendEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_RATCHET_SEND, enabled).apply()
+    }
+
     fun nickname(): String? = prefs.getString(KEY_NICKNAME, null)
     fun userId(): String? = prefs.getString(KEY_USER_ID, null)
     fun identityIdHex(): String? = prefs.getString(KEY_IDENTITY_ID, null)
@@ -167,6 +181,7 @@ class PreferenceRepository @Inject constructor(
         private const val KEY_IDENTITY_ID = "identity_id_hex"
         private const val KEY_SHARE_LINK = "share_link"
         private const val KEY_ONBOARDED = "onboarded"
+        private const val KEY_RATCHET_SEND = "ratchet_send_enabled"
         private const val KEY_SECRET_PREFIX = "secret/"
     }
 }

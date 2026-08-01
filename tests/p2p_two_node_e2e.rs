@@ -361,6 +361,7 @@ async fn p2p_key_rotation_e2e() {
         .unwrap();
 
     // Helper: run the in-process handshake to enrol a joiner.
+    #[allow(clippy::too_many_arguments)]
     fn enrol(
         owner_kp: &IdentityKeyPair,
         owner_gm: &mut GroupManager,

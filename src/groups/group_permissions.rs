@@ -112,7 +112,7 @@ pub enum PermissionLevel {
 }
 
 /// Permission context for conditional permissions
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct PermissionContext {
     /// Time-based restrictions
     pub time_restrictions: Option<TimeRestriction>,
@@ -153,9 +153,9 @@ pub struct ContentRestriction {
     pub max_message_length: Option<usize>,
 }
 
-impl GroupPermissions {
+impl Default for GroupPermissions {
     /// Create default permissions for a standard group
-    pub fn default() -> Self {
+    fn default() -> Self {
         let mut role_permissions = HashMap::new();
 
         // Owner permissions (all permissions)
@@ -229,7 +229,9 @@ impl GroupPermissions {
             custom_overrides: HashMap::new(),
         }
     }
+}
 
+impl GroupPermissions {
     /// Create permissions for a broadcast channel
     pub fn broadcast_channel() -> Self {
         let mut permissions = Self::default();
@@ -288,7 +290,7 @@ impl GroupPermissions {
     pub fn add_permission_to_role(&mut self, role: Role, permission: Permission) {
         self.role_permissions
             .entry(role)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(permission);
     }
 
@@ -415,16 +417,6 @@ impl GroupPermissions {
         }
 
         false
-    }
-}
-
-impl Default for PermissionContext {
-    fn default() -> Self {
-        PermissionContext {
-            time_restrictions: None,
-            member_count_restrictions: None,
-            content_restrictions: None,
-        }
     }
 }
 

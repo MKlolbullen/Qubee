@@ -41,7 +41,8 @@ use pqcrypto_mlkem::mlkem768::{
     decapsulate as kem_decapsulate, encapsulate as kem_encapsulate, keypair as kem_keypair,
     Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
 };
-use pqcrypto_traits::kem::SharedSecret as _;
+use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
@@ -115,6 +116,40 @@ pub struct InitialMessage {
     /// Whether Alice consumed Bob's one-time prekey (so Bob knows to
     /// include it in his DH set + delete it).
     pub used_one_time_prekey: bool,
+}
+
+/// Serialisable form of an [`InitialMessage`]. The X25519 publics and
+/// the ML-KEM ciphertext aren't serde-native, so the on-wire encoding
+/// round-trips through this byte mirror. Carries only public handshake
+/// material (no secrets), so — unlike ratchet/session state — it is safe
+/// to place on the wire.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct WireInitialMessage {
+    pub identity: [u8; 32],
+    pub ephemeral: [u8; 32],
+    pub kem_ciphertext: Vec<u8>,
+    pub used_one_time_prekey: bool,
+}
+
+impl WireInitialMessage {
+    pub fn from_message(m: &InitialMessage) -> Self {
+        WireInitialMessage {
+            identity: *m.identity.as_bytes(),
+            ephemeral: *m.ephemeral.as_bytes(),
+            kem_ciphertext: m.kem_ciphertext.as_bytes().to_vec(),
+            used_one_time_prekey: m.used_one_time_prekey,
+        }
+    }
+
+    pub fn to_message(&self) -> Result<InitialMessage> {
+        Ok(InitialMessage {
+            identity: PublicKey::from(self.identity),
+            ephemeral: PublicKey::from(self.ephemeral),
+            kem_ciphertext: KemCiphertext::from_bytes(&self.kem_ciphertext)
+                .map_err(|e| anyhow!("invalid KEM ciphertext: {e}"))?,
+            used_one_time_prekey: self.used_one_time_prekey,
+        })
+    }
 }
 
 /// Result of the initiator handshake.

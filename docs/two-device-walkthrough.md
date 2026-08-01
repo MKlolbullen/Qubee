@@ -287,6 +287,71 @@ useful when running the walkthrough against an older build.)
   shared library didn't link the Rust bridge — check the build
   output of `build_rust.sh` for the target ABIs your device uses.
 
+## Ratchet cutover checklist (Stage 3d validation)
+
+The PQXDH + Double Ratchet 1:1 path is fully implemented and exposed
+over JNI (`installPeerPrekeyBundle` / `encryptDirectMessage` /
+`decryptDirectMessage` / `inspectDirectMessageSender` on
+`QubeeManager`), but **dark**: `MessageService` still routes live 1:1
+traffic through the legacy envelope. Before flipping the default,
+validate on two devices:
+
+1. **Bundle exchange.** A and B each call `buildLocalPrekeyBundle` and
+   deliver the frame to the other device (over the group topic or any
+   authenticated channel); `installPeerPrekeyBundle` must return the
+   peer's identity id hex on both sides. Without this, both directions
+   fail closed by design.
+2. **First contact.** A sends via `encryptDirectMessage(bIdHex, …)`;
+   B routes the received bytes (recognised via
+   `inspectDirectMessageSender != null`) into `decryptDirectMessage`
+   and sees the plaintext. Repeat B→A.
+3. **Restart persistence.** Force-stop both apps, reopen, exchange
+   another pair of messages — sessions must resume from the keystore
+   with no re-handshake.
+4. **Lossy first message.** Clear app data on B only, re-exchange
+   bundles, have A send *two* messages, deliver only the second — it
+   must still decrypt (the initial rides every frame until A first
+   hears back).
+5. **Replay.** Re-deliver an already-decrypted frame — must return
+   null, and the next fresh message must still decrypt.
+6. **Simultaneous open.** Both devices send their first message before
+   either receives. The byte-wise-smaller identity id wins the
+   initiator role; the other side's first send is dropped (expected —
+   note it in the test log) and everything after converges.
+
+Only after all six pass does the send path in `MessageService` switch
+from the legacy envelope to `encryptDirectMessage`.
+
+## Group sender-keys checklist (Stage 4 validation)
+
+The v3 group format (`createSenderKeyDistribution` /
+`installSenderKeyDistribution` / `encryptGroupMessageV3` /
+`decryptGroupMessageV3` on `QubeeManager`) is likewise dark. It
+depends on the 1:1 ratchet path above — distributions travel inside
+`encryptDirectMessage` frames. Validate with three devices in one
+group (A owner, B, C members), after the 1:1 checklist passes between
+every pair:
+
+1. **Distribution fan-out.** Each device calls
+   `createDirectDistributionMessage(peerIdHex, groupIdHex)` once per
+   other member and sends the frames over the P2P transport. On
+   receipt, `decryptDirectMessage` returns
+   `{"kind": "senderKeyDistribution", "groupId": …}` — Rust has
+   already membership-checked and installed it. All six deliveries
+   must return that JSON shape.
+2. **Group round-trip.** A sends via `encryptGroupMessageV3`; B and C
+   both decrypt and see `senderId == A` in the returned JSON. Repeat
+   from B and C.
+3. **Out-of-order + replay.** Hold back one of A's frames, deliver a
+   later one first, then the held frame — both decrypt. Re-deliver
+   either — must return null.
+4. **Member removal rekey.** Remove C via the existing flow. The
+   rotation wipes sender chains automatically on every device that
+   processes it (verify `resetGroupSenderState` returns 0 afterwards —
+   nothing left to delete). Re-run step 1 among A+B; A↔B traffic must
+   resume on fresh chains, and C must decrypt nothing sent after the
+   rotation.
+
 ## Build commands
 
 ```bash

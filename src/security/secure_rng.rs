@@ -193,14 +193,12 @@ impl SecureRng {
 
         // File system entropy (if available)
         if let Ok(temp_dir) = std::env::temp_dir().read_dir() {
-            for entry in temp_dir.take(5) {
-                if let Ok(entry) = entry {
-                    if let Ok(metadata) = entry.metadata() {
-                        hasher.update(&metadata.len().to_le_bytes());
-                        if let Ok(modified) = metadata.modified() {
-                            if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                                hasher.update(&duration.as_nanos().to_le_bytes());
-                            }
+            for entry in temp_dir.take(5).flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    hasher.update(&metadata.len().to_le_bytes());
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                            hasher.update(&duration.as_nanos().to_le_bytes());
                         }
                     }
                 }

@@ -85,11 +85,14 @@ class SqlCipherKeyProvider(private val context: Context) {
      *
      * This is an **independent** 32-byte random secret — NOT the
      * SQLCipher DB key. Key separation: a compromise of one secret
-     * doesn't hand over the other. Returned as a 64-char lowercase
-     * hex string because the JNI bridge passes it as a `String`; the
-     * Rust side treats the UTF-8 bytes of that hex as the passphrase
-     * (it never needs to decode it — it just needs a stable
-     * high-entropy byte string).
+     * doesn't hand over the other. Returned as the ASCII bytes of the
+     * 64-char lowercase hex encoding — byte-identical to the UTF-8 of
+     * the hex `String` earlier builds passed over JNI, so existing
+     * keystore wraps keep opening. A `ByteArray` rather than a
+     * `String` so the caller can zero it after handing it to
+     * `nativeInitialize`; JVM strings are immutable and interned, so a
+     * `String` passphrase could linger in the heap indefinitely.
+     * **Callers must `fill(0)` the returned array when done.**
      *
      * Before this existed, the Rust keystore wrapped its master key
      * under a hardcoded `"default_password"`, meaning the private keys
@@ -99,7 +102,7 @@ class SqlCipherKeyProvider(private val context: Context) {
      * Throws [SecurityException] if the Keystore is unavailable —
      * fail closed, same policy as [getOrCreate].
      */
-    fun getOrCreateCoreKeystorePassphrase(): String {
+    fun getOrCreateCoreKeystorePassphrase(): ByteArray {
         val prefs = openEncryptedPrefs()
             ?: throw SecurityException(
                 "Android Keystore unavailable; refusing to derive core keystore passphrase.",
@@ -109,7 +112,7 @@ class SqlCipherKeyProvider(private val context: Context) {
         val storedIv = prefs.getString(KEY_CORE_PASS_IV, null)
         if (storedCiphertext != null && storedIv != null) {
             val raw = unwrap(decodeBase64(storedCiphertext), decodeBase64(storedIv))
-            return raw.toHex()
+            return raw.toHexAsciiBytes().also { raw.fill(0) }
         }
 
         val raw = ByteArray(KEY_LENGTH_BYTES).also { SecureRandom().nextBytes(it) }
@@ -118,7 +121,7 @@ class SqlCipherKeyProvider(private val context: Context) {
             .putString(KEY_CORE_PASS_CIPHERTEXT, encodeBase64(ciphertext))
             .putString(KEY_CORE_PASS_IV, encodeBase64(iv))
             .apply()
-        return raw.toHex()
+        return raw.toHexAsciiBytes().also { raw.fill(0) }
     }
 
     /**
@@ -145,14 +148,19 @@ class SqlCipherKeyProvider(private val context: Context) {
             ?.apply()
     }
 
-    private fun ByteArray.toHex(): String {
-        val sb = StringBuilder(size * 2)
-        for (b in this) {
-            val v = b.toInt() and 0xFF
-            sb.append(HEX_DIGITS[v ushr 4])
-            sb.append(HEX_DIGITS[v and 0x0F])
+    /**
+     * Lowercase-hex encode straight into a `ByteArray` of ASCII codes —
+     * deliberately never materialising a `String`, so the only heap
+     * copies of the secret are arrays the caller can zero.
+     */
+    private fun ByteArray.toHexAsciiBytes(): ByteArray {
+        val out = ByteArray(size * 2)
+        for (i in indices) {
+            val v = this[i].toInt() and 0xFF
+            out[i * 2] = HEX_DIGITS[v ushr 4].code.toByte()
+            out[i * 2 + 1] = HEX_DIGITS[v and 0x0F].code.toByte()
         }
-        return sb.toString()
+        return out
     }
 
     /**

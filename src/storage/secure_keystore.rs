@@ -1,5 +1,6 @@
 use crate::security::secure_rng;
 use anyhow::{Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use blake3::Hasher;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
@@ -10,6 +11,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, Zeroizing};
+
+/// Magic prefix of the v2 `.master` file layout:
+/// `"QKM2" || salt(16) || nonce(12) || ciphertext`.
+///
+/// v2 wraps the master key under **Argon2id(passphrase, salt)** with a
+/// per-install random salt stored alongside the ciphertext. The v1
+/// layout (`nonce || ciphertext`, unsalted BLAKE3 `derive_key`) and the
+/// pre-v1 hardcoded-passphrase layout are still *read* for one-time
+/// migration but never written.
+const MASTER_V2_MAGIC: &[u8; 4] = b"QKM2";
+const WRAP_SALT_LEN: usize = 16;
+
+/// Argon2id cost parameters for the master-key wrap (OWASP
+/// "interactive" tier: 19 MiB, 2 passes, 1 lane). The derivation runs
+/// once per keystore open — process start on Android — so tens of
+/// milliseconds is invisible. The passphrase from the Android side is
+/// already a full-entropy 256-bit Keystore-wrapped secret, for which
+/// stretching adds nothing; the memory-hard KDF + per-install salt are
+/// defence-in-depth for every *other* caller of this API (tests,
+/// future desktop ports, CLI tools) where nothing enforces passphrase
+/// entropy, and they kill cross-install precomputation either way.
+const ARGON2_M_COST_KIB: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
 
 /// Secure key storage with encryption and integrity protection.
 ///
@@ -28,7 +54,20 @@ pub struct SecureKeyStore {
     /// disk (`.master` file). Kept so `rotate_master_key` can re-persist
     /// the rotated master key without re-threading the raw passphrase.
     wrap_key: SecretBox<[u8; 32]>,
+    /// The per-install random Argon2id salt `wrap_key` was derived
+    /// under. Persisted in the `.master` header; kept here so re-seals
+    /// (rotation) stay consistent with the stored `wrap_key` without
+    /// re-running the KDF.
+    wrap_salt: [u8; WRAP_SALT_LEN],
     keys: HashMap<String, EncryptedKeyEntry>,
+}
+
+/// Everything `load_master_key` recovers in one pass, so `new()` never
+/// runs the (deliberately expensive) KDF twice.
+struct UnwrappedMaster {
+    master_key: SecretBox<[u8; 32]>,
+    wrap_key: SecretBox<[u8; 32]>,
+    wrap_salt: [u8; WRAP_SALT_LEN],
 }
 
 /// Alias maintained for backwards compatibility with existing code. Some
@@ -89,11 +128,11 @@ impl SecureKeyStore {
     /// `.master` file — that hole is closed by requiring the passphrase
     /// here.
     ///
-    /// The passphrase is expected to already be full-entropy (≥ 256
-    /// bits of randomness). We therefore use BLAKE3's KDF mode
-    /// (`derive_key`) rather than a memory-hard password stretcher:
-    /// stretching only helps for low-entropy human passwords, and adds
-    /// nothing when the input is a random 256-bit key.
+    /// The wrapping key is derived with **Argon2id** over a
+    /// per-install random salt stored in the `.master` header (see
+    /// [`ARGON2_M_COST_KIB`] for the parameter rationale). Legacy v1
+    /// (unsalted BLAKE3) and pre-v1 (hardcoded passphrase) files are
+    /// transparently migrated to the v2 layout on first open.
     pub fn new<P: AsRef<Path>>(storage_path: P, passphrase: &[u8]) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
 
@@ -103,13 +142,13 @@ impl SecureKeyStore {
         }
 
         // Generate or load master key, wrapped under `passphrase`.
-        let master_key = Self::load_or_generate_master_key(&storage_path, passphrase)?;
-        let wrap_key = SecretBox::new(Box::new(Self::derive_key_from_passphrase(passphrase)));
+        let unwrapped = Self::load_or_generate_master_key(&storage_path, passphrase)?;
 
         let mut keystore = SecureKeyStore {
             storage_path: storage_path.clone(),
-            master_key,
-            wrap_key,
+            master_key: unwrapped.master_key,
+            wrap_key: unwrapped.wrap_key,
+            wrap_salt: unwrapped.wrap_salt,
             keys: HashMap::new(),
         };
 
@@ -218,18 +257,22 @@ impl SecureKeyStore {
         let new_cipher = ChaCha20Poly1305::new(new_master_key.expose_secret().into());
 
         for (_, entry) in self.keys.iter_mut() {
-            // Decrypt with old key
+            // Decrypt with old key. The plaintext key material is
+            // zeroised the moment the re-encrypt is done (Zeroizing
+            // wraps the drop), never left for the allocator.
             let old_nonce = Nonce::from_slice(&entry.nonce);
-            let decrypted_data = old_cipher
-                .decrypt(old_nonce, entry.encrypted_data.as_ref())
-                .map_err(|e| anyhow::anyhow!("Failed to decrypt during rotation: {}", e))?;
+            let decrypted_data = Zeroizing::new(
+                old_cipher
+                    .decrypt(old_nonce, entry.encrypted_data.as_ref())
+                    .map_err(|e| anyhow::anyhow!("Failed to decrypt during rotation: {}", e))?,
+            );
 
             // Generate new nonce and encrypt with new key
             let new_nonce_bytes = secure_rng::random::array::<12>()?;
             let new_nonce = Nonce::from_slice(&new_nonce_bytes);
 
             let new_encrypted_data = new_cipher
-                .encrypt(new_nonce, decrypted_data.as_ref())
+                .encrypt(new_nonce, decrypted_data.as_slice())
                 .map_err(|e| anyhow::anyhow!("Failed to encrypt during rotation: {}", e))?;
 
             entry.encrypted_data = new_encrypted_data;
@@ -270,52 +313,87 @@ impl SecureKeyStore {
 
         Ok(removed_count)
     }
-    
+
     fn load_or_generate_master_key(
         storage_path: &Path,
         passphrase: &[u8],
-    ) -> Result<SecretBox<[u8; 32]>> {
+    ) -> Result<UnwrappedMaster> {
         let master_key_path = storage_path.with_extension("master");
 
         if master_key_path.exists() {
             Self::load_master_key(&master_key_path, passphrase)
         } else {
             let master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
-            Self::save_master_key_to_path(&master_key, &master_key_path, passphrase)?;
-            Ok(master_key)
+            Self::rewrap_as_v2(master_key, &master_key_path, passphrase)
         }
     }
 
-    fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<SecretBox<[u8; 32]>> {
-        let encrypted_data = fs::read(path)
-            .context("Failed to read master key file")?;
-        if encrypted_data.len() < 12 {
-            return Err(anyhow::anyhow!("master key file too short"));
+    fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<UnwrappedMaster> {
+        let encrypted_data = fs::read(path).context("Failed to read master key file")?;
+
+        // v2 layout: "QKM2" || salt(16) || nonce(12) || ciphertext,
+        // wrapped under Argon2id(passphrase, salt).
+        if encrypted_data.starts_with(MASTER_V2_MAGIC)
+            && encrypted_data.len() >= MASTER_V2_MAGIC.len() + WRAP_SALT_LEN + 12
+        {
+            let mut wrap_salt = [0u8; WRAP_SALT_LEN];
+            wrap_salt.copy_from_slice(
+                &encrypted_data[MASTER_V2_MAGIC.len()..MASTER_V2_MAGIC.len() + WRAP_SALT_LEN],
+            );
+            let body = &encrypted_data[MASTER_V2_MAGIC.len() + WRAP_SALT_LEN..];
+            let wrap_key = Self::derive_wrap_key_v2(passphrase, &wrap_salt)?;
+            if let Ok(master_key) = Self::try_decrypt_master(body, wrap_key.expose_secret()) {
+                return Ok(UnwrappedMaster {
+                    master_key,
+                    wrap_key,
+                    wrap_salt,
+                });
+            }
+            // A genuine v2 file failing here means a wrong passphrase;
+            // fall through anyway so a (2^-32) v1 file whose nonce
+            // happens to start with the magic still opens.
         }
 
-        // Primary path: unwrap with the caller's (Keystore-derived)
-        // passphrase.
-        let derived = Self::derive_key_from_passphrase(passphrase);
-        if let Ok(key) = Self::try_decrypt_master(&encrypted_data, &derived) {
-            return Ok(key);
-        }
+        if encrypted_data.len() >= 12 {
+            // v1 migration: `nonce || ciphertext`, wrapped under the
+            // unsalted BLAKE3 derivation of the real passphrase.
+            let derived = Self::derive_key_v1(passphrase);
+            if let Ok(master_key) = Self::try_decrypt_master(&encrypted_data, &derived) {
+                return Self::rewrap_as_v2(master_key, path, passphrase);
+            }
 
-        // Migration path: a `.master` written by a pre-this-change
-        // build was wrapped under a key derived from the hardcoded
-        // legacy passphrase (a *different* derivation construction).
-        // Detect that, and if it unwraps, transparently re-wrap under
-        // the real passphrase so the next launch uses the secure key.
-        // Non-destructive — existing identity material is preserved.
-        let legacy = Self::derive_key_legacy();
-        if let Ok(key) = Self::try_decrypt_master(&encrypted_data, &legacy) {
-            Self::save_master_key_to_path(&key, path, passphrase)
-                .context("re-wrapping legacy master key under Keystore passphrase")?;
-            return Ok(key);
+            // Pre-v1 migration: same layout, but wrapped under the
+            // hardcoded legacy passphrase (a *different* derivation
+            // construction). If it unwraps, transparently re-wrap
+            // under the real passphrase + v2 layout. Non-destructive —
+            // existing identity material is preserved.
+            let legacy = Self::derive_key_legacy();
+            if let Ok(master_key) = Self::try_decrypt_master(&encrypted_data, &legacy) {
+                return Self::rewrap_as_v2(master_key, path, passphrase);
+            }
         }
 
         Err(anyhow::anyhow!(
             "Failed to decrypt master key (wrong passphrase or corrupt file)"
         ))
+    }
+
+    /// Seal `master_key` to `path` in the v2 layout under a **fresh**
+    /// random salt, returning the full unwrapped state. Used for new
+    /// keystores and for migrating v1 / legacy files.
+    fn rewrap_as_v2(
+        master_key: SecretBox<[u8; 32]>,
+        path: &Path,
+        passphrase: &[u8],
+    ) -> Result<UnwrappedMaster> {
+        let wrap_salt: [u8; WRAP_SALT_LEN] = secure_rng::random::array::<WRAP_SALT_LEN>()?;
+        let wrap_key = Self::derive_wrap_key_v2(passphrase, &wrap_salt)?;
+        Self::seal_master_v2(&master_key, path, wrap_key.expose_secret(), &wrap_salt)?;
+        Ok(UnwrappedMaster {
+            master_key,
+            wrap_key,
+            wrap_salt,
+        })
     }
 
     /// Attempt to unwrap the master-key file with an already-derived
@@ -329,42 +407,43 @@ impl SecureKeyStore {
         let nonce = Nonce::from_slice(&encrypted_data[..12]);
         let ciphertext = &encrypted_data[12..];
 
-        let decrypted = cipher
+        let mut decrypted = cipher
             .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {}", e))?;
 
         if decrypted.len() != 32 {
+            decrypted.zeroize();
             return Err(anyhow::anyhow!("Invalid master key size"));
         }
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(&decrypted);
+        decrypted.zeroize();
         Ok(SecretBox::new(Box::new(key_array)))
     }
 
     /// Re-persist the in-memory `master_key` to disk, sealed under the
-    /// stored passphrase-derived `wrap_key`. Used after rotation.
+    /// stored `wrap_key` + `wrap_salt` (no KDF re-run). Used after
+    /// rotation.
     fn save_master_key(&self) -> Result<()> {
         let master_key_path = self.storage_path.with_extension("master");
-        Self::seal_master_key_to_path(
+        Self::seal_master_v2(
             &self.master_key,
             &master_key_path,
             self.wrap_key.expose_secret(),
+            &self.wrap_salt,
         )
     }
 
-    fn save_master_key_to_path(
-        master_key: &SecretBox<[u8; 32]>,
-        path: &Path,
-        passphrase: &[u8],
-    ) -> Result<()> {
-        let derived_key = Self::derive_key_from_passphrase(passphrase);
-        Self::seal_master_key_to_path(master_key, path, &derived_key)
-    }
-
-    fn seal_master_key_to_path(
+    /// Write the v2 `.master` layout:
+    /// `"QKM2" || salt(16) || nonce(12) || ciphertext`. The salt is
+    /// stored in the clear alongside the ciphertext — it isn't a
+    /// secret, it exists so the Argon2id derivation is unique per
+    /// install.
+    fn seal_master_v2(
         master_key: &SecretBox<[u8; 32]>,
         path: &Path,
         wrap_key: &[u8; 32],
+        salt: &[u8; WRAP_SALT_LEN],
     ) -> Result<()> {
         let cipher = ChaCha20Poly1305::new_from_slice(wrap_key).expect("32-byte key");
         let nonce_bytes = secure_rng::random::array::<12>()?;
@@ -374,27 +453,66 @@ impl SecureKeyStore {
             .encrypt(nonce, master_key.expose_secret().as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
 
-        let mut file_data = Vec::with_capacity(12 + encrypted.len());
+        let mut file_data =
+            Vec::with_capacity(MASTER_V2_MAGIC.len() + WRAP_SALT_LEN + 12 + encrypted.len());
+        file_data.extend_from_slice(MASTER_V2_MAGIC);
+        file_data.extend_from_slice(salt);
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
 
-        fs::write(path, file_data)
-            .context("Failed to write master key file")?;
+        fs::write(path, file_data).context("Failed to write master key file")?;
 
         Ok(())
     }
 
-    /// Derive the 32-byte master-key-wrapping key from the supplied
-    /// passphrase using BLAKE3's KDF mode. The context string is a
-    /// fixed domain separator; the passphrase is the keying material.
-    ///
-    /// No memory-hard stretching: the passphrase is expected to be a
-    /// full-entropy 256-bit secret from the platform Keystore, so a
-    /// single KDF derivation is sufficient. (Stretching exists to slow
-    /// brute force of *guessable* passwords; a random 256-bit key is
-    /// not guessable.)
-    fn derive_key_from_passphrase(passphrase: &[u8]) -> [u8; 32] {
-        blake3::derive_key("qubee secure_keystore master-wrap v1", passphrase)
+    /// v1-layout writer (`nonce || ciphertext`, no salt). Retained only
+    /// so tests can forge pre-migration files.
+    #[cfg(test)]
+    fn seal_master_key_to_path(
+        master_key: &SecretBox<[u8; 32]>,
+        path: &Path,
+        wrap_key: &[u8; 32],
+    ) -> Result<()> {
+        let cipher = ChaCha20Poly1305::new_from_slice(wrap_key).expect("32-byte key");
+        let nonce_bytes = secure_rng::random::array::<12>()?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let encrypted = cipher
+            .encrypt(nonce, master_key.expose_secret().as_ref())
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
+        let mut file_data = Vec::with_capacity(12 + encrypted.len());
+        file_data.extend_from_slice(&nonce_bytes);
+        file_data.extend_from_slice(&encrypted);
+        fs::write(path, file_data).context("Failed to write master key file")?;
+        Ok(())
+    }
+
+    /// Derive the master-key-wrapping key: **Argon2id** over the
+    /// per-install salt from the `.master` header. See
+    /// [`ARGON2_M_COST_KIB`] for the parameter rationale.
+    fn derive_wrap_key_v2(
+        passphrase: &[u8],
+        salt: &[u8; WRAP_SALT_LEN],
+    ) -> Result<SecretBox<[u8; 32]>> {
+        let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+            .map_err(|e| anyhow::anyhow!("Argon2 params: {e}"))?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut out = [0u8; 32];
+        argon2
+            .hash_password_into(passphrase, salt, &mut out)
+            .map_err(|e| anyhow::anyhow!("Argon2 derivation: {e}"))?;
+        let boxed = SecretBox::new(Box::new(out));
+        out.zeroize();
+        Ok(boxed)
+    }
+
+    /// The v1 derivation (unsalted BLAKE3 `derive_key`), kept only so
+    /// the migration path in [`load_master_key`] can unwrap a v1
+    /// `.master` file. Never used for writing.
+    fn derive_key_v1(passphrase: &[u8]) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(blake3::derive_key(
+            "qubee secure_keystore master-wrap v1",
+            passphrase,
+        ))
     }
 
     /// Reproduce the *exact* pre-this-change derivation
@@ -403,12 +521,12 @@ impl SecureKeyStore {
     /// `.master` file. Used only for one-time migration; never for
     /// writing. Once a legacy file is re-wrapped under the real
     /// passphrase this code path is never hit again for that install.
-    fn derive_key_legacy() -> [u8; 32] {
+    fn derive_key_legacy() -> Zeroizing<[u8; 32]> {
         let mut hasher = Hasher::new();
         hasher.update(b"default_password");
         hasher.update(b"qubee_keystore_salt");
         let hash = hasher.finalize();
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&hash.as_bytes()[..32]);
         key
     }
@@ -453,7 +571,8 @@ mod tests {
     fn create_test_keystore() -> (SecureKeyStore, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let keystore_path = temp_dir.path().join("test_keystore.db");
-        let keystore = SecureKeyStore::new(keystore_path, b"test-keystore-passphrase").expect("Failed to create keystore");
+        let keystore = SecureKeyStore::new(keystore_path, b"test-keystore-passphrase")
+            .expect("Failed to create keystore");
         (keystore, temp_dir)
     }
 
@@ -515,7 +634,9 @@ mod tests {
             let cipher = ChaCha20Poly1305::new(legacy_master.expose_secret().into());
             let nonce_bytes = secure_rng::random::array::<12>().unwrap();
             let nonce = Nonce::from_slice(&nonce_bytes);
-            let ct = cipher.encrypt(nonce, b"legacy identity key".as_ref()).unwrap();
+            let ct = cipher
+                .encrypt(nonce, b"legacy identity key".as_ref())
+                .unwrap();
             let mut keys = HashMap::new();
             keys.insert(
                 "id".to_string(),
@@ -541,7 +662,10 @@ mod tests {
         // legacy wrapping, re-wraps under the real passphrase, and the
         // stored key is still retrievable.
         let mut ks = SecureKeyStore::new(&path, b"real-keystore-passphrase").unwrap();
-        let got = ks.retrieve_key("id").unwrap().expect("legacy key survived migration");
+        let got = ks
+            .retrieve_key("id")
+            .unwrap()
+            .expect("legacy key survived migration");
         assert_eq!(got.expose_secret().as_slice(), b"legacy identity key");
 
         // After migration the `.master` is re-wrapped: opening with the
@@ -678,5 +802,121 @@ mod tests {
             .expect("Key not found after rotation");
 
         assert_eq!(retrieved.expose_secret(), key_data);
+    }
+
+    fn plain_metadata(size: usize) -> KeyMetadata {
+        KeyMetadata {
+            algorithm: "x".into(),
+            key_size: size,
+            usage: vec![KeyUsage::Encryption],
+            expiry: None,
+            tags: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn master_file_uses_v2_layout_with_per_install_salt() {
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (p1, p2) = (d1.path().join("ks.db"), d2.path().join("ks.db"));
+        // Same passphrase on two installs.
+        SecureKeyStore::new(&p1, b"same-passphrase").unwrap();
+        SecureKeyStore::new(&p2, b"same-passphrase").unwrap();
+
+        let f1 = fs::read(p1.with_extension("master")).unwrap();
+        let f2 = fs::read(p2.with_extension("master")).unwrap();
+        assert!(f1.starts_with(MASTER_V2_MAGIC));
+        assert!(f2.starts_with(MASTER_V2_MAGIC));
+
+        let salt =
+            |f: &[u8]| f[MASTER_V2_MAGIC.len()..MASTER_V2_MAGIC.len() + WRAP_SALT_LEN].to_vec();
+        assert_ne!(
+            salt(&f1),
+            salt(&f2),
+            "two installs with the same passphrase must get different salts",
+        );
+    }
+
+    #[test]
+    fn v1_master_file_migrates_to_v2_and_preserves_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let master_path = path.with_extension("master");
+        let passphrase = b"v1-era-passphrase";
+
+        // Forge a v1-era install: master key wrapped under the unsalted
+        // BLAKE3 derivation, one entry sealed under that master key.
+        let master = SecretBox::new(Box::new(secure_rng::random::array::<32>().unwrap()));
+        let v1_wrap = SecureKeyStore::derive_key_v1(passphrase);
+        SecureKeyStore::seal_master_key_to_path(&master, &master_path, &v1_wrap).unwrap();
+        {
+            let cipher = ChaCha20Poly1305::new(master.expose_secret().into());
+            let nonce_bytes = secure_rng::random::array::<12>().unwrap();
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce_bytes), b"v1 identity key".as_ref())
+                .unwrap();
+            let mut keys = HashMap::new();
+            keys.insert(
+                "id".to_string(),
+                EncryptedKeyEntry {
+                    encrypted_data: ct,
+                    nonce: nonce_bytes,
+                    key_type: KeyType::IdentityKey,
+                    created_at: 0,
+                    last_accessed: 0,
+                    metadata: plain_metadata(15),
+                },
+            );
+            fs::write(&path, bincode::serialize(&keys).unwrap()).unwrap();
+        }
+
+        // Opening under the same passphrase migrates the wrap to v2 and
+        // keeps the data readable.
+        let mut ks = SecureKeyStore::new(&path, passphrase).unwrap();
+        let got = ks.retrieve_key("id").unwrap().expect("v1 key survived");
+        assert_eq!(got.expose_secret().as_slice(), b"v1 identity key");
+        drop(ks);
+
+        let migrated = fs::read(&master_path).unwrap();
+        assert!(
+            migrated.starts_with(MASTER_V2_MAGIC),
+            "migration must land the .master file on the v2 layout",
+        );
+        // And it still opens (Argon2id path) while a wrong passphrase fails.
+        assert!(SecureKeyStore::new(&path, passphrase).is_ok());
+        assert!(SecureKeyStore::new(&path, b"wrong").is_err());
+    }
+
+    #[test]
+    fn rotation_reseals_under_stored_salt_and_reopens() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let passphrase = b"rotation-passphrase";
+
+        let mut ks = SecureKeyStore::new(&path, passphrase).unwrap();
+        ks.store_key(
+            "k",
+            b"data before rotation",
+            KeyType::EncryptionKey,
+            plain_metadata(20),
+        )
+        .unwrap();
+        ks.rotate_master_key().unwrap();
+        drop(ks);
+
+        // The re-sealed .master must still be v2 and re-derivable from
+        // the salt stored in its own header.
+        assert!(fs::read(path.with_extension("master"))
+            .unwrap()
+            .starts_with(MASTER_V2_MAGIC));
+        let mut reopened = SecureKeyStore::new(&path, passphrase).unwrap();
+        assert_eq!(
+            reopened
+                .retrieve_key("k")
+                .unwrap()
+                .unwrap()
+                .expose_secret()
+                .as_slice(),
+            b"data before rotation",
+        );
     }
 }

@@ -32,11 +32,19 @@ use crate::groups::handshake_handlers::{
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
+use crate::ratchet::direct::{
+    decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text,
+    inspect_direct_sender, install_peer_bundle, reset_direct_session, DirectPayload,
+};
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
+use crate::ratchet::sender_keys::{
+    create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
+    install_sender_key, peek_v3_group_id, reset_group_sender_state, SenderKeyDistribution,
+};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
 use std::collections::HashMap;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const ACTIVE_IDENTITY_KEY: &str = "active_identity";
 
@@ -49,6 +57,15 @@ struct PersistedActiveIdentity {
 }
 
 // --- Global State ---
+
+/// Replay cache backing store: a membership `HashSet` for O(1) lookups
+/// paired with a FIFO `VecDeque` for bounded eviction. See
+/// [`SEEN_MESSAGE_IDS`].
+type ReplayCache = (
+    std::collections::HashSet<[u8; 16]>,
+    std::collections::VecDeque<[u8; 16]>,
+);
+
 lazy_static! {
     static ref INITIALIZED: Mutex<bool> = Mutex::new(false);
 
@@ -92,7 +109,7 @@ lazy_static! {
     /// dispatch AND a duplicate auto-ack. This dedupes both. `set` is
     /// the membership index; `order` is the FIFO eviction queue capped
     /// at REPLAY_CACHE_CAP.
-    static ref SEEN_MESSAGE_IDS: Mutex<(std::collections::HashSet<[u8; 16]>, std::collections::VecDeque<[u8; 16]>)> =
+    static ref SEEN_MESSAGE_IDS: Mutex<ReplayCache> =
         Mutex::new((std::collections::HashSet::new(), std::collections::VecDeque::new()));
 }
 
@@ -206,7 +223,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     mut env: JNIEnv,
     _class: JClass,
     data_dir: JString,
-    keystore_passphrase: JString,
+    keystore_passphrase: JByteArray,
 ) -> jboolean {
     let result = jni_catch_or(|| -> anyhow::Result<()> {
         let mut init = INITIALIZED.lock().unwrap();
@@ -219,16 +236,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
             .map_err(|e| anyhow::anyhow!("invalid data_dir: {e}"))?
             .into();
 
-        let passphrase: String = env
-            .get_string(&keystore_passphrase)
-            .map_err(|e| anyhow::anyhow!("invalid keystore_passphrase: {e}"))?
-            .into();
+        // byte[] rather than String on the Java side so the caller can
+        // zero its copy after this call; ours is zeroised on every exit
+        // path by the Zeroizing wrapper.
+        let passphrase = Zeroizing::new(
+            env.convert_byte_array(&keystore_passphrase)
+                .map_err(|e| anyhow::anyhow!("invalid keystore_passphrase: {e}"))?,
+        );
         if passphrase.is_empty() {
             return Err(anyhow::anyhow!(
                 "empty keystore passphrase; refusing to open keystore under no protection"
             ));
         }
-        let passphrase_bytes = passphrase.as_bytes();
+        let passphrase_bytes: &[u8] = &passphrase;
 
         if let Ok(vm) = env.get_java_vm() {
             *JVM.lock().unwrap() = Some(vm);
@@ -886,6 +906,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
                 plan_key_rotation(gm, identity.as_ref(), group_id, Some(member_id), &reason)?
             };
+
+            // The removed member holds every member's Stage 4 sender
+            // chain key; wipe ours so the next v3 send starts a fresh
+            // chain (remaining members reset on receiving the rotation).
+            {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                reset_group_sender_state(ks, &group_id)?;
+            }
 
             let generation = match &signed {
                 GroupHandshake::KeyRotation { body, .. } => body.generation,
@@ -1547,11 +1578,24 @@ fn on_key_rotation(
     if body.rotator_id == identity.identity_id() {
         return Ok(());
     }
-    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-    let gm = gm_guard
+    {
+        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+        let gm = gm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+        process_key_rotation(gm, identity.identity_id(), &body, &signature)?;
+    }
+    // An authenticated rotation means membership changed: wipe our
+    // Stage 4 sender chains for the group so everyone re-distributes
+    // on fresh ones (a removed member holds the old chain keys). Only
+    // after a *successful* process — a forged rotation frame must not
+    // be able to trigger rekey churn.
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
         .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-    process_key_rotation(gm, identity.identity_id(), &body, &signature)
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    reset_group_sender_state(ks, &body.group_id)?;
+    Ok(())
 }
 
 fn on_request_join(
@@ -2219,6 +2263,470 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildL
         })();
         result.unwrap_or(std::ptr::null_mut())
     })
+}
+
+/// Verify + cache a peer's signed prekey bundle wire frame (Ratchet
+/// Stage 3d). Returns the publisher's identity id as a 64-char hex
+/// string, or `null` when the frame is malformed or its hybrid
+/// signature doesn't verify. Installing a bundle is the precondition
+/// for both initiating to that peer (`nativeEncryptDirectMessage`) and
+/// accepting a first message *from* them (identity binding).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInstallPeerPrekeyBundle(
+    env: JNIEnv,
+    _class: JClass,
+    bundle_wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire = env
+                .convert_byte_array(&bundle_wire)
+                .map_err(|e| anyhow::anyhow!("invalid bundle_wire: {e}"))?;
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let id = install_peer_bundle(ks, &wire)?;
+            let java_str = env
+                .new_string(hex::encode(id.as_ref() as &[u8]))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Encrypt a chat text for a single peer over the PQXDH + Double
+/// Ratchet session (Ratchet Stage 3d/5), establishing the session from
+/// the peer's installed prekey bundle on first use. The text rides as
+/// a tagged payload so the same channel can also carry sender-key
+/// distributions (`nativeCreateDirectDistributionMessage`). Returns
+/// the `QUBEE_DMS\x01` wire frame, or `null` on failure (no identity,
+/// no keystore, no bundle installed for the peer). Dark-launched:
+/// nothing routes live 1:1 traffic through this yet.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptDirectMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    plaintext: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_hex: String = env
+                .get_string(&peer_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+                .into();
+            let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+            let plaintext_str: String = env
+                .get_string(&plaintext)
+                .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?
+                .into();
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let wire = encrypt_direct_text(ks, local_id, peer_id, &plaintext_str, now_secs())?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Encrypt this device's sender key for `group_id_hex` to one peer over
+/// the 1:1 ratchet session (Ratchet Stage 5 plumbing). Creates the
+/// group sender chain on first use. Call once per group member; the
+/// receiver's `nativeDecryptDirectMessage` verifies membership and
+/// installs it automatically. Returns the `QUBEE_DMS\x01` wire frame,
+/// or `null` on failure (unknown group, no session/bundle for peer).
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateDirectDistributionMessage(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    group_id_hex: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_hex: String = env
+                .get_string(&peer_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+                .into();
+            let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+            let group_id = parse_session_id(&mut env, group_id_hex)?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                gm.get_group(&group_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown group"))?;
+            }
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let dist = create_or_get_own_sender_key(ks, &group_id, local_id)?;
+            let wire = encrypt_direct_distribution(ks, local_id, peer_id, &dist, now_secs())?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Decrypt an inbound `QUBEE_DMS\x01` frame (Ratchet Stage 3d/5),
+/// establishing the responder side of the session on a conversation's
+/// first message, and decode its tagged payload. Returns JSON:
+///
+/// * `{"senderId": hex, "kind": "text", "text": str}` — a chat message.
+/// * `{"senderId": hex, "kind": "senderKeyDistribution", "groupId":
+///   hex}` — a Stage 4 sender key, already verified against the group's
+///   membership and installed as a side effect (the sender id used for
+///   the binding is the one this channel authenticated, never the
+///   distribution's own claim).
+///
+/// `null` on any failure — wrong frame type, no session and no (bound)
+/// initial, replay, tampering, unknown payload tag, or a distribution
+/// from a non-member.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptDirectMessage(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let wire_bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let (sender, payload) = {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                decrypt_direct_payload(ks, local_id, &wire_bytes, now_secs())?
+            };
+            let sender_hex = hex::encode(sender.as_ref() as &[u8]);
+            match payload {
+                DirectPayload::Text(text) => Ok(json!({
+                    "senderId": sender_hex,
+                    "kind": "text",
+                    "text": text,
+                })),
+                DirectPayload::SenderKeyDistribution(dist) => {
+                    {
+                        let gm_guard = GROUP_MANAGER.lock().unwrap();
+                        let gm = gm_guard
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                        let group = gm
+                            .get_group(&dist.group_id)
+                            .ok_or_else(|| anyhow::anyhow!("unknown group"))?;
+                        if !group.members.contains_key(&sender) {
+                            anyhow::bail!("distribution sender is not a member of the group");
+                        }
+                    }
+                    let mut ks_guard = KEYSTORE.lock().unwrap();
+                    let ks = ks_guard
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                    install_sender_key(ks, sender, &dist)?;
+                    Ok(json!({
+                        "senderId": sender_hex,
+                        "kind": "senderKeyDistribution",
+                        "groupId": hex::encode(dist.group_id.as_bytes()),
+                    }))
+                }
+            }
+        })();
+        ok_or_null(env, result)
+    })
+}
+
+/// Cheap dispatcher probe: if `wire` is a `QUBEE_DMS\x01` frame, return
+/// the claimed sender's identity id as a 64-char hex string without
+/// touching session state; `null` otherwise. The claim is only
+/// authenticated once `nativeDecryptDirectMessage` succeeds.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspectDirectMessageSender(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let wire_bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let sender = inspect_direct_sender(&wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("not a direct message frame"))?;
+            let java_str = env
+                .new_string(hex::encode(sender.as_ref() as &[u8]))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Create (or reload) this device's sender key for a group (Ratchet
+/// Stage 4) and return the distribution payload as a Java `byte[]`.
+/// The payload **contains the live chain key** — the caller must
+/// deliver it exclusively through the encrypted 1:1 path
+/// (`nativeEncryptDirectMessage`), one copy per group member, never on
+/// a plaintext or group topic. Returns `null` when there's no active
+/// identity, no keystore, or the group is unknown.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateSenderKeyDistribution(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let group_id = parse_session_id(&mut env, group_id_hex)?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                gm.get_group(&group_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown group"))?;
+            }
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let dist = create_or_get_own_sender_key(ks, &group_id, local_id)?;
+            let arr = env
+                .byte_array_from_slice(&dist.to_bytes()?)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Install a group member's sender key distribution (Ratchet Stage 4).
+/// `authenticated_sender_hex` must be the identity the *carrying
+/// channel* proved — i.e. the sender id returned by the 1:1 decrypt
+/// that delivered these bytes — and must match both the distribution's
+/// claim and the group's membership list. Returns the group id hex on
+/// success, `null` otherwise.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInstallSenderKeyDistribution(
+    mut env: JNIEnv,
+    _class: JClass,
+    authenticated_sender_hex: JString,
+    distribution: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let sender_hex: String = env
+                .get_string(&authenticated_sender_hex)
+                .map_err(|e| anyhow::anyhow!("invalid authenticated_sender_hex: {e}"))?
+                .into();
+            let sender_id = IdentityId::from(parse_hex32(Some(&sender_hex))?);
+            let bytes = env
+                .convert_byte_array(&distribution)
+                .map_err(|e| anyhow::anyhow!("invalid distribution: {e}"))?;
+            let dist = SenderKeyDistribution::from_bytes(&bytes)?;
+            {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                let group = gm
+                    .get_group(&dist.group_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown group"))?;
+                if !group.members.contains_key(&sender_id) {
+                    anyhow::bail!("distribution sender is not a member of the group");
+                }
+            }
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            install_sender_key(ks, sender_id, &dist)?;
+            let java_str = env
+                .new_string(hex::encode(dist.group_id.as_bytes()))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Encrypt a UTF-8 plaintext for a group over the v3 sender-keys
+/// format (Ratchet Stage 4). Returns the `QUBEE_GMS\x03` wire frame,
+/// or `null` on failure. Dark-launched: live group traffic still rides
+/// the v2 path via `nativeSendGroupMessage`.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptGroupMessageV3(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    plaintext: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let group_id = parse_session_id(&mut env, group_id_hex)?;
+            let plaintext_str: String = env
+                .get_string(&plaintext)
+                .map_err(|e| anyhow::anyhow!("invalid plaintext: {e}"))?
+                .into();
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let group_key = {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                gm.export_group_key(&group_id)
+                    .ok_or_else(|| anyhow::anyhow!("group key not installed"))?
+            };
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let wire = encrypt_sender_key_message(
+                ks,
+                &group_id,
+                &group_key,
+                local_id,
+                plaintext_str.as_bytes(),
+            )?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Decrypt an inbound `QUBEE_GMS\x03` frame (Ratchet Stage 4). Returns
+/// a JSON object `{"groupId": hex, "senderId": hex, "plaintext": str}`
+/// — the sender is authenticated by the member's ephemeral group
+/// signing key, not just the AEAD. `null` on wrong frame type, unknown
+/// group, missing distribution, forgery, or replay.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptGroupMessageV3(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let wire_bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
+            let group_id = peek_v3_group_id(&wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("not a v3 group message frame"))?;
+            let group_key = {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                gm.export_group_key(&group_id)
+                    .ok_or_else(|| anyhow::anyhow!("group key not installed"))?
+            };
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let (gid, sender, plaintext) = decrypt_sender_key_message(ks, &group_key, &wire_bytes)?;
+            let plaintext = String::from_utf8(plaintext)
+                .map_err(|e| anyhow::anyhow!("plaintext is not UTF-8: {e}"))?;
+            Ok(json!({
+                "groupId": hex::encode(gid.as_bytes()),
+                "senderId": hex::encode(sender.as_ref() as &[u8]),
+                "plaintext": plaintext,
+            }))
+        })();
+        ok_or_null(env, result)
+    })
+}
+
+/// Tear down the 1:1 ratchet session with a peer (session state,
+/// pending initial, replay marker). The recovery lever for a peer who
+/// wiped their device and re-initiated but loses the simultaneous-open
+/// tie-break — after the reset, their next inbound initial
+/// re-establishes. Trigger from a user action or trust-state event
+/// only; in-flight messages on the old session are lost. Returns the
+/// number of keystore entries removed, or `-1` on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetDirectSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+) -> jni::sys::jint {
+    let result: anyhow::Result<usize> = (|| {
+        let peer_hex: String = env
+            .get_string(&peer_id_hex)
+            .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+            .into();
+        let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        reset_direct_session(ks, &peer_id)
+    })();
+    match result {
+        Ok(n) => n as jni::sys::jint,
+        Err(e) => {
+            tracing::warn!(error = ?e, "direct session reset failed");
+            -1
+        }
+    }
+}
+
+/// Wipe all Stage 4 sender-key state for a group (own chain + every
+/// installed peer chain), forcing fresh distributions all around.
+/// Called automatically on member removal / key rotation; exposed for
+/// the app layer to trigger a manual rekey. Returns the number of
+/// states deleted, or `-1` on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetGroupSenderState(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jni::sys::jint {
+    let result: anyhow::Result<usize> = (|| {
+        let group_id = parse_session_id(&mut env, group_id_hex)?;
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        reset_group_sender_state(ks, &group_id)
+    })();
+    match result {
+        Ok(n) => n as jni::sys::jint,
+        Err(e) => {
+            tracing::warn!(error = ?e, "sender state reset failed");
+            -1
+        }
+    }
 }
 
 /// Decrypt a wire envelope produced by `nativeEncryptMessage` (or

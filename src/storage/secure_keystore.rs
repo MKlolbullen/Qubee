@@ -23,7 +23,18 @@ use zeroize::{Zeroize, Zeroizing};
 /// pre-v1 hardcoded-passphrase layout are still *read* for one-time
 /// migration but never written.
 const MASTER_V2_MAGIC: &[u8; 4] = b"QKM2";
+/// Transient dual-key `.master` layout written *only* during
+/// `rotate_master_key`: `"QKM3" || salt(16) || count(1) || [nonce(12)
+/// || ct(48)]×count`, count ∈ {1,2}. Candidate 0 is the intended
+/// post-rotation (new) master key; candidate 1 (when present) is the
+/// pre-rotation (old) key, retained so the two-file (`.master` + `.db`)
+/// rotation commit is crash-recoverable — see `rotate_master_key` and
+/// `resolve_pending_rotation`. Collapsed back to `QKM2` once rotation
+/// completes, so steady state never carries two keys.
+const MASTER_V3_MAGIC: &[u8; 4] = b"QKM3";
 const WRAP_SALT_LEN: usize = 16;
+/// `nonce(12) || ChaCha20-Poly1305(32-byte master key)` = 12 + 32 + 16.
+const MASTER_WRAP_BLOCK_LEN: usize = 12 + 32 + 16;
 
 /// Argon2id cost parameters for the master-key wrap (OWASP
 /// "interactive" tier: 19 MiB, 2 passes, 1 lane). The derivation runs
@@ -67,6 +78,11 @@ pub struct SecureKeyStore {
 /// runs the (deliberately expensive) KDF twice.
 struct UnwrappedMaster {
     master_key: SecretBox<[u8; 32]>,
+    /// Set only when the `.master` file was a transient dual-key
+    /// (`QKM3`) layout — i.e. the process crashed mid-rotation. The
+    /// constructor resolves which key the `.db` is actually under and
+    /// collapses back to single-key, so this never reaches steady state.
+    alt_master_key: Option<SecretBox<[u8; 32]>>,
     wrap_key: SecretBox<[u8; 32]>,
     wrap_salt: [u8; WRAP_SALT_LEN],
 }
@@ -235,7 +251,52 @@ impl SecureKeyStore {
         // Load existing keys
         keystore.load_keys()?;
 
+        // If the `.master` was a transient dual-key layout, the process
+        // crashed mid-rotation: decide which key the `.db` is actually
+        // under and collapse back to a single-key `.master`.
+        if let Some(alt) = unwrapped.alt_master_key {
+            keystore.resolve_pending_rotation(alt)?;
+        }
+
         Ok(keystore)
+    }
+
+    /// Finish an interrupted `rotate_master_key`. `self.master_key` holds
+    /// the intended post-rotation key; `alt` is the pre-rotation key.
+    /// Whichever one decrypts the loaded entries is the live key (the
+    /// `.db` write may or may not have committed before the crash); adopt
+    /// it and rewrite `.master` as a single-key `QKM2` file.
+    fn resolve_pending_rotation(&mut self, alt: SecretBox<[u8; 32]>) -> Result<()> {
+        if !self.keys_open_under(self.master_key.expose_secret()) {
+            // The `.db` was not rewritten under the new key before the
+            // crash — the entries are still under the old (alt) key.
+            self.master_key = alt;
+        }
+        self.save_master_key()
+    }
+
+    /// Whether the stored entries decrypt under `candidate`. Checks a
+    /// single entry (they all share the master key) via the AAD path
+    /// then the legacy no-AAD path; an empty keystore trivially matches.
+    fn keys_open_under(&self, candidate: &[u8; 32]) -> bool {
+        // One entry decides — they all share the master key. An empty
+        // keystore trivially matches (adopt the intended new key).
+        let Some((key_id, entry)) = self.keys.iter().next() else {
+            return true;
+        };
+        let cipher = ChaCha20Poly1305::new(candidate.into());
+        let nonce = Nonce::from_slice(&entry.nonce);
+        let aad = entry_aad(key_id, &entry.key_type);
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &entry.encrypted_data,
+                    aad: &aad,
+                },
+            )
+            .is_ok()
+            || cipher.decrypt(nonce, entry.encrypted_data.as_ref()).is_ok()
     }
 
     /// Store a key in the secure keystore
@@ -375,7 +436,9 @@ impl SecureKeyStore {
 
     /// Rotate the master key (re-encrypt all stored keys)
     pub fn rotate_master_key(&mut self) -> Result<()> {
-        // Generate new master key
+        // Generate new master key; keep a copy of the old one so the
+        // `.master` can carry both across the `.db` write below.
+        let old_master = Zeroizing::new(*self.master_key.expose_secret());
         let new_master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
 
         // Re-encrypt all keys with new master key
@@ -422,11 +485,32 @@ impl SecureKeyStore {
             entry.nonce = new_nonce_bytes;
         }
 
-        // Update master key
-        self.master_key = new_master_key;
+        // Crash-safe two-file commit. `self.keys` now holds new-key
+        // ciphertexts but `self.master_key` is still the old key. The
+        // `.master` and `.db` are separate files, so we can't write both
+        // in one atomic step; instead we keep *both* master keys
+        // recoverable across the window:
+        //
+        //   1. Write a dual-key `.master` (new primary + old fallback).
+        //   2. Commit the new-key `.db`.
+        //   3. Collapse `.master` back to the single new key.
+        //
+        // A crash after step 1 or 2 leaves a dual-key `.master`; the next
+        // open (`resolve_pending_rotation`) probes which key the `.db` is
+        // under and adopts it — so no crash point can strand entries
+        // under an unrecoverable master key.
+        let master_path = self.storage_path.with_extension("master");
+        Self::seal_master_dual(
+            new_master_key.expose_secret(),
+            Some(&old_master),
+            &master_path,
+            self.wrap_key.expose_secret(),
+            &self.wrap_salt,
+        )?;
 
-        // Save updated keystore
+        self.master_key = new_master_key;
         self.save_keys()?;
+        // Collapse the dual `.master` back to a single (new) key.
         self.save_master_key()?;
 
         Ok(())
@@ -474,6 +558,40 @@ impl SecureKeyStore {
     fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<UnwrappedMaster> {
         let encrypted_data = fs::read(path).context("Failed to read master key file")?;
 
+        // v3 (transient dual-key) layout, written only mid-rotation:
+        // "QKM3" || salt(16) || count(1) || [nonce(12) || ct]×count.
+        let v3_header = MASTER_V3_MAGIC.len() + WRAP_SALT_LEN + 1;
+        if encrypted_data.starts_with(MASTER_V3_MAGIC) && encrypted_data.len() >= v3_header {
+            let mut wrap_salt = [0u8; WRAP_SALT_LEN];
+            wrap_salt.copy_from_slice(
+                &encrypted_data[MASTER_V3_MAGIC.len()..MASTER_V3_MAGIC.len() + WRAP_SALT_LEN],
+            );
+            let count = encrypted_data[MASTER_V3_MAGIC.len() + WRAP_SALT_LEN] as usize;
+            if count == 0
+                || count > 2
+                || encrypted_data.len() < v3_header + count * MASTER_WRAP_BLOCK_LEN
+            {
+                return Err(anyhow::anyhow!(
+                    "corrupt QKM3 master file (bad count/length)"
+                ));
+            }
+            let wrap_key = Self::derive_wrap_key_v2(passphrase, &wrap_salt)?;
+            let mut candidates = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = v3_header + i * MASTER_WRAP_BLOCK_LEN;
+                let block = &encrypted_data[off..off + MASTER_WRAP_BLOCK_LEN];
+                candidates.push(Self::try_decrypt_master(block, wrap_key.expose_secret())?);
+            }
+            let mut it = candidates.into_iter();
+            let master_key = it.next().expect("count >= 1");
+            return Ok(UnwrappedMaster {
+                master_key,
+                alt_master_key: it.next(),
+                wrap_key,
+                wrap_salt,
+            });
+        }
+
         // v2 layout: "QKM2" || salt(16) || nonce(12) || ciphertext,
         // wrapped under Argon2id(passphrase, salt).
         if encrypted_data.starts_with(MASTER_V2_MAGIC)
@@ -488,6 +606,7 @@ impl SecureKeyStore {
             if let Ok(master_key) = Self::try_decrypt_master(body, wrap_key.expose_secret()) {
                 return Ok(UnwrappedMaster {
                     master_key,
+                    alt_master_key: None,
                     wrap_key,
                     wrap_salt,
                 });
@@ -534,9 +653,44 @@ impl SecureKeyStore {
         Self::seal_master_v2(&master_key, path, wrap_key.expose_secret(), &wrap_salt)?;
         Ok(UnwrappedMaster {
             master_key,
+            alt_master_key: None,
             wrap_key,
             wrap_salt,
         })
+    }
+
+    /// Write the transient dual-key `QKM3` `.master` used mid-rotation:
+    /// `"QKM3" || salt(16) || count(1) || [nonce(12) || ct]×count`.
+    /// `primary` is the post-rotation key; `secondary`, when `Some`, is
+    /// the pre-rotation key kept for crash recovery across the `.db`
+    /// write.
+    fn seal_master_dual(
+        primary: &[u8; 32],
+        secondary: Option<&[u8; 32]>,
+        path: &Path,
+        wrap_key: &[u8; 32],
+        salt: &[u8; WRAP_SALT_LEN],
+    ) -> Result<()> {
+        let cipher = ChaCha20Poly1305::new_from_slice(wrap_key).expect("32-byte key");
+        let mut keys: Vec<&[u8; 32]> = vec![primary];
+        if let Some(s) = secondary {
+            keys.push(s);
+        }
+        let mut out = Vec::with_capacity(
+            MASTER_V3_MAGIC.len() + WRAP_SALT_LEN + 1 + keys.len() * MASTER_WRAP_BLOCK_LEN,
+        );
+        out.extend_from_slice(MASTER_V3_MAGIC);
+        out.extend_from_slice(salt);
+        out.push(keys.len() as u8);
+        for k in keys {
+            let nonce_bytes = secure_rng::random::array::<12>()?;
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce_bytes), k.as_ref())
+                .map_err(|e| anyhow::anyhow!("Failed to wrap master key: {e}"))?;
+            out.extend_from_slice(&nonce_bytes);
+            out.extend_from_slice(&ct);
+        }
+        atomic_write(path, &out).context("Failed to write dual master key file")
     }
 
     /// Attempt to unwrap the master-key file with an already-derived
@@ -1188,6 +1342,113 @@ mod tests {
         // And it still opens (Argon2id path) while a wrong passphrase fails.
         assert!(SecureKeyStore::new(&path, passphrase).is_ok());
         assert!(SecureKeyStore::new(&path, b"wrong").is_err());
+    }
+
+    #[test]
+    fn rotation_crash_before_db_rewrite_recovers_old_key() {
+        // Simulates a crash after the dual-key `.master` is written but
+        // before the `.db` is re-encrypted: entries are still under the
+        // OLD key. The next open must adopt the old key and collapse.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-1").unwrap();
+        ks.store_key("k", b"secret value", KeyType::RootKey, plain_metadata(12))
+            .unwrap();
+
+        let m_old = *ks.master_key.expose_secret();
+        let wrap = *ks.wrap_key.expose_secret();
+        let salt = ks.wrap_salt;
+        let m_new = secure_rng::random::array::<32>().unwrap();
+        // Dual `.master` written; `.db` still holds old-key entries.
+        SecureKeyStore::seal_master_dual(
+            &m_new,
+            Some(&m_old),
+            &path.with_extension("master"),
+            &wrap,
+            &salt,
+        )
+        .unwrap();
+        drop(ks);
+
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-1").unwrap();
+        assert_eq!(
+            ks.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            b"secret value",
+        );
+        drop(ks);
+        // `.master` collapsed back to a single-key layout.
+        assert!(fs::read(path.with_extension("master"))
+            .unwrap()
+            .starts_with(MASTER_V2_MAGIC));
+    }
+
+    #[test]
+    fn rotation_crash_after_db_rewrite_recovers_new_key() {
+        // Simulates a crash after the `.db` was re-encrypted under the
+        // NEW key but before `.master` collapsed: entries are under the
+        // new key while `.master` still carries both. The next open must
+        // adopt the new key.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-2").unwrap();
+        ks.store_key("k", b"secret value", KeyType::RootKey, plain_metadata(12))
+            .unwrap();
+
+        let m_old = *ks.master_key.expose_secret();
+        let wrap = *ks.wrap_key.expose_secret();
+        let salt = ks.wrap_salt;
+        let m_new = secure_rng::random::array::<32>().unwrap();
+
+        // Re-encrypt the entries under the new key and commit the `.db`.
+        {
+            let old_c = ChaCha20Poly1305::new((&m_old).into());
+            let new_c = ChaCha20Poly1305::new((&m_new).into());
+            for (key_id, entry) in ks.keys.iter_mut() {
+                let aad = entry_aad(key_id, &entry.key_type);
+                let pt = old_c
+                    .decrypt(
+                        Nonce::from_slice(&entry.nonce),
+                        Payload {
+                            msg: &entry.encrypted_data,
+                            aad: &aad,
+                        },
+                    )
+                    .unwrap();
+                let nb = secure_rng::random::array::<12>().unwrap();
+                let ct = new_c
+                    .encrypt(
+                        Nonce::from_slice(&nb),
+                        Payload {
+                            msg: pt.as_slice(),
+                            aad: &aad,
+                        },
+                    )
+                    .unwrap();
+                entry.encrypted_data = ct;
+                entry.nonce = nb;
+            }
+            ks.save_keys().unwrap();
+        }
+        // Dual `.master`, not yet collapsed.
+        SecureKeyStore::seal_master_dual(
+            &m_new,
+            Some(&m_old),
+            &path.with_extension("master"),
+            &wrap,
+            &salt,
+        )
+        .unwrap();
+        drop(ks);
+
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-2").unwrap();
+        assert_eq!(
+            ks.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            b"secret value",
+        );
+        drop(ks);
+        assert!(fs::read(path.with_extension("master"))
+            .unwrap()
+            .starts_with(MASTER_V2_MAGIC));
     }
 
     #[test]

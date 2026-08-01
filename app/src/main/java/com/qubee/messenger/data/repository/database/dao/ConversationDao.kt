@@ -50,12 +50,14 @@ interface ConversationDao {
                   AND status != 'READ'
                   AND isFromMe = 0) as unreadCount
         FROM conversations c
-        LEFT JOIN (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY conversationId ORDER BY timestamp DESC) as rn
-            FROM messages
-            WHERE isDeleted = 0
-        ) m ON c.id = m.conversationId AND m.rn = 1
+        LEFT JOIN messages m ON m.conversationId = c.id
+            AND m.isDeleted = 0
+            AND m.id = (
+                SELECT m2.id FROM messages m2
+                WHERE m2.conversationId = c.id AND m2.isDeleted = 0
+                ORDER BY m2.timestamp DESC, m2.id DESC
+                LIMIT 1
+            )
         WHERE c.isArchived = 0
         ORDER BY COALESCE(m.timestamp, c.updatedAt) DESC
         """

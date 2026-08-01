@@ -48,7 +48,8 @@ use crate::identity::identity_key::IdentityId;
 use crate::ratchet::direct_message::DirectMessage;
 use crate::ratchet::pqxdh::WireInitialMessage;
 use crate::ratchet::prekey_store::{
-    body_to_public, get_or_create_local_bundle, get_peer_bundle, store_peer_bundle,
+    body_to_public, consume_one_time_prekey, get_or_create_local_bundle, get_peer_bundle,
+    store_peer_bundle,
 };
 use crate::ratchet::sender_keys::SenderKeyDistribution;
 use crate::ratchet::session::{load_session, store_session, Session};
@@ -211,6 +212,13 @@ pub fn decrypt_direct(
         Session::establish_responder(local_id, peer_id, &local_secret, &initial.to_message()?)?;
     let plaintext = session.decrypt(&dm.header, &dm.ciphertext)?;
     store_session(ks, &session)?;
+    // The handshake is now AEAD-verified. If it consumed our one-time
+    // prekey, rotate it so it's never reused (single-use forward
+    // secrecy). Doing this only after a successful decrypt stops a
+    // spoofed initial from burning OTPs.
+    if initial.used_one_time_prekey {
+        consume_one_time_prekey(ks)?;
+    }
     ks.store_key(
         &accepted_initial_key(&peer_id),
         &hash,
@@ -566,6 +574,34 @@ mod tests {
         dm.sender_id = bid;
         let err = decrypt_direct(&mut b.ks, bid, &dm.to_wire().unwrap(), 1).unwrap_err();
         assert!(err.to_string().contains("from ourselves"));
+    }
+
+    #[test]
+    fn responder_consumes_one_time_prekey_after_handshake() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+
+        // Bob's published one-time prekey before receiving anything.
+        let otp_before = {
+            let (s, _) = get_or_create_local_bundle(&mut b.ks, 1).unwrap();
+            *x25519_dalek::PublicKey::from(s.one_time_prekey.as_ref().unwrap()).as_bytes()
+        };
+
+        // Alice initiates (her PQXDH uses Bob's published OTP), Bob
+        // receives + establishes as responder.
+        let w = encrypt_direct(&mut a.ks, aid, bid, b"hello with otp", 1).unwrap();
+        let (from, pt) = decrypt_direct(&mut b.ks, bid, &w, 1).unwrap();
+        assert_eq!((from, pt.as_slice()), (aid, b"hello with otp".as_slice()));
+
+        // Bob's OTP must have rotated — the used one is single-use.
+        let otp_after = {
+            let (s, _) = get_or_create_local_bundle(&mut b.ks, 2).unwrap();
+            *x25519_dalek::PublicKey::from(s.one_time_prekey.as_ref().unwrap()).as_bytes()
+        };
+        assert_ne!(
+            otp_before, otp_after,
+            "responder must consume (rotate) its OTP after a successful handshake",
+        );
     }
 
     #[test]

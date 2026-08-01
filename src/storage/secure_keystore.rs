@@ -10,6 +10,7 @@ use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -113,6 +114,28 @@ pub enum KeyUsage {
     Encryption,
     KeyAgreement,
     Authentication,
+}
+
+/// Write `data` to `path` atomically: stage it in a sibling `.tmp`
+/// file, flush it to disk, then rename over the target. `fs::rename`
+/// is atomic on POSIX (Android/Linux), so a crash or power loss leaves
+/// either the previous file fully intact or the fully-written new one —
+/// never the truncated mix a plain `fs::write` produces, which for the
+/// keystore or master-key file would destroy all local key state.
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("create temp file {}", tmp.display()))?;
+        f.write_all(data).context("write temp file")?;
+        // Durability: the bytes must hit disk before the rename, or a
+        // crash could leave the renamed file pointing at empty content.
+        f.sync_all().context("fsync temp file")?;
+    }
+    fs::rename(&tmp, path).context("atomic rename over target")?;
+    Ok(())
 }
 
 /// Domain-separation tag for the per-entry AEAD associated data.
@@ -562,7 +585,7 @@ impl SecureKeyStore {
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
 
-        fs::write(path, file_data).context("Failed to write master key file")?;
+        atomic_write(path, &file_data).context("Failed to write master key file")?;
 
         Ok(())
     }
@@ -652,7 +675,7 @@ impl SecureKeyStore {
     fn save_keys(&self) -> Result<()> {
         let data = bincode::serialize(&self.keys).context("Failed to serialize keystore")?;
 
-        fs::write(&self.storage_path, data).context("Failed to write keystore file")?;
+        atomic_write(&self.storage_path, &data).context("Failed to write keystore file")?;
 
         Ok(())
     }
@@ -913,6 +936,41 @@ mod tests {
             usage: vec![KeyUsage::Encryption],
             expiry: None,
             tags: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn writes_are_atomic_and_leave_no_partial_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"atomic-pass").unwrap();
+
+        // Many store/rotate cycles; each must leave a fully-valid db and
+        // .master (rename-over-target), never a truncated temp.
+        for i in 0..8 {
+            ks.store_key(
+                &format!("k{i}"),
+                format!("val{i}").as_bytes(),
+                KeyType::EncryptionKey,
+                plain_metadata(4),
+            )
+            .unwrap();
+        }
+        ks.rotate_master_key().unwrap();
+        drop(ks);
+
+        // No leftover temp files, and everything reopens + reads back.
+        assert!(!path.with_extension("db.tmp").exists());
+        assert!(!dir.path().join("ks.master.tmp").exists());
+        let mut ks = SecureKeyStore::new(&path, b"atomic-pass").unwrap();
+        for i in 0..8 {
+            assert_eq!(
+                ks.retrieve_key(&format!("k{i}"))
+                    .unwrap()
+                    .unwrap()
+                    .expose_secret(),
+                format!("val{i}").as_bytes(),
+            );
         }
     }
 

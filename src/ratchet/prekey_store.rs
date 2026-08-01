@@ -88,6 +88,47 @@ pub fn get_or_create_local_bundle(
     Ok((secret, kem_public))
 }
 
+/// Consume this device's one-time prekey after a responder handshake
+/// has *successfully* used it (see the caller in [`super::direct`],
+/// which only calls this after an AEAD-verified decrypt so a spoofed
+/// initial can't burn OTPs). The X25519 OTP is single-use: reusing it
+/// across handshakes means a later device compromise would recover the
+/// very-first-message keys of *every* handshake that shared it. We
+/// delete the used secret and regenerate a fresh one so the *next*
+/// published bundle carries a new OTP.
+///
+/// **Limitation:** this is a single-OTP model, not a pool. Between
+/// consuming and the next `nativeBuildLocalPrekeyBundle` republish, the
+/// published bundle still advertises the old OTP public, so a concurrent
+/// initiator that fetched it will fail the OTP path and must retry
+/// against a fresh bundle. A one-time-prekey *pool* (publish N, consume
+/// by id) is the complete fix and is tracked separately.
+///
+/// Returns `Ok(true)` if an OTP was present and rotated, `Ok(false)` if
+/// the local bundle had none.
+pub fn consume_one_time_prekey(ks: &mut SecureKeyStore) -> Result<bool> {
+    let stored_secret = match ks.retrieve_key(LOCAL_BUNDLE_KEY_ID)? {
+        Some(s) => s,
+        None => return Ok(false),
+    };
+    let mut stored: StoredLocalBundle = bincode::deserialize(stored_secret.expose_secret())
+        .map_err(|e| anyhow!("decode local bundle for OTP consume: {e}"))?;
+    if stored.one_time_prekey.is_none() {
+        return Ok(false);
+    }
+    // Replace the consumed OTP with a fresh random scalar seed so the
+    // mechanism stays alive for the next published bundle.
+    stored.one_time_prekey = Some(crate::security::secure_rng::random::array::<32>()?);
+    let bytes = bincode::serialize(&stored).map_err(|e| anyhow!("encode local bundle: {e}"))?;
+    ks.store_key(
+        LOCAL_BUNDLE_KEY_ID,
+        &bytes,
+        KeyType::PreKey,
+        bundle_metadata(),
+    )?;
+    Ok(true)
+}
+
 fn stored_to_secret(stored: StoredLocalBundle) -> Result<(PrekeyBundleSecret, KemPublicKey)> {
     let kem_secret = KemSecretKey::from_bytes(&stored.kem_secret)
         .map_err(|e| anyhow!("invalid stored KEM secret: {e}"))?;
@@ -195,6 +236,31 @@ mod tests {
             PublicKey::from(&s2.identity).as_bytes(),
         );
         assert_eq!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    #[test]
+    fn consume_rotates_the_one_time_prekey_only() {
+        let (mut ks, _d) = fresh_ks();
+        let (s1, _k) = get_or_create_local_bundle(&mut ks, 1).unwrap();
+        let otp_before = *PublicKey::from(s1.one_time_prekey.as_ref().unwrap()).as_bytes();
+        let id_before = *PublicKey::from(&s1.identity).as_bytes();
+        let spk_before = *PublicKey::from(&s1.signed_prekey).as_bytes();
+
+        assert!(consume_one_time_prekey(&mut ks).unwrap());
+
+        let (s2, _k) = get_or_create_local_bundle(&mut ks, 2).unwrap();
+        let otp_after = *PublicKey::from(s2.one_time_prekey.as_ref().unwrap()).as_bytes();
+        // The OTP rotated; identity + signed prekey are untouched.
+        assert_ne!(otp_before, otp_after, "OTP must change after consume");
+        assert_eq!(id_before, *PublicKey::from(&s2.identity).as_bytes());
+        assert_eq!(spk_before, *PublicKey::from(&s2.signed_prekey).as_bytes());
+    }
+
+    #[test]
+    fn consume_without_a_bundle_is_a_noop() {
+        let (mut ks, _d) = fresh_ks();
+        // No local bundle generated yet.
+        assert!(!consume_one_time_prekey(&mut ks).unwrap());
     }
 
     #[test]

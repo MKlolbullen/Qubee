@@ -47,7 +47,12 @@ android {
         // Android's per-package version comparator accepts as an
         // upgrade).
         versionName project.findProperty('qubeeVersionName') ?: '0.1.0-alpha'
-        versionCode (project.findProperty('qubeeVersionCode') ?: '100').toInteger()
+        // No parens after `versionCode`: `versionCode (x).toInteger()`
+        // parses as `(versionCode(x)).toInteger()` in Groovy, passing
+        // the raw String to AGP and crashing configuration with
+        // "BeanDynamicObject: Value is null". Command form takes the
+        // whole expression as the argument.
+        versionCode Integer.parseInt((project.findProperty('qubeeVersionCode') ?: '100').toString())
 
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 

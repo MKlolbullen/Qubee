@@ -3,9 +3,8 @@ package com.qubee.messenger
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.os.Build
-import androidx.core.content.ContextCompat
-import dagger.hilt.android.HiltAndroidApp
+import android.hilt.HiltAndroidApp
+import com.qubee.messenger.BuildConfig
 import timber.log.Timber
 
 @HiltAndroidApp

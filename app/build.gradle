@@ -8,6 +8,7 @@ plugins {
     // versions; with 1.3.4 + AGP 8.4 the order here works because the
     // Android plugin is applied first by the line above.
     id 'app.cash.paparazzi'
+    id 'org.jetbrains.kotlin.plugin.compose'
 }
 
 // Release signing pulls every credential from env vars so the
@@ -113,11 +114,9 @@ android {
     buildFeatures {
         viewBinding true
         compose true
+        buildConfig true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion '1.5.4'
-    }
     // No externalNativeBuild — Rust shared libraries are built out of band
     // by build_rust.sh / cargo-ndk and copied into jniLibs.
 }

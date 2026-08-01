@@ -86,7 +86,14 @@ jobs:
           shared-key: rust-audit
 
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+        # Pin the binary version explicitly: `--locked` only fixes
+        # cargo-audit's transitive deps, not the cargo-audit crate
+        # itself, so an unpinned install could silently change audit
+        # behaviour. 0.22.2 requires rustc >= 1.88 (satisfied by the
+        # pinned toolchain). The advisory database is fetched fresh at
+        # run time regardless of this pin. Bump alongside
+        # rust-toolchain.toml.
+        run: cargo install --locked cargo-audit --version 0.22.2
       - name: Audit Cargo.lock
         # Treat actual vulnerabilities as failures. Unmaintained-crate
         # warnings (`-D warnings` style) are known and tracked in the

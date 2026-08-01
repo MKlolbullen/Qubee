@@ -126,15 +126,33 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp_os = path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
-    {
+
+    // Stage the bytes; on any failure remove the temp so a partial
+    // `.tmp` can't be left behind (and preserve the original error).
+    let staged = (|| -> Result<()> {
         let mut f = fs::File::create(&tmp)
             .with_context(|| format!("create temp file {}", tmp.display()))?;
         f.write_all(data).context("write temp file")?;
         // Durability: the bytes must hit disk before the rename, or a
         // crash could leave the renamed file pointing at empty content.
-        f.sync_all().context("fsync temp file")?;
+        f.sync_all().context("fsync temp file")
+    })();
+    if staged.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return staged;
     }
+
     fs::rename(&tmp, path).context("atomic rename over target")?;
+
+    // The rename is only durable once the containing directory entry is
+    // flushed; without this a power loss can resurrect the pre-rename
+    // directory state. Best-effort — not all platforms allow fsync on a
+    // directory handle, and a failure here doesn't corrupt anything.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(())
 }
 

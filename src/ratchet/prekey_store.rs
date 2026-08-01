@@ -104,6 +104,13 @@ pub fn get_or_create_local_bundle(
 /// against a fresh bundle. A one-time-prekey *pool* (publish N, consume
 /// by id) is the complete fix and is tracked separately.
 ///
+// TODO(prekey-pool): replace the single one-time prekey with a pool —
+// publish N OTP publics in the bundle, tag each initial with the OTP id
+// it consumed, and delete only that one on the responder. Removes the
+// stale-published-OTP window above. Tracked in the docs
+// (docs/double-ratchet-design.md, "Stage 3" follow-ups); file a repo
+// issue before starting.
+///
 /// Returns `Ok(true)` if an OTP was present and rotated, `Ok(false)` if
 /// the local bundle had none.
 pub fn consume_one_time_prekey(ks: &mut SecureKeyStore) -> Result<bool> {

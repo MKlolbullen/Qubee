@@ -216,8 +216,16 @@ pub fn decrypt_direct(
     // prekey, rotate it so it's never reused (single-use forward
     // secrecy). Doing this only after a successful decrypt stops a
     // spoofed initial from burning OTPs.
+    //
+    // Rotation failure must NOT discard the message: the ratchet already
+    // consumed this frame's message key (and we persisted the session),
+    // so the caller can never re-decrypt this exact frame on retry.
+    // Losing an authenticated message to a keystore-bookkeeping hiccup
+    // would be worse than a not-yet-rotated OTP — log and continue.
     if initial.used_one_time_prekey {
-        consume_one_time_prekey(ks)?;
+        if let Err(e) = consume_one_time_prekey(ks) {
+            tracing::warn!(error = %e, "failed to rotate one-time prekey after handshake");
+        }
     }
     ks.store_key(
         &accepted_initial_key(&peer_id),

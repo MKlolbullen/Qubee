@@ -21,7 +21,7 @@ machine.
 | JDK | Temurin 17 | `.github/workflows/release.yml` step `Set up JDK 17` |
 | Android compileSdk | 34 | `app/build.gradle` |
 | Gradle | `8.7` with pinned SHA-256 | `gradle/wrapper/gradle-wrapper.properties` |
-| Compose compiler | `1.5.4` | `app/build.gradle` (`composeOptions`) |
+| Compose compiler | `1.5.14` | `app/build.gradle` (`composeOptions`) |
 
 ## Canonical build command
 

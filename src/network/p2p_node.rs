@@ -3,17 +3,108 @@
 // libp2p 0.55 swarm wired to gossipsub + Kademlia + (optional) mDNS.
 
 use anyhow::{anyhow, Result};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures::StreamExt;
 use libp2p::{
     gossipsub,
     identity::Keypair,
-    kad, mdns, noise,
+    kad, mdns, noise, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, Swarm,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Wire protocol id for the one-to-one direct-delivery stream.
+const DIRECT_PROTOCOL: StreamProtocol = StreamProtocol::new("/qubee/direct/1");
+
+/// Hard cap on a single direct frame. Group handshake frames are small
+/// (a wrapped key + signatures); 1 MiB is comfortably above any real
+/// frame while bounding what a peer can force us to buffer.
+const MAX_DIRECT_FRAME: usize = 1 << 20;
+
+/// Minimal request/response codec: a big-endian u32 length prefix
+/// followed by the raw already-serialized frame bytes. The payloads are
+/// the existing signed `GroupHandshake` wire frames — direct delivery is
+/// a transport choice, not a new message format — and the response is a
+/// zero-length ack so the sender learns the frame landed.
+#[derive(Clone, Default)]
+struct DirectCodec;
+
+async fn write_len_prefixed<T>(io: &mut T, data: &[u8]) -> std::io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    io.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    io.write_all(data).await?;
+    io.flush().await?;
+    Ok(())
+}
+
+async fn read_len_prefixed<T>(io: &mut T, max: usize) -> std::io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut len_buf = [0u8; 4];
+    io.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "direct frame exceeds size cap",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    io.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+#[async_trait::async_trait]
+impl request_response::Codec for DirectCodec {
+    type Protocol = StreamProtocol;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+
+    async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> std::io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_len_prefixed(io, MAX_DIRECT_FRAME).await
+    }
+
+    async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> std::io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        // Ack only; cap tiny.
+        read_len_prefixed(io, 64).await
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        req: Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_len_prefixed(io, &req).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        res: Vec<u8>,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_len_prefixed(io, &res).await
+    }
+}
 
 // --- Data Structures ---
 
@@ -22,6 +113,11 @@ use tokio::sync::mpsc;
 pub enum P2PCommand {
     /// Send a message to a specific peer or broadcast on the global topic.
     SendMessage { peer_id: String, data: Vec<u8> },
+    /// Deliver bytes to exactly one peer over the "/qubee/direct/1"
+    /// request-response protocol, off any gossip topic. Used for frames
+    /// addressed to a single recipient (JoinAccepted / JoinRejected)
+    /// that must not be broadcast to the whole group.
+    SendDirect { peer_id: String, data: Vec<u8> },
     /// Try to find a peer by their ID in the DHT
     FindPeer { peer_id: String },
     /// Subscribe to a named gossipsub topic. Idempotent.
@@ -126,6 +222,7 @@ struct QubeeBehaviour {
     gossipsub: gossipsub::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     mdns: Toggle<mdns::tokio::Behaviour>,
+    direct: request_response::Behaviour<DirectCodec>,
 }
 
 // --- The P2P Node ---
@@ -191,10 +288,16 @@ impl P2PNode {
                     None.into()
                 };
 
+                let direct = request_response::Behaviour::<DirectCodec>::new(
+                    std::iter::once((DIRECT_PROTOCOL, request_response::ProtocolSupport::Full)),
+                    request_response::Config::default(),
+                );
+
                 Ok(QubeeBehaviour {
                     gossipsub,
                     kademlia,
                     mdns,
+                    direct,
                 })
             })
             .map_err(|e| anyhow!("behaviour: {e}"))?
@@ -231,6 +334,25 @@ impl P2PNode {
                             .publish(chat_topic.clone(), data)
                         {
                             eprintln!("Publish error: {e:?}");
+                        }
+                    }
+                    Some(P2PCommand::SendDirect { peer_id, data }) => {
+                        match PeerId::from_str(&peer_id) {
+                            Ok(pid) => {
+                                // request-response dials the peer if it
+                                // isn't already connected, using addresses
+                                // the other behaviours (Kademlia/mDNS) have
+                                // learned. If none are known the outbound
+                                // request fails and surfaces as an
+                                // OutboundFailure event below — we never
+                                // silently fall back to broadcasting a
+                                // directed frame.
+                                self.swarm
+                                    .behaviour_mut()
+                                    .direct
+                                    .send_request(&pid, data);
+                            }
+                            Err(e) => eprintln!("SendDirect: invalid peer id {peer_id}: {e}"),
                         }
                     }
                     Some(P2PCommand::FindPeer { peer_id }) => {
@@ -294,6 +416,47 @@ impl P2PNode {
                                 .send(NodeEvent::PeerDiscovered { peer_id: peer_id.to_string() })
                                 .await;
                         }
+                    }
+                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Direct(request_response::Event::Message {
+                        peer,
+                        message,
+                        ..
+                    })) => {
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                // A directed frame arrived. Surface it on the
+                                // same path as gossip messages, attributed to
+                                // the authenticated sending peer, then ack so
+                                // the sender knows it landed. Direct frames
+                                // carry no gossip topic.
+                                let _ = event_sender
+                                    .send(NodeEvent::MessageReceived {
+                                        sender: peer.to_string(),
+                                        topic: String::new(),
+                                        data: request,
+                                    })
+                                    .await;
+                                let _ = self
+                                    .swarm
+                                    .behaviour_mut()
+                                    .direct
+                                    .send_response(channel, Vec::new());
+                            }
+                            request_response::Message::Response { .. } => {
+                                // Delivery ack for one of our own SendDirects.
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Direct(request_response::Event::OutboundFailure {
+                        peer,
+                        error,
+                        ..
+                    })) => {
+                        // A directed frame could not be delivered. We do NOT
+                        // fall back to broadcasting it — that would leak the
+                        // very metadata this path exists to hide. The caller's
+                        // retry/timeout logic is responsible for recovery.
+                        eprintln!("Direct delivery to {peer} failed: {error}");
                     }
                     SwarmEvent::Behaviour(QubeeBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. })) => {
                         let _ = event_sender

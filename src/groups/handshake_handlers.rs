@@ -47,6 +47,18 @@ pub enum HandshakeOutcome {
         member_added_body: MemberAddedBody,
         member_added_signature: HybridSignature,
     },
+    /// The requester is *already* an active member — a prior `Accept`
+    /// enrolled them, but its `JoinAccepted` reply may not have reached
+    /// them (e.g. a direct-delivery failure). Re-send only the
+    /// `JoinAccepted` (addressed to the one joiner); do NOT re-broadcast
+    /// `MemberAdded` (the group already knows) and do NOT consume another
+    /// invitation use. This makes a reissued `RequestJoin` idempotent so
+    /// a dropped reply can't wedge the joiner out of a group the inviter
+    /// already counts them in.
+    ReIssueAccept {
+        body: JoinAcceptedBody,
+        signature: HybridSignature,
+    },
     /// Joiner refused (cap reached, expired, etc.); serialise + publish.
     Reject {
         body: JoinRejectedBody,
@@ -84,6 +96,31 @@ pub fn process_request_join(
     }
 
     let now = now_secs();
+
+    // Idempotent re-issue: if this signed requester is already an active
+    // member, a prior Accept enrolled them but its JoinAccepted may not
+    // have reached them (a direct-delivery failure, say). Re-send the
+    // reply without consuming another invitation use or re-adding, and
+    // do not re-broadcast MemberAdded — the group already knows. Re-stamp
+    // their Kyber pubkey so future rotations target the key they hold now.
+    let already_member = gm
+        .get_group(&body.group_id)
+        .and_then(|g| g.members.get(&body.joiner_public_key.identity_id))
+        .map(|m| m.member_status == MemberStatus::Active)
+        .unwrap_or(false);
+    if already_member {
+        let _ = gm.set_member_kyber_pub(
+            body.group_id,
+            body.joiner_public_key.identity_id,
+            body.joiner_kyber_pub.clone(),
+        );
+        let (accepted_body, accepted_signature) = build_join_accepted(gm, inviter_identity, body)?;
+        return Ok(HandshakeOutcome::ReIssueAccept {
+            body: accepted_body,
+            signature: accepted_signature,
+        });
+    }
+
     // Atomically reserve one use of the invitation, re-validating expiry
     // and max_uses and bumping the counter in a single step. Doing this
     // *before* enrolment — rather than the old best-effort
@@ -125,70 +162,23 @@ pub fn process_request_join(
         body.joiner_kyber_pub.clone(),
     );
 
-    // Build the member snapshot + wrap the group key for the joiner.
-    // The snapshot now carries each member's Kyber pubkey so the
-    // joiner's local view can route subsequent rotations back to
-    // existing members.
-    let group = gm
-        .get_group(&body.group_id)
-        .ok_or_else(|| anyhow!("group vanished after add_member"))?;
-    let members: Vec<GroupMemberSummary> = group
-        .members
-        .values()
-        .map(|m| GroupMemberSummary {
-            identity_id: m.identity_id,
-            identity_key: m.identity_key.clone(),
-            display_name: m.display_name.clone(),
-            role: m.role.clone(),
-            joined_at: m.joined_at,
-            kyber_pub: m.kyber_pub.clone(),
-        })
-        .collect();
-    let group_name = group.name.clone();
-    // Snapshot the inviter's `group.version` *after* `add_member`
-    // ran, so the joiner adopts the post-enrolment value. Same
-    // counter the generation gates in `decrypt_group_message` and
-    // `process_key_rotation` compare against.
-    let snapshot_version = group.version;
+    // Build the signed JoinAccepted (roster snapshot + the group key
+    // wrapped to this request's Kyber pubkey), then a MemberAdded so
+    // existing members learn the late joiner + their Kyber pubkey.
+    let (accepted_body, accepted_signature) = build_join_accepted(gm, inviter_identity, body)?;
 
-    // Pull out the new member's snapshot for the broadcast. Cloning
-    // out of the borrow keeps the rest of this function from running
-    // into split-borrow hassles.
-    let new_member_summary = members
+    let new_member_summary = accepted_body
+        .members
         .iter()
         .find(|m| m.identity_id == body.joiner_public_key.identity_id)
         .cloned()
         .ok_or_else(|| anyhow!("new member missing from snapshot"))?;
 
-    gm.ensure_group_key(body.group_id)?;
-    let mut group_key = gm
-        .export_group_key(&body.group_id)
-        .ok_or_else(|| anyhow!("group key missing after ensure"))?;
-    let wrapped_group_key = WrappedGroupKey::wrap(&group_key, &body.joiner_kyber_pub)?;
-    group_key.zeroize();
-
-    let accepted_body = JoinAcceptedBody {
-        group_id: body.group_id,
-        invitation_code: body.invitation_code.clone(),
-        group_name,
-        members,
-        joiner_id: body.joiner_public_key.identity_id,
-        wrapped_group_key,
-        snapshot_version,
-    };
-    let (accepted_body, accepted_signature) =
-        match sign_join_accepted(inviter_identity, accepted_body)? {
-            crate::groups::group_handshake::GroupHandshake::JoinAccepted { body, signature } => {
-                (body, signature)
-            }
-            _ => unreachable!("sign_join_accepted always returns JoinAccepted"),
-        };
-
     let member_added_payload = MemberAddedBody {
         group_id: body.group_id,
         adder_id: invitation.inviter_id,
         new_member: new_member_summary,
-        new_version: snapshot_version,
+        new_version: accepted_body.snapshot_version,
         timestamp: now,
     };
     let (member_added_body, member_added_signature) =
@@ -205,6 +195,62 @@ pub fn process_request_join(
         member_added_body,
         member_added_signature,
     })
+}
+
+/// Build + sign a `JoinAccepted` for `body`'s requester against the
+/// group's *current* roster and key. Shared by the fresh-enrolment path
+/// and the idempotent re-issue path. The snapshot carries every member's
+/// Kyber pubkey so the joiner can route later rotations back to them, and
+/// the group key is wrapped to the Kyber pubkey in *this* request — so a
+/// joiner that re-requested with a fresh ephemeral key still receives a
+/// blob it can unwrap.
+fn build_join_accepted(
+    gm: &mut GroupManager,
+    inviter_identity: &IdentityKeyPair,
+    body: &RequestJoinBody,
+) -> Result<(JoinAcceptedBody, HybridSignature)> {
+    gm.ensure_group_key(body.group_id)?;
+
+    let (members, group_name, snapshot_version) = {
+        let group = gm
+            .get_group(&body.group_id)
+            .ok_or_else(|| anyhow!("group missing while building JoinAccepted"))?;
+        let members: Vec<GroupMemberSummary> = group
+            .members
+            .values()
+            .map(|m| GroupMemberSummary {
+                identity_id: m.identity_id,
+                identity_key: m.identity_key.clone(),
+                display_name: m.display_name.clone(),
+                role: m.role.clone(),
+                joined_at: m.joined_at,
+                kyber_pub: m.kyber_pub.clone(),
+            })
+            .collect();
+        (members, group.name.clone(), group.version)
+    };
+
+    let mut group_key = gm
+        .export_group_key(&body.group_id)
+        .ok_or_else(|| anyhow!("group key missing after ensure"))?;
+    let wrapped_group_key = WrappedGroupKey::wrap(&group_key, &body.joiner_kyber_pub)?;
+    group_key.zeroize();
+
+    let accepted_body = JoinAcceptedBody {
+        group_id: body.group_id,
+        invitation_code: body.invitation_code.clone(),
+        group_name,
+        members,
+        joiner_id: body.joiner_public_key.identity_id,
+        wrapped_group_key,
+        snapshot_version,
+    };
+    match sign_join_accepted(inviter_identity, accepted_body)? {
+        crate::groups::group_handshake::GroupHandshake::JoinAccepted { body, signature } => {
+            Ok((body, signature))
+        }
+        _ => unreachable!("sign_join_accepted always returns JoinAccepted"),
+    }
 }
 
 /// Joiner-side handler: verify the inviter's signed `JoinAccepted`,

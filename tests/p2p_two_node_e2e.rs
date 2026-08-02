@@ -525,3 +525,64 @@ async fn p2p_key_rotation_e2e() {
         "Bob (kicked, offline) keeps the pre-rotation key locally; new traffic he can't decrypt",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 3 — direct (off-topic) delivery to exactly one addressed peer
+// ---------------------------------------------------------------------------
+
+/// The "/qubee/direct/1" request-response path delivers bytes to a single
+/// peer without any gossip topic. Bob dials Alice, sends her a direct
+/// frame, and Alice sees a `MessageReceived` attributed to Bob's PeerId
+/// with an empty topic — the transport JoinAccepted/JoinRejected will use
+/// so those replies stop being broadcast to the whole group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_delivery_reaches_only_the_addressed_peer() {
+    let mut alice_node = spawn_test_node("alice").await;
+    let bob_node = spawn_test_node("bob").await;
+
+    // Bob dials Alice so the two are connected; request-response reuses
+    // the live connection.
+    send_cmd(
+        &bob_node,
+        P2PCommand::Dial {
+            multiaddr: alice_node.listen_addr.clone(),
+        },
+        "bob",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let payload = b"direct-only-for-alice".to_vec();
+    send_cmd(
+        &bob_node,
+        P2PCommand::SendDirect {
+            peer_id: alice_node.peer_id.clone(),
+            data: payload.clone(),
+        },
+        "bob",
+    )
+    .await;
+
+    let received = next_matching(&mut alice_node, Duration::from_secs(5), |evt| {
+        matches!(evt, NodeEvent::MessageReceived { .. })
+    })
+    .await;
+    let NodeEvent::MessageReceived {
+        sender,
+        topic,
+        data,
+    } = received
+    else {
+        unreachable!("predicate guarantees MessageReceived")
+    };
+
+    assert_eq!(data, payload, "Alice must receive the exact direct payload");
+    assert_eq!(
+        sender, bob_node.peer_id,
+        "direct frame must be attributed to Bob's authenticated PeerId",
+    );
+    assert!(
+        topic.is_empty(),
+        "a direct frame carries no gossip topic (got {topic:?})",
+    );
+}

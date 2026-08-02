@@ -1364,6 +1364,24 @@ fn publish_to_topic(topic: String, data: Vec<u8>) -> bool {
     )
 }
 
+/// Deliver `data` to exactly one peer over "/qubee/direct/1" instead of
+/// broadcasting it on a group topic. Used for frames addressed to a
+/// single recipient (JoinAccepted / JoinRejected) so a subscriber can't
+/// observe who is joining. Returns `false` if the P2P node isn't up or
+/// the command queue is full — the caller must treat that as
+/// non-delivery, never as a cue to fall back to broadcasting.
+fn send_direct(peer_id: String, data: Vec<u8>) -> bool {
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return false,
+    };
+    matches!(
+        commander.try_send(P2PCommand::SendDirect { peer_id, data }),
+        Ok(())
+    )
+}
+
 /// Snapshot the active identity Arc without holding the mutex across
 /// awaits. Returns `Ok(None)` if onboarding hasn't happened yet.
 fn active_identity() -> anyhow::Result<Option<Arc<IdentityKeyPair>>> {
@@ -1399,7 +1417,7 @@ fn active_display_name() -> anyhow::Result<String> {
 /// route the *first* outbound from before any inbound had landed.
 fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
     let extracted_identity = extract_peer_identity_hex(&frame);
-    if let Err(e) = process_handshake(frame) {
+    if let Err(e) = process_handshake(frame, sender_peer_id.clone()) {
         tracing::info!(error = ?e, "handshake rejected");
         return;
     }
@@ -1471,10 +1489,13 @@ fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
     );
 }
 
-fn process_handshake(frame: GroupHandshake) -> anyhow::Result<()> {
+fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::Result<()> {
     match frame {
         GroupHandshake::RequestJoin { body, signature } => {
-            on_request_join(body, signature)?;
+            // The joiner's authenticated PeerId is the delivering peer —
+            // gossipsub runs Signed+Strict, so this is the RequestJoin
+            // author. Reply to it directly instead of broadcasting.
+            on_request_join(body, signature, sender_peer_id)?;
         }
         GroupHandshake::JoinAccepted { body, signature } => {
             on_join_accepted(body, signature)?;
@@ -1653,6 +1674,7 @@ fn on_key_rotation(
 fn on_request_join(
     body: RequestJoinBody,
     signature: crate::identity::identity_key::HybridSignature,
+    joiner_peer_id: String,
 ) -> anyhow::Result<()> {
     // We only act on RequestJoins for invitations *we* minted.
     let identity =
@@ -1674,13 +1696,31 @@ fn on_request_join(
             member_added_body,
             member_added_signature,
         } => {
+            // The JoinAccepted (which carries the joiner's wrapped group
+            // key) is addressed to exactly one peer — send it direct so
+            // subscribers can't observe that a join happened. It is NOT
+            // broadcast as a fallback if the direct send fails; the
+            // joiner re-issues its RequestJoin instead.
+            //
+            // NOTE (phase 1.5): direct delivery needs the inviter to be
+            // able to route to `joiner_peer_id`. Peers that just
+            // exchanged gossip / are on the same LAN resolve fine;
+            // gossip-only multi-hop topologies need the address-discovery
+            // + JoinAccepted-redelivery hardening tracked for the next
+            // step before this is robust everywhere.
             let signed = GroupHandshake::JoinAccepted {
                 body: accepted,
                 signature: accepted_sig,
             };
-            let _ = publish_to_topic(topic.clone(), signed.to_wire()?);
-            // Broadcast MemberAdded so existing members learn about
-            // the new joiner (and their Kyber pubkey).
+            if !send_direct(joiner_peer_id, signed.to_wire()?) {
+                tracing::warn!(
+                    group_id = %body.group_id,
+                    "direct JoinAccepted delivery could not be enqueued; joiner must retry",
+                );
+            }
+            // MemberAdded IS a genuine group-wide announcement (existing
+            // members learn the new joiner + their Kyber pubkey), so it
+            // stays on the topic.
             let added = GroupHandshake::MemberAdded {
                 body: member_added_body,
                 signature: member_added_signature,
@@ -1691,11 +1731,17 @@ fn on_request_join(
             body: rejected,
             signature: rejected_sig,
         } => {
+            // Also addressed to the one joiner — direct, not broadcast.
             let signed = GroupHandshake::JoinRejected {
                 body: rejected,
                 signature: rejected_sig,
             };
-            let _ = publish_to_topic(topic, signed.to_wire()?);
+            if !send_direct(joiner_peer_id, signed.to_wire()?) {
+                tracing::warn!(
+                    group_id = %body.group_id,
+                    "direct JoinRejected delivery could not be enqueued",
+                );
+            }
         }
         HandshakeOutcome::UnknownInvitation => {
             // The RequestJoin doesn't match any invitation we minted.

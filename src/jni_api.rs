@@ -331,6 +331,51 @@ fn store_identity_to_keystore(
     Ok(())
 }
 
+/// Keystore id for the persisted libp2p transport keypair.
+const LIBP2P_NODE_KEY: &str = "libp2p_node_key";
+
+/// Load the device's libp2p transport keypair, minting and persisting a
+/// fresh one only on first use.
+///
+/// The PeerId is derived from this keypair, and peers bind a PeerId to a
+/// TOFU-verified `IdentityId` (see `NetworkCallback.onPeerLinked` /
+/// `nativeInspectEnvelopeSender`). Generating a new keypair on every
+/// launch — as the node did before — gave the device a new PeerId each
+/// session, so that linkage never survived a restart: a returning device
+/// looked like a stranger, and gossipsub's authenticated `message.source`
+/// (the author's PeerId) was useless for recognising a peer across
+/// sessions. Persisting the keypair in the identity keystore makes the
+/// PeerId stable and the linkage durable.
+fn load_or_create_libp2p_keypair() -> anyhow::Result<libp2p::identity::Keypair> {
+    {
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        if let Some(secret) = ks.retrieve_key(LIBP2P_NODE_KEY)? {
+            return Ok(libp2p::identity::Keypair::from_protobuf_encoding(
+                secret.expose_secret(),
+            )?);
+        }
+    }
+
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let encoded = keypair.to_protobuf_encoding()?;
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    let metadata = KeyMetadata {
+        algorithm: "libp2p-ed25519".to_string(),
+        key_size: encoded.len(),
+        usage: vec![KeyUsage::Signing, KeyUsage::Authentication],
+        expiry: None,
+        tags: std::collections::HashMap::new(),
+    };
+    ks.store_key(LIBP2P_NODE_KEY, &encoded, KeyType::SigningKey, metadata)?;
+    Ok(keypair)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRegisterCallback(
     env: JNIEnv,
@@ -362,7 +407,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
         std::thread::spawn(|| {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
-                let id_keys = libp2p::identity::Keypair::generate_ed25519();
+                let id_keys = match load_or_create_libp2p_keypair() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to load libp2p node key; not starting P2P node");
+                        return;
+                    }
+                };
                 tracing::info!(
                     peer_id = %libp2p::PeerId::from(id_keys.public()),
                     "Starting P2P Node",

@@ -84,18 +84,20 @@ pub fn process_request_join(
     }
 
     let now = now_secs();
-    if let Some(exp) = invitation.expires_at {
-        if now > exp {
-            return reject(inviter_identity, body, "invitation expired");
-        }
-    }
-    if let Some(max) = invitation.max_uses {
-        if invitation.current_uses >= max {
-            return reject(inviter_identity, body, "invitation exhausted");
-        }
-    }
+    // Atomically reserve one use of the invitation, re-validating expiry
+    // and max_uses and bumping the counter in a single step. Doing this
+    // *before* enrolment — rather than the old best-effort
+    // `mark_invitation_used` *after* it — is what keeps a `max_uses = 1`
+    // invite from admitting two joiners whose requests interleave, and
+    // stops a use going unrecorded if the counter write fails.
+    let invitation = match gm.consume_invitation_use(&body.invitation_code, now) {
+        Ok(inv) => inv,
+        Err(e) => return reject(inviter_identity, body, &format!("{e}")),
+    };
 
-    // Enrol the joiner. add_member enforces the 16-member cap.
+    // Enrol the joiner. add_member enforces the 16-member cap. On
+    // failure, hand the reserved use back so a rejected join doesn't
+    // permanently burn a slot on the invite.
     if let Err(e) = gm.add_member(
         body.group_id,
         invitation.inviter_id,
@@ -104,6 +106,12 @@ pub fn process_request_join(
         body.joiner_display_name.clone(),
         Role::Member,
     ) {
+        if let Err(release_err) = gm.release_invitation_use(&body.invitation_code) {
+            tracing::warn!(
+                error = %release_err,
+                "failed to return reserved invitation use after enrolment error",
+            );
+        }
         let reason = format!("{e}");
         return reject(inviter_identity, body, &reason);
     }
@@ -116,7 +124,6 @@ pub fn process_request_join(
         body.joiner_public_key.identity_id,
         body.joiner_kyber_pub.clone(),
     );
-    let _ = gm.mark_invitation_used(&body.invitation_code);
 
     // Build the member snapshot + wrap the group key for the joiner.
     // The snapshot now carries each member's Kyber pubkey so the

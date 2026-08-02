@@ -305,9 +305,21 @@ impl P2PNode {
                         message,
                         ..
                     })) => {
+                        // Attribute the message to its author, not the relay
+                        // hop. `propagation_source` is merely the peer that
+                        // forwarded this frame to us; the PeerId a receiver
+                        // links to a verified IdentityId must be the original
+                        // publisher. Gossipsub runs Signed + Strict here, so
+                        // `message.source` is the authenticated author PeerId
+                        // and is always present on a delivered message; fall
+                        // back to the relay only defensively.
+                        let author = message
+                            .source
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| propagation_source.to_string());
                         let _ = event_sender
                             .send(NodeEvent::MessageReceived {
-                                sender: propagation_source.to_string(),
+                                sender: author,
                                 topic: message.topic.into_string(),
                                 data: message.data,
                             })

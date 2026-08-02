@@ -901,21 +901,7 @@ impl GroupManager {
         };
 
         // Store invitation
-        let invitation_key = format!("invitation_{}", invitation.invitation_code);
-        let serialized = bincode::serialize(&invitation)?;
-        let metadata = KeyMetadata {
-            algorithm: "bincode".to_string(),
-            key_size: serialized.len(),
-            usage: vec![KeyUsage::Authentication],
-            expiry: invitation.expires_at,
-            tags: StdHashMap::new(),
-        };
-        self.keystore.store_key(
-            &invitation_key,
-            &serialized,
-            KeyType::EncryptionKey,
-            metadata,
-        )?;
+        self.store_invitation(&invitation)?;
 
         // Log event
         self.log_group_event(
@@ -1087,7 +1073,13 @@ impl GroupManager {
             display_name,
             Role::Member,
         ) {
-            let _ = self.release_invitation_use(&invitation_code);
+            if let Err(release_err) = self.release_invitation_use(&invitation_code) {
+                tracing::warn!(
+                    error = %release_err,
+                    invitation_code = %invitation_code,
+                    "failed to return reserved invitation use after enrolment error",
+                );
+            }
             return Err(e);
         }
 
@@ -1489,7 +1481,6 @@ impl GroupManager {
         Ok(GroupId(hash.as_bytes()[..32].try_into().unwrap()))
     }
 
-    /// Generate an invitation code
     /// Mint a fresh, unguessable invitation code: 128 bits drawn from
     /// the process CSPRNG, hex-encoded.
     ///
@@ -1941,6 +1932,63 @@ mod tests {
         assert!(gm
             .consume_invitation_use(&expiring.invitation_code, 1_000)
             .is_err());
+    }
+
+    #[test]
+    fn join_rollback_returns_reserved_use_when_enrolment_fails() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let keystore =
+            SecureKeystore::new(temp_dir.path().join("k.db"), b"test-keystore-passphrase")
+                .expect("keystore");
+        let mut gm = GroupManager::new(keystore).expect("gm");
+
+        let owner = IdentityKeyPair::generate().expect("kp");
+        let owner_id = owner.public_key().identity_id;
+        let group_id = gm
+            .create_group(
+                owner_id,
+                owner.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("group");
+
+        let code = gm
+            .create_invitation(group_id, owner_id, None, Some(2))
+            .expect("invite")
+            .invitation_code;
+
+        let joiner = IdentityKeyPair::generate().expect("kp");
+        let joiner_key = joiner.public_key();
+        let joiner_id = joiner_key.identity_id;
+
+        // First join succeeds and consumes one use.
+        gm.join_group_with_invitation(code.clone(), joiner_id, joiner_key.clone(), "J".to_string())
+            .expect("first join");
+        assert_eq!(
+            gm.get_invitation(&code)
+                .expect("get")
+                .expect("some")
+                .current_uses,
+            1
+        );
+
+        // Re-joining with the same member id fails inside add_member. The
+        // reserved use must be returned through the public join path — the
+        // whole point of reserve-before-enrol + rollback — so the counter
+        // stays at 1 rather than leaking to 2.
+        assert!(gm
+            .join_group_with_invitation(code.clone(), joiner_id, joiner_key, "J".to_string())
+            .is_err());
+        assert_eq!(
+            gm.get_invitation(&code)
+                .expect("get")
+                .expect("some")
+                .current_uses,
+            1
+        );
     }
 
     /// Restart-preserves-membership: the create-group → drop-manager →

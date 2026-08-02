@@ -347,24 +347,25 @@ const LIBP2P_NODE_KEY: &str = "libp2p_node_key";
 /// sessions. Persisting the keypair in the identity keystore makes the
 /// PeerId stable and the linkage durable.
 fn load_or_create_libp2p_keypair() -> anyhow::Result<libp2p::identity::Keypair> {
-    {
-        let mut ks_guard = KEYSTORE.lock().unwrap();
-        let ks = ks_guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-        if let Some(secret) = ks.retrieve_key(LIBP2P_NODE_KEY)? {
-            return Ok(libp2p::identity::Keypair::from_protobuf_encoding(
-                secret.expose_secret(),
-            )?);
-        }
-    }
-
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let encoded = keypair.to_protobuf_encoding()?;
+    // Hold a single keystore lock across the whole check-then-create
+    // sequence. Releasing it between the lookup and the store would open
+    // a TOCTOU window: two concurrent `nativeStartNetwork` calls (there's
+    // no reentrancy guard on it) could both miss the cache, each generate
+    // a *different* keypair, and race their writes — leaving two nodes on
+    // two PeerIds and a persisted key matching neither, which is exactly
+    // the instability this persistence is meant to remove.
     let mut ks_guard = KEYSTORE.lock().unwrap();
     let ks = ks_guard
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    if let Some(secret) = ks.retrieve_key(LIBP2P_NODE_KEY)? {
+        return Ok(libp2p::identity::Keypair::from_protobuf_encoding(
+            secret.expose_secret(),
+        )?);
+    }
+
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let encoded = keypair.to_protobuf_encoding()?;
     let metadata = KeyMetadata {
         algorithm: "libp2p-ed25519".to_string(),
         key_size: encoded.len(),

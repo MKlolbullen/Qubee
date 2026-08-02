@@ -106,7 +106,12 @@ pub fn process_request_join(
         body.joiner_display_name.clone(),
         Role::Member,
     ) {
-        let _ = gm.release_invitation_use(&body.invitation_code);
+        if let Err(release_err) = gm.release_invitation_use(&body.invitation_code) {
+            tracing::warn!(
+                error = %release_err,
+                "failed to return reserved invitation use after enrolment error",
+            );
+        }
         let reason = format!("{e}");
         return reject(inviter_identity, body, &reason);
     }

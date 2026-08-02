@@ -886,7 +886,7 @@ impl GroupManager {
             .get(&admin_id)
             .ok_or_else(|| anyhow::anyhow!("Admin not found in group"))?;
 
-        let invitation_code = self.generate_invitation_code(group_id, admin_id)?;
+        let invitation_code = self.generate_invitation_code()?;
 
         let invitation = GroupInvitation {
             group_id,
@@ -1073,49 +1073,23 @@ impl GroupManager {
         member_key: IdentityKey,
         display_name: String,
     ) -> Result<GroupId> {
-        let invitation_key = format!("invitation_{invitation_code}");
-        let secret = self
-            .keystore
-            .retrieve_key(&invitation_key)?
-            .ok_or_else(|| anyhow::anyhow!("Invitation not found locally"))?;
-        let mut invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
-
         let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if let Some(expires_at) = invitation.expires_at {
-            if current_time > expires_at {
-                return Err(anyhow::anyhow!("Invitation has expired"));
-            }
-        }
-        if let Some(max_uses) = invitation.max_uses {
-            if invitation.current_uses >= max_uses {
-                return Err(anyhow::anyhow!("Invitation has reached maximum uses"));
-            }
-        }
+        // Reserve the use up front (validates existence, expiry, and
+        // max_uses atomically). If the enrolment below fails, hand the
+        // reserved use back so a rejected join doesn't burn a slot.
+        let invitation = self.consume_invitation_use(&invitation_code, current_time)?;
 
-        self.add_member(
+        if let Err(e) = self.add_member(
             invitation.group_id,
             invitation.inviter_id,
             member_id,
             member_key,
             display_name,
             Role::Member,
-        )?;
-
-        invitation.current_uses += 1;
-        let serialized = bincode::serialize(&invitation)?;
-        let metadata = KeyMetadata {
-            algorithm: "bincode".to_string(),
-            key_size: serialized.len(),
-            usage: vec![KeyUsage::Authentication],
-            expiry: invitation.expires_at,
-            tags: StdHashMap::new(),
-        };
-        self.keystore.store_key(
-            &invitation_key,
-            &serialized,
-            KeyType::EncryptionKey,
-            metadata,
-        )?;
+        ) {
+            let _ = self.release_invitation_use(&invitation_code);
+            return Err(e);
+        }
 
         Ok(invitation.group_id)
     }
@@ -1133,15 +1107,10 @@ impl GroupManager {
         Ok(Some(invitation))
     }
 
-    /// Bump an invitation's `current_uses` after a successful enrolment.
-    pub fn mark_invitation_used(&mut self, invitation_code: &str) -> Result<()> {
-        let key = format!("invitation_{invitation_code}");
-        let mut invitation = match self.get_invitation(invitation_code)? {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        invitation.current_uses = invitation.current_uses.saturating_add(1);
-        let serialized = bincode::serialize(&invitation)?;
+    /// Persist an invitation record back to the keystore under its code.
+    fn store_invitation(&mut self, invitation: &GroupInvitation) -> Result<()> {
+        let key = format!("invitation_{}", invitation.invitation_code);
+        let serialized = bincode::serialize(invitation)?;
         let metadata = KeyMetadata {
             algorithm: "bincode".to_string(),
             key_size: serialized.len(),
@@ -1152,6 +1121,55 @@ impl GroupManager {
         self.keystore
             .store_key(&key, &serialized, KeyType::EncryptionKey, metadata)?;
         Ok(())
+    }
+
+    /// Atomically reserve one use of an invitation.
+    ///
+    /// Validates that the invitation exists, hasn't expired, and hasn't
+    /// hit `max_uses`, then bumps `current_uses` and persists — all in a
+    /// single call so the check can't race a concurrent enrolment into
+    /// over-using a capped invite. This replaces the old
+    /// check-then-`add_member`-then-best-effort-`mark_invitation_used`
+    /// sequence, where a failure to record the use (or two interleaved
+    /// joins) let a `max_uses = 1` invite admit more than one member.
+    ///
+    /// Returns the updated invitation on success. On any validation
+    /// failure nothing is persisted. A caller that reserves a use and
+    /// then fails to enrol must hand it back via
+    /// [`release_invitation_use`].
+    pub fn consume_invitation_use(
+        &mut self,
+        invitation_code: &str,
+        now: u64,
+    ) -> Result<GroupInvitation> {
+        let mut invitation = self
+            .get_invitation(invitation_code)?
+            .ok_or_else(|| anyhow::anyhow!("invitation not found"))?;
+        if let Some(expires_at) = invitation.expires_at {
+            if now > expires_at {
+                return Err(anyhow::anyhow!("invitation expired"));
+            }
+        }
+        if let Some(max_uses) = invitation.max_uses {
+            if invitation.current_uses >= max_uses {
+                return Err(anyhow::anyhow!("invitation exhausted"));
+            }
+        }
+        invitation.current_uses = invitation.current_uses.saturating_add(1);
+        self.store_invitation(&invitation)?;
+        Ok(invitation)
+    }
+
+    /// Give back a use previously reserved by [`consume_invitation_use`]
+    /// when the enrolment it was reserved for didn't complete. Saturating,
+    /// and a no-op if the invitation has since disappeared.
+    pub fn release_invitation_use(&mut self, invitation_code: &str) -> Result<()> {
+        let mut invitation = match self.get_invitation(invitation_code)? {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        invitation.current_uses = invitation.current_uses.saturating_sub(1);
+        self.store_invitation(&invitation)
     }
 
     /// Promote an outstanding `accepted_invite_*` receipt into a real
@@ -1472,17 +1490,18 @@ impl GroupManager {
     }
 
     /// Generate an invitation code
-    fn generate_invitation_code(&self, group_id: GroupId, admin_id: IdentityId) -> Result<String> {
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-        let mut hasher = Hasher::new();
-        hasher.update(group_id.as_ref());
-        hasher.update(admin_id.as_ref());
-        hasher.update(&current_time.to_le_bytes());
-        hasher.update(b"qubee_invitation");
-
-        let hash = hasher.finalize();
-        Ok(hex::encode(&hash.as_bytes()[..16]))
+    /// Mint a fresh, unguessable invitation code: 128 bits drawn from
+    /// the process CSPRNG, hex-encoded.
+    ///
+    /// The previous derivation hashed `group_id || admin_id ||
+    /// unix_seconds` — every input an observer can learn (group id and
+    /// inviter are on the wire / in rosters) or guess to within a
+    /// one-second window, leaving essentially no entropy. An attacker
+    /// who knew the group and inviter could reconstruct the code and
+    /// join uninvited. Random bytes remove that structure entirely.
+    fn generate_invitation_code(&self) -> Result<String> {
+        let bytes = crate::security::secure_rng::random::array::<16>()?;
+        Ok(hex::encode(bytes))
     }
 
     /// Log a group event
@@ -1827,6 +1846,101 @@ mod tests {
             .expect("Should find group");
         assert_eq!(group.members.len(), 2);
         assert!(group.members.contains_key(&joiner_id));
+    }
+
+    #[test]
+    fn invitation_codes_are_unpredictable() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let keystore =
+            SecureKeystore::new(temp_dir.path().join("k.db"), b"test-keystore-passphrase")
+                .expect("keystore");
+        let mut gm = GroupManager::new(keystore).expect("gm");
+
+        let owner = IdentityKeyPair::generate().expect("kp");
+        let owner_id = owner.public_key().identity_id;
+        let group_id = gm
+            .create_group(
+                owner_id,
+                owner.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("group");
+
+        // Same group + same inviter: the old derivation hashed those
+        // plus unix-seconds, so two invites minted in the same second
+        // collided and were fully predictable. CSPRNG codes must differ
+        // and carry a full 128 bits (32 hex chars).
+        let a = gm
+            .create_invitation(group_id, owner_id, None, None)
+            .expect("a");
+        let b = gm
+            .create_invitation(group_id, owner_id, None, None)
+            .expect("b");
+        assert_ne!(a.invitation_code, b.invitation_code);
+        assert_eq!(a.invitation_code.len(), 32);
+        assert!(a.invitation_code.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn invitation_use_is_capped_atomically_and_reversible() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let keystore =
+            SecureKeystore::new(temp_dir.path().join("k.db"), b"test-keystore-passphrase")
+                .expect("keystore");
+        let mut gm = GroupManager::new(keystore).expect("gm");
+
+        let owner = IdentityKeyPair::generate().expect("kp");
+        let owner_id = owner.public_key().identity_id;
+        let group_id = gm
+            .create_group(
+                owner_id,
+                owner.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("group");
+
+        let code = gm
+            .create_invitation(group_id, owner_id, None, Some(1))
+            .expect("invite")
+            .invitation_code;
+        let now = 1_000u64;
+
+        // First reservation succeeds and bumps the counter in the same
+        // step; the second is refused because the cap is enforced here,
+        // not best-effort after enrolment.
+        assert_eq!(
+            gm.consume_invitation_use(&code, now)
+                .expect("first")
+                .current_uses,
+            1
+        );
+        assert!(gm.consume_invitation_use(&code, now).is_err());
+
+        // Handing the reserved use back re-opens the slot so it can be
+        // consumed again (the rollback path when enrolment fails).
+        gm.release_invitation_use(&code).expect("release");
+        assert_eq!(
+            gm.get_invitation(&code)
+                .expect("get")
+                .expect("some")
+                .current_uses,
+            0
+        );
+        assert!(gm.consume_invitation_use(&code, now).is_ok());
+
+        // Expired invitations are refused regardless of remaining uses.
+        let expiring = gm
+            .create_invitation(group_id, owner_id, Some(500), Some(5))
+            .expect("expiring invite");
+        assert!(gm
+            .consume_invitation_use(&expiring.invitation_code, 1_000)
+            .is_err());
     }
 
     /// Restart-preserves-membership: the create-group → drop-manager →

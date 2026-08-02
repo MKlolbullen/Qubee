@@ -483,3 +483,98 @@ fn enforces_sixteen_member_cap_via_handshake() {
     // Group still has exactly 16 members.
     assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 16);
 }
+
+/// A reissued `RequestJoin` from an already-enrolled member must be an
+/// idempotent re-issue (`ReIssueAccept`), not a reject: it must NOT
+/// consume another invitation use, must NOT duplicate membership, and
+/// must re-wrap the group key to the *new* ephemeral Kyber key so a
+/// joiner whose original `JoinAccepted` was lost can still unwrap it.
+/// Closes the direct-delivery-failure wedge from the peer-directed
+/// delivery change.
+#[test]
+fn reissued_request_join_is_idempotent() {
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "G".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .expect("create_group");
+    alice_gm.ensure_group_key(group_id).expect("ensure key");
+
+    // Single-use invite: the re-issue must succeed without a second use.
+    let code = alice_gm
+        .create_invitation(group_id, alice_id, None, Some(1))
+        .expect("create_invitation")
+        .invitation_code;
+
+    let (_bob_dir, bob_kp, _bob_gm) = fresh_device("bob");
+    let bob_id = bob_kp.identity_id();
+
+    let sign_req = |kyber_pub: Vec<u8>| {
+        let body = RequestJoinBody {
+            group_id,
+            invitation_code: code.clone(),
+            joiner_public_key: bob_kp.public_key(),
+            joiner_display_name: "Bob".to_string(),
+            joiner_kyber_pub: kyber_pub,
+        };
+        match sign_request_join(&bob_kp, body).unwrap() {
+            GroupHandshake::RequestJoin { body, signature } => (body, signature),
+            _ => unreachable!(),
+        }
+    };
+
+    // First request: fresh enrolment, consumes the single use.
+    let (kyber_pub1, _sec1) = generate_ephemeral_kyber();
+    let (rb1, rs1) = sign_req(kyber_pub1);
+    let out1 = process_request_join(&mut alice_gm, &alice_kp, &rb1, &rs1).expect("first");
+    assert!(
+        matches!(out1, HandshakeOutcome::Accept { .. }),
+        "first request enrols the joiner",
+    );
+    assert_eq!(
+        alice_gm
+            .get_invitation(&code)
+            .unwrap()
+            .unwrap()
+            .current_uses,
+        1
+    );
+    assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
+
+    // Second request (a lost JoinAccepted, retried) with a *new*
+    // ephemeral Kyber key. Must be a no-consume re-issue, not a reject.
+    let (kyber_pub2, kyber_sec2) = generate_ephemeral_kyber();
+    let (rb2, rs2) = sign_req(kyber_pub2);
+    let out2 = process_request_join(&mut alice_gm, &alice_kp, &rb2, &rs2).expect("reissue");
+    let accepted = match out2 {
+        HandshakeOutcome::ReIssueAccept { body, .. } => body,
+        other => panic!("expected ReIssueAccept, got {other:?}"),
+    };
+
+    // The spent single use is unchanged; membership is unchanged.
+    assert_eq!(
+        alice_gm
+            .get_invitation(&code)
+            .unwrap()
+            .unwrap()
+            .current_uses,
+        1,
+        "re-issue must not consume another invitation use",
+    );
+    assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
+    assert_eq!(accepted.joiner_id, bob_id);
+
+    // The re-issued key is wrapped to the new ephemeral key, so the
+    // joiner (holding kyber_sec2) can unwrap it.
+    assert!(
+        accepted.wrapped_group_key.unwrap(&kyber_sec2).is_ok(),
+        "re-issued JoinAccepted must unwrap with the joiner's new ephemeral secret",
+    );
+}

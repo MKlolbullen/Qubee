@@ -1727,6 +1727,26 @@ fn on_request_join(
             };
             let _ = publish_to_topic(topic, added.to_wire()?);
         }
+        HandshakeOutcome::ReIssueAccept {
+            body: accepted,
+            signature: accepted_sig,
+        } => {
+            // The requester is already an active member (a prior Accept
+            // enrolled them but its reply may have been lost). Re-send
+            // ONLY the JoinAccepted, direct to the joiner — no MemberAdded
+            // re-broadcast (the group already knows) and no invitation use
+            // was consumed. This makes a reissued RequestJoin idempotent.
+            let signed = GroupHandshake::JoinAccepted {
+                body: accepted,
+                signature: accepted_sig,
+            };
+            if !send_direct(joiner_peer_id, signed.to_wire()?) {
+                tracing::warn!(
+                    group_id = %body.group_id,
+                    "direct JoinAccepted re-issue could not be enqueued; joiner must retry",
+                );
+            }
+        }
         HandshakeOutcome::Reject {
             body: rejected,
             signature: rejected_sig,

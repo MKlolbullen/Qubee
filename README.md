@@ -9,7 +9,7 @@
 [![CI](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/ci.yml)
 [![Android](https://github.com/MKlolbullen/Qubee/actions/workflows/android-smoke.yml/badge.svg?branch=main)](https://github.com/MKlolbullen/Qubee/actions/workflows/android-smoke.yml)
 [![Release](https://img.shields.io/github/v/release/MKlolbullen/Qubee?include_prereleases&label=release)](https://github.com/MKlolbullen/Qubee/releases)
-![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)
+![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange)
 ![Status](https://img.shields.io/badge/status-pre--alpha-red)
 
 ---
@@ -62,7 +62,7 @@ via JNI.
 * **Cryptography:** `pqcrypto-mlkem`, `pqcrypto-mldsa`, `ed25519-dalek`,
   `x25519-dalek`, `chacha20poly1305`, `blake3`, `hkdf`/`sha2`.
 * **P2P:** `libp2p 0.55`.
-* **Toolchain:** Rust 1.86 (pinned in `rust-toolchain.toml`).
+* **Toolchain:** Rust 1.88 (pinned in `rust-toolchain.toml`).
 
 ## Installing
 
@@ -96,7 +96,7 @@ trusting it for anything that matters.
 
 ### Prerequisites
 1. **Android Studio** (Ladybug or newer recommended).
-2. **Rust toolchain** — pinned to 1.86 via `rust-toolchain.toml`. Run `rustup show` from the repo root to install.
+2. **Rust toolchain** — pinned to 1.88 via `rust-toolchain.toml`. Run `rustup show` from the repo root to install.
 3. **Android NDK** (installed via SDK Manager).
 4. **cargo-ndk:**
    ```bash
@@ -160,7 +160,7 @@ Qubee/
 │   ├── p2p_two_node_e2e.rs       # Real two-node libp2p E2E
 │   └── wire_stability.rs         # Pinned canonical wire vectors
 ├── Cargo.toml                    # Rust dependencies
-├── rust-toolchain.toml           # Pin to Rust 1.86
+├── rust-toolchain.toml           # Pin to Rust 1.88
 └── build_rust.sh / .ps1          # Build scripts
 ```
 

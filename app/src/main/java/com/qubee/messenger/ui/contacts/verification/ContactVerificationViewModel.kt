@@ -5,7 +5,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.model.Contact
-import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.ContactRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -109,8 +108,7 @@ class ContactVerificationViewModel @Inject constructor(
                 verificationData = typed.toByteArray(Charsets.UTF_8),
             )
             if (ok) {
-                persistVerified(target)
-                _events.emit(ContactVerificationEvent.Verified)
+                promoteOrNotify(target)
             } else {
                 _events.emit(
                     ContactVerificationEvent.Notice(
@@ -124,13 +122,39 @@ class ContactVerificationViewModel @Inject constructor(
     /**
      * The user attests that the SAS code on both devices matches.
      * No bridge round-trip — the user's claim of a visual match
-     * IS the trust ceremony. Persist the `VERIFIED` flag.
+     * IS the trust ceremony. Still routed through the trust policy so
+     * a compromised contact isn't silently un-compromised.
      */
     fun confirmSasMatch() {
         val target = contact ?: return
-        viewModelScope.launch {
-            persistVerified(target)
+        if (target.identityKey == null) {
+            viewModelScope.launch {
+                _events.emit(ContactVerificationEvent.Notice("Contact has no stored identity key."))
+            }
+            return
+        }
+        viewModelScope.launch { promoteOrNotify(target) }
+    }
+
+    /**
+     * Persist an out-of-band verification through
+     * [ContactRepository.markVerifiedOutOfBand], which applies
+     * [com.qubee.messenger.security.TrustStatePolicy] — so a sticky
+     * COMPROMISED contact is refused rather than silently promoted to
+     * VERIFIED. On success emit [ContactVerificationEvent.Verified];
+     * on a policy refusal surface a notice instead of a false success.
+     */
+    private suspend fun promoteOrNotify(target: Contact) {
+        val promoted = contactRepository.markVerifiedOutOfBand(target.id)
+        if (promoted) {
+            _uiState.value = _uiState.value.copy(alreadyVerified = true)
             _events.emit(ContactVerificationEvent.Verified)
+        } else {
+            _events.emit(
+                ContactVerificationEvent.Notice(
+                    "This contact is flagged as compromised. Clear that state before verifying.",
+                ),
+            )
         }
     }
 
@@ -142,12 +166,6 @@ class ContactVerificationViewModel @Inject constructor(
     fun onQrScanned(payload: String) {
         _uiState.value = _uiState.value.copy(typedFingerprint = payload)
         confirmFingerprintMatch()
-    }
-
-    private suspend fun persistVerified(target: Contact) {
-        contactRepository.updateTrustLevel(target.id, TrustLevel.VERIFIED)
-        contactRepository.updateVerificationStatus(target.id, ContactVerificationStatus.VERIFIED)
-        _uiState.value = _uiState.value.copy(alreadyVerified = true)
     }
 }
 

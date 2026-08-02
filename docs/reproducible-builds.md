@@ -11,7 +11,7 @@ machine.
 
 | Layer | What | Where pinned |
 |---|---|---|
-| Rust toolchain | `1.86.0` + `clippy` + `rustfmt` | `rust-toolchain.toml` |
+| Rust toolchain | `1.88.0` + `clippy` + `rustfmt` | `rust-toolchain.toml` |
 | Rust dependencies | locked at exact versions | `Cargo.lock` (committed) |
 | Rust release profile | `opt-level=3`, `lto=thin`, `codegen-units=1`, `strip=symbols`, `incremental=false` (panic left at default `unwind` so the JNI `catch_unwind` guards work) | `[profile.release]` in `Cargo.toml` |
 | Path remapping | `$CARGO_HOME → /__cargo`, `$PWD → /__src` | `RUSTFLAGS` in `build_rust.sh` |
@@ -21,7 +21,7 @@ machine.
 | JDK | Temurin 17 | `.github/workflows/release.yml` step `Set up JDK 17` |
 | Android compileSdk | 34 | `app/build.gradle` |
 | Gradle | `8.7` with pinned SHA-256 | `gradle/wrapper/gradle-wrapper.properties` |
-| Compose compiler | `1.5.4` | `app/build.gradle` (`composeOptions`) |
+| Compose compiler | `1.5.14` | `app/build.gradle` (`composeOptions`) |
 
 ## Canonical build command
 

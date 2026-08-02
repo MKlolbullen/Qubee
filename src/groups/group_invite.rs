@@ -56,16 +56,13 @@ impl InvitePayload {
     pub fn to_invite_link(&self) -> Result<String> {
         let bytes = bincode::serialize(self).context("invite serialize failed")?;
         let token = URL_SAFE_NO_PAD.encode(bytes);
-        Ok(format!(
-            "{}://{}/{}",
-            QUBEE_URI_SCHEME, QUBEE_INVITE_HOST, token
-        ))
+        Ok(format!("{QUBEE_URI_SCHEME}://{QUBEE_INVITE_HOST}/{token}"))
     }
 
     /// Parse a `qubee://invite/<token>` deep link and verify its
     /// fingerprint. Returns the embedded payload on success.
     pub fn from_invite_link(link: &str) -> Result<Self> {
-        let prefix = format!("{}://{}/", QUBEE_URI_SCHEME, QUBEE_INVITE_HOST);
+        let prefix = format!("{QUBEE_URI_SCHEME}://{QUBEE_INVITE_HOST}/");
         let token = link
             .strip_prefix(&prefix)
             .ok_or_else(|| anyhow!("not a qubee invite link"))?;

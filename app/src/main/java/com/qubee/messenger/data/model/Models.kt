@@ -207,7 +207,14 @@ data class Conversation(
 
 data class ConversationWithDetails(
     @Embedded val conversation: Conversation = Conversation(),
-    @Embedded(prefix = "lastMsg_") val lastMessage: Message? = null,
+    // Flat nullable projection of the latest message, mirroring
+    // ContactWithLastMessage. A LEFT JOIN leaves these null when the
+    // conversation has no message; embedding the whole `Message?` here
+    // instead made Room generate `int = null` for its non-null
+    // primitive fields (retryAttempt, timestamp, ...) — a CURSOR_MISMATCH
+    // that only surfaces once compileDebugJavaWithJavac runs.
+    @ColumnInfo(name = "lastMsg_content") val lastMessageContent: String? = null,
+    @ColumnInfo(name = "lastMsg_timestamp") val lastMessageTimestamp: Long? = null,
     @ColumnInfo(name = "unreadCount") val unreadCount: Int = 0,
 )
 

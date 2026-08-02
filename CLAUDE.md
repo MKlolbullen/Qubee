@@ -110,11 +110,11 @@ PeerId ↔ IdentityId linkage has two population paths: handshake-time (`Network
 
 The Rust dependency set has been deliberately pinned to keep `rand_core 0.6` consistent across `chacha20poly1305 0.10`, `rand_chacha 0.3`, and `ed25519-dalek 2.x`. Bumping `rand` to 0.9 (or `secrecy` away from 0.10, or `pqcrypto-{mlkem,mldsa}` to a non-0.1 line) cascades into trait-bound mismatches across half the crate. `Cargo.toml` has inline comments explaining each pin. Don't bump these without a reason called out in the PR.
 
-The Android side similarly pins AGP 8.4 / Kotlin 1.9.22 / Hilt 2.48 / Compose BOM 2023.10.01 / Paparazzi 1.3.4 / SQLCipher 4.6.0. Same rule.
+The Android side similarly pins AGP 8.4 / Kotlin 1.9.24 / Hilt 2.48 / Compose BOM 2023.10.01 / Paparazzi 1.3.4 / SQLCipher 4.6.0. Same rule.
 
 ## Conventions that bite if you don't know them
 
-- **`rust-toolchain.toml` pins 1.86.** Run `rustup show` from the repo root once; that's all you need.
+- **`rust-toolchain.toml` pins 1.88.** Run `rustup show` from the repo root once; that's all you need.
 - **Default to writing no comments.** Names are documentation. Comments are for the *why*: a hidden invariant, a workaround, surprising behavior. Don't restate what the code does. `CONTRIBUTING.md` is explicit about this; the rev-3 cleanup paid off a year of accreted-fiction comments and the project actively avoids reopening that account.
 - **No half-finished implementations.** If you're scaffolding, say so explicitly with a TODO + tracking issue rather than letting a silent stub merge.
 - **No new dependencies for trivia.** A 30 MB transitive tree to format a string is not worth it.

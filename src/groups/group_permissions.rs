@@ -428,7 +428,7 @@ impl std::fmt::Display for Role {
             Role::Moderator => write!(f, "Moderator"),
             Role::Member => write!(f, "Member"),
             Role::Observer => write!(f, "Observer"),
-            Role::Custom(name) => write!(f, "Custom({})", name),
+            Role::Custom(name) => write!(f, "Custom({name})"),
         }
     }
 }
@@ -480,7 +480,7 @@ impl std::fmt::Display for Permission {
             Permission::ReadMessages => write!(f, "Read Messages"),
             Permission::ReadMemberList => write!(f, "Read Member List"),
             Permission::ReadGroupInfo => write!(f, "Read Group Info"),
-            Permission::Custom(name) => write!(f, "Custom({})", name),
+            Permission::Custom(name) => write!(f, "Custom({name})"),
         }
     }
 }

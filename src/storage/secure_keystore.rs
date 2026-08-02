@@ -3,13 +3,14 @@ use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake3::Hasher;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -22,7 +23,18 @@ use zeroize::{Zeroize, Zeroizing};
 /// pre-v1 hardcoded-passphrase layout are still *read* for one-time
 /// migration but never written.
 const MASTER_V2_MAGIC: &[u8; 4] = b"QKM2";
+/// Transient dual-key `.master` layout written *only* during
+/// `rotate_master_key`: `"QKM3" || salt(16) || count(1) || [nonce(12)
+/// || ct(48)]×count`, count ∈ {1,2}. Candidate 0 is the intended
+/// post-rotation (new) master key; candidate 1 (when present) is the
+/// pre-rotation (old) key, retained so the two-file (`.master` + `.db`)
+/// rotation commit is crash-recoverable — see `rotate_master_key` and
+/// `resolve_pending_rotation`. Collapsed back to `QKM2` once rotation
+/// completes, so steady state never carries two keys.
+const MASTER_V3_MAGIC: &[u8; 4] = b"QKM3";
 const WRAP_SALT_LEN: usize = 16;
+/// `nonce(12) || ChaCha20-Poly1305(32-byte master key)` = 12 + 32 + 16.
+const MASTER_WRAP_BLOCK_LEN: usize = 12 + 32 + 16;
 
 /// Argon2id cost parameters for the master-key wrap (OWASP
 /// "interactive" tier: 19 MiB, 2 passes, 1 lane). The derivation runs
@@ -66,6 +78,11 @@ pub struct SecureKeyStore {
 /// runs the (deliberately expensive) KDF twice.
 struct UnwrappedMaster {
     master_key: SecretBox<[u8; 32]>,
+    /// Set only when the `.master` file was a transient dual-key
+    /// (`QKM3`) layout — i.e. the process crashed mid-rotation. The
+    /// constructor resolves which key the `.db` is actually under and
+    /// collapses back to single-key, so this never reaches steady state.
+    alt_master_key: Option<SecretBox<[u8; 32]>>,
     wrap_key: SecretBox<[u8; 32]>,
     wrap_salt: [u8; WRAP_SALT_LEN],
 }
@@ -115,6 +132,85 @@ pub enum KeyUsage {
     Authentication,
 }
 
+/// Write `data` to `path` atomically: stage it in a sibling `.tmp`
+/// file, flush it to disk, then rename over the target. `fs::rename`
+/// is atomic on POSIX (Android/Linux), so a crash or power loss leaves
+/// either the previous file fully intact or the fully-written new one —
+/// never the truncated mix a plain `fs::write` produces, which for the
+/// keystore or master-key file would destroy all local key state.
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+
+    // Stage the bytes; on any failure remove the temp so a partial
+    // `.tmp` can't be left behind (and preserve the original error).
+    let staged = (|| -> Result<()> {
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("create temp file {}", tmp.display()))?;
+        f.write_all(data).context("write temp file")?;
+        // Durability: the bytes must hit disk before the rename, or a
+        // crash could leave the renamed file pointing at empty content.
+        f.sync_all().context("fsync temp file")
+    })();
+    if staged.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return staged;
+    }
+
+    fs::rename(&tmp, path).context("atomic rename over target")?;
+
+    // The rename is only durable once the containing directory entry is
+    // flushed; without this a power loss can resurrect the pre-rename
+    // directory state. Best-effort — not all platforms allow fsync on a
+    // directory handle, and a failure here doesn't corrupt anything.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Domain-separation tag for the per-entry AEAD associated data.
+const ENTRY_AAD_TAG: &[u8] = b"qubee_keystore_entry_v1";
+
+/// Stable 1-byte discriminant for [`KeyType`], bound into the entry AAD
+/// so a ciphertext can't be relabelled to a different type. Explicit
+/// (not `as u8` on the enum) so reordering the enum can't silently
+/// change the on-disk binding.
+fn key_type_discriminant(kt: &KeyType) -> u8 {
+    match kt {
+        KeyType::IdentityKey => 0,
+        KeyType::SigningKey => 1,
+        KeyType::EncryptionKey => 2,
+        KeyType::PreKey => 3,
+        KeyType::EphemeralKey => 4,
+        KeyType::RootKey => 5,
+        KeyType::ChainKey => 6,
+        KeyType::MessageKey => 7,
+    }
+}
+
+/// Associated data bound into every entry's ChaCha20-Poly1305: the
+/// domain tag, the entry's `key_id`, and its type discriminant. This is
+/// what stops an attacker with write access to the `.db` from moving a
+/// `(nonce, ciphertext)` pair from one slot to another (e.g. swapping a
+/// peer's sender-key state into your own slot) — the AEAD tag no longer
+/// verifies once the id/type it's decrypted under differs from the one
+/// it was sealed under. `last_accessed` is deliberately *not* bound (it
+/// mutates on read); `metadata.tags` is a `HashMap` and excluded to
+/// avoid iteration-order nondeterminism.
+fn entry_aad(key_id: &str, key_type: &KeyType) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(ENTRY_AAD_TAG.len() + 2 + key_id.len());
+    aad.extend_from_slice(ENTRY_AAD_TAG);
+    aad.push(0);
+    aad.extend_from_slice(key_id.as_bytes());
+    aad.push(0);
+    aad.push(key_type_discriminant(key_type));
+    aad
+}
+
 impl SecureKeyStore {
     /// Create a new secure key store whose master key is wrapped under
     /// the caller-supplied `passphrase`.
@@ -155,7 +251,52 @@ impl SecureKeyStore {
         // Load existing keys
         keystore.load_keys()?;
 
+        // If the `.master` was a transient dual-key layout, the process
+        // crashed mid-rotation: decide which key the `.db` is actually
+        // under and collapse back to a single-key `.master`.
+        if let Some(alt) = unwrapped.alt_master_key {
+            keystore.resolve_pending_rotation(alt)?;
+        }
+
         Ok(keystore)
+    }
+
+    /// Finish an interrupted `rotate_master_key`. `self.master_key` holds
+    /// the intended post-rotation key; `alt` is the pre-rotation key.
+    /// Whichever one decrypts the loaded entries is the live key (the
+    /// `.db` write may or may not have committed before the crash); adopt
+    /// it and rewrite `.master` as a single-key `QKM2` file.
+    fn resolve_pending_rotation(&mut self, alt: SecretBox<[u8; 32]>) -> Result<()> {
+        if !self.keys_open_under(self.master_key.expose_secret()) {
+            // The `.db` was not rewritten under the new key before the
+            // crash — the entries are still under the old (alt) key.
+            self.master_key = alt;
+        }
+        self.save_master_key()
+    }
+
+    /// Whether the stored entries decrypt under `candidate`. Checks a
+    /// single entry (they all share the master key) via the AAD path
+    /// then the legacy no-AAD path; an empty keystore trivially matches.
+    fn keys_open_under(&self, candidate: &[u8; 32]) -> bool {
+        // One entry decides — they all share the master key. An empty
+        // keystore trivially matches (adopt the intended new key).
+        let Some((key_id, entry)) = self.keys.iter().next() else {
+            return true;
+        };
+        let cipher = ChaCha20Poly1305::new(candidate.into());
+        let nonce = Nonce::from_slice(&entry.nonce);
+        let aad = entry_aad(key_id, &entry.key_type);
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &entry.encrypted_data,
+                    aad: &aad,
+                },
+            )
+            .is_ok()
+            || cipher.decrypt(nonce, entry.encrypted_data.as_ref()).is_ok()
     }
 
     /// Store a key in the secure keystore
@@ -175,11 +316,19 @@ impl SecureKeyStore {
         let nonce_bytes = secure_rng::random::array::<12>()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Encrypt the key data
+        // Encrypt the key data, binding the entry's id + type as AAD so
+        // the ciphertext can't be swapped into a different slot.
         let cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
+        let aad = entry_aad(key_id, &key_type);
         let encrypted_data = cipher
-            .encrypt(nonce, key_data)
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: key_data,
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
 
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -202,25 +351,63 @@ impl SecureKeyStore {
 
     /// Retrieve a key from the secure keystore
     pub fn retrieve_key(&mut self, key_id: &str) -> Result<Option<SecretBox<Vec<u8>>>> {
-        let entry = match self.keys.get_mut(key_id) {
-            Some(entry) => entry,
+        // Snapshot the fields we need without holding a mutable borrow
+        // across the possible re-seal + save below.
+        let (nonce_bytes, ciphertext, key_type) = match self.keys.get_mut(key_id) {
+            Some(entry) => {
+                entry.last_accessed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                (
+                    entry.nonce,
+                    entry.encrypted_data.clone(),
+                    entry.key_type.clone(),
+                )
+            }
             None => return Ok(None),
         };
 
-        // Update last accessed time
-        entry.last_accessed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-
-        // Decrypt the key data
         let cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
-        let nonce = Nonce::from_slice(&entry.nonce);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let aad = entry_aad(key_id, &key_type);
 
-        let decrypted_data = cipher
-            .decrypt(nonce, entry.encrypted_data.as_ref())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+        // Primary path: decrypt with the entry's bound AAD.
+        if let Ok(pt) = cipher.decrypt(
+            nonce,
+            Payload {
+                msg: &ciphertext,
+                aad: &aad,
+            },
+        ) {
+            return Ok(Some(SecretBox::new(Box::new(pt))));
+        }
 
-        Ok(Some(SecretBox::new(Box::new(decrypted_data))))
+        // Migration path: entries written before AAD binding sealed with
+        // empty AAD. If it opens that way it's a genuine legacy entry —
+        // transparently re-seal it *with* AAD (fresh nonce) so the next
+        // read is on the hardened path. If it doesn't open either way,
+        // it's a wrong key or tampering.
+        let legacy_pt = cipher
+            .decrypt(nonce, ciphertext.as_ref())
+            .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?;
+
+        let new_nonce_bytes = secure_rng::random::array::<12>()?;
+        let new_ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&new_nonce_bytes),
+                Payload {
+                    msg: legacy_pt.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("re-seal on AAD migration: {e}"))?;
+        if let Some(entry) = self.keys.get_mut(key_id) {
+            entry.encrypted_data = new_ciphertext;
+            entry.nonce = new_nonce_bytes;
+        }
+        self.save_keys()?;
+
+        Ok(Some(SecretBox::new(Box::new(legacy_pt))))
     }
 
     /// Delete a key from the keystore
@@ -249,41 +436,81 @@ impl SecureKeyStore {
 
     /// Rotate the master key (re-encrypt all stored keys)
     pub fn rotate_master_key(&mut self) -> Result<()> {
-        // Generate new master key
+        // Generate new master key; keep a copy of the old one so the
+        // `.master` can carry both across the `.db` write below.
+        let old_master = Zeroizing::new(*self.master_key.expose_secret());
         let new_master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
 
         // Re-encrypt all keys with new master key
         let old_cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
         let new_cipher = ChaCha20Poly1305::new(new_master_key.expose_secret().into());
 
-        for (_, entry) in self.keys.iter_mut() {
-            // Decrypt with old key. The plaintext key material is
-            // zeroised the moment the re-encrypt is done (Zeroizing
-            // wraps the drop), never left for the allocator.
+        for (key_id, entry) in self.keys.iter_mut() {
+            let aad = entry_aad(key_id, &entry.key_type);
+            // Decrypt with old key + the entry's AAD, falling back to the
+            // legacy (no-AAD) form for any entry not yet migrated. The
+            // plaintext is zeroised the moment the re-encrypt is done
+            // (Zeroizing wraps the drop), never left for the allocator.
             let old_nonce = Nonce::from_slice(&entry.nonce);
             let decrypted_data = Zeroizing::new(
-                old_cipher
-                    .decrypt(old_nonce, entry.encrypted_data.as_ref())
-                    .map_err(|e| anyhow::anyhow!("Failed to decrypt during rotation: {}", e))?,
+                match old_cipher.decrypt(
+                    old_nonce,
+                    Payload {
+                        msg: entry.encrypted_data.as_ref(),
+                        aad: &aad,
+                    },
+                ) {
+                    Ok(pt) => pt,
+                    Err(_) => old_cipher
+                        .decrypt(old_nonce, entry.encrypted_data.as_ref())
+                        .map_err(|e| anyhow::anyhow!("Failed to decrypt during rotation: {e}"))?,
+                },
             );
 
-            // Generate new nonce and encrypt with new key
+            // Generate new nonce and encrypt with new key (AAD bound).
             let new_nonce_bytes = secure_rng::random::array::<12>()?;
             let new_nonce = Nonce::from_slice(&new_nonce_bytes);
 
             let new_encrypted_data = new_cipher
-                .encrypt(new_nonce, decrypted_data.as_slice())
-                .map_err(|e| anyhow::anyhow!("Failed to encrypt during rotation: {}", e))?;
+                .encrypt(
+                    new_nonce,
+                    Payload {
+                        msg: decrypted_data.as_slice(),
+                        aad: &aad,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt during rotation: {e}"))?;
 
             entry.encrypted_data = new_encrypted_data;
             entry.nonce = new_nonce_bytes;
         }
 
-        // Update master key
-        self.master_key = new_master_key;
+        // Crash-safe two-file commit. `self.keys` now holds new-key
+        // ciphertexts but `self.master_key` is still the old key. The
+        // `.master` and `.db` are separate files, so we can't write both
+        // in one atomic step; instead we keep *both* master keys
+        // recoverable across the window:
+        //
+        //   1. Write a dual-key `.master` (new primary + old fallback).
+        //   2. Commit the new-key `.db`.
+        //   3. Collapse `.master` back to the single new key.
+        //
+        // A crash after step 1 or 2 leaves a dual-key `.master`; the next
+        // open (`resolve_pending_rotation`) probes which key the `.db` is
+        // under and adopts it — so no crash point can strand entries
+        // under an unrecoverable master key.
+        let master_path = self.storage_path.with_extension("master");
+        Self::seal_master_dual(
+            new_master_key.expose_secret(),
+            Some(&old_master),
+            &master_path,
+            self.wrap_key.expose_secret(),
+            &self.wrap_salt,
+        )?;
 
-        // Save updated keystore
+        self.master_key = new_master_key;
         self.save_keys()?;
+        // Collapse the dual `.master` back to a single (new) key.
         self.save_master_key()?;
 
         Ok(())
@@ -331,6 +558,47 @@ impl SecureKeyStore {
     fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<UnwrappedMaster> {
         let encrypted_data = fs::read(path).context("Failed to read master key file")?;
 
+        // v3 (transient dual-key) layout, written only mid-rotation:
+        // "QKM3" || salt(16) || count(1) || [nonce(12) || ct]×count.
+        let v3_header = MASTER_V3_MAGIC.len() + WRAP_SALT_LEN + 1;
+        if encrypted_data.starts_with(MASTER_V3_MAGIC) && encrypted_data.len() >= v3_header {
+            let mut wrap_salt = [0u8; WRAP_SALT_LEN];
+            wrap_salt.copy_from_slice(
+                &encrypted_data[MASTER_V3_MAGIC.len()..MASTER_V3_MAGIC.len() + WRAP_SALT_LEN],
+            );
+            let count = encrypted_data[MASTER_V3_MAGIC.len() + WRAP_SALT_LEN] as usize;
+            if count == 0
+                || count > 2
+                || encrypted_data.len() < v3_header + count * MASTER_WRAP_BLOCK_LEN
+            {
+                return Err(anyhow::anyhow!(
+                    "corrupt QKM3 master file (bad count/length)"
+                ));
+            }
+            let wrap_key = Self::derive_wrap_key_v2(passphrase, &wrap_salt)?;
+            let block_at = |i: usize| {
+                let off = v3_header + i * MASTER_WRAP_BLOCK_LEN;
+                &encrypted_data[off..off + MASTER_WRAP_BLOCK_LEN]
+            };
+            // Candidate 0 is the primary key and is required. Candidate 1
+            // exists only as a rotation-crash fallback, so a damaged
+            // block there must not refuse the open when the primary key
+            // unwraps cleanly — that would defeat the recovery the QKM3
+            // layout is here to provide.
+            let master_key = Self::try_decrypt_master(block_at(0), wrap_key.expose_secret())?;
+            let alt_master_key = if count > 1 {
+                Self::try_decrypt_master(block_at(1), wrap_key.expose_secret()).ok()
+            } else {
+                None
+            };
+            return Ok(UnwrappedMaster {
+                master_key,
+                alt_master_key,
+                wrap_key,
+                wrap_salt,
+            });
+        }
+
         // v2 layout: "QKM2" || salt(16) || nonce(12) || ciphertext,
         // wrapped under Argon2id(passphrase, salt).
         if encrypted_data.starts_with(MASTER_V2_MAGIC)
@@ -345,6 +613,7 @@ impl SecureKeyStore {
             if let Ok(master_key) = Self::try_decrypt_master(body, wrap_key.expose_secret()) {
                 return Ok(UnwrappedMaster {
                     master_key,
+                    alt_master_key: None,
                     wrap_key,
                     wrap_salt,
                 });
@@ -391,9 +660,44 @@ impl SecureKeyStore {
         Self::seal_master_v2(&master_key, path, wrap_key.expose_secret(), &wrap_salt)?;
         Ok(UnwrappedMaster {
             master_key,
+            alt_master_key: None,
             wrap_key,
             wrap_salt,
         })
+    }
+
+    /// Write the transient dual-key `QKM3` `.master` used mid-rotation:
+    /// `"QKM3" || salt(16) || count(1) || [nonce(12) || ct]×count`.
+    /// `primary` is the post-rotation key; `secondary`, when `Some`, is
+    /// the pre-rotation key kept for crash recovery across the `.db`
+    /// write.
+    fn seal_master_dual(
+        primary: &[u8; 32],
+        secondary: Option<&[u8; 32]>,
+        path: &Path,
+        wrap_key: &[u8; 32],
+        salt: &[u8; WRAP_SALT_LEN],
+    ) -> Result<()> {
+        let cipher = ChaCha20Poly1305::new_from_slice(wrap_key).expect("32-byte key");
+        let mut keys: Vec<&[u8; 32]> = vec![primary];
+        if let Some(s) = secondary {
+            keys.push(s);
+        }
+        let mut out = Vec::with_capacity(
+            MASTER_V3_MAGIC.len() + WRAP_SALT_LEN + 1 + keys.len() * MASTER_WRAP_BLOCK_LEN,
+        );
+        out.extend_from_slice(MASTER_V3_MAGIC);
+        out.extend_from_slice(salt);
+        out.push(keys.len() as u8);
+        for k in keys {
+            let nonce_bytes = secure_rng::random::array::<12>()?;
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce_bytes), k.as_ref())
+                .map_err(|e| anyhow::anyhow!("Failed to wrap master key: {e}"))?;
+            out.extend_from_slice(&nonce_bytes);
+            out.extend_from_slice(&ct);
+        }
+        atomic_write(path, &out).context("Failed to write dual master key file")
     }
 
     /// Attempt to unwrap the master-key file with an already-derived
@@ -409,7 +713,7 @@ impl SecureKeyStore {
 
         let mut decrypted = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt master key: {e}"))?;
 
         if decrypted.len() != 32 {
             decrypted.zeroize();
@@ -451,7 +755,7 @@ impl SecureKeyStore {
 
         let encrypted = cipher
             .encrypt(nonce, master_key.expose_secret().as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {e}"))?;
 
         let mut file_data =
             Vec::with_capacity(MASTER_V2_MAGIC.len() + WRAP_SALT_LEN + 12 + encrypted.len());
@@ -460,7 +764,7 @@ impl SecureKeyStore {
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
 
-        fs::write(path, file_data).context("Failed to write master key file")?;
+        atomic_write(path, &file_data).context("Failed to write master key file")?;
 
         Ok(())
     }
@@ -478,7 +782,7 @@ impl SecureKeyStore {
         let nonce = Nonce::from_slice(&nonce_bytes);
         let encrypted = cipher
             .encrypt(nonce, master_key.expose_secret().as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt master key: {e}"))?;
         let mut file_data = Vec::with_capacity(12 + encrypted.len());
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
@@ -550,7 +854,7 @@ impl SecureKeyStore {
     fn save_keys(&self) -> Result<()> {
         let data = bincode::serialize(&self.keys).context("Failed to serialize keystore")?;
 
-        fs::write(&self.storage_path, data).context("Failed to write keystore file")?;
+        atomic_write(&self.storage_path, &data).context("Failed to write keystore file")?;
 
         Ok(())
     }
@@ -815,6 +1119,167 @@ mod tests {
     }
 
     #[test]
+    fn writes_are_atomic_and_leave_no_partial_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"atomic-pass").unwrap();
+
+        // Many store/rotate cycles; each must leave a fully-valid db and
+        // .master (rename-over-target), never a truncated temp.
+        for i in 0..8 {
+            ks.store_key(
+                &format!("k{i}"),
+                format!("val{i}").as_bytes(),
+                KeyType::EncryptionKey,
+                plain_metadata(4),
+            )
+            .unwrap();
+        }
+        ks.rotate_master_key().unwrap();
+        drop(ks);
+
+        // No leftover temp files, and everything reopens + reads back.
+        assert!(!path.with_extension("db.tmp").exists());
+        assert!(!dir.path().join("ks.master.tmp").exists());
+        let mut ks = SecureKeyStore::new(&path, b"atomic-pass").unwrap();
+        for i in 0..8 {
+            assert_eq!(
+                ks.retrieve_key(&format!("k{i}"))
+                    .unwrap()
+                    .unwrap()
+                    .expose_secret(),
+                format!("val{i}").as_bytes(),
+            );
+        }
+    }
+
+    #[test]
+    fn entry_ciphertext_cannot_be_swapped_between_slots() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"aad-swap-pass").unwrap();
+        ks.store_key(
+            "slot_a",
+            b"alice secret",
+            KeyType::RootKey,
+            plain_metadata(12),
+        )
+        .unwrap();
+        ks.store_key(
+            "slot_b",
+            b"bob secret",
+            KeyType::RootKey,
+            plain_metadata(10),
+        )
+        .unwrap();
+        drop(ks);
+
+        // Attacker with .db write access moves slot_a's sealed bytes into
+        // slot_b (same master key, so without AAD this would decrypt).
+        let mut keys: HashMap<String, EncryptedKeyEntry> =
+            bincode::deserialize(&fs::read(&path).unwrap()).unwrap();
+        let a = keys.get("slot_a").unwrap().clone();
+        let b = keys.get_mut("slot_b").unwrap();
+        b.encrypted_data = a.encrypted_data.clone();
+        b.nonce = a.nonce;
+        fs::write(&path, bincode::serialize(&keys).unwrap()).unwrap();
+
+        // The AAD (key_id "slot_b") no longer matches what was sealed
+        // under "slot_a", so the swapped entry must fail to open.
+        let mut ks = SecureKeyStore::new(&path, b"aad-swap-pass").unwrap();
+        assert!(
+            ks.retrieve_key("slot_b").is_err(),
+            "AAD must reject a ciphertext moved from a different slot",
+        );
+        // The untouched slot still opens.
+        assert_eq!(
+            ks.retrieve_key("slot_a").unwrap().unwrap().expose_secret(),
+            b"alice secret",
+        );
+    }
+
+    #[test]
+    fn entry_type_cannot_be_relabelled() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"aad-type-pass").unwrap();
+        ks.store_key(
+            "k",
+            b"typed secret",
+            KeyType::SigningKey,
+            plain_metadata(12),
+        )
+        .unwrap();
+        drop(ks);
+
+        // Flip the stored key_type; the AAD binds the type discriminant.
+        let mut keys: HashMap<String, EncryptedKeyEntry> =
+            bincode::deserialize(&fs::read(&path).unwrap()).unwrap();
+        keys.get_mut("k").unwrap().key_type = KeyType::EncryptionKey;
+        fs::write(&path, bincode::serialize(&keys).unwrap()).unwrap();
+
+        let mut ks = SecureKeyStore::new(&path, b"aad-type-pass").unwrap();
+        assert!(
+            ks.retrieve_key("k").is_err(),
+            "relabelling the key type must invalidate the AEAD tag",
+        );
+    }
+
+    #[test]
+    fn legacy_no_aad_entry_opens_and_migrates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        // Forge a pre-AAD entry: seal with empty AAD directly under a
+        // master key, exactly as an older build wrote it.
+        let mut ks = SecureKeyStore::new(&path, b"legacy-aad-pass").unwrap();
+        let master = ks.master_key.expose_secret();
+        let cipher = ChaCha20Poly1305::new(master.into());
+        let nonce_bytes = secure_rng::random::array::<12>().unwrap();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), b"legacy value".as_ref())
+            .unwrap();
+        ks.keys.insert(
+            "legacy".to_string(),
+            EncryptedKeyEntry {
+                encrypted_data: ct,
+                nonce: nonce_bytes,
+                key_type: KeyType::EncryptionKey,
+                created_at: 0,
+                last_accessed: 0,
+                metadata: plain_metadata(12),
+            },
+        );
+        ks.save_keys().unwrap();
+
+        // First read opens it (empty-AAD fallback) and re-seals with AAD.
+        assert_eq!(
+            ks.retrieve_key("legacy").unwrap().unwrap().expose_secret(),
+            b"legacy value",
+        );
+        drop(ks);
+
+        // Reopen: the migrated entry now opens on the primary AAD path,
+        // and its bytes are no longer the empty-AAD form (verify a raw
+        // empty-AAD decrypt of the stored ciphertext now fails).
+        let mut ks = SecureKeyStore::new(&path, b"legacy-aad-pass").unwrap();
+        assert_eq!(
+            ks.retrieve_key("legacy").unwrap().unwrap().expose_secret(),
+            b"legacy value",
+        );
+        let migrated = ks.keys.get("legacy").unwrap();
+        let cipher = ChaCha20Poly1305::new(ks.master_key.expose_secret().into());
+        assert!(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&migrated.nonce),
+                    migrated.encrypted_data.as_ref()
+                )
+                .is_err(),
+            "after migration the entry must no longer open under empty AAD",
+        );
+    }
+
+    #[test]
     fn master_file_uses_v2_layout_with_per_install_salt() {
         let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let (p1, p2) = (d1.path().join("ks.db"), d2.path().join("ks.db"));
@@ -884,6 +1349,113 @@ mod tests {
         // And it still opens (Argon2id path) while a wrong passphrase fails.
         assert!(SecureKeyStore::new(&path, passphrase).is_ok());
         assert!(SecureKeyStore::new(&path, b"wrong").is_err());
+    }
+
+    #[test]
+    fn rotation_crash_before_db_rewrite_recovers_old_key() {
+        // Simulates a crash after the dual-key `.master` is written but
+        // before the `.db` is re-encrypted: entries are still under the
+        // OLD key. The next open must adopt the old key and collapse.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-1").unwrap();
+        ks.store_key("k", b"secret value", KeyType::RootKey, plain_metadata(12))
+            .unwrap();
+
+        let m_old = *ks.master_key.expose_secret();
+        let wrap = *ks.wrap_key.expose_secret();
+        let salt = ks.wrap_salt;
+        let m_new = secure_rng::random::array::<32>().unwrap();
+        // Dual `.master` written; `.db` still holds old-key entries.
+        SecureKeyStore::seal_master_dual(
+            &m_new,
+            Some(&m_old),
+            &path.with_extension("master"),
+            &wrap,
+            &salt,
+        )
+        .unwrap();
+        drop(ks);
+
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-1").unwrap();
+        assert_eq!(
+            ks.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            b"secret value",
+        );
+        drop(ks);
+        // `.master` collapsed back to a single-key layout.
+        assert!(fs::read(path.with_extension("master"))
+            .unwrap()
+            .starts_with(MASTER_V2_MAGIC));
+    }
+
+    #[test]
+    fn rotation_crash_after_db_rewrite_recovers_new_key() {
+        // Simulates a crash after the `.db` was re-encrypted under the
+        // NEW key but before `.master` collapsed: entries are under the
+        // new key while `.master` still carries both. The next open must
+        // adopt the new key.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-2").unwrap();
+        ks.store_key("k", b"secret value", KeyType::RootKey, plain_metadata(12))
+            .unwrap();
+
+        let m_old = *ks.master_key.expose_secret();
+        let wrap = *ks.wrap_key.expose_secret();
+        let salt = ks.wrap_salt;
+        let m_new = secure_rng::random::array::<32>().unwrap();
+
+        // Re-encrypt the entries under the new key and commit the `.db`.
+        {
+            let old_c = ChaCha20Poly1305::new((&m_old).into());
+            let new_c = ChaCha20Poly1305::new((&m_new).into());
+            for (key_id, entry) in ks.keys.iter_mut() {
+                let aad = entry_aad(key_id, &entry.key_type);
+                let pt = old_c
+                    .decrypt(
+                        Nonce::from_slice(&entry.nonce),
+                        Payload {
+                            msg: &entry.encrypted_data,
+                            aad: &aad,
+                        },
+                    )
+                    .unwrap();
+                let nb = secure_rng::random::array::<12>().unwrap();
+                let ct = new_c
+                    .encrypt(
+                        Nonce::from_slice(&nb),
+                        Payload {
+                            msg: pt.as_slice(),
+                            aad: &aad,
+                        },
+                    )
+                    .unwrap();
+                entry.encrypted_data = ct;
+                entry.nonce = nb;
+            }
+            ks.save_keys().unwrap();
+        }
+        // Dual `.master`, not yet collapsed.
+        SecureKeyStore::seal_master_dual(
+            &m_new,
+            Some(&m_old),
+            &path.with_extension("master"),
+            &wrap,
+            &salt,
+        )
+        .unwrap();
+        drop(ks);
+
+        let mut ks = SecureKeyStore::new(&path, b"rot-crash-2").unwrap();
+        assert_eq!(
+            ks.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            b"secret value",
+        );
+        drop(ks);
+        assert!(fs::read(path.with_extension("master"))
+            .unwrap()
+            .starts_with(MASTER_V2_MAGIC));
     }
 
     #[test]

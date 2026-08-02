@@ -90,7 +90,7 @@ needs the Android SDK.**
   `gradle/wrapper/gradle-wrapper.{jar,properties}`). Generated with
   `gradle wrapper --gradle-version 8.7`.
 * Plugin metadata downloaded successfully: AGP 8.4.0,
-  Kotlin 1.9.22, Hilt 2.48, Navigation 2.7.7, Paparazzi 1.3.4.
+  Kotlin 1.9.24, Hilt 2.48, Navigation 2.7.7, Paparazzi 1.3.4.
 * `gradle :app:recordPaparazziDebug` now fails on:
   ```
   SDK location not found. Define a valid SDK location with an

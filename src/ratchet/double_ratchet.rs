@@ -312,27 +312,89 @@ impl DoubleRatchet {
         ciphertext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>> {
-        // 1. A skipped key for exactly this (dh, n)?
+        // Ratchet on a throwaway copy and commit it back only once the
+        // AEAD verifies. Without this, the receive-side mutations
+        // (DH-ratchet step, chain-key advance, nr/pn bumps) happen
+        // *before* authentication — so a spoofed or corrupt frame would
+        // poison the live session. Persisting only on success (the
+        // session/keystore layer) contains that today, but as soon as a
+        // caller holds the ratchet in memory (the obvious per-message
+        // cache), one forged packet would brick the session. Staging
+        // makes the atomicity structural rather than caller-dependent.
+        //
+        // The staged copy holds a second transient copy of the chain
+        // secrets; both it and the replaced `self` zeroise on drop, and
+        // no message key is ever *reused* (the point of `!Clone`), so
+        // this doesn't reopen the fork hazard the type guards against.
+        let mut staged = self.snapshot();
+        let plaintext = staged.decrypt_in_place(header, ciphertext, associated_data)?;
+        *self = staged;
+        Ok(plaintext)
+    }
+
+    /// A private, transient duplicate of the ratchet for staged decrypt.
+    /// **Not** the `Clone` trait — duplicating a ratchet into two live
+    /// sessions would reuse message keys, which is exactly what the
+    /// missing `Clone` impl prevents. This copy is committed back or
+    /// dropped within a single `decrypt` call.
+    fn snapshot(&self) -> Self {
+        DoubleRatchet {
+            dhs_secret: self.dhs_secret.clone(),
+            dhs_public: self.dhs_public,
+            dhr: self.dhr,
+            rk: self.rk,
+            cks: self.cks,
+            ckr: self.ckr,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            skipped: self.skipped.clone(),
+            skipped_order: self.skipped_order.clone(),
+        }
+    }
+
+    /// The mutating receive path, run on the staged copy.
+    fn decrypt_in_place(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        // 1. A skipped key for exactly this (dh, n)? (single-use)
         if let Some(pt) = self.try_skipped(header, ciphertext, associated_data)? {
             return Ok(pt);
         }
 
-        // 2. New ratchet public key ⇒ skip the rest of the old recv
-        //    chain, then perform a DH ratchet step.
         let their_dh = PublicKey::from(header.dh);
         let is_new_ratchet = match &self.dhr {
             Some(cur) => cur.as_bytes() != their_dh.as_bytes(),
             None => true,
         };
+
+        // 2. Reject replays of already-consumed current-chain messages
+        //    up front: a frame on the current receive chain (same DH)
+        //    with `n < nr` and no matching skipped key is a message we
+        //    already delivered. Erroring here — before advancing the
+        //    chain or spending ~`MAX_SKIP` BLAKE3 iterations — stops a
+        //    replayed frame from burning a message key and doubles as a
+        //    cheap DoS guard.
+        if !is_new_ratchet && header.n < self.nr {
+            return Err(anyhow!(
+                "replayed or already-consumed message (n < nr, no skipped key)"
+            ));
+        }
+
+        // 3. New ratchet public key ⇒ skip the rest of the old recv
+        //    chain, then perform a DH ratchet step.
         if is_new_ratchet {
             self.skip_message_keys(header.pn)?;
             self.dh_ratchet(&their_dh)?;
         }
 
-        // 3. Skip up to this message in the current recv chain.
+        // 4. Skip up to this message in the current recv chain.
         self.skip_message_keys(header.n)?;
 
-        // 4. Derive the message key and decrypt.
+        // 5. Derive the message key and decrypt.
         let ckr = self
             .ckr
             .as_mut()
@@ -567,6 +629,51 @@ mod tests {
             let (h, c) = bob.encrypt(r.as_bytes(), AD).unwrap();
             assert_eq!(alice.decrypt(&h, &c, AD).unwrap(), r.as_bytes());
         }
+    }
+
+    #[test]
+    fn failed_decrypt_does_not_poison_the_session() {
+        let (mut alice, mut bob) = pair();
+        let (h1, c1) = alice.encrypt(b"first", AD).unwrap();
+
+        // A tampered ciphertext for the very first message must fail
+        // *and* leave Bob's ratchet exactly as it was — the staged copy
+        // is discarded on AEAD failure, no chain advance.
+        let mut tampered = c1.clone();
+        *tampered.last_mut().unwrap() ^= 0x01;
+        assert!(bob.decrypt(&h1, &tampered, AD).is_err());
+
+        // The genuine first message still decrypts (state wasn't
+        // advanced by the failed attempt). Pre-staging, the DH-ratchet
+        // step + nr bump from the failed frame would have desynced Bob.
+        assert_eq!(bob.decrypt(&h1, &c1, AD).unwrap(), b"first");
+
+        // And the conversation continues normally both directions.
+        let (h2, c2) = alice.encrypt(b"second", AD).unwrap();
+        assert_eq!(bob.decrypt(&h2, &c2, AD).unwrap(), b"second");
+        let (h3, c3) = bob.encrypt(b"reply", AD).unwrap();
+        assert_eq!(alice.decrypt(&h3, &c3, AD).unwrap(), b"reply");
+    }
+
+    #[test]
+    fn replayed_frame_is_rejected_without_advancing() {
+        let (mut alice, mut bob) = pair();
+        let (h1, c1) = alice.encrypt(b"m1", AD).unwrap();
+        let (h2, c2) = alice.encrypt(b"m2", AD).unwrap();
+
+        assert_eq!(bob.decrypt(&h1, &c1, AD).unwrap(), b"m1");
+        assert_eq!(bob.decrypt(&h2, &c2, AD).unwrap(), b"m2");
+
+        // Replaying m1 (n=0 < nr=2, no skipped key) is rejected up front,
+        // before any chain work — its message key was consumed on first
+        // delivery and is not retained.
+        assert!(bob.decrypt(&h1, &c1, AD).is_err());
+        assert!(bob.decrypt(&h2, &c2, AD).is_err());
+
+        // A fresh in-order message still decrypts, proving the replays
+        // didn't move nr or the chain key.
+        let (h3, c3) = alice.encrypt(b"m3", AD).unwrap();
+        assert_eq!(bob.decrypt(&h3, &c3, AD).unwrap(), b"m3");
     }
 
     #[test]

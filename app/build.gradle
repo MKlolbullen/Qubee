@@ -8,7 +8,6 @@ plugins {
     // versions; with 1.3.4 + AGP 8.4 the order here works because the
     // Android plugin is applied first by the line above.
     id 'app.cash.paparazzi'
-    id 'org.jetbrains.kotlin.plugin.compose'
 }
 
 // Release signing pulls every credential from env vars so the
@@ -48,7 +47,12 @@ android {
         // Android's per-package version comparator accepts as an
         // upgrade).
         versionName project.findProperty('qubeeVersionName') ?: '0.1.0-alpha'
-        versionCode (project.findProperty('qubeeVersionCode') ?: '100').toInteger()
+        // No parens after `versionCode`: `versionCode (x).toInteger()`
+        // parses as `(versionCode(x)).toInteger()` in Groovy, passing
+        // the raw String to AGP and crashing configuration with
+        // "BeanDynamicObject: Value is null". Command form takes the
+        // whole expression as the argument.
+        versionCode Integer.parseInt((project.findProperty('qubeeVersionCode') ?: '100').toString())
 
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
@@ -114,9 +118,21 @@ android {
     buildFeatures {
         viewBinding true
         compose true
+        // Generate BuildConfig (AGP 8.x defaults this off). QubeeApplication
+        // reads BuildConfig.DEBUG to gate Timber's debug logging.
         buildConfig true
     }
 
+    composeOptions {
+        // Paired with Kotlin 1.9.24. The Kotlin plugin is declared at
+        // 1.9.24 (build.gradle) — pinned plugins (Hilt / Paparazzi /
+        // safeargs) transitively require 1.9.24 on the compiler
+        // classpath, so that is the effective compiler version and the
+        // declaration matches it. 1.5.14 is the 1.9.24-compatible
+        // Compose compiler per the AndroidX Compose-Kotlin map. Bump
+        // both together.
+        kotlinCompilerExtensionVersion '1.5.14'
+    }
     // No externalNativeBuild — Rust shared libraries are built out of band
     // by build_rust.sh / cargo-ndk and copied into jniLibs.
 }
@@ -226,6 +242,11 @@ dependencies {
 
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+    // ui-test-junit4 is versioned by the Compose BOM, so the BOM
+    // platform has to be on the androidTest classpath too — otherwise
+    // the version resolves to empty and the debugAndroidTest classpath
+    // fails with "Could not find androidx.compose.ui:ui-test-junit4:".
+    androidTestImplementation platform('androidx.compose:compose-bom:2023.10.01')
     androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
     // Room in-memory database support for instrumented DAO tests.
     androidTestImplementation 'androidx.room:room-testing:2.6.0'

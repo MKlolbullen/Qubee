@@ -120,19 +120,7 @@ private fun IdentityBootstrapView(
         modifier = Modifier.fillMaxWidth(),
     )
 
-                Spacer(Modifier.height(24.dp))
-
-                if (s is OnboardingState.Loading) {
-                    CircularProgressIndicator()
-                    Spacer(Modifier.height(8.dp))
-                    Text("Generating Ed25519 + Dilithium-2 keys, signing identity bundle…")
-                } else {
-                    Button(
-                        onClick = { viewModel.createIdentity(nickname) },
-                        enabled = nickname.isNotBlank(),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Create identity") }
-                }
+    Spacer(Modifier.height(24.dp))
 
     QubeePanel {
         Text(
@@ -161,7 +149,7 @@ private fun IdentityBootstrapView(
             ) {
                 CircularProgressIndicator(color = QubeePalette.Cyan, modifier = Modifier.size(28.dp))
                 Spacer(Modifier.width(12.dp))
-                QubeeMutedText("Generating Kyber/Dilithium keys + ZK proof…")
+                QubeeMutedText("Generating Kyber/Dilithium keys…")
             }
         } else {
             QubeePrimaryButton(

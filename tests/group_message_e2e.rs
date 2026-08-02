@@ -1114,6 +1114,218 @@ fn lagging_member_resyncs_after_missing_key_rotation() {
 }
 
 // ---------------------------------------------------------------------
+// State-sync authorization (roadmap P0-1)
+//
+// A StateSyncResponse rewrites the whole roster — roles included — so a
+// forged one from an unprivileged member must never be trusted. Two
+// gates defend this: the requester only accepts snapshots from an
+// Owner/Admin responder, and even an Admin responder can't change who
+// holds Owner (that needs an OwnershipTransfer).
+// ---------------------------------------------------------------------
+
+#[test]
+fn state_sync_from_non_privileged_member_is_rejected() {
+    use qubee_crypto::groups::group_handshake::{
+        sign_state_sync_response, GroupHandshake, GroupMemberSummary, StateSyncResponseBody,
+    };
+    use qubee_crypto::groups::group_permissions::Role;
+    use qubee_crypto::groups::handshake_handlers::process_state_sync_response;
+
+    // Alice owns the group. Bob joins first, then Carol — so Carol's
+    // local view already carries Alice(Owner) + Bob(Member) + herself.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    let bob_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, _bob_gm, _mb, _ms) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        bob_invite.invitation_code,
+        bob_invite.inviter_name,
+    );
+    let bob_id = bob_kp.identity_id();
+
+    let carol_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_carol_dir, carol_kp, mut carol_gm, _mc, _mcs) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        carol_invite.invitation_code,
+        carol_invite.inviter_name,
+    );
+    let carol_id = carol_kp.identity_id();
+
+    // Bob (a plain Member) forges a snapshot promoting himself to Owner
+    // and demoting Alice, and addresses it to Carol.
+    let forged_members = vec![
+        GroupMemberSummary {
+            identity_id: bob_id,
+            identity_key: bob_kp.public_key(),
+            display_name: "Bob".to_string(),
+            role: Role::Owner,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+        GroupMemberSummary {
+            identity_id: alice_id,
+            identity_key: alice_kp.public_key(),
+            display_name: "Alice".to_string(),
+            role: Role::Member,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+        GroupMemberSummary {
+            identity_id: carol_id,
+            identity_key: carol_kp.public_key(),
+            display_name: "Carol".to_string(),
+            role: Role::Member,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+    ];
+    let alice_version = alice_gm.get_group(&group_id).unwrap().version;
+    let forged = StateSyncResponseBody {
+        group_id,
+        responder_id: bob_id,
+        requester_id: carol_id,
+        members: forged_members,
+        current_version: alice_version + 100,
+        wrapped_group_key: None,
+        timestamp: 0,
+    };
+    let (forged_body, forged_sig) = match sign_state_sync_response(&bob_kp, forged).unwrap() {
+        GroupHandshake::StateSyncResponse { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    // Carol must reject it — Bob is only a Member in her view.
+    let err = process_state_sync_response(&mut carol_gm, carol_id, &forged_body, &forged_sig)
+        .expect_err("Carol must reject a roster snapshot from a non-privileged responder");
+    assert!(
+        err.to_string().contains("lacks authority to define roster"),
+        "rejection must come from the authority gate, got: {err:#}",
+    );
+
+    // Carol's roster is untouched: Alice is still Owner, Bob still Member.
+    let carol_view = carol_gm.get_group(&group_id).unwrap();
+    assert_eq!(
+        carol_view.members.get(&alice_id).unwrap().role,
+        Role::Owner,
+        "Alice must remain Owner after the rejected forgery",
+    );
+    assert_eq!(
+        carol_view.members.get(&bob_id).unwrap().role,
+        Role::Member,
+        "Bob must remain a plain Member after the rejected forgery",
+    );
+}
+
+#[test]
+fn state_sync_owner_pin_blocks_ownership_change_from_non_owner() {
+    use qubee_crypto::groups::group_handshake::GroupMemberSummary;
+    use qubee_crypto::groups::group_permissions::Role;
+
+    // Alice owns the group locally. `apply_state_sync` is the raw merge
+    // primitive; drive it directly with an Admin authority to prove the
+    // owner-pin fires independently of the handler's responder gate.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    let mallory_kp = IdentityKeyPair::generate().unwrap();
+    let mallory_id = mallory_kp.identity_id();
+
+    // Owner-preserving snapshot from an Admin authority is fine: Alice
+    // stays Owner, Mallory is admitted as a Member.
+    let ok_snapshot = vec![
+        GroupMemberSummary {
+            identity_id: alice_id,
+            identity_key: alice_kp.public_key(),
+            display_name: "Alice".to_string(),
+            role: Role::Owner,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+        GroupMemberSummary {
+            identity_id: mallory_id,
+            identity_key: mallory_kp.public_key(),
+            display_name: "Mallory".to_string(),
+            role: Role::Member,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+    ];
+    let base_version = alice_gm.get_group(&group_id).unwrap().version;
+    alice_gm
+        .apply_state_sync(group_id, &ok_snapshot, base_version + 1, &Role::Admin)
+        .expect("owner-preserving snapshot from an Admin must apply");
+
+    // Ownership-changing snapshot from a non-Owner authority is refused:
+    // Mallory tries to make herself Owner and demote Alice.
+    let seize_snapshot = vec![
+        GroupMemberSummary {
+            identity_id: alice_id,
+            identity_key: alice_kp.public_key(),
+            display_name: "Alice".to_string(),
+            role: Role::Member,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+        GroupMemberSummary {
+            identity_id: mallory_id,
+            identity_key: mallory_kp.public_key(),
+            display_name: "Mallory".to_string(),
+            role: Role::Owner,
+            joined_at: 0,
+            kyber_pub: Vec::new(),
+        },
+    ];
+    let result =
+        alice_gm.apply_state_sync(group_id, &seize_snapshot, base_version + 2, &Role::Admin);
+    assert!(
+        result.is_err(),
+        "a non-owner authority must not be able to change the group owner",
+    );
+    assert_eq!(
+        alice_gm
+            .get_group(&group_id)
+            .unwrap()
+            .members
+            .get(&alice_id)
+            .unwrap()
+            .role,
+        Role::Owner,
+        "Alice must remain Owner after the blocked seizure",
+    );
+}
+
+// ---------------------------------------------------------------------
 // 5d — transfer_ownership + OwnershipTransfer wire frame
 // ---------------------------------------------------------------------
 

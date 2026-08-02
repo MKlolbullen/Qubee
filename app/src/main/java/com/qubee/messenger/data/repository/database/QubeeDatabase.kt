@@ -63,10 +63,11 @@ abstract class QubeeDatabase : RoomDatabase() {
             context: Context,
             keyProvider: SqlCipherKeyProvider,
         ): QubeeDatabase {
-            // SQLCipher's native loader has to run before the first
-            // connection opens. The 4.6 release moved the entry-point
-            // to `net.zetetic.database.sqlcipher.SQLiteDatabase`.
-            SQLiteDatabase.loadLibs(context)
+            // SQLCipher's native library has to be loaded before the
+            // first connection opens. The sqlcipher-android 4.6 rewrite
+            // dropped the old `SQLiteDatabase.loadLibs(Context)` helper;
+            // the entry point is now a plain `System.loadLibrary`.
+            System.loadLibrary("sqlcipher")
 
             // Detect a database file written under the previous
             // hardcoded passphrase and wipe it before opening with
@@ -150,11 +151,15 @@ abstract class QubeeDatabase : RoomDatabase() {
             if (!dbFile.exists()) return
 
             val opensWithLegacy = try {
+                // sqlcipher-android 4.6 has no 4-arg byte[] overload:
+                // the shortest form is (path, password, factory, flags,
+                // hook). Pass a null CursorFactory and null hook.
                 SQLiteDatabase.openDatabase(
                     dbFile.absolutePath,
                     legacyPassphrase,
                     null,
                     SQLiteDatabase.OPEN_READONLY,
+                    null,
                 ).use { /* opened cleanly — confirmed legacy */ }
                 true
             } catch (e: Exception) {

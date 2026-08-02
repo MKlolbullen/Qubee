@@ -55,11 +55,13 @@ interface ContactDao {
                m.timestamp as lastMessageTimestamp,
                COUNT(CASE WHEN m.status != 'READ' AND m.isFromMe = 0 THEN 1 END) as unreadCount
         FROM contacts c
-        LEFT JOIN (
-            SELECT conversationId, senderId, content, timestamp, status, isFromMe,
-                   ROW_NUMBER() OVER (PARTITION BY conversationId ORDER BY timestamp DESC) as rn
-            FROM messages
-        ) m ON c.id = m.senderId AND m.rn = 1
+        LEFT JOIN messages m ON c.id = m.senderId
+            AND m.id = (
+                SELECT m2.id FROM messages m2
+                WHERE m2.conversationId = m.conversationId
+                ORDER BY m2.timestamp DESC, m2.id DESC
+                LIMIT 1
+            )
         WHERE c.isBlocked = 0
         GROUP BY c.id
         ORDER BY COALESCE(m.timestamp, c.createdAt) DESC

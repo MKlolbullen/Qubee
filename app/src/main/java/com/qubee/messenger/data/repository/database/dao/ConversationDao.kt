@@ -28,34 +28,21 @@ interface ConversationDao {
     @Query(
         """
         SELECT c.*,
-               m.id as lastMsg_id,
-               m.conversationId as lastMsg_conversationId,
-               m.senderId as lastMsg_senderId,
                m.content as lastMsg_content,
-               m.contentType as lastMsg_contentType,
                m.timestamp as lastMsg_timestamp,
-               m.status as lastMsg_status,
-               m.isFromMe as lastMsg_isFromMe,
-               m.replyToMessageId as lastMsg_replyToMessageId,
-               m.attachmentPath as lastMsg_attachmentPath,
-               m.attachmentMimeType as lastMsg_attachmentMimeType,
-               m.attachmentSize as lastMsg_attachmentSize,
-               m.reactions as lastMsg_reactions,
-               m.isDeleted as lastMsg_isDeleted,
-               m.deletedAt as lastMsg_deletedAt,
-               m.editedAt as lastMsg_editedAt,
-               m.disappearsAt as lastMsg_disappearsAt,
                (SELECT COUNT(*) FROM messages
                 WHERE conversationId = c.id
                   AND status != 'READ'
                   AND isFromMe = 0) as unreadCount
         FROM conversations c
-        LEFT JOIN (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY conversationId ORDER BY timestamp DESC) as rn
-            FROM messages
-            WHERE isDeleted = 0
-        ) m ON c.id = m.conversationId AND m.rn = 1
+        LEFT JOIN messages m ON m.conversationId = c.id
+            AND m.isDeleted = 0
+            AND m.id = (
+                SELECT m2.id FROM messages m2
+                WHERE m2.conversationId = c.id AND m2.isDeleted = 0
+                ORDER BY m2.timestamp DESC, m2.id DESC
+                LIMIT 1
+            )
         WHERE c.isArchived = 0
         ORDER BY COALESCE(m.timestamp, c.updatedAt) DESC
         """

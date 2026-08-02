@@ -2161,7 +2161,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
         // spec is a 4-digit ceiling, not just a minimum width.
         let high = ((value >> 16) & 0xFFFF) % 10_000;
         let low = (value & 0xFFFF) % 10_000;
-        let sas = format!("{:04} {:04}", high, low);
+        let sas = format!("{high:04} {low:04}");
         let java_str = env.new_string(sas)?;
         Ok(java_str.into_raw())
     })
@@ -2958,7 +2958,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
                 | (h[3] as u32);
             let high = ((value >> 16) & 0xFFFF) % 10_000;
             let low = (value & 0xFFFF) % 10_000;
-            let sas = format!("{:04} {:04}", high, low);
+            let sas = format!("{high:04} {low:04}");
             let java_str = env
                 .new_string(sas)
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;

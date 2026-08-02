@@ -534,10 +534,30 @@ pub fn process_state_sync_response(
     if responder.member_status != MemberStatus::Active {
         return Err(anyhow!("StateSyncResponse responder is not active"));
     }
+    // Authority gate: a state-sync snapshot rewrites the whole roster —
+    // roles included — so only privileged members are trusted to answer
+    // authoritatively, mirroring `MemberAdded`'s adder gate. Without
+    // this, any active member could evict peers or shuffle roles with
+    // just their own signature. `apply_state_sync` additionally pins the
+    // owner so even an Admin responder can't seize ownership. If our
+    // local view is stale and doesn't yet know the responder is
+    // privileged we fail closed — the roster still converges once an
+    // owner/admin frame reaches us.
+    if !matches!(responder.role, Role::Owner | Role::Admin) {
+        return Err(anyhow!(
+            "StateSyncResponse responder lacks authority to define roster"
+        ));
+    }
+    let responder_role = responder.role.clone();
     if !verify_state_sync_response(body, signature, &responder.identity_key)? {
         return Err(anyhow!("StateSyncResponse signature failed"));
     }
-    gm.apply_state_sync(body.group_id, &body.members, body.current_version)?;
+    gm.apply_state_sync(
+        body.group_id,
+        &body.members,
+        body.current_version,
+        &responder_role,
+    )?;
 
     // Install the wrapped group key if the responder included one.
     // Unwrap requires our long-lived per-group Kyber secret, set

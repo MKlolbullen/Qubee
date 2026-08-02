@@ -224,6 +224,40 @@ pub struct KeyRotationBody {
     pub timestamp: u64,
 }
 
+/// Broadcast component of a split key rotation, sent **only** when a
+/// member was removed. Its sole job is to reach the *removed* member —
+/// who gets no direct [`KeyDeliveryBody`] — so they learn they are out
+/// and can wipe their per-group Kyber secret. It carries no key
+/// material and, critically, never advances a receiver's generation on
+/// its own: that stays lock-stepped to key installation, which only a
+/// [`KeyDeliveryBody`] performs. Proactive rotations (no removal) send
+/// no announce at all.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyRotationAnnounceBody {
+    pub group_id: GroupId,
+    pub generation: u64,
+    pub rotator_id: IdentityId,
+    pub removed_member_id: IdentityId,
+    pub timestamp: u64,
+}
+
+/// Directed component of a split key rotation: the new group key wrapped
+/// to exactly one remaining member's Kyber pubkey, delivered off-topic
+/// over `/qubee/direct/1`. This is the frame that atomically advances
+/// the recipient's generation and installs the key. It also carries
+/// `removed_member_id` so a recipient converges its roster from the
+/// delivery alone, without depending on the broadcast announce.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyDeliveryBody {
+    pub group_id: GroupId,
+    pub generation: u64,
+    pub rotator_id: IdentityId,
+    pub removed_member_id: Option<IdentityId>,
+    pub recipient_id: IdentityId,
+    pub wrapped_key: WrappedGroupKey,
+    pub timestamp: u64,
+}
+
 /// Body of a `MemberAdded` payload. Inviters broadcast this to the
 /// group topic immediately after a successful `RequestJoin` so that
 /// existing members learn about the late joiner — including the late
@@ -409,6 +443,18 @@ pub enum GroupHandshake {
         body: KeyRotationBody,
         signature: HybridSignature,
     },
+    /// Broadcast half of a split rotation (removal notice for the
+    /// removed member; see [`KeyRotationAnnounceBody`]).
+    KeyRotationAnnounce {
+        body: KeyRotationAnnounceBody,
+        signature: HybridSignature,
+    },
+    /// Directed half of a split rotation (one recipient's wrapped key;
+    /// see [`KeyDeliveryBody`]). Delivered off-topic, one per member.
+    KeyDelivery {
+        body: KeyDeliveryBody,
+        signature: HybridSignature,
+    },
     MemberAdded {
         body: MemberAddedBody,
         signature: HybridSignature,
@@ -513,6 +559,8 @@ const REQUEST_JOIN_TAG: &[u8] = b"qubee_handshake_request_join_v1";
 const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v2";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
+const KEY_ROTATION_ANNOUNCE_TAG: &[u8] = b"qubee_handshake_key_rotation_announce_v1";
+const KEY_DELIVERY_TAG: &[u8] = b"qubee_handshake_key_delivery_v1";
 const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
 const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
 const OWNERSHIP_TRANSFER_TAG: &[u8] = b"qubee_handshake_ownership_transfer_v1";
@@ -741,6 +789,51 @@ pub fn canonical_key_rotation(body: &KeyRotationBody) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn canonical_key_rotation_announce(body: &KeyRotationAnnounceBody) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(KEY_ROTATION_ANNOUNCE_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&body.generation.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(body.rotator_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(body.removed_member_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    out
+}
+
+pub fn canonical_key_delivery(body: &KeyDeliveryBody) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(KEY_DELIVERY_TAG);
+    out.push(0u8);
+    out.extend_from_slice(body.group_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&body.generation.to_le_bytes());
+    out.push(0u8);
+    out.extend_from_slice(body.rotator_id.as_ref());
+    out.push(0u8);
+    if let Some(removed) = body.removed_member_id {
+        out.push(1u8);
+        out.extend_from_slice(removed.as_ref());
+    } else {
+        out.push(0u8);
+    }
+    out.push(0u8);
+    out.extend_from_slice(body.recipient_id.as_ref());
+    out.push(0u8);
+    out.extend_from_slice(&(body.wrapped_key.kem_ciphertext.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body.wrapped_key.kem_ciphertext);
+    out.extend_from_slice(&body.wrapped_key.nonce);
+    out.extend_from_slice(&(body.wrapped_key.wrapped_key.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body.wrapped_key.wrapped_key);
+    out.push(0u8);
+    out.extend_from_slice(&body.timestamp.to_le_bytes());
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Sign / verify helpers
 // ---------------------------------------------------------------------------
@@ -823,6 +916,46 @@ pub fn verify_key_rotation(
     expected_rotator: &IdentityKey,
 ) -> Result<bool> {
     let payload = canonical_key_rotation(body)?;
+    expected_rotator.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Sign a `KeyRotationAnnounce` (broadcast removal notice).
+pub fn sign_key_rotation_announce(
+    keypair: &IdentityKeyPair,
+    body: KeyRotationAnnounceBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_key_rotation_announce(&body);
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::KeyRotationAnnounce { body, signature })
+}
+
+/// Verify a `KeyRotationAnnounce` against the rotator's stated key.
+pub fn verify_key_rotation_announce(
+    body: &KeyRotationAnnounceBody,
+    signature: &HybridSignature,
+    expected_rotator: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_key_rotation_announce(body);
+    expected_rotator.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
+}
+
+/// Sign a `KeyDelivery` (directed per-recipient wrapped key).
+pub fn sign_key_delivery(
+    keypair: &IdentityKeyPair,
+    body: KeyDeliveryBody,
+) -> Result<GroupHandshake> {
+    let payload = canonical_key_delivery(&body);
+    let signature = keypair.sign(&payload)?;
+    Ok(GroupHandshake::KeyDelivery { body, signature })
+}
+
+/// Verify a `KeyDelivery` against the rotator's stated key.
+pub fn verify_key_delivery(
+    body: &KeyDeliveryBody,
+    signature: &HybridSignature,
+    expected_rotator: &IdentityKey,
+) -> Result<bool> {
+    let payload = canonical_key_delivery(body);
     expected_rotator.verify_with_max_age(&payload, signature, HANDSHAKE_MAX_AGE_SECS)
 }
 

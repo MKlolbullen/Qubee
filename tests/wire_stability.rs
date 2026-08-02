@@ -15,11 +15,12 @@
 //! running the old code will silently drop frames from the new code.
 
 use qubee_crypto::groups::group_handshake::{
-    canonical_join_accepted, canonical_join_rejected, canonical_key_rotation,
-    canonical_member_added, canonical_prekey_bundle, canonical_request_join, canonical_role_change,
+    canonical_join_accepted, canonical_join_rejected, canonical_key_delivery,
+    canonical_key_rotation, canonical_key_rotation_announce, canonical_member_added,
+    canonical_prekey_bundle, canonical_request_join, canonical_role_change,
     generate_ephemeral_kyber, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody,
-    KeyRotationBody, MemberAddedBody, PrekeyBundleBody, RequestJoinBody, RoleChangeBody,
-    HANDSHAKE_MAGIC,
+    KeyDeliveryBody, KeyRotationAnnounceBody, KeyRotationBody, MemberAddedBody, PrekeyBundleBody,
+    RequestJoinBody, RoleChangeBody, WrappedGroupKey, HANDSHAKE_MAGIC,
 };
 use qubee_crypto::groups::group_manager::GroupId;
 use qubee_crypto::groups::group_message::{
@@ -164,6 +165,38 @@ fn canonical_key_rotation_starts_with_versioned_tag() {
     };
     let canonical = canonical_key_rotation(&body).unwrap();
     assert!(canonical.starts_with(b"qubee_handshake_key_rotation_v1"));
+}
+
+#[test]
+fn canonical_key_rotation_announce_starts_with_versioned_tag() {
+    let body = KeyRotationAnnounceBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        generation: 1,
+        rotator_id: IdentityId::from([0u8; 32]),
+        removed_member_id: IdentityId::from([1u8; 32]),
+        timestamp: 0,
+    };
+    let canonical = canonical_key_rotation_announce(&body);
+    assert!(canonical.starts_with(b"qubee_handshake_key_rotation_announce_v1"));
+}
+
+#[test]
+fn canonical_key_delivery_starts_with_versioned_tag() {
+    let body = KeyDeliveryBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        generation: 1,
+        rotator_id: IdentityId::from([0u8; 32]),
+        removed_member_id: None,
+        recipient_id: IdentityId::from([2u8; 32]),
+        wrapped_key: WrappedGroupKey {
+            kem_ciphertext: Vec::new(),
+            nonce: [0u8; 12],
+            wrapped_key: Vec::new(),
+        },
+        timestamp: 0,
+    };
+    let canonical = canonical_key_delivery(&body);
+    assert!(canonical.starts_with(b"qubee_handshake_key_delivery_v1"));
 }
 
 #[test]

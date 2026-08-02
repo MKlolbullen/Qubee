@@ -13,12 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 use crate::groups::group_handshake::{
-    sign_join_accepted, sign_join_rejected, sign_key_rotation, sign_member_added,
-    sign_state_sync_response, verify_join_accepted, verify_key_rotation, verify_member_added,
+    sign_join_accepted, sign_join_rejected, sign_key_delivery, sign_key_rotation,
+    sign_key_rotation_announce, sign_member_added, sign_state_sync_response, verify_join_accepted,
+    verify_key_delivery, verify_key_rotation, verify_key_rotation_announce, verify_member_added,
     verify_request_join, verify_request_state_sync, verify_role_change, verify_state_sync_response,
-    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, KeyRotationBody,
-    MemberAddedBody, MemberKeyDelivery, RequestJoinBody, RequestStateSyncBody, RoleChangeBody,
-    StateSyncResponseBody, WrappedGroupKey,
+    GroupHandshake, GroupMemberSummary, JoinAcceptedBody, JoinRejectedBody, KeyDeliveryBody,
+    KeyRotationAnnounceBody, KeyRotationBody, MemberAddedBody, MemberKeyDelivery, RequestJoinBody,
+    RequestStateSyncBody, RoleChangeBody, StateSyncResponseBody, WrappedGroupKey,
 };
 use crate::groups::group_manager::{GroupId, GroupManager, GroupMember, MemberStatus};
 use crate::groups::group_permissions::{Permission, Role};
@@ -852,6 +853,211 @@ pub fn process_key_rotation(
     // above already advanced us to the same value (this is then a
     // no-op); for proactive rotations it's the only thing that keeps
     // sender and receiver on the same generation.
+    gm.adopt_group_version(body.group_id, body.generation)?;
+    Ok(())
+}
+
+/// Plan a *split* key rotation — the metadata-reducing successor to
+/// [`plan_key_rotation`]. Same side effects on `gm` (removes the member
+/// if any, bumps the generation, installs the new key), but instead of
+/// one broadcast frame carrying every recipient's wrapped key it returns
+///   * an optional broadcast `KeyRotationAnnounce`, present only when a
+///     member was removed, so that member — who gets no direct delivery —
+///     learns they're out; and
+///   * one signed `KeyDelivery` per remaining member, each carrying only
+///     that member's wrapped key, for off-topic direct delivery.
+///
+/// A proactive rotation (no removal) produces no announce at all, so it
+/// leaves nothing on the broadcast channel.
+#[allow(clippy::type_complexity)]
+pub fn plan_key_rotation_split(
+    gm: &mut GroupManager,
+    rotator_identity: &IdentityKeyPair,
+    group_id: GroupId,
+    removed_member: Option<IdentityId>,
+    reason: &str,
+) -> Result<(Option<GroupHandshake>, Vec<(IdentityId, GroupHandshake)>)> {
+    let rotator_id = rotator_identity.identity_id();
+
+    gm.check_permission(group_id, rotator_id, Permission::RemoveMembers)
+        .context("rotator lacks RemoveMembers permission")?;
+
+    if let Some(target) = removed_member {
+        gm.remove_member(group_id, rotator_id, target, reason.to_string())
+            .context("remove_member during rotation")?;
+    } else {
+        gm.bump_version_for_rotation(group_id)
+            .context("bump version for proactive rotation")?;
+    }
+
+    let recipients = gm.rotate_group_key_after_removal(group_id, rotator_id)?;
+    let new_key = gm
+        .export_group_key(&group_id)
+        .ok_or_else(|| anyhow!("group key vanished after rotation"))?;
+    let generation = gm.get_group(&group_id).map(|g| g.version).unwrap_or(0);
+    let timestamp = now_secs();
+
+    let announce = match removed_member {
+        Some(removed) => Some(sign_key_rotation_announce(
+            rotator_identity,
+            KeyRotationAnnounceBody {
+                group_id,
+                generation,
+                rotator_id,
+                removed_member_id: removed,
+                timestamp,
+            },
+        )?),
+        None => None,
+    };
+
+    let mut deliveries: Vec<(IdentityId, GroupHandshake)> = Vec::with_capacity(recipients.len());
+    for (recipient_id, kyber_pub) in recipients {
+        let wrapped = WrappedGroupKey::wrap(&new_key, &kyber_pub)
+            .context("wrap new group key for recipient")?;
+        let frame = sign_key_delivery(
+            rotator_identity,
+            KeyDeliveryBody {
+                group_id,
+                generation,
+                rotator_id,
+                removed_member_id: removed_member,
+                recipient_id,
+                wrapped_key: wrapped,
+                timestamp,
+            },
+        )?;
+        deliveries.push((recipient_id, frame));
+    }
+
+    Ok((announce, deliveries))
+}
+
+/// Handler for a broadcast `KeyRotationAnnounce`. Its only jobs are to
+/// let the *removed* member learn they're out (wipe their per-group
+/// Kyber secret) and to converge remaining members' rosters. It never
+/// installs a key or advances the generation — that stays lock-stepped
+/// to [`process_key_delivery`], the only frame carrying the key. Keeping
+/// generation adoption out of the announce is what makes announce-before-
+/// delivery ordering safe.
+pub fn process_key_rotation_announce(
+    gm: &mut GroupManager,
+    local_id: IdentityId,
+    body: &KeyRotationAnnounceBody,
+    signature: &HybridSignature,
+) -> Result<()> {
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("KeyRotationAnnounce for unknown group"))?;
+
+    // Replay/stale guard: ignore announces at or below our current
+    // generation — we've already applied (or moved past) that rotation.
+    // The announce never bumps our generation, so re-delivery of a
+    // still-pending announce keeps acting idempotently until the matching
+    // KeyDelivery advances us past it.
+    if body.generation <= group.version {
+        return Ok(());
+    }
+
+    let rotator = group
+        .members
+        .get(&body.rotator_id)
+        .ok_or_else(|| anyhow!("KeyRotationAnnounce from non-member"))?;
+    if rotator.member_status != MemberStatus::Active {
+        return Err(anyhow!("KeyRotationAnnounce from inactive member"));
+    }
+    let rotator_key = rotator.identity_key.clone();
+    if !verify_key_rotation_announce(body, signature, &rotator_key)? {
+        return Err(anyhow!("KeyRotationAnnounce signature failed"));
+    }
+    gm.check_permission(body.group_id, body.rotator_id, Permission::RemoveMembers)
+        .context("rotator lacks RemoveMembers in local view")?;
+
+    if body.removed_member_id == local_id {
+        // We're the one removed. Wipe our long-lived Kyber secret so the
+        // kicked-out copy can't decapsulate any future rotations.
+        let _ = gm.wipe_my_kyber_secret(body.group_id);
+    } else {
+        // Converge our roster: drop the removed member locally.
+        let _ = gm.remove_member(
+            body.group_id,
+            body.rotator_id,
+            body.removed_member_id,
+            "rotation".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Handler for a directed `KeyDelivery`. This is the frame that
+/// atomically advances the recipient's generation and installs the new
+/// group key — mirroring the old single-broadcast `process_key_rotation`
+/// but for exactly one recipient (us).
+pub fn process_key_delivery(
+    gm: &mut GroupManager,
+    local_id: IdentityId,
+    body: &KeyDeliveryBody,
+    signature: &HybridSignature,
+) -> Result<()> {
+    let group = gm
+        .get_group(&body.group_id)
+        .ok_or_else(|| anyhow!("KeyDelivery for unknown group"))?;
+
+    if body.generation <= group.version {
+        return Err(anyhow!(
+            "KeyDelivery generation not newer than local (frame={}, local={})",
+            body.generation,
+            group.version
+        ));
+    }
+
+    let rotator = group
+        .members
+        .get(&body.rotator_id)
+        .ok_or_else(|| anyhow!("KeyDelivery from non-member"))?;
+    if rotator.member_status != MemberStatus::Active {
+        return Err(anyhow!("KeyDelivery from inactive member"));
+    }
+    let rotator_key = rotator.identity_key.clone();
+    if !verify_key_delivery(body, signature, &rotator_key)? {
+        return Err(anyhow!("KeyDelivery signature failed"));
+    }
+    gm.check_permission(body.group_id, body.rotator_id, Permission::RemoveMembers)
+        .context("rotator lacks RemoveMembers in local view")?;
+
+    if body.recipient_id != local_id {
+        return Err(anyhow!("KeyDelivery not addressed to us"));
+    }
+
+    // A delivery carries removed_member_id so we converge our roster from
+    // it alone, without depending on the broadcast announce.
+    if let Some(removed) = body.removed_member_id {
+        if removed == local_id {
+            // Shouldn't happen — a removed member gets no delivery — but
+            // be safe: don't install, wipe our secret.
+            let _ = gm.wipe_my_kyber_secret(body.group_id);
+            return Ok(());
+        }
+        let _ = gm.remove_member(
+            body.group_id,
+            body.rotator_id,
+            removed,
+            "rotation".to_string(),
+        );
+    }
+
+    let secret = gm
+        .load_my_kyber_secret(body.group_id)?
+        .ok_or_else(|| anyhow!("no persisted Kyber secret for group"))?;
+    let mut new_key = body
+        .wrapped_key
+        .unwrap(&secret)
+        .context("unwrap rotated group key")?;
+    drop(secret);
+
+    gm.install_group_key(body.group_id, &new_key)?;
+    new_key.zeroize();
+
     gm.adopt_group_version(body.group_id, body.generation)?;
     Ok(())
 }

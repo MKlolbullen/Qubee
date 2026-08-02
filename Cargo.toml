@@ -42,6 +42,10 @@ secrecy = "0.10"
 # raw hash_password_into, not the PHC-string machinery.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 thiserror = "1.0"
+# Required to implement libp2p's request_response::Codec trait, which is
+# declared with #[async_trait]. Already in the tree via libp2p, so this
+# only surfaces the macro — no new transitive weight.
+async-trait = "0.1"
 blake3 = "1.8"
 hkdf = "0.12"
 sha2 = "0.10"
@@ -88,6 +92,12 @@ libp2p = { version = "0.55", features = [
     "kad",
     "mdns",
     "gossipsub",
+    # One-to-one addressed delivery ("/qubee/direct/1") for frames that
+    # are logically for a single peer (JoinAccepted / JoinRejected, and
+    # later per-member key deliveries). Broadcasting those on the group
+    # topic leaks who-is-joining / who-is-being-rekeyed to every
+    # subscriber; request-response routes them off the topic.
+    "request-response",
     "tokio",
     "macros",
 ] }

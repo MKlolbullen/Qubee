@@ -585,7 +585,7 @@ Requires an emulator or physical device:
 
 | Workflow | Purpose |
 |---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | Rust format, clippy, tests, JNI typecheck, benchmark compile, RustSec audit |
+| [`ci.yml`](.github/workflows/ci.yml) | Rust format, clippy, tests, JNI typecheck, benchmark compile, RustSec audit, OSV.dev sweep |
 | [`jni-contracts.yml`](.github/workflows/jni-contracts.yml) | Kotlin ↔ Rust JNI symbol and descriptor parity |
 | [`android-smoke.yml`](.github/workflows/android-smoke.yml) | Four-ABI Rust build, debug APK, release/R8 dry run, Android lint |
 | [`instrumented-tests.yml`](.github/workflows/instrumented-tests.yml) | API 34 emulator and connected Android tests |

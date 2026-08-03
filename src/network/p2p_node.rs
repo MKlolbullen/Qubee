@@ -1,6 +1,6 @@
 // src/network/p2p_node.rs
 //
-// libp2p 0.55 swarm wired to gossipsub + Kademlia + (optional) mDNS.
+// libp2p 0.56 swarm wired to gossipsub + Kademlia + (optional) mDNS.
 
 use anyhow::{anyhow, Result};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

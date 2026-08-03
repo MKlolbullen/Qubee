@@ -75,7 +75,13 @@ yamux = "0.13.10"
 
 
 # P2P Network Layer
-libp2p = { version = "0.55", features = [
+#
+# 0.56 pulls libp2p-gossipsub 0.49.5 — the security floor is 0.49.4
+# (GHSA-gc42-3jg7-rxr2 + GHSA-xqmp-fxgv-xvq5 remote-crash fixes), and
+# 0.49.0–0.49.2 additionally have mesh-construction regressions fixed
+# in 0.49.1+. scripts/osv_scan.sh enforces the advisory floor; don't
+# `cargo update --precise` gossipsub below 0.49.5 regardless.
+libp2p = { version = "0.56", features = [
     "tcp",
     "dns",
     "websocket",

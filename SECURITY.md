@@ -217,3 +217,9 @@ them through the same channel as a vulnerability.
 
 Cargo.lock is committed; CI runs `cargo audit` on every PR plus a
 weekly cron to catch new RustSec advisories on a green tree.
+Because cargo-audit only sees the RustSec database, CI additionally
+sweeps against OSV.dev (`scripts/osv_scan.sh`), which catches
+GHSA-only advisories that RustSec never imports: every Cargo.lock
+crate version-matched, direct Gradle coordinates, and workflow
+actions at package level (the script header documents each
+surface's fidelity and its allowlist discipline).

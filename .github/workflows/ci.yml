@@ -101,3 +101,20 @@ jobs:
         run: cargo audit --deny warnings || true
       - name: Audit (vulnerabilities only — must pass)
         run: cargo audit --deny unsound --deny yanked
+
+  osv-scan:
+    name: OSV scan (GHSA coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-audit above only sees the RustSec database; GHSA-only
+      # advisories (e.g. the 2026-03 libp2p-gossipsub remote-crash
+      # pair) never fire there. This sweep queries OSV.dev over
+      # Cargo.lock (version-matched, authoritative), direct Gradle
+      # coordinates, and workflow actions (package-level only — see
+      # the script header for each surface's fidelity), so a new GHSA
+      # fails the PR instead of appearing silently in the repo's
+      # security tab.
+      - name: Sweep dependency surfaces against OSV.dev
+        run: bash scripts/osv_scan.sh

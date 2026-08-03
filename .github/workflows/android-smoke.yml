@@ -19,7 +19,12 @@ jobs:
   assemble-debug:
     name: ./gradlew :app:assembleDebug
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30 was enough with a warm Rust cache, but a dependency bump
+    # (e.g. libp2p 0.55 → 0.56) invalidates it and the cold rebuild of
+    # 4 ABIs + the R8 release pass overruns — the job dies at the cap
+    # and the APK artifact never uploads. 60 covers the cold case;
+    # warm runs are unaffected.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -39,7 +39,8 @@ use crate::ratchet::direct::{
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
-    install_sender_key, peek_v3_group_id, reset_group_sender_state, SenderKeyDistribution,
+    install_sender_key, own_chain_iteration, peek_v3_group_id, reset_group_sender_state,
+    SenderKeyDistribution,
 };
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
@@ -2964,6 +2965,68 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetG
             -1
         }
     }
+}
+
+/// Iteration of this device's own Stage 4 sender chain for a group, or
+/// `-1` when no chain exists (never sent, or wiped by a rekey). The
+/// Kotlin send orchestrator treats `<= 0` as "no member holds my
+/// current chain" and fans out distributions before the next
+/// `nativeEncryptGroupMessageV3` — covering both first-send and
+/// post-rekey redistribution with one probe.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOwnSenderChainIteration(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+) -> jni::sys::jlong {
+    let result: anyhow::Result<Option<u32>> = (|| {
+        let group_id = parse_session_id(&mut env, group_id_hex)?;
+        let mut ks_guard = KEYSTORE.lock().unwrap();
+        let ks = ks_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+        own_chain_iteration(ks, &group_id)
+    })();
+    match result {
+        Ok(Some(n)) => n as jni::sys::jlong,
+        Ok(None) => -1,
+        Err(e) => {
+            tracing::warn!(error = ?e, "own sender chain iteration probe failed");
+            -1
+        }
+    }
+}
+
+/// Publish an already-encrypted frame on a group's gossip topic. The
+/// v3 send path needs this split because `nativeEncryptGroupMessageV3`
+/// returns wire bytes for the caller to persist for retry — unlike the
+/// legacy `nativeSendGroupMessage`, which encrypts and publishes in one
+/// call. Accepts any frame; the payload is opaque to the transport.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePublishGroupFrame(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    wire: JByteArray,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        if parse_hex32(Some(group_id_hex.as_str())).is_err() {
+            return 0;
+        }
+        let wire = match env.convert_byte_array(&wire) {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        if publish_to_topic(group_topic(&group_id_hex), wire) {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Decrypt a wire envelope produced by `nativeEncryptMessage` (or

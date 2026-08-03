@@ -38,6 +38,7 @@ class ChatViewModel @Inject constructor(
     private val conversationRepository: ConversationRepository,
     private val groupRepository: com.qubee.messenger.data.repository.GroupRepository,
     private val qubeeManager: QubeeManager,
+    private val ratchetSender: com.qubee.messenger.crypto.RatchetSender,
 ) : ViewModel() {
 
     private val contactId: String = savedStateHandle["contactId"] ?: ""
@@ -141,10 +142,25 @@ class ChatViewModel @Inject constructor(
             // Encryption is cheap (sub-millisecond on modern
             // devices); the slight UI delay vs. saving a placeholder
             // SENDING row first is well under perceptual.
-            val encrypted = runCatching {
-                qubeeManager.encryptMessage(conversationId, payload)
+            //
+            // Flag-gated Stage 5 cutover: with `ratchetSendEnabled`
+            // on, outbound traffic uses the forward-secret wire
+            // formats and NEVER falls back to the legacy envelope —
+            // a failed v3 encrypt is a failed send (see
+            // RatchetSender for the downgrade-resistance rationale).
+            val isGroup = _uiState.value.isGroup
+            val wire = runCatching {
+                if (ratchetSender.enabled()) {
+                    if (isGroup) {
+                        ratchetSender.encryptGroupText(conversationId, selfSenderId, payload)
+                    } else {
+                        ratchetSender.encryptDirectText(contactId, payload)
+                    }
+                } else {
+                    qubeeManager.encryptMessage(conversationId, payload)?.toBytes()
+                }
             }.getOrNull()
-            if (encrypted == null) {
+            if (wire == null) {
                 // Persist a FAILED row so the UI still shows what
                 // the user typed and surfaces the error.
                 messageRepository.saveMessage(
@@ -161,18 +177,19 @@ class ChatViewModel @Inject constructor(
                 )
                 _events.emit(
                     ChatUiEvent.Notice(
-                        "Encrypt failed — peer may not have accepted the group invite yet",
+                        "Encrypt failed — peer may not have accepted the invite or shared keys yet",
                     ),
                 )
                 return@launch
             }
 
-            val wire = encrypted.toBytes()
-            // Best-effort id extraction. Null for non-group wires
-            // (none today, defensive); row persists without a
-            // wireId in that case, meaning future acks for it
-            // won't correlate, which is acceptable on a non-group
-            // path that can't fire acks anyway.
+            // Best-effort id extraction. Null for ratchet wires
+            // (QUBEE_DMS / v3 frames have no legacy envelope id) and
+            // defensive for anything else; the row persists without a
+            // wireId in that case, meaning acks won't correlate and
+            // the retry loop re-sends the identical frame until its
+            // budget runs out — replay-guarded receiver-side, and the
+            // documented gap until v3 grows its own ack.
             val wireId = qubeeManager.extractMessageId(wire)
 
             // Save the row with the wireId + retry payload already
@@ -207,8 +224,15 @@ class ChatViewModel @Inject constructor(
             // SENT here means "encrypted bytes left this device".
             // The DELIVERED transition lands later when the first
             // `MessageAck` arrives via `MessageService.onMessageAcked`.
+            // Ratchet group frames go on the group's own topic; the
+            // offline retry loop re-publishes on the global topic,
+            // which receivers also route (frames are self-describing).
             val sendOk = runCatching {
-                qubeeManager.sendP2PMessage(contactId, wire)
+                if (ratchetSender.enabled() && isGroup) {
+                    qubeeManager.publishGroupFrame(conversationId, wire)
+                } else {
+                    qubeeManager.sendP2PMessage(contactId, wire)
+                }
             }.getOrDefault(false)
             val newStatus = if (sendOk) MessageStatus.SENT else MessageStatus.FAILED
             messageRepository.updateMessageStatus(messageId, newStatus)

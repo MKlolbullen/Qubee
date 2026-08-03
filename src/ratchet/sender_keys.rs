@@ -440,6 +440,16 @@ fn take_message_key(state: &mut StoredRecvState, iteration: u32) -> Result<[u8; 
     Ok(mk)
 }
 
+/// Iteration of this device's own sender chain for `group`, or `None`
+/// when no chain exists yet (never sent, or wiped by
+/// [`reset_group_sender_state`]). The send orchestrator uses `0`/`None`
+/// as the "nobody holds my current chain" signal to trigger a
+/// distribution fan-out before the first frame — which also covers
+/// post-rekey redistribution, since a reset chain restarts at 0.
+pub fn own_chain_iteration(ks: &mut SecureKeyStore, group: &GroupId) -> Result<Option<u32>> {
+    Ok(load_own_state(ks, group)?.map(|s| s.iteration))
+}
+
 /// Wipe all sender-key state for a group (own chain + every installed
 /// peer chain). Call on membership change — a removed member holds
 /// everyone's chain keys, so all of them must be re-generated and
@@ -600,6 +610,22 @@ mod tests {
     #[test]
     fn v3_magic_is_pinned() {
         assert_eq!(MAGIC_GROUP_MESSAGE_V3, b"QUBEE_GMS\x03");
+    }
+
+    #[test]
+    fn own_chain_iteration_tracks_lifecycle() {
+        let mut a = Member::new(9);
+        let g = group();
+        assert_eq!(own_chain_iteration(&mut a.ks, &g).unwrap(), None);
+
+        create_or_get_own_sender_key(&mut a.ks, &g, a.id).unwrap();
+        assert_eq!(own_chain_iteration(&mut a.ks, &g).unwrap(), Some(0));
+
+        encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, b"x").unwrap();
+        assert_eq!(own_chain_iteration(&mut a.ks, &g).unwrap(), Some(1));
+
+        reset_group_sender_state(&mut a.ks, &g).unwrap();
+        assert_eq!(own_chain_iteration(&mut a.ks, &g).unwrap(), None);
     }
 
     #[test]

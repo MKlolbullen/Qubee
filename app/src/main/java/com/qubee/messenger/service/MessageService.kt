@@ -165,6 +165,15 @@ class MessageService : Service(), NetworkCallback {
                 qubeeManager.setNetworkCallback(this@MessageService)
                 if (qubeeManager.startNetworkNode()) {
                     Timber.d("P2P Network Node started successfully")
+                    // Announce our signed prekey bundle so peers can
+                    // open forward-secret sessions with us (Ratchet
+                    // Stage 5). Best-effort: peers who miss it get it
+                    // on our next service start; without it they
+                    // simply can't initiate v3 and their sends fail
+                    // closed on their side.
+                    if (!qubeeManager.publishLocalPrekeyBundle()) {
+                        Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
+                    }
                 } else {
                     Timber.e("Failed to start P2P Network Node")
                 }

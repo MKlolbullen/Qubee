@@ -1011,8 +1011,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
                 if sent {
                     delivered += 1;
                 } else {
-                    tracing::warn!(
-                        recipient = %recipient_hex,
+                    // Debug, not warn, and only a short prefix: a full
+                    // IdentityId at warn level lands in production log sinks
+                    // / crash reporters as a persistent per-user identifier
+                    // plus this group's membership. Matches the publisher-id
+                    // log elsewhere in this file.
+                    tracing::debug!(
+                        recipient = %&recipient_hex[..8.min(recipient_hex.len())],
                         "no direct route for KeyDelivery; recipient must re-sync via state-sync",
                     );
                     unresolved += 1;

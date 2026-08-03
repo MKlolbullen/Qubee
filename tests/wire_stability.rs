@@ -178,6 +178,25 @@ fn canonical_key_rotation_announce_starts_with_versioned_tag() {
     };
     let canonical = canonical_key_rotation_announce(&body);
     assert!(canonical.starts_with(b"qubee_handshake_key_rotation_announce_v1"));
+
+    // Pin the full byte layout, not just the tag — a reordered field or a
+    // dropped separator is a silent wire-format change on a signed payload.
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_key_rotation_announce_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(&1u64.to_le_bytes()); // generation
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // rotator_id
+    expected.push(0);
+    expected.extend_from_slice(&[1u8; 32]); // removed_member_id
+    expected.push(0);
+    expected.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    assert_eq!(
+        canonical, expected,
+        "canonical KeyRotationAnnounce bytes changed"
+    );
 }
 
 #[test]
@@ -197,6 +216,26 @@ fn canonical_key_delivery_starts_with_versioned_tag() {
     };
     let canonical = canonical_key_delivery(&body);
     assert!(canonical.starts_with(b"qubee_handshake_key_delivery_v1"));
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_key_delivery_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(&1u64.to_le_bytes()); // generation
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // rotator_id
+    expected.push(0);
+    expected.push(0); // removed_member_id == None
+    expected.push(0);
+    expected.extend_from_slice(&[2u8; 32]); // recipient_id
+    expected.push(0);
+    expected.extend_from_slice(&0u32.to_le_bytes()); // kem_ciphertext len
+    expected.extend_from_slice(&[0u8; 12]); // nonce
+    expected.extend_from_slice(&0u32.to_le_bytes()); // wrapped_key len
+    expected.push(0);
+    expected.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    assert_eq!(canonical, expected, "canonical KeyDelivery bytes changed");
 }
 
 #[test]

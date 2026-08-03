@@ -891,7 +891,7 @@ pub fn plan_key_rotation_split(
     }
 
     let recipients = gm.rotate_group_key_after_removal(group_id, rotator_id)?;
-    let new_key = gm
+    let mut new_key = gm
         .export_group_key(&group_id)
         .ok_or_else(|| anyhow!("group key vanished after rotation"))?;
     let generation = gm.get_group(&group_id).map(|g| g.version).unwrap_or(0);
@@ -930,6 +930,9 @@ pub fn plan_key_rotation_split(
         deliveries.push((recipient_id, frame));
     }
 
+    // The plaintext group key has been wrapped to every recipient; wipe
+    // our stack copy (each wrapped blob keeps its own encrypted copy).
+    new_key.zeroize();
     Ok((announce, deliveries))
 }
 
@@ -977,15 +980,15 @@ pub fn process_key_rotation_announce(
         // We're the one removed. Wipe our long-lived Kyber secret so the
         // kicked-out copy can't decapsulate any future rotations.
         let _ = gm.wipe_my_kyber_secret(body.group_id);
-    } else {
-        // Converge our roster: drop the removed member locally.
-        let _ = gm.remove_member(
-            body.group_id,
-            body.rotator_id,
-            body.removed_member_id,
-            "rotation".to_string(),
-        );
     }
+    // For everyone *else* the announce is a no-op: a remaining member
+    // converges its roster from its own KeyDelivery (which carries
+    // removed_member_id). We must NOT call remove_member here — that bumps
+    // group.version up to the rotation generation, and the KeyDelivery's
+    // strict `generation > version` gate would then reject the delivery
+    // for any member who processed the broadcast announce before their
+    // direct delivery arrived. Generation only ever advances in
+    // process_key_delivery, atomically with installing the key.
     Ok(())
 }
 

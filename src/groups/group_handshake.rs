@@ -443,18 +443,6 @@ pub enum GroupHandshake {
         body: KeyRotationBody,
         signature: HybridSignature,
     },
-    /// Broadcast half of a split rotation (removal notice for the
-    /// removed member; see [`KeyRotationAnnounceBody`]).
-    KeyRotationAnnounce {
-        body: KeyRotationAnnounceBody,
-        signature: HybridSignature,
-    },
-    /// Directed half of a split rotation (one recipient's wrapped key;
-    /// see [`KeyDeliveryBody`]). Delivered off-topic, one per member.
-    KeyDelivery {
-        body: KeyDeliveryBody,
-        signature: HybridSignature,
-    },
     MemberAdded {
         body: MemberAddedBody,
         signature: HybridSignature,
@@ -486,6 +474,22 @@ pub enum GroupHandshake {
     /// Not consumed by send/receive yet.
     PrekeyBundle {
         body: PrekeyBundleBody,
+        signature: HybridSignature,
+    },
+    // NOTE: `to_wire` bincodes this enum, which tags variants by their
+    // *position*. New variants MUST be appended here (never inserted
+    // mid-enum) or every later variant's wire tag shifts and old peers
+    // misdecode existing frames.
+    /// Broadcast half of a split rotation (removal notice for the removed
+    /// member; see [`KeyRotationAnnounceBody`]).
+    KeyRotationAnnounce {
+        body: KeyRotationAnnounceBody,
+        signature: HybridSignature,
+    },
+    /// Directed half of a split rotation (one recipient's wrapped key;
+    /// see [`KeyDeliveryBody`]). Delivered off-topic, one per member.
+    KeyDelivery {
+        body: KeyDeliveryBody,
         signature: HybridSignature,
     },
 }

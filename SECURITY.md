@@ -81,8 +81,7 @@ why.
   has its own backpressure knobs; Qubee doesn't add a second layer.
 - Issues that require a rooted device with physical access *and* an
   unlocked screen. The threat model assumes a locked device; an
-  attacker with full physical access has already won (see
-  `docs/security/threat-model.md` once published).
+  attacker with full physical access has already won.
 - Bugs in the `legacy` feature-gated modules (`hybrid_ratchet`,
   `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
   These are documented as broken in `docs/build-status.md`; they're
@@ -97,23 +96,32 @@ why.
 These are known and are not vulnerabilities — they're the shape of
 the pre-alpha:
 
-- **No forward secrecy or post-compromise security at the message
-  layer (yet).** Group and 1:1 messaging use a single per-group
-  symmetric key, rotated only on membership change (or a proactive
-  rotation). Compromise of a member's device therefore exposes the
-  group's message history back to the last key rotation. A hybrid
-  Double Ratchet (1:1) + sender keys (groups) is designed in
-  `docs/double-ratchet-design.md` and is the highest-priority
-  cryptographic work; until it lands, treat message confidentiality
-  as "secure against a network adversary, not against later device
-  compromise."
-- **Messages are cryptographically non-repudiable, by design.** Every
-  wire frame carries a hybrid Ed25519 + ML-DSA-44 signature over the
-  long-term identity keys, so a recipient (or anyone who captures the
-  frame + the signer's public key) can *prove* who authored it. This
-  is the opposite of Signal's deniability-by-MAC, and is a deliberate
-  choice for the research/evidence use case. If you need deniability,
-  Qubee is not currently the right tool.
+- **No forward secrecy or post-compromise security on the live
+  message path (yet).** The *live* group and 1:1 send path still uses a
+  single per-group symmetric key, rotated only on membership change (or
+  a proactive rotation). Compromise of a member's device therefore
+  exposes the group's message history back to the last key rotation.
+  The hybrid Double Ratchet (1:1) + sender keys (groups) that closes
+  this gap is **implemented, tested, and dark-launched** (see
+  `docs/double-ratchet-design.md`, Stages 1–5): the receive path
+  already understands `QUBEE_DMS` / `QUBEE_GMS\x03` frames, and the
+  send path is gated behind `PreferenceRepository.ratchetSendEnabled`
+  (default off) pending the two-device validation checklist. This is
+  the highest-priority cryptographic work; until the send cutover
+  ships, treat live message confidentiality as "secure against a
+  network adversary, not against later device compromise."
+- **Messages on the live (v2) path are cryptographically
+  non-repudiable.** Every current wire frame carries a hybrid
+  Ed25519 + ML-DSA-44 signature over the long-term identity keys, so a
+  recipient (or anyone who captures the frame + the signer's public
+  key) can *prove* who authored it — the opposite of Signal's
+  deniability-by-MAC. **This is being reversed.** The locked decision
+  (see `docs/double-ratchet-design.md`) moves Qubee to the
+  full-deniability model: per-message identity signatures are removed
+  and messages are authenticated only by the AEAD/MAC under the ratchet
+  keys, matching Signal / SimpleX / Session. Identity keys will sign
+  only the prekey bundle, never messages. Until the ratchet send path
+  is cut over, treat live messages as non-repudiable.
 - **Network metadata / IP exposure.** The libp2p transport uses direct
   TCP (+ Noise), so every peer you connect to or gossip with learns
   your IP address. There is no onion routing or mixnet. Traffic
@@ -201,10 +209,10 @@ them through the same channel as a vulnerability.
 |-----------|-------|----------|
 | ML-KEM-768 (FIPS 203) | `pqcrypto-mlkem` 0.1 | <https://github.com/rustpq/pqcrypto> |
 | ML-DSA-44 (FIPS 204) | `pqcrypto-mldsa` 0.1 | <https://github.com/rustpq/pqcrypto> |
-| Ed25519 | `ed25519-dalek` 2.1 | <https://github.com/dalek-cryptography/ed25519-dalek> |
+| Ed25519 | `ed25519-dalek` 2.2 | <https://github.com/dalek-cryptography/ed25519-dalek> |
 | X25519 | `x25519-dalek` 2.0 | <https://github.com/dalek-cryptography/curve25519-dalek> |
 | ChaCha20-Poly1305 | `chacha20poly1305` 0.10 | <https://github.com/RustCrypto/AEADs> |
-| BLAKE3 | `blake3` 1.4 | <https://github.com/BLAKE3-team/BLAKE3> |
+| BLAKE3 | `blake3` 1.8 | <https://github.com/BLAKE3-team/BLAKE3> |
 | HKDF / SHA-2 | `hkdf` 0.12 / `sha2` 0.10 | <https://github.com/RustCrypto/KDFs> |
 
 Cargo.lock is committed; CI runs `cargo audit` on every PR plus a

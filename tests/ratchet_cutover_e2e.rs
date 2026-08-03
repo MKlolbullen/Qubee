@@ -1,0 +1,295 @@
+//! Rust-level rehearsal of the two-device cutover checklist
+//! (`docs/two-device-walkthrough.md`) for the ratchet send path, over
+//! exactly the public API the JNI bridge calls. The send flip
+//! (`ratchetSendEnabled`) is gated on device validation; this file
+//! proves the full multi-member choreography — distribution fan-out,
+//! mesh messaging, removal rekey, late join, restart — so the only
+//! thing left for the devices to validate is transport.
+
+use qubee_crypto::groups::group_handshake::sign_prekey_bundle;
+use qubee_crypto::groups::group_manager::GroupId;
+use qubee_crypto::identity::identity_key::{IdentityId, IdentityKeyPair};
+use qubee_crypto::ratchet::direct::{
+    decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text, install_peer_bundle,
+    DirectPayload,
+};
+use qubee_crypto::ratchet::prekey_store::{build_body, get_or_create_local_bundle};
+use qubee_crypto::ratchet::sender_keys::{
+    create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
+    install_sender_key, reset_group_sender_state,
+};
+use qubee_crypto::storage::secure_keystore::SecureKeyStore;
+use tempfile::TempDir;
+
+const PASSPHRASE: &[u8] = b"cutover-rehearsal";
+
+struct Device {
+    ks: SecureKeyStore,
+    kp: IdentityKeyPair,
+    dir: TempDir,
+}
+
+impl Device {
+    fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let ks = SecureKeyStore::new(dir.path().join("ks.db"), PASSPHRASE).unwrap();
+        Device {
+            ks,
+            kp: IdentityKeyPair::generate().unwrap(),
+            dir,
+        }
+    }
+
+    fn id(&self) -> IdentityId {
+        self.kp.identity_id()
+    }
+
+    fn signed_bundle_wire(&mut self, now: u64) -> Vec<u8> {
+        let (secret, kem_pub) = get_or_create_local_bundle(&mut self.ks, now).unwrap();
+        let body = build_body(&secret, &kem_pub, self.kp.public_key(), now);
+        sign_prekey_bundle(&self.kp, body)
+            .unwrap()
+            .to_wire()
+            .unwrap()
+    }
+
+    /// App restart: reopen the keystore from disk. Identity and every
+    /// session / chain must come back from persistence alone.
+    fn restart(&mut self) {
+        self.ks = SecureKeyStore::new(self.dir.path().join("ks.db"), PASSPHRASE).unwrap();
+    }
+}
+
+fn pair(a: &mut Device, b: &mut Device, now: u64) {
+    let (aw, bw) = (a.signed_bundle_wire(now), b.signed_bundle_wire(now));
+    assert_eq!(install_peer_bundle(&mut a.ks, &bw).unwrap(), b.id());
+    assert_eq!(install_peer_bundle(&mut b.ks, &aw).unwrap(), a.id());
+}
+
+/// The rekey fan-out leg the Kotlin flip must implement: sender key
+/// travels only over the established 1:1 ratchet session, and the
+/// receiver installs it under the channel-authenticated identity.
+fn distribute(from: &mut Device, to: &mut Device, group: &GroupId, now: u64) {
+    let (from_id, to_id) = (from.id(), to.id());
+    let dist = create_or_get_own_sender_key(&mut from.ks, group, from_id).unwrap();
+    let wire = encrypt_direct_distribution(&mut from.ks, from_id, to_id, &dist, now).unwrap();
+    let (sender, payload) = decrypt_direct_payload(&mut to.ks, to_id, &wire, now).unwrap();
+    assert_eq!(sender, from_id);
+    match payload {
+        DirectPayload::SenderKeyDistribution(d) => {
+            install_sender_key(&mut to.ks, sender, &d).unwrap()
+        }
+        other => panic!("expected distribution, got {other:?}"),
+    }
+}
+
+/// Pairwise sessions + full sender-key mesh. Within each pair the
+/// lower-index device initiates first so the responder reuses that
+/// session instead of racing a simultaneous open.
+fn mesh(devices: &mut [Device], group: &GroupId, now: u64) {
+    for i in 0..devices.len() {
+        for j in (i + 1)..devices.len() {
+            let (left, right) = devices.split_at_mut(j);
+            pair(&mut left[i], &mut right[0], now);
+            distribute(&mut left[i], &mut right[0], group, now);
+            distribute(&mut right[0], &mut left[i], group, now);
+        }
+    }
+}
+
+fn send(dev: &mut Device, group: &GroupId, group_key: &[u8; 32], text: &[u8]) -> Vec<u8> {
+    let id = dev.id();
+    encrypt_sender_key_message(&mut dev.ks, group, group_key, id, text).unwrap()
+}
+
+fn recv(dev: &mut Device, group_key: &[u8; 32], wire: &[u8]) -> (IdentityId, Vec<u8>) {
+    let (_, sender, pt) = decrypt_sender_key_message(&mut dev.ks, group_key, wire).unwrap();
+    (sender, pt)
+}
+
+#[test]
+fn three_member_mesh_full_choreography() {
+    let mut devs = [Device::new(), Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0xA1; 32]);
+    let group_key = [0x11u8; 32];
+    mesh(&mut devs, &group, 1);
+
+    for s in 0..devs.len() {
+        let wire = send(
+            &mut devs[s],
+            &group,
+            &group_key,
+            format!("from {s}").as_bytes(),
+        );
+        for r in 0..devs.len() {
+            if r == s {
+                // No recv chain for self — the app keeps the local
+                // plaintext; it never round-trips its own frames.
+                assert!(decrypt_sender_key_message(&mut devs[r].ks, &group_key, &wire).is_err());
+                continue;
+            }
+            let sender_id = devs[s].id();
+            let (from, pt) = recv(&mut devs[r], &group_key, &wire);
+            assert_eq!((from, pt), (sender_id, format!("from {s}").into_bytes()));
+            // Forward secrecy at the state level: the consumed message
+            // key is gone, so the captured frame is dead on replay.
+            let err = decrypt_sender_key_message(&mut devs[r].ks, &group_key, &wire).unwrap_err();
+            assert!(err.to_string().contains("consumed"), "{err}");
+        }
+    }
+}
+
+#[test]
+fn removal_rekey_locks_out_removed_member() {
+    let mut devs = [Device::new(), Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0xB2; 32]);
+    let old_key = [0x11u8; 32];
+    mesh(&mut devs, &group, 1);
+
+    let w = send(&mut devs[0], &group, &old_key, b"before removal");
+    recv(&mut devs[1], &old_key, &w);
+    recv(&mut devs[2], &old_key, &w);
+
+    // Carol (index 2) is removed. The v2 rotation delivers a fresh
+    // group key to the remaining members; each wipes every chain for
+    // the group and redistributes over the surviving 1:1 sessions.
+    let new_key = [0x22u8; 32];
+    assert!(reset_group_sender_state(&mut devs[0].ks, &group).unwrap() >= 1);
+    assert!(reset_group_sender_state(&mut devs[1].ks, &group).unwrap() >= 1);
+    {
+        let (left, right) = devs.split_at_mut(1);
+        distribute(&mut left[0], &mut right[0], &group, 2);
+        distribute(&mut right[0], &mut left[0], &group, 2);
+    }
+
+    let w = send(&mut devs[0], &group, &new_key, b"after removal");
+    let (from, pt) = recv(&mut devs[1], &new_key, &w);
+    assert_eq!(
+        (from, pt.as_slice()),
+        (devs[0].id(), b"after removal".as_slice())
+    );
+
+    // Carol never received the rotated group key: the outer envelope
+    // fails before anything else runs.
+    assert!(decrypt_sender_key_message(&mut devs[2].ks, &old_key, &w).is_err());
+
+    // Even if the new group key leaks to her, Alice's fresh chain does
+    // not match the stale distribution Carol still holds.
+    assert!(decrypt_sender_key_message(&mut devs[2].ks, &new_key, &w).is_err());
+
+    // Carol's own sends are equally dead: under the old key the outer
+    // AEAD fails, and under a leaked new key the remaining members
+    // wiped her chain, so there is nothing to verify against.
+    let stale = send(&mut devs[2], &group, &old_key, b"i am still here");
+    assert!(decrypt_sender_key_message(&mut devs[0].ks, &new_key, &stale).is_err());
+    let leaked = send(&mut devs[2], &group, &new_key, b"with the new key");
+    let err = decrypt_sender_key_message(&mut devs[0].ks, &new_key, &leaked).unwrap_err();
+    assert!(err.to_string().contains("no sender key"), "{err}");
+}
+
+#[test]
+fn late_joiner_reads_forward_never_backward() {
+    let mut devs = [Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0xC3; 32]);
+    let group_key = [0x11u8; 32];
+    mesh(&mut devs, &group, 1);
+
+    let mut history = Vec::new();
+    for i in 0..3u8 {
+        let w = send(&mut devs[0], &group, &group_key, &[i]);
+        recv(&mut devs[1], &group_key, &w);
+        history.push(w);
+    }
+
+    // Dave joins. His distributions from the existing members start at
+    // their *current* iterations — the chain never runs backward.
+    let alice_id = devs[0].id();
+    let mut dave = Device::new();
+    let dave_id = dave.id();
+    for existing in devs.iter_mut() {
+        pair(existing, &mut dave, 2);
+        let existing_id = existing.id();
+        let dist = create_or_get_own_sender_key(&mut existing.ks, &group, existing_id).unwrap();
+        if dist.sender_id == alice_id {
+            assert!(dist.iteration > 0, "history must have advanced the chain");
+        }
+        let wire =
+            encrypt_direct_distribution(&mut existing.ks, existing_id, dave_id, &dist, 2).unwrap();
+        let (sender, payload) = decrypt_direct_payload(&mut dave.ks, dave_id, &wire, 2).unwrap();
+        match payload {
+            DirectPayload::SenderKeyDistribution(d) => {
+                install_sender_key(&mut dave.ks, sender, &d).unwrap()
+            }
+            other => panic!("expected distribution, got {other:?}"),
+        }
+        distribute(&mut dave, existing, &group, 2);
+    }
+
+    let w = send(&mut devs[0], &group, &group_key, b"welcome dave");
+    let (from, pt) = recv(&mut dave, &group_key, &w);
+    assert_eq!(
+        (from, pt.as_slice()),
+        (devs[0].id(), b"welcome dave".as_slice())
+    );
+
+    for old in &history {
+        let err = decrypt_sender_key_message(&mut dave.ks, &group_key, old).unwrap_err();
+        assert!(err.to_string().contains("consumed"), "{err}");
+    }
+}
+
+#[test]
+fn state_survives_restart_mid_conversation() {
+    let mut devs = [Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0xD4; 32]);
+    let group_key = [0x11u8; 32];
+    mesh(&mut devs, &group, 1);
+
+    let f1 = send(&mut devs[0], &group, &group_key, b"before restart");
+    recv(&mut devs[1], &group_key, &f1);
+
+    devs[0].restart();
+    devs[1].restart();
+
+    // Consumed keys stay consumed across the restart — a captured
+    // frame must not become decryptable again by rebooting.
+    assert!(decrypt_sender_key_message(&mut devs[1].ks, &group_key, &f1).is_err());
+
+    // Chains continue where they left off, in both directions, with no
+    // re-pairing and no redistribution.
+    let f2 = send(&mut devs[1], &group, &group_key, b"b after restart");
+    assert_eq!(
+        recv(&mut devs[0], &group_key, &f2).1,
+        b"b after restart".to_vec()
+    );
+    let f3 = send(&mut devs[0], &group, &group_key, b"a after restart");
+    assert_eq!(
+        recv(&mut devs[1], &group_key, &f3).1,
+        b"a after restart".to_vec()
+    );
+}
+
+#[test]
+fn one_to_one_text_leg_survives_restart() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    pair(&mut a, &mut b, 1);
+    let (aid, bid) = (a.id(), b.id());
+
+    let w = encrypt_direct_text(&mut a.ks, aid, bid, "hello", 1).unwrap();
+    let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &w, 1).unwrap();
+    assert_eq!(
+        (sender, payload),
+        (aid, DirectPayload::Text("hello".into()))
+    );
+
+    a.restart();
+    b.restart();
+
+    let w = encrypt_direct_text(&mut b.ks, bid, aid, "still here", 2).unwrap();
+    let (sender, payload) = decrypt_direct_payload(&mut a.ks, aid, &w, 2).unwrap();
+    assert_eq!(
+        (sender, payload),
+        (bid, DirectPayload::Text("still here".into()))
+    );
+}

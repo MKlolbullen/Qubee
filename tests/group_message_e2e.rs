@@ -1792,3 +1792,132 @@ fn sealed_envelope_tampering_is_detected() {
         "outer AEAD must reject single-bit ciphertext tampering",
     );
 }
+
+// ---------------------------------------------------------------------
+// Phase 2 — split key rotation (announce broadcast + direct KeyDelivery)
+// ---------------------------------------------------------------------
+
+/// A removal rotation planned via `plan_key_rotation_split` must:
+///   * produce a broadcast `KeyRotationAnnounce` naming the removed
+///     member, and a direct `KeyDelivery` for each *remaining* member
+///     (never for the removed one — that's the metadata property);
+///   * let a remaining member converge on the new key + generation from
+///     their own `KeyDelivery` alone; and
+///   * leave the removed member on the old key after they process the
+///     announce (they get no delivery), so they can't read new traffic.
+#[test]
+fn split_rotation_delivers_direct_and_excludes_removed_member() {
+    use qubee_crypto::groups::group_handshake::GroupHandshake;
+    use qubee_crypto::groups::handshake_handlers::{
+        plan_key_rotation_split, process_key_delivery, process_key_rotation_announce,
+    };
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    let bob_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, bob_kp, mut bob_gm, _mb, _ms) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        bob_invite.invitation_code,
+        bob_invite.inviter_name,
+    );
+    let bob_id = bob_kp.identity_id();
+
+    let carol_invite = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_carol_dir, carol_kp, mut carol_gm, _mc, _mcs) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        carol_invite.invitation_code,
+        carol_invite.inviter_name,
+    );
+    let carol_id = carol_kp.identity_id();
+
+    let carol_pre_key = carol_gm.export_group_key(&group_id).unwrap();
+
+    // Alice removes Carol via the split rotation.
+    let (announce, deliveries) = plan_key_rotation_split(
+        &mut alice_gm,
+        &alice_kp,
+        group_id,
+        Some(carol_id),
+        "kick carol",
+    )
+    .expect("split rotation plans");
+
+    // An announce is produced (there was a removal), and no KeyDelivery
+    // targets the removed member.
+    assert!(
+        announce.is_some(),
+        "removal rotation must broadcast an announce"
+    );
+    assert!(
+        deliveries.iter().all(|(rid, _)| *rid != carol_id),
+        "the removed member must not receive a KeyDelivery",
+    );
+    let alice_new_key = alice_gm.export_group_key(&group_id).unwrap();
+    assert_ne!(
+        alice_new_key, carol_pre_key,
+        "Alice's key must have rotated"
+    );
+
+    // Bob converges from his own direct KeyDelivery alone.
+    let (_rid, bob_frame) = deliveries
+        .iter()
+        .find(|(rid, _)| *rid == bob_id)
+        .expect("Bob must have a KeyDelivery");
+    let (kd_body, kd_sig) = match bob_frame {
+        GroupHandshake::KeyDelivery { body, signature } => (body, signature),
+        _ => unreachable!("deliveries are KeyDelivery frames"),
+    };
+    process_key_delivery(&mut bob_gm, bob_id, kd_body, kd_sig)
+        .expect("Bob applies his KeyDelivery");
+    assert_eq!(
+        bob_gm.export_group_key(&group_id).unwrap(),
+        alice_new_key,
+        "Bob must converge on the rotated key from his direct delivery",
+    );
+
+    // Carol (removed) processes only the broadcast announce: she keeps
+    // the old key and never sees the new one.
+    let (an_body, an_sig) = match announce.unwrap() {
+        GroupHandshake::KeyRotationAnnounce { body, signature } => (body, signature),
+        _ => unreachable!("announce is a KeyRotationAnnounce"),
+    };
+    process_key_rotation_announce(&mut carol_gm, carol_id, &an_body, &an_sig)
+        .expect("Carol processes the removal announce");
+    assert_eq!(
+        carol_gm.export_group_key(&group_id).unwrap(),
+        carol_pre_key,
+        "removed member must not obtain the rotated key",
+    );
+
+    // End to end: Alice's new-key message decrypts for Bob, not Carol.
+    let wire =
+        encrypt_group_message(&alice_gm, &alice_kp, group_id, b"after split rotation").unwrap();
+    assert_eq!(
+        decrypt_group_message(&bob_gm, &wire).unwrap().plaintext,
+        b"after split rotation",
+    );
+    assert!(
+        decrypt_group_message(&carol_gm, &wire).is_err(),
+        "removed member must not decrypt post-rotation traffic",
+    );
+}

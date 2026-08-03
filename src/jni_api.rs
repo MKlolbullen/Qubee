@@ -26,8 +26,8 @@ use crate::groups::group_message::{
 };
 use crate::groups::group_permissions::Role;
 use crate::groups::handshake_handlers::{
-    plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
-    HandshakeOutcome,
+    plan_key_rotation_split, process_join_accepted, process_key_delivery, process_key_rotation,
+    process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
@@ -111,6 +111,15 @@ lazy_static! {
     /// at REPLAY_CACHE_CAP.
     static ref SEEN_MESSAGE_IDS: Mutex<ReplayCache> =
         Mutex::new((std::collections::HashSet::new(), std::collections::VecDeque::new()));
+
+    /// TOFU directory mapping a peer's `IdentityId` (hex) to the libp2p
+    /// PeerId (string) we last saw deliver an authenticated frame from
+    /// them. Populated on every inbound handshake (same signal as
+    /// `onPeerLinked`) and read by the split key-rotation fan-out to
+    /// address each recipient's `KeyDelivery` directly. Best-effort: a
+    /// miss means we can't direct-deliver to that member, and they
+    /// re-sync the key via `StateSyncResponse` instead.
+    static ref PEER_DIRECTORY: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
 }
 
 /// Max entries retained in [`SEEN_MESSAGE_IDS`]. Bounds memory; oldest
@@ -951,12 +960,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
             let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
             let member_id = IdentityId::from(parse_hex32(Some(member_id_hex.as_str()))?);
 
-            let signed = {
+            let (announce, deliveries) = {
                 let mut gm_guard = GROUP_MANAGER.lock().unwrap();
                 let gm = gm_guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                plan_key_rotation(gm, identity.as_ref(), group_id, Some(member_id), &reason)?
+                plan_key_rotation_split(gm, identity.as_ref(), group_id, Some(member_id), &reason)?
             };
 
             // The removed member holds every member's Stage 4 sender
@@ -970,20 +979,54 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRemove
                 reset_group_sender_state(ks, &group_id)?;
             }
 
-            let generation = match &signed {
-                GroupHandshake::KeyRotation { body, .. } => body.generation,
-                _ => 0,
+            let generation = {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                gm_guard
+                    .as_ref()
+                    .and_then(|gm| gm.get_group(&group_id))
+                    .map(|g| g.version)
+                    .unwrap_or(0)
             };
 
+            // Broadcast the announce (the removed member's only signal —
+            // they get no direct KeyDelivery), then fan out each remaining
+            // member's wrapped key direct so the recipient set never hits
+            // the topic. Fail-closed: a recipient whose PeerId we can't
+            // resolve re-syncs the key via StateSyncResponse rather than
+            // us broadcasting their delivery.
             let topic = group_topic(&hex::encode(group_id.as_ref()));
-            let wire = signed.to_wire()?;
-            let published = publish_to_topic(topic, wire);
+            let mut announced = false;
+            if let Some(frame) = announce {
+                announced = publish_to_topic(topic, frame.to_wire()?);
+            }
+
+            let mut delivered = 0usize;
+            let mut unresolved = 0usize;
+            for (recipient_id, frame) in deliveries {
+                let recipient_hex = hex::encode(recipient_id.as_ref());
+                let sent = match resolve_peer_id(&recipient_hex) {
+                    Some(peer_id) => send_direct(peer_id, frame.to_wire()?),
+                    None => false,
+                };
+                if sent {
+                    delivered += 1;
+                } else {
+                    tracing::warn!(
+                        recipient = %recipient_hex,
+                        "no direct route for KeyDelivery; recipient must re-sync via state-sync",
+                    );
+                    unresolved += 1;
+                }
+            }
 
             Ok(json!({
                 "group_id_hex": hex::encode(group_id.as_ref()),
                 "removed_member_hex": hex::encode(member_id.as_ref()),
                 "generation": generation,
-                "network_published": published,
+                "network_published": announced || delivered > 0,
+                "announced": announced,
+                "delivered": delivered,
+                "unresolved": unresolved,
             }))
         })();
 
@@ -1422,8 +1465,23 @@ fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
         return;
     }
     if let Some(identity_hex) = extracted_identity {
+        // Record the IdentityId -> PeerId mapping so the split
+        // key-rotation fan-out can address this member's KeyDelivery
+        // directly later. Same TOFU signal as the onPeerLinked dispatch.
+        PEER_DIRECTORY
+            .lock()
+            .unwrap()
+            .insert(identity_hex.clone(), sender_peer_id.clone());
         dispatch_peer_linked(sender_peer_id, identity_hex);
     }
+}
+
+/// Resolve a member's `IdentityId` (hex) to a known PeerId for direct
+/// delivery. `None` when we've never seen an authenticated frame from
+/// them — the caller must fail closed (the member re-syncs via
+/// StateSyncResponse) rather than broadcast a directed frame.
+fn resolve_peer_id(identity_hex: &str) -> Option<String> {
+    PEER_DIRECTORY.lock().unwrap().get(identity_hex).cloned()
 }
 
 /// Pull the sender's `IdentityId` out of a handshake frame, hex-
@@ -1437,6 +1495,8 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
     let id: IdentityId = match frame {
         GroupHandshake::RequestJoin { body, .. } => body.joiner_public_key.identity_id,
         GroupHandshake::KeyRotation { body, .. } => body.rotator_id,
+        GroupHandshake::KeyRotationAnnounce { body, .. } => body.rotator_id,
+        GroupHandshake::KeyDelivery { body, .. } => body.rotator_id,
         GroupHandshake::MemberAdded { body, .. } => body.adder_id,
         GroupHandshake::RoleChange { body, .. } => body.promoter_id,
         GroupHandshake::OwnershipTransfer { body, .. } => body.donor_id,
@@ -1518,6 +1578,12 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
         }
         GroupHandshake::KeyRotation { body, signature } => {
             on_key_rotation(body, signature)?;
+        }
+        GroupHandshake::KeyRotationAnnounce { body, signature } => {
+            on_key_rotation_announce(body, signature)?;
+        }
+        GroupHandshake::KeyDelivery { body, signature } => {
+            on_key_delivery(body, signature)?;
         }
         GroupHandshake::MemberAdded { body, signature } => {
             // Existing-member side handler for inviter-broadcast
@@ -1663,6 +1729,54 @@ fn on_key_rotation(
     // on fresh ones (a removed member holds the old chain keys). Only
     // after a *successful* process — a forged rotation frame must not
     // be able to trigger rekey churn.
+    let mut ks_guard = KEYSTORE.lock().unwrap();
+    let ks = ks_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+    reset_group_sender_state(ks, &body.group_id)?;
+    Ok(())
+}
+
+/// Receive-side handler for a broadcast `KeyRotationAnnounce`. Applies
+/// the removal / self-removal (never a key install — that's the
+/// KeyDelivery's job). We skip our own broadcast.
+fn on_key_rotation_announce(
+    body: crate::groups::group_handshake::KeyRotationAnnounceBody,
+    signature: crate::identity::identity_key::HybridSignature,
+) -> anyhow::Result<()> {
+    let identity =
+        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    if body.rotator_id == identity.identity_id() {
+        return Ok(());
+    }
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = gm_guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+    process_key_rotation_announce(gm, identity.identity_id(), &body, &signature)
+}
+
+/// Receive-side handler for a directed `KeyDelivery`. Installs the new
+/// key + adopts the generation (via the handler), then — as with
+/// `on_key_rotation` — resets our Stage 4 sender chains, since an
+/// authenticated rotation means the membership changed.
+fn on_key_delivery(
+    body: crate::groups::group_handshake::KeyDeliveryBody,
+    signature: crate::identity::identity_key::HybridSignature,
+) -> anyhow::Result<()> {
+    let identity =
+        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    // Our own rotation, or a delivery not addressed to us: ignore.
+    if body.rotator_id == identity.identity_id() || body.recipient_id != identity.identity_id() {
+        return Ok(());
+    }
+    {
+        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+        let gm = gm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+        process_key_delivery(gm, identity.identity_id(), &body, &signature)?;
+    }
     let mut ks_guard = KEYSTORE.lock().unwrap();
     let ks = ks_guard
         .as_mut()

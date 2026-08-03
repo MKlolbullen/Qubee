@@ -1878,7 +1878,19 @@ fn split_rotation_delivers_direct_and_excludes_removed_member() {
         "Alice's key must have rotated"
     );
 
-    // Bob converges from his own direct KeyDelivery alone.
+    // The announce is broadcast, so both a remaining member and the
+    // removed member receive it. Destructure it once.
+    let (an_body, an_sig) = match announce.unwrap() {
+        GroupHandshake::KeyRotationAnnounce { body, signature } => (body, signature),
+        _ => unreachable!("announce is a KeyRotationAnnounce"),
+    };
+
+    // Bob is a remaining member. In production the gossipsub announce
+    // reaches him *before* his direct KeyDelivery, so exercise that order:
+    // processing the announce must NOT advance his generation, or the
+    // delivery's strict `generation > version` gate would reject it.
+    process_key_rotation_announce(&mut bob_gm, bob_id, &an_body, &an_sig)
+        .expect("Bob processes the broadcast announce");
     let (_rid, bob_frame) = deliveries
         .iter()
         .find(|(rid, _)| *rid == bob_id)
@@ -1888,19 +1900,15 @@ fn split_rotation_delivers_direct_and_excludes_removed_member() {
         _ => unreachable!("deliveries are KeyDelivery frames"),
     };
     process_key_delivery(&mut bob_gm, bob_id, kd_body, kd_sig)
-        .expect("Bob applies his KeyDelivery");
+        .expect("Bob applies his KeyDelivery after the announce");
     assert_eq!(
         bob_gm.export_group_key(&group_id).unwrap(),
         alice_new_key,
-        "Bob must converge on the rotated key from his direct delivery",
+        "Bob must converge on the rotated key even when the announce arrived first",
     );
 
     // Carol (removed) processes only the broadcast announce: she keeps
     // the old key and never sees the new one.
-    let (an_body, an_sig) = match announce.unwrap() {
-        GroupHandshake::KeyRotationAnnounce { body, signature } => (body, signature),
-        _ => unreachable!("announce is a KeyRotationAnnounce"),
-    };
     process_key_rotation_announce(&mut carol_gm, carol_id, &an_body, &an_sig)
         .expect("Carol processes the removal announce");
     assert_eq!(

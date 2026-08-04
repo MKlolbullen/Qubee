@@ -61,6 +61,12 @@ class ChatViewModel @Inject constructor(
     // contact id in that window so the row still persists.
     private var selfSenderId: String? = null
 
+    // The peer's 64-char identity hex from the Contact row — NOT the
+    // same as `contactId`, which is a local random UUID primary key.
+    // The ratchet 1:1 path needs the identity hex; null (unknown
+    // contact / pre-handshake) fails the ratchet send closed.
+    private var peerIdentityIdHex: String? = null
+
     init {
         viewModelScope.launch {
             // Resolve the conversation row + contact metadata first
@@ -75,6 +81,7 @@ class ChatViewModel @Inject constructor(
             val isGroup =
                 conversation?.type == com.qubee.messenger.data.model.ConversationType.GROUP
             val contact = contactRepository.getContactById(contactId)
+            peerIdentityIdHex = contact?.identityId?.takeIf { it.isNotBlank() }
             val name = when {
                 isGroup -> conversation?.name?.takeIf { it.isNotBlank() } ?: "Group"
                 else -> contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
@@ -154,7 +161,7 @@ class ChatViewModel @Inject constructor(
                     if (isGroup) {
                         ratchetSender.encryptGroupText(conversationId, selfSenderId, payload)
                     } else {
-                        ratchetSender.encryptDirectText(contactId, payload)
+                        peerIdentityIdHex?.let { ratchetSender.encryptDirectText(it, payload) }
                     }
                 } else {
                     qubeeManager.encryptMessage(conversationId, payload)?.toBytes()

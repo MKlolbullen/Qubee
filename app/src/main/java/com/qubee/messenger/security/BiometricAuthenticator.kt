@@ -1,5 +1,7 @@
 package com.qubee.messenger.security
 
+import android.app.KeyguardManager
+import android.content.Context
 import android.os.Build
 import androidx.appcompat.app.AppCompatActivity
 import androidx.biometric.BiometricManager
@@ -24,8 +26,21 @@ class BiometricAuthenticator(private val activity: AppCompatActivity) {
     /** Whether the device can satisfy a biometric-or-credential prompt. */
     fun canAuthenticate(): Boolean {
         val manager = BiometricManager.from(activity)
-        return manager.canAuthenticate(allowedAuthenticators()) ==
-            BiometricManager.BIOMETRIC_SUCCESS
+        if (manager.canAuthenticate(allowedAuthenticators()) == BiometricManager.BIOMETRIC_SUCCESS) {
+            return true
+        }
+        // Pre-30 can't query DEVICE_CREDENTIAL through BiometricManager,
+        // and BIOMETRIC_STRONG alone reports non-success on a
+        // credential-only device (PIN/pattern/password, no biometric).
+        // Those devices CAN still authenticate via the credential
+        // prompt (setDeviceCredentialAllowed), so treat a secure
+        // keyguard as authenticatable — otherwise the caller would
+        // fail open and the lock would silently do nothing for them.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            val keyguard = activity.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+            return keyguard.isDeviceSecure
+        }
+        return false
     }
 
     /**

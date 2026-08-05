@@ -222,10 +222,6 @@ class MainActivity : AppCompatActivity() {
      */
     private fun setupLockOverlay() {
         lockOverlay = ComposeView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            )
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             setContent {
                 UnlockScreen(
@@ -234,28 +230,41 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
-        addContentView(
-            lockOverlay,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 appLockManager.locked.collect { locked ->
-                    lockOverlay.visibility = if (locked) View.VISIBLE else View.GONE
-                    if (locked) {
-                        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-                        showUnlockPrompt()
-                    } else {
-                        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-                        lockError = null
-                    }
+                    if (locked) showLockOverlay() else hideLockOverlay()
                 }
             }
         }
+    }
+
+    /**
+     * Attach the gate on top of the activity content (only while
+     * locked — we add/remove rather than toggle visibility so no
+     * dormant full-screen view lingers hidden in the hierarchy) and
+     * set `FLAG_SECURE` so the gate, not the conversations, is what
+     * the recents thumbnail captures.
+     */
+    private fun showLockOverlay() {
+        if (lockOverlay.parent == null) {
+            addContentView(
+                lockOverlay,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        showUnlockPrompt()
+    }
+
+    private fun hideLockOverlay() {
+        (lockOverlay.parent as? android.view.ViewGroup)?.removeView(lockOverlay)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        lockError = null
     }
 
     /**

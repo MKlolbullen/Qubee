@@ -34,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -203,17 +204,16 @@ private fun AppLockPanel(viewModel: SettingsViewModel) {
 @androidx.annotation.VisibleForTesting
 internal fun AppLockPanelBody(enabled: Boolean, onToggle: (Boolean) -> Unit) {
     QubeePanel {
-        QubeeStatusPill("SCREEN LOCK")
+        QubeeStatusPill(stringResource(R.string.app_lock_panel_status))
         Spacer(Modifier.height(14.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Require unlock", style = MaterialTheme.typography.titleLarge)
-                Spacer(Modifier.height(6.dp))
-                QubeeMutedText(
-                    "Ask for your fingerprint, face, or device PIN when Qubee " +
-                        "opens or returns from the background. Gates the app UI; " +
-                        "it does not yet encrypt the database under your unlock.",
+                Text(
+                    stringResource(R.string.app_lock_panel_title),
+                    style = MaterialTheme.typography.titleLarge,
                 )
+                Spacer(Modifier.height(6.dp))
+                QubeeMutedText(stringResource(R.string.app_lock_panel_body))
             }
             Spacer(Modifier.width(12.dp))
             Switch(

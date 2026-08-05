@@ -12,9 +12,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.qubee.messenger.R
 import com.qubee.messenger.ui.theme.QubeeHeroMark
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
@@ -49,11 +51,11 @@ fun UnlockScreen(
                 QubeeHeroMark()
                 Spacer(Modifier.height(24.dp))
 
-                QubeeStatusPill("DEVICE LOCKED")
+                QubeeStatusPill(stringResource(R.string.unlock_screen_status))
                 Spacer(Modifier.height(16.dp))
 
                 Text(
-                    "Qubee is locked",
+                    stringResource(R.string.unlock_screen_title),
                     color = QubeePalette.Text,
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Black,
@@ -61,7 +63,7 @@ fun UnlockScreen(
                 )
                 Spacer(Modifier.height(10.dp))
                 QubeeMutedText(
-                    "Verify with your fingerprint, face, or device PIN to open your conversations.",
+                    stringResource(R.string.unlock_screen_body),
                     modifier = Modifier.fillMaxWidth(),
                 )
 

@@ -39,8 +39,8 @@ use crate::ratchet::direct::{
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
-    install_sender_key, own_chain_iteration, peek_v3_group_id, reset_group_sender_state,
-    SenderKeyDistribution,
+    extract_v3_message_id, install_sender_key, own_chain_iteration, peek_v3_group_id,
+    reset_group_sender_state, SenderKeyDistribution,
 };
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
@@ -1224,6 +1224,99 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtrac
             Ok(java_str.into_raw())
         })();
         result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Extract the deterministic 16-byte id of a v3 sender-key group frame
+/// as a 32-char hex string, or `null` if the bytes aren't a v3 frame
+/// for a group we hold the key to. Mirrors [`nativeExtractMessageId`]
+/// for the v2 path: the sender stamps this on the outbound row so the
+/// receiver's `MessageAck` (carrying the same id) flips it to
+/// DELIVERED via `onMessageAcked`.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtractV3MessageId(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("convert_byte_array: {e}"))?;
+            let group_id = match peek_v3_group_id(&bytes) {
+                Some(g) => g,
+                None => return Ok(std::ptr::null_mut()),
+            };
+            let group_key = {
+                let gm_guard = GROUP_MANAGER.lock().unwrap();
+                let gm = gm_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                match gm.export_group_key(&group_id) {
+                    Some(k) => k,
+                    None => return Ok(std::ptr::null_mut()),
+                }
+            };
+            let id = match extract_v3_message_id(&group_key, &bytes) {
+                Some(id) => id,
+                None => return Ok(std::ptr::null_mut()),
+            };
+            let java_str = env
+                .new_string(hex::encode(id))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Sign and publish a `MessageAck` for a v3 group message id on the
+/// group's topic. Called by the receiver after a successful v3
+/// decrypt (the v2 path auto-acks Rust-side; v3 decrypts in Kotlin, so
+/// the ack is triggered from there). Reuses the same `MessageAck`
+/// frame the sender already validates via `process_message_ack`.
+/// Returns `false` on a bad id, missing identity, or transport down.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativePublishGroupMessageAck(
+    mut env: JNIEnv,
+    _class: JClass,
+    group_id_hex: JString,
+    message_id_hex: JString,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let group_id_hex: String = match env.get_string(&group_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let message_id_hex: String = match env.get_string(&message_id_hex) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let result: anyhow::Result<()> = (|| {
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let group_id = GroupId::from_bytes(parse_hex32(Some(group_id_hex.as_str()))?);
+            let id_bytes = hex::decode(message_id_hex.trim())
+                .map_err(|e| anyhow::anyhow!("bad message id hex: {e}"))?;
+            let message_id: [u8; 16] = id_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("message id must be 16 bytes"))?;
+            publish_message_ack(
+                identity.as_ref(),
+                group_id,
+                message_id,
+                identity.identity_id(),
+            )
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::debug!(error = ?e, "v3 message ack publish failed");
+                0
+            }
+        }
     })
 }
 

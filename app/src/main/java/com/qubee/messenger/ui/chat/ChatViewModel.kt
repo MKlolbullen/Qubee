@@ -190,14 +190,17 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
 
-            // Best-effort id extraction. Null for ratchet wires
-            // (QUBEE_DMS / v3 frames have no legacy envelope id) and
-            // defensive for anything else; the row persists without a
-            // wireId in that case, meaning acks won't correlate and
-            // the retry loop re-sends the identical frame until its
-            // budget runs out — replay-guarded receiver-side, and the
-            // documented gap until v3 grows its own ack.
-            val wireId = qubeeManager.extractMessageId(wire)
+            // Best-effort id extraction, so a delivery ack flips the
+            // row to DELIVERED. Group v3 (QUBEE_GMS\x03) frames now
+            // carry their own deterministic id; the v2 envelope path
+            // uses the legacy id. 1:1 QUBEE_DMS frames still have no
+            // ack channel and persist without a wireId (retry re-sends
+            // the same frame; replay-guarded receiver-side).
+            val wireId = if (ratchetSender.enabled() && isGroup) {
+                qubeeManager.extractV3MessageId(wire)
+            } else {
+                qubeeManager.extractMessageId(wire)
+            }
 
             // Save the row with the wireId + retry payload already
             // present. `wireBytes` lets `MessageService`'s background

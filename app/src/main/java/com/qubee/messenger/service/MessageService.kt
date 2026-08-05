@@ -548,12 +548,22 @@ class MessageService : Service(), NetworkCallback {
                 return true
             }
             val result = JSONObject(resultJson)
+            val groupIdHex = result.optString("groupId")
             persistInboundGroupMessage(
-                groupIdHex = result.optString("groupId"),
+                groupIdHex = groupIdHex,
                 senderIdHex = result.optString("senderId"),
                 content = result.optString("plaintext"),
                 timestampMillis = System.currentTimeMillis(),
             )
+            // Delivery ack: v2 auto-acks in Rust, but v3 decrypts here,
+            // so publish the signed MessageAck for this frame's id. The
+            // sender stamped the same id as the row's wireId, so its
+            // onMessageAcked → applyAck flips the row to DELIVERED.
+            // Best-effort: a dropped ack just leaves the sender at SENT.
+            val v3MessageId = qubeeManager.extractV3MessageId(data)
+            if (v3MessageId != null) {
+                qubeeManager.publishGroupMessageAck(groupIdHex, v3MessageId)
+            }
             return true
         }
 

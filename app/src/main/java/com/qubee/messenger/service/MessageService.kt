@@ -57,6 +57,7 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var messageRepository: MessageRepository
     @Inject lateinit var conversationRepository: ConversationRepository
     @Inject lateinit var contactRepository: ContactRepository
+    @Inject lateinit var ratchetSender: com.qubee.messenger.crypto.RatchetSender
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var isRunning = false
@@ -245,6 +246,13 @@ class MessageService : Service(), NetworkCallback {
     }
 
     private suspend fun runOfflineRetryTick() {
+        // Retry any sender-key distributions still owed to members we
+        // couldn't reach before (their prekey bundle may have since
+        // arrived). Cheap no-op when the ratchet flag is off or nothing
+        // is pending; a full bundle-install callback is a later refinement.
+        runCatching { ratchetSender.redeliverPending() }
+            .onFailure { Timber.w(it, "pending-distribution redelivery failed") }
+
         val now = System.currentTimeMillis()
         val due = messageRepository.dueForRetry(now, OFFLINE_RETRY_MAX_ATTEMPTS, RETRY_BATCH_LIMIT)
         if (due.isEmpty()) return

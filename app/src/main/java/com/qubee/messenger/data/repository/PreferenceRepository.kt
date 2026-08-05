@@ -146,6 +146,19 @@ class PreferenceRepository @Inject constructor(
         prefs.edit().putBoolean(KEY_APP_LOCK, enabled).apply()
     }
 
+    /**
+     * Persist the ratchet sender-key "pending distribution" map
+     * (groupIdHex → set of member identity hexes still owed the current
+     * chain) as JSON, so a process restart doesn't drop members who
+     * hadn't received their distribution yet. Rides the encrypted store
+     * like everything else here.
+     */
+    fun savePendingDistribution(json: String) {
+        prefs.edit().putString(KEY_PENDING_DIST, json).apply()
+    }
+
+    fun loadPendingDistribution(): String? = prefs.getString(KEY_PENDING_DIST, null)
+
     fun nickname(): String? = prefs.getString(KEY_NICKNAME, null)
     fun userId(): String? = prefs.getString(KEY_USER_ID, null)
     fun identityIdHex(): String? = prefs.getString(KEY_IDENTITY_ID, null)
@@ -199,6 +212,7 @@ class PreferenceRepository @Inject constructor(
         private const val KEY_ONBOARDED = "onboarded"
         private const val KEY_RATCHET_SEND = "ratchet_send_enabled"
         private const val KEY_APP_LOCK = "app_lock_enabled"
+        private const val KEY_PENDING_DIST = "ratchet_pending_distribution"
         private const val KEY_SECRET_PREFIX = "secret/"
     }
 }

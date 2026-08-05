@@ -208,7 +208,7 @@ private fun EmptyMembers() {
 }
 
 @Composable
-private fun MemberList(
+internal fun MemberList(
     members: List<GroupMemberInfo>,
     myIdentityIdHex: String?,
     canManage: Boolean,

@@ -142,7 +142,7 @@ private fun ContactsScreen(
 }
 
 @Composable
-private fun ContactsBody(
+internal fun ContactsBody(
     active: List<ContactSummaryUi>,
     blocked: List<ContactSummaryUi>,
     onContactClick: (ContactSummaryUi) -> Unit,
@@ -266,7 +266,7 @@ private fun LoadingContacts() {
 }
 
 @Composable
-private fun EmptyContacts(onAddContactClick: () -> Unit) {
+internal fun EmptyContacts(onAddContactClick: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.Center,

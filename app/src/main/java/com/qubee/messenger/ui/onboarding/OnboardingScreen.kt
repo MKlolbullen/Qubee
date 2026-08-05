@@ -96,7 +96,7 @@ fun OnboardingScreen(
 }
 
 @Composable
-private fun IdentityBootstrapView(
+internal fun IdentityBootstrapView(
     state: OnboardingState,
     nickname: String,
     onNicknameChange: (String) -> Unit,

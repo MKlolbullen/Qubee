@@ -180,7 +180,7 @@ private fun SettingsContent(
 }
 
 @Composable
-private fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
+internal fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,

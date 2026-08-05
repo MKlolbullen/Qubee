@@ -10,13 +10,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.Button
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -28,6 +30,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
@@ -36,6 +41,10 @@ import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.identity.IdentityBundle
+import com.qubee.messenger.ui.theme.QubeeMutedText
+import com.qubee.messenger.ui.theme.QubeePalette
+import com.qubee.messenger.ui.theme.QubeePrimaryButton
+import com.qubee.messenger.ui.theme.QubeeTheme
 import com.qubee.messenger.util.QrUtils
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -117,38 +126,80 @@ private fun AddContactScreen(
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top,
-    ) {
-        Text("Add contact", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(16.dp))
-
-        when {
-            state.isWorking -> CircularProgressIndicator()
-            state.error != null -> Text(state.error!!, color = MaterialTheme.colorScheme.error)
-            state.bundle != null -> {
-                val bundle = state.bundle!!
-                Text(bundle.displayName, style = MaterialTheme.typography.titleLarge)
-                Text("Fingerprint: ${bundle.fingerprint}")
+    // Flat Void ground rather than `QubeeScreen` — this surface sits
+    // in the same family as the verify screen, which drops the grid
+    // and radial wash so the scanned-identity payload is the only
+    // thing on the page.
+    QubeeTheme {
+        Surface(color = QubeePalette.Void, modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Top,
+            ) {
+                Text(
+                    "Add contact",
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.headlineSmall,
+                )
                 Spacer(Modifier.height(16.dp))
-                val link = bundle.shareLink
-                val bitmap = remember(link) { link?.let { QrUtils.encodeAsBitmap(it) } }
-                bitmap?.let {
-                    Image(
-                        bitmap = it.asImageBitmap(),
-                        contentDescription = "Identity QR",
-                        modifier = Modifier.size(200.dp),
+
+                when {
+                    state.isWorking -> CircularProgressIndicator(color = QubeePalette.Cyan)
+                    state.error != null -> Text(
+                        state.error!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                    state.bundle != null -> {
+                        val bundle = state.bundle!!
+                        Text(
+                            bundle.displayName,
+                            color = QubeePalette.Text,
+                            style = MaterialTheme.typography.titleLarge,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        QubeeMutedText("Fingerprint")
+                        Text(
+                            bundle.fingerprint,
+                            color = QubeePalette.Text,
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.height(16.dp))
+                        val link = bundle.shareLink
+                        val bitmap = remember(link) { link?.let { QrUtils.encodeAsBitmap(it) } }
+                        bitmap?.let {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = QubeePalette.Text,
+                            ) {
+                                Image(
+                                    bitmap = it.asImageBitmap(),
+                                    contentDescription = "Identity QR",
+                                    modifier = Modifier.padding(12.dp).size(200.dp),
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        QubeePrimaryButton(
+                            text = "Save contact",
+                            onClick = { /* hook into ContactRepository.addContact when wired */ },
+                        )
+                    }
+                    else -> Text(
+                        "Open a qubee://identity/... link to verify a contact.",
+                        color = QubeePalette.Text,
+                        style = MaterialTheme.typography.bodyLarge,
+                        textAlign = TextAlign.Center,
                     )
                 }
-                Spacer(Modifier.height(16.dp))
-                Button(
-                    onClick = { /* hook into ContactRepository.addContact when wired */ },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Save contact") }
             }
-            else -> Text("Open a qubee://identity/... link to verify a contact.")
         }
     }
 }

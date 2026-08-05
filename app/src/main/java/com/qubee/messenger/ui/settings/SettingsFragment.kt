@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.material3.AlertDialog
@@ -103,6 +105,10 @@ private fun SettingsContent(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
+                    // The identity panel alone runs past the viewport
+                    // once the 220dp share QR is in it — without this
+                    // the reset panel below is unreachable.
+                    .verticalScroll(rememberScrollState())
                     .padding(24.dp),
                 verticalArrangement = Arrangement.Top,
             ) {

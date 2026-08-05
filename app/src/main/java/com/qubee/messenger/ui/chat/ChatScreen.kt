@@ -170,7 +170,7 @@ fun ChatScreen(
                             verticalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
                             items(uiState.messages.reversed(), key = { it.id }) { msg ->
-                                MessageItem(msg)
+                                MessageItem(msg, isGroup = uiState.isGroup)
                             }
                         }
                     }
@@ -442,17 +442,38 @@ private fun EmptyChatState(contactName: String) {
 }
 
 @Composable
-private fun MessageItem(msg: UiMessage) {
+private fun MessageItem(msg: UiMessage, isGroup: Boolean) {
+    // Only incoming group messages get a sender line: a 1:1 chat
+    // already names the peer in the top bar, and our own bubbles
+    // sit on the other edge of the screen.
+    val showSender = isGroup && !msg.isFromMe && msg.senderName.isNotBlank()
     when (msg.type) {
-        UiMessageType.TEXT -> MessageBubble(msg)
-        UiMessageType.IMAGE -> MediaMessageCard(msg, Icons.Default.PhotoCamera, "Encrypted image")
-        UiMessageType.FILE -> MediaMessageCard(msg, Icons.Default.InsertDriveFile, "Encrypted file")
-        UiMessageType.AUDIO -> AudioMessageCard(msg)
+        UiMessageType.TEXT -> MessageBubble(msg, showSender)
+        UiMessageType.IMAGE -> MediaMessageCard(msg, Icons.Default.PhotoCamera, "Encrypted image", showSender)
+        UiMessageType.FILE -> MediaMessageCard(msg, Icons.Default.InsertDriveFile, "Encrypted file", showSender)
+        UiMessageType.AUDIO -> AudioMessageCard(msg, showSender)
     }
 }
 
+/**
+ * Attribution line above an incoming group message. Sits flush on
+ * top of the body text — no spacer — so the name reads as part of
+ * the bubble rather than a separate row.
+ */
 @Composable
-fun MessageBubble(msg: UiMessage) {
+private fun SenderLabel(name: String) {
+    Text(
+        text = name,
+        color = QubeePalette.Cyan,
+        style = MaterialTheme.typography.bodySmall,
+        fontWeight = FontWeight.Bold,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+@Composable
+fun MessageBubble(msg: UiMessage, showSender: Boolean = false) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
     val bubbleBrush = if (msg.isFromMe) {
         Brush.linearGradient(colors = listOf(QubeePalette.Cyan.copy(alpha = 0.26f), QubeePalette.Green.copy(alpha = 0.11f)))
@@ -479,6 +500,7 @@ fun MessageBubble(msg: UiMessage) {
                     .background(bubbleBrush)
                     .padding(start = 14.dp, end = 10.dp, top = 9.dp, bottom = 7.dp),
             ) {
+                if (showSender) SenderLabel(msg.senderName)
                 Text(text = msg.text, color = QubeePalette.Text, style = MaterialTheme.typography.bodyLarge)
                 Spacer(Modifier.height(6.dp))
                 MessageMeta(msg)
@@ -488,7 +510,7 @@ fun MessageBubble(msg: UiMessage) {
 }
 
 @Composable
-private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String) {
+private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String, showSender: Boolean = false) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
     Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
         Surface(
@@ -498,6 +520,10 @@ private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String) {
             border = BorderStroke(1.dp, QubeePalette.Cyan.copy(alpha = 0.22f)),
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
+                if (showSender) {
+                    SenderLabel(msg.senderName)
+                    Spacer(Modifier.height(6.dp))
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -523,7 +549,7 @@ private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String) {
 }
 
 @Composable
-private fun AudioMessageCard(msg: UiMessage) {
+private fun AudioMessageCard(msg: UiMessage, showSender: Boolean = false) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
     Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
         Surface(
@@ -533,6 +559,10 @@ private fun AudioMessageCard(msg: UiMessage) {
             border = BorderStroke(1.dp, QubeePalette.Cyan.copy(alpha = 0.22f)),
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
+                if (showSender) {
+                    SenderLabel(msg.senderName)
+                    Spacer(Modifier.height(6.dp))
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Surface(modifier = Modifier.size(58.dp), shape = RoundedCornerShape(18.dp), color = QubeePalette.Green.copy(alpha = 0.72f)) {
                         Box(contentAlignment = Alignment.Center) {

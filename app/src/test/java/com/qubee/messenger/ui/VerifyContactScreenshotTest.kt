@@ -7,7 +7,6 @@ import androidx.compose.ui.Modifier
 import com.qubee.messenger.ui.contacts.verification.ContactVerificationUiState
 import com.qubee.messenger.ui.contacts.verification.VerifyContent
 import com.qubee.messenger.ui.theme.QubeePalette
-import com.qubee.messenger.ui.theme.QubeeTheme
 import androidx.compose.foundation.background
 import org.junit.Rule
 import org.junit.Test
@@ -24,10 +23,8 @@ class VerifyContactScreenshotTest {
     private val sas = "garden-piano-42"
 
     private fun host(content: @Composable () -> Unit) {
-        paparazzi.snapshot {
-            QubeeTheme {
-                Surface { androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().background(QubeePalette.Void)) { content() } }
-            }
+        paparazzi.snapshotThemed {
+            Surface { androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().background(QubeePalette.Void)) { content() } }
         }
     }
 

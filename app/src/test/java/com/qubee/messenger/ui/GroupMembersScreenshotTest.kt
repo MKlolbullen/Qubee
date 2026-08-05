@@ -9,7 +9,6 @@ import androidx.compose.ui.unit.dp
 import com.qubee.messenger.groups.GroupMemberInfo
 import com.qubee.messenger.ui.chat.MemberList
 import com.qubee.messenger.ui.theme.QubeePalette
-import com.qubee.messenger.ui.theme.QubeeTheme
 import androidx.compose.foundation.background
 import androidx.compose.material3.Surface
 import org.junit.Rule
@@ -35,16 +34,14 @@ class GroupMembersScreenshotTest {
         )
 
     private fun host(content: @Composable () -> Unit) {
-        paparazzi.snapshot {
-            QubeeTheme {
-                Surface {
-                    Column(
-                        Modifier
-                            .fillMaxSize()
-                            .background(QubeePalette.Panel)
-                            .padding(horizontal = 22.dp, vertical = 18.dp),
-                    ) { content() }
-                }
+        paparazzi.snapshotThemed {
+            Surface {
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .background(QubeePalette.Panel)
+                        .padding(horizontal = 22.dp, vertical = 18.dp),
+                ) { content() }
             }
         }
     }

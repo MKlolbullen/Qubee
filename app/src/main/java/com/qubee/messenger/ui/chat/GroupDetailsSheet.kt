@@ -208,6 +208,7 @@ private fun EmptyMembers() {
 }
 
 @Composable
+@androidx.annotation.VisibleForTesting
 internal fun MemberList(
     members: List<GroupMemberInfo>,
     myIdentityIdHex: String?,

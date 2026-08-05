@@ -14,7 +14,6 @@ import androidx.compose.ui.unit.dp
 import com.qubee.messenger.ui.settings.ResetButton
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
-import com.qubee.messenger.ui.theme.QubeeTheme
 import androidx.compose.foundation.background
 import org.junit.Rule
 import org.junit.Test
@@ -31,25 +30,23 @@ class SettingsScreenshotTest {
     val paparazzi = paparazziRule()
 
     private fun host(content: @Composable () -> Unit) {
-        paparazzi.snapshot {
-            QubeeTheme {
-                Surface {
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .background(QubeePalette.Void)
-                            .padding(24.dp),
-                        verticalArrangement = Arrangement.Top,
-                    ) {
-                        Text("Danger zone", color = QubeePalette.Text)
-                        Spacer(Modifier.height(6.dp))
-                        QubeeMutedText(
-                            "Destroys the local identity keystore (private keys and " +
-                                "group state) and forces re-onboarding. This cannot be undone.",
-                        )
-                        Spacer(Modifier.height(14.dp))
-                        content()
-                    }
+        paparazzi.snapshotThemed {
+            Surface {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(QubeePalette.Void)
+                        .padding(24.dp),
+                    verticalArrangement = Arrangement.Top,
+                ) {
+                    Text("Danger zone", color = QubeePalette.Text)
+                    Spacer(Modifier.height(6.dp))
+                    QubeeMutedText(
+                        "Destroys the local identity keystore (private keys and " +
+                            "group state) and forces re-onboarding. This cannot be undone.",
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    content()
                 }
             }
         }

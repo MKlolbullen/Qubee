@@ -9,7 +9,6 @@ import com.qubee.messenger.ui.main.ConversationList
 import com.qubee.messenger.ui.main.ConversationListSecurityState
 import com.qubee.messenger.ui.main.ConversationSummaryUi
 import com.qubee.messenger.ui.theme.QubeeScreen
-import com.qubee.messenger.ui.theme.QubeeTheme
 import org.junit.Rule
 import org.junit.Test
 
@@ -22,9 +21,7 @@ class ConversationsScreenshotTest {
     val paparazzi = paparazziRule()
 
     private fun host(content: @Composable () -> Unit) {
-        paparazzi.snapshot {
-            QubeeTheme { QubeeScreen { content() } }
-        }
+        paparazzi.snapshotThemed { QubeeScreen { content() } }
     }
 
     private fun convo(

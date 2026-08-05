@@ -8,7 +8,6 @@ import androidx.compose.ui.unit.dp
 import com.qubee.messenger.ui.onboarding.IdentityBootstrapView
 import com.qubee.messenger.ui.onboarding.OnboardingState
 import com.qubee.messenger.ui.theme.QubeeScreen
-import com.qubee.messenger.ui.theme.QubeeTheme
 import org.junit.Rule
 import org.junit.Test
 
@@ -24,12 +23,10 @@ class OnboardingScreenshotTest {
     val paparazzi = paparazziRule()
 
     private fun host(content: @androidx.compose.runtime.Composable () -> Unit) {
-        paparazzi.snapshot {
-            QubeeTheme {
-                QubeeScreen {
-                    Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 28.dp)) {
-                        content()
-                    }
+        paparazzi.snapshotThemed {
+            QubeeScreen {
+                Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 28.dp)) {
+                    content()
                 }
             }
         }

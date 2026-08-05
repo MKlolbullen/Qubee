@@ -1,6 +1,5 @@
 package com.qubee.messenger.ui
 
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -9,7 +8,6 @@ import com.qubee.messenger.ui.contacts.ContactSummaryUi
 import com.qubee.messenger.ui.contacts.ContactsBody
 import com.qubee.messenger.ui.contacts.EmptyContacts
 import com.qubee.messenger.ui.theme.QubeeScreen
-import com.qubee.messenger.ui.theme.QubeeTheme
 import org.junit.Rule
 import org.junit.Test
 
@@ -21,10 +19,8 @@ class ContactsScreenshotTest {
     val paparazzi = paparazziRule()
 
     private fun host(content: @Composable () -> Unit) {
-        paparazzi.snapshot {
-            QubeeTheme {
-                QubeeScreen { Modifier.fillMaxSize(); content() }
-            }
+        paparazzi.snapshotThemed {
+            QubeeScreen { content() }
         }
     }
 

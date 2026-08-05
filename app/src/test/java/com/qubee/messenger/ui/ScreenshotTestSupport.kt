@@ -1,7 +1,9 @@
 package com.qubee.messenger.ui
 
+import androidx.compose.runtime.Composable
 import app.cash.paparazzi.DeviceConfig
 import app.cash.paparazzi.Paparazzi
+import com.qubee.messenger.ui.theme.QubeeTheme
 
 /**
  * Shared Paparazzi rule factory for the screen-level baseline tests.
@@ -22,3 +24,13 @@ import app.cash.paparazzi.Paparazzi
  * pixels changed", never "the backend behaved differently".
  */
 internal fun paparazziRule(): Paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)
+
+/**
+ * Snapshot [content] wrapped in [QubeeTheme] — the one piece of the
+ * host every screen shares. Each test still supplies its own
+ * screen-specific scaffold (a `QubeeScreen` background, a `Surface`,
+ * etc.) inside the lambda, since those differ per screen.
+ */
+internal fun Paparazzi.snapshotThemed(content: @Composable () -> Unit) {
+    snapshot { QubeeTheme { content() } }
+}

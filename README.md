@@ -92,8 +92,8 @@ The distinction between **implemented**, **enabled**, and **planned** matters. S
 | Group creation, invites, membership, roles, and state sync | ✅ Active | CSPRNG invitation codes, atomic use accounting, signed membership broadcasts, and offline snapshot resync. |
 | SQLCipher-backed Android storage | ✅ Active | Messages, contacts, and conversations are stored in encrypted Room tables. |
 | Delivery acknowledgements | 🟡 Partial | The protocol includes signed acknowledgements; UI semantics and end-to-end device validation remain pre-alpha. |
-| PQXDH + Double Ratchet for 1:1 messaging | 🟡 Dark-launched | Receive-side support and persistence exist; emission is gated behind a rollout preference and is off by default. |
-| Sender keys for groups | 🟡 Dark-launched | New wire format and receive path exist; default send traffic has not fully cut over. |
+| PQXDH + Double Ratchet for 1:1 messaging | 🟡 Dark-launched | Send and receive paths are both fully wired (prekey publication, fail-closed send, session persistence); emission is gated behind a rollout preference that is off by default pending two-device validation. |
+| Sender keys for groups | 🟡 Dark-launched | Wire format, receive path, and the flag-gated send path (sender-key distribution fan-out, post-rekey redistribution) are wired; default send traffic has not cut over pending two-device validation. |
 | Reproducible signed releases | 🟡 Infrastructure present | Release workflow and reproducibility guidance exist; verify the actual tag, checksum, and CI result before installing. |
 | Voice/video calling | ❌ Not shipped | WebRTC code is feature-gated behind `calling` and not part of the default build. |
 | File-transfer protocol | ❌ Not shipped | Legacy code is feature-gated and not production-ready. |

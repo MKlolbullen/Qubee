@@ -9,9 +9,22 @@ import android.view.MenuItem
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import android.view.WindowManager
+import android.widget.FrameLayout
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.Lifecycle
+import com.qubee.messenger.security.AppLockManager
+import com.qubee.messenger.security.BiometricAuthenticator
+import com.qubee.messenger.ui.lock.UnlockScreen
 import androidx.navigation.NavController
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.AppBarConfiguration
@@ -41,6 +54,18 @@ class MainActivity : AppCompatActivity() {
     @Inject
     lateinit var preferences: PreferenceRepository
 
+    @Inject
+    lateinit var appLockManager: AppLockManager
+
+    private val biometricAuthenticator by lazy { BiometricAuthenticator(this) }
+
+    // Full-screen Compose overlay that covers the fragment host while
+    // the app is locked. Added on top of the activity's content view so
+    // no conversation UI is ever visible behind the gate.
+    private lateinit var lockOverlay: ComposeView
+    private var lockError by mutableStateOf<String?>(null)
+    private var promptInFlight = false
+
     // Permission launcher
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -53,6 +78,8 @@ class MainActivity : AppCompatActivity() {
         
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        setupLockOverlay()
 
         setupToolbar()
         setupNavigation(isFreshLaunch = savedInstanceState == null)
@@ -185,6 +212,98 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Add the lock gate as the top-most view in the activity window and
+     * bind it to [AppLockManager.locked]. While locked we also set
+     * `FLAG_SECURE` so the gate (not the conversations behind it) is
+     * what shows in the recents thumbnail.
+     */
+    private fun setupLockOverlay() {
+        lockOverlay = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setContent {
+                UnlockScreen(
+                    error = lockError,
+                    onUnlockClick = { showUnlockPrompt() },
+                )
+            }
+        }
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                appLockManager.locked.collect { locked ->
+                    if (locked) showLockOverlay() else hideLockOverlay()
+                }
+            }
+        }
+    }
+
+    /**
+     * Attach the gate on top of the activity content (only while
+     * locked — we add/remove rather than toggle visibility so no
+     * dormant full-screen view lingers hidden in the hierarchy) and
+     * set `FLAG_SECURE` so the gate, not the conversations, is what
+     * the recents thumbnail captures.
+     */
+    private fun showLockOverlay() {
+        if (lockOverlay.parent == null) {
+            addContentView(
+                lockOverlay,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        showUnlockPrompt()
+    }
+
+    private fun hideLockOverlay() {
+        (lockOverlay.parent as? android.view.ViewGroup)?.removeView(lockOverlay)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        lockError = null
+    }
+
+    /**
+     * Launch the biometric / device-credential prompt. Guards against
+     * re-entrancy (the state collector and the on-screen button can
+     * both call this). If the device has no biometric AND no device
+     * credential set up, there is nothing to authenticate against —
+     * fail open rather than trap the user out of their own app.
+     */
+    private fun showUnlockPrompt() {
+        if (promptInFlight) return
+        if (!biometricAuthenticator.canAuthenticate()) {
+            Timber.w("No biometric or device credential enrolled — unlocking without a gate")
+            appLockManager.unlock()
+            return
+        }
+        promptInFlight = true
+        biometricAuthenticator.authenticate(
+            title = getString(R.string.app_lock_prompt_title),
+            subtitle = getString(R.string.app_lock_prompt_subtitle),
+            onSuccess = {
+                promptInFlight = false
+                appLockManager.unlock()
+            },
+            onFail = { reason ->
+                promptInFlight = false
+                lockError = reason
+            },
+        )
+    }
+
+    override fun onStart() {
+        super.onStart()
+        appLockManager.onEnterForeground()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        appLockManager.onEnterBackground()
     }
 
     private fun checkPermissions() {

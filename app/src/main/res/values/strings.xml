@@ -25,4 +25,13 @@
     <string name="notification_channel_calls_description">Incoming voice and video calls.</string>
     <string name="notification_channel_service">Background service</string>
     <string name="notification_channel_service_description">Keeps the peer-to-peer node running while the app is in the background.</string>
+    <string name="app_lock_prompt_title">Unlock Qubee</string>
+    <string name="app_lock_prompt_subtitle">Verify to open your conversations</string>
+    <string name="unlock_screen_status">DEVICE LOCKED</string>
+    <string name="unlock_screen_title">Qubee is locked</string>
+    <string name="unlock_screen_body">Verify with your fingerprint, face, or device PIN to open your conversations.</string>
+    <string name="unlock_button">Unlock</string>
+    <string name="app_lock_panel_status">SCREEN LOCK</string>
+    <string name="app_lock_panel_title">Require unlock</string>
+    <string name="app_lock_panel_body">Ask for your fingerprint, face, or device PIN when Qubee opens or returns from the background. Gates the app UI; it does not yet encrypt the database under your unlock.</string>
 </resources>

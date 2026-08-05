@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.identity.IdentityBundle
+import com.qubee.messenger.security.AppLockManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +24,7 @@ import timber.log.Timber
 class SettingsViewModel @Inject constructor(
     private val qubeeManager: QubeeManager,
     private val preferences: PreferenceRepository,
+    private val appLockManager: AppLockManager,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<SettingsResetState>(SettingsResetState.Idle)
@@ -31,8 +33,24 @@ class SettingsViewModel @Inject constructor(
     private val _identity = MutableStateFlow<IdentityBundle?>(null)
     val identity: StateFlow<IdentityBundle?> = _identity.asStateFlow()
 
+    private val _appLockEnabled = MutableStateFlow(preferences.appLockEnabled())
+    val appLockEnabled: StateFlow<Boolean> = _appLockEnabled.asStateFlow()
+
     init {
         loadIdentity()
+    }
+
+    /**
+     * Toggle the screen lock. Persists the preference and re-evaluates
+     * the live lock state — turning it off clears any pending gate;
+     * turning it on takes effect on the next background→foreground
+     * transition (the user is present now, so we don't slam the gate
+     * up under them).
+     */
+    fun setAppLockEnabled(enabled: Boolean) {
+        preferences.setAppLockEnabled(enabled)
+        _appLockEnabled.value = enabled
+        appLockManager.onPreferenceChanged()
     }
 
     /// Pull the active onboarding bundle (display name, fingerprint,

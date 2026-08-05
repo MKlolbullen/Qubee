@@ -130,6 +130,22 @@ class PreferenceRepository @Inject constructor(
         prefs.edit().putBoolean(KEY_RATCHET_SEND, enabled).apply()
     }
 
+    /**
+     * App-lock (screen lock) toggle. When true, the app requires a
+     * biometric or device-credential (PIN/pattern/password) unlock on
+     * cold start and after returning from the background past the
+     * grace window. Default off, opt-in from Settings.
+     *
+     * This gates the *UI*, not yet the database key — the deeper
+     * `setUserAuthenticationRequired(true)` keystore binding tracked
+     * in SECURITY.md is a separate change. See [AppLockManager].
+     */
+    fun appLockEnabled(): Boolean = prefs.getBoolean(KEY_APP_LOCK, false)
+
+    fun setAppLockEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_APP_LOCK, enabled).apply()
+    }
+
     fun nickname(): String? = prefs.getString(KEY_NICKNAME, null)
     fun userId(): String? = prefs.getString(KEY_USER_ID, null)
     fun identityIdHex(): String? = prefs.getString(KEY_IDENTITY_ID, null)
@@ -182,6 +198,7 @@ class PreferenceRepository @Inject constructor(
         private const val KEY_SHARE_LINK = "share_link"
         private const val KEY_ONBOARDED = "onboarded"
         private const val KEY_RATCHET_SEND = "ratchet_send_enabled"
+        private const val KEY_APP_LOCK = "app_lock_enabled"
         private const val KEY_SECRET_PREFIX = "secret/"
     }
 }

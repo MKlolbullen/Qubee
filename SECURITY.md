@@ -135,9 +135,18 @@ the pre-alpha:
   explicitly documented in
   `app/src/main/java/com/qubee/messenger/security/SqlCipherKeyProvider.kt`;
   enables headless `MessageService` operation at the cost of no
-  per-open biometric/PIN gate. The key is StrongBox-backed where
-  available (TEE-backed otherwise). A "lock-on-screen-off" mode that
-  re-gates behind biometric unlock is v0.2+ work.
+  per-open biometric/PIN gate on the *key material*. The key is
+  StrongBox-backed where available (TEE-backed otherwise). An
+  opt-in **app-level screen lock** now exists
+  (`AppLockManager` + `BiometricAuthenticator`, Settings → Screen
+  lock, default off): it gates the app *UI* behind a biometric /
+  device-credential prompt on cold start and on return from the
+  background past a grace window. This is defense against a casual
+  "someone picked up my unlocked phone", **not** against a forensic
+  attacker — the database key is still unwrapped without user auth.
+  Binding the SQLCipher key itself to the unlock
+  (`setUserAuthenticationRequired(true)`) remains v0.2+ work, since
+  it breaks headless service operation.
 - The Rust core keystore (`qubee_keys.db` / `qubee_groups.db`, which
   hold the Ed25519 + ML-DSA private identity keys) wraps its master
   key under a 256-bit passphrase derived in the hardware Keystore and

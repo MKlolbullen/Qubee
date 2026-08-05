@@ -49,6 +49,19 @@ Qubee is an experimental secure messenger built around three ideas:
 
 The project currently focuses on Android, small trusted groups, QR/deep-link onboarding, out-of-band contact verification, encrypted local storage, and a staged migration toward forward-secret and deniable messaging.
 
+### A look at the app
+
+<p align="center">
+  <img src="docs/mockups/png/01-inbox.png" width="185" alt="Inbox"/>
+  <img src="docs/mockups/png/02-group-chat.png" width="185" alt="Group chat"/>
+  <img src="docs/mockups/png/03-group-details.png" width="185" alt="Group details"/>
+  <img src="docs/mockups/png/06-screen-lock.png" width="185" alt="Screen lock"/>
+</p>
+<p align="center">
+  <em>Inbox · Group chat · Group details · Screen lock —
+  design mockups; the committed Paparazzi baselines are the source of truth for shipped UI.</em>
+</p>
+
 ### What Qubee is—and is not
 
 | Qubee is | Qubee is not |
@@ -390,10 +403,12 @@ Paparazzi snapshots are preferred over hand-drawn mockups for shipped UI because
 
 ### Mockups
 
+Rendered PNGs are shown for reliable display; the editable sources live alongside them as `.svg`.
+
 | | | |
 |---|---|---|
-| [<img src="docs/mockups/01-inbox.svg" width="200"/>](docs/mockups/01-inbox.svg)<br/>**Inbox** | [<img src="docs/mockups/02-group-chat.svg" width="200"/>](docs/mockups/02-group-chat.svg)<br/>**Group chat** | [<img src="docs/mockups/03-group-details.svg" width="200"/>](docs/mockups/03-group-details.svg)<br/>**Group details** |
-| [<img src="docs/mockups/04-role-picker.svg" width="200"/>](docs/mockups/04-role-picker.svg)<br/>**Role picker** | [<img src="docs/mockups/05-settings-identity.svg" width="200"/>](docs/mockups/05-settings-identity.svg)<br/>**Settings — identity** | [<img src="docs/mockups/06-screen-lock.svg" width="200"/>](docs/mockups/06-screen-lock.svg)<br/>**Screen lock** |
+| [<img src="docs/mockups/png/01-inbox.png" width="210"/>](docs/mockups/01-inbox.svg)<br/>**Inbox** | [<img src="docs/mockups/png/02-group-chat.png" width="210"/>](docs/mockups/02-group-chat.svg)<br/>**Group chat** | [<img src="docs/mockups/png/03-group-details.png" width="210"/>](docs/mockups/03-group-details.svg)<br/>**Group details** |
+| [<img src="docs/mockups/png/04-role-picker.png" width="210"/>](docs/mockups/04-role-picker.svg)<br/>**Role picker** | [<img src="docs/mockups/png/05-settings-identity.png" width="210"/>](docs/mockups/05-settings-identity.svg)<br/>**Settings — identity** | [<img src="docs/mockups/png/06-screen-lock.png" width="210"/>](docs/mockups/06-screen-lock.svg)<br/>**Screen lock** |
 
 ## Install
 

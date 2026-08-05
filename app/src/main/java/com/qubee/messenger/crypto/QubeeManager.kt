@@ -328,6 +328,65 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Iteration of this device's own sender chain for a group, or -1
+     * when no chain exists (never sent, or wiped by a rekey). `<= 0`
+     * means no member holds the current chain — [RatchetSender] uses
+     * that as the fan-out-distributions-first signal.
+     */
+    suspend fun ownSenderChainIteration(groupIdHex: String): Long = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext -1L
+        try {
+            nativeOwnSenderChainIteration(groupIdHex)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust chain-iteration JNI is not linked")
+            -1L
+        } catch (e: Exception) {
+            Timber.e(e, "Rust chain-iteration probe failed")
+            -1L
+        }
+    }
+
+    /**
+     * Publish an already-encrypted frame on a group's gossip topic.
+     * The v3 send path encrypts and publishes in two steps (unlike the
+     * legacy one-shot [sendGroupMessage]) so the wire bytes can be
+     * persisted for offline retry before the first publish attempt.
+     */
+    suspend fun publishGroupFrame(groupIdHex: String, wire: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        try {
+            nativePublishGroupFrame(groupIdHex, wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust group-frame-publish JNI is not linked")
+            false
+        } catch (e: Exception) {
+            Timber.e(e, "Rust group-frame publish failed")
+            false
+        }
+    }
+
+    /**
+     * Build this device's signed prekey bundle and broadcast it on the
+     * global topic so peers can initiate ratchet sessions with us.
+     * Receivers verify + cache it Rust-side from any topic. Call after
+     * the network node starts; re-publishing is idempotent (the bundle
+     * is stable until its prekeys rotate).
+     */
+    suspend fun publishLocalPrekeyBundle(): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        try {
+            val wire = nativeBuildLocalPrekeyBundle() ?: return@withContext false
+            nativeSendP2PMessage("", wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust prekey-bundle JNI is not linked")
+            false
+        } catch (e: Exception) {
+            Timber.e(e, "Prekey bundle publish failed")
+            false
+        }
+    }
+
+    /**
      * Decrypt an inbound v3 group frame (Ratchet Stage 4). Returns a
      * JSON string `{"groupId": hex, "senderId": hex, "plaintext": str}`
      * — the sender is authenticated by their ephemeral group signing
@@ -785,6 +844,8 @@ class QubeeManager @Inject constructor(
     private external fun nativeEncryptGroupMessageV3(groupIdHex: String, plaintext: String): ByteArray?
     private external fun nativeDecryptGroupMessageV3(wire: ByteArray): String?
     private external fun nativeCreateDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray?
+    private external fun nativeOwnSenderChainIteration(groupIdHex: String): Long
+    private external fun nativePublishGroupFrame(groupIdHex: String, wire: ByteArray): Boolean
     private external fun nativeResetGroupSenderState(groupIdHex: String): Int
     private external fun nativeResetDirectSession(peerIdHex: String): Int
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?

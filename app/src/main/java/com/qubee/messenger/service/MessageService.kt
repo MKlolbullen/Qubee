@@ -79,6 +79,13 @@ class MessageService : Service(), NetworkCallback {
         /// 30m, 2h) = ~3 hours of attempts before the row is left
         /// alone.
         private const val OFFLINE_RETRY_MAX_ATTEMPTS: Int = 5
+
+        /// Prekey bundles ride gossipsub, so peers offline at publish
+        /// time miss them and can never initiate v3 toward us. A
+        /// periodic republish bounds that window; the bundle is
+        /// stable between prekey rotations, so re-broadcasts are
+        /// idempotent on the receiving side.
+        private const val PREKEY_REPUBLISH_INTERVAL_MS: Long = 30L * 60 * 1000
         /// Soft cap on rows processed per tick to keep the DB scan
         /// cheap even with a large backlog.
         private const val RETRY_BATCH_LIMIT: Int = 32
@@ -141,6 +148,7 @@ class MessageService : Service(), NetworkCallback {
                 )
                 startP2PNetwork()
                 startOfflineRetryLoop()
+                startPrekeyRepublishLoop()
                 isRunning = true
                 Timber.d("MessageService started")
             } catch (e: Exception) {
@@ -165,6 +173,15 @@ class MessageService : Service(), NetworkCallback {
                 qubeeManager.setNetworkCallback(this@MessageService)
                 if (qubeeManager.startNetworkNode()) {
                     Timber.d("P2P Network Node started successfully")
+                    // Announce our signed prekey bundle so peers can
+                    // open forward-secret sessions with us (Ratchet
+                    // Stage 5). Best-effort: peers who miss it get it
+                    // on our next service start; without it they
+                    // simply can't initiate v3 and their sends fail
+                    // closed on their side.
+                    if (!qubeeManager.publishLocalPrekeyBundle()) {
+                        Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
+                    }
                 } else {
                     Timber.e("Failed to start P2P Network Node")
                 }
@@ -206,6 +223,27 @@ class MessageService : Service(), NetworkCallback {
         }
     }
 
+    /**
+     * Periodic re-broadcast of the local prekey bundle (see
+     * [PREKEY_REPUBLISH_INTERVAL_MS]). Complements the publish-on-
+     * network-start in [startP2PNetwork] so peers who were offline
+     * then still get the bundle within one interval of coming online.
+     */
+    private fun startPrekeyRepublishLoop() {
+        serviceScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(PREKEY_REPUBLISH_INTERVAL_MS)
+                try {
+                    if (!qubeeManager.publishLocalPrekeyBundle()) {
+                        Timber.w("Periodic prekey bundle republish failed")
+                    }
+                } catch (e: Exception) {
+                    Timber.w(e, "prekey republish tick failed")
+                }
+            }
+        }
+    }
+
     private suspend fun runOfflineRetryTick() {
         val now = System.currentTimeMillis()
         val due = messageRepository.dueForRetry(now, OFFLINE_RETRY_MAX_ATTEMPTS, RETRY_BATCH_LIMIT)
@@ -213,8 +251,16 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("offline retry tick: %d row(s) due", due.size)
         for (row in due) {
             val wire = row.wireBytes ?: continue
-            val ok = runCatching { qubeeManager.sendP2PMessage(row.senderId, wire) }
-                .getOrDefault(false)
+            // v3 group frames belong on their group's topic — the
+            // row's conversationId IS the group id hex on that path.
+            // Everything else re-publishes exactly as it was sent.
+            val ok = runCatching {
+                if (isGroupV3Frame(wire)) {
+                    qubeeManager.publishGroupFrame(row.conversationId, wire)
+                } else {
+                    qubeeManager.sendP2PMessage(row.senderId, wire)
+                }
+            }.getOrDefault(false)
             val nextAttempt = row.retryAttempt + 1
             val nextRetry = if (!ok || nextAttempt < OFFLINE_RETRY_MAX_ATTEMPTS) {
                 now + retryBackoffMs(nextAttempt)

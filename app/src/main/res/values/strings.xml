@@ -25,4 +25,6 @@
     <string name="notification_channel_calls_description">Incoming voice and video calls.</string>
     <string name="notification_channel_service">Background service</string>
     <string name="notification_channel_service_description">Keeps the peer-to-peer node running while the app is in the background.</string>
+    <string name="app_lock_prompt_title">Unlock Qubee</string>
+    <string name="app_lock_prompt_subtitle">Verify to open your conversations</string>
 </resources>

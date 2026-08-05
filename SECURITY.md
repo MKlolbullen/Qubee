@@ -135,18 +135,42 @@ the pre-alpha:
   explicitly documented in
   `app/src/main/java/com/qubee/messenger/security/SqlCipherKeyProvider.kt`;
   enables headless `MessageService` operation at the cost of no
-  per-open biometric/PIN gate on the *key material*. The key is
-  StrongBox-backed where available (TEE-backed otherwise). An
-  opt-in **app-level screen lock** now exists
-  (`AppLockManager` + `BiometricAuthenticator`, Settings → Screen
-  lock, default off): it gates the app *UI* behind a biometric /
-  device-credential prompt on cold start and on return from the
-  background past a grace window. This is defense against a casual
-  "someone picked up my unlocked phone", **not** against a forensic
-  attacker — the database key is still unwrapped without user auth.
-  Binding the SQLCipher key itself to the unlock
-  (`setUserAuthenticationRequired(true)`) remains v0.2+ work, since
-  it breaks headless service operation.
+  per-open biometric/PIN gate on the *key material* — **unless the
+  opt-in Screen Lock is enabled** (see below). The key is
+  StrongBox-backed where available (TEE-backed otherwise).
+- **Opt-in Screen Lock (`AppLockManager` + `BiometricAuthenticator` +
+  `DatabaseKeyHolder`, Settings → Screen lock, default off).** Two
+  layers, both engaged by the one toggle:
+  1. *UI gate* — a biometric / device-credential prompt covers the
+     app on cold start and on return from the background past a grace
+     window (`FLAG_SECURE` while locked).
+  2. *Key binding* — the SQLCipher DB key **and** the Rust-core
+     keystore passphrase are re-wrapped under a second, **auth-bound**
+     Keystore key (`setUserAuthenticationRequired(true)`, per-use;
+     `AUTH_BIOMETRIC_STRONG | AUTH_DEVICE_CREDENTIAL` on API 30+), and
+     the auth-free copies are deleted. The unlock ceremony runs a
+     `BiometricPrompt` `CryptoObject` that authorises the very cipher
+     that unwraps the secrets; the plaintext keys live only in
+     `DatabaseKeyHolder` (in-memory, wiped on lock). **A cold process
+     while locked cannot open the database** — the "no DB while
+     locked" property. The PIN/pattern/password path is always an
+     accepted authenticator; on API 24–29 a `CryptoObject` prompt is
+     biometric-only, so the key binding there is gated by biometric
+     while the plain UI gate keeps its PIN fallback.
+
+  Scope and caveats: an *already-open* DB connection in a live process
+  stays open across a background/lock (the binding is enforced at
+  cold-start / at-rest, not by closing a live SQLite handle). Enabling
+  the toggle is refused when the device has no biometric and no device
+  credential, so an auth-bound key can never be created that nobody
+  can satisfy. With Screen Lock **off**, behaviour is byte-identical
+  to before (auth-free hardware key, headless service works).
+
+  **Validation status:** the binding path is wired and builds green
+  but exercises auth-bound Keystore + `BiometricPrompt` semantics that
+  can only be verified on real hardware across API levels — treat it,
+  like the ratchet cutover, as landed-but-device-validation-pending
+  before relying on it.
 - The Rust core keystore (`qubee_keys.db` / `qubee_groups.db`, which
   hold the Ed25519 + ML-DSA private identity keys) wraps its master
   key under a 256-bit passphrase derived in the hardware Keystore and

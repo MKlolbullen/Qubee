@@ -24,6 +24,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.Lifecycle
 import com.qubee.messenger.security.AppLockManager
 import com.qubee.messenger.security.BiometricAuthenticator
+import com.qubee.messenger.security.SqlCipherKeyProvider
 import com.qubee.messenger.ui.lock.UnlockScreen
 import androidx.navigation.NavController
 import androidx.navigation.fragment.NavHostFragment
@@ -57,7 +58,22 @@ class MainActivity : AppCompatActivity() {
     @Inject
     lateinit var appLockManager: AppLockManager
 
+    @Inject
+    lateinit var keyProvider: com.qubee.messenger.security.SqlCipherKeyProvider
+
+    @Inject
+    lateinit var keyHolder: com.qubee.messenger.security.DatabaseKeyHolder
+
+    @Inject
+    lateinit var qubeeManager: com.qubee.messenger.crypto.QubeeManager
+
     private val biometricAuthenticator by lazy { BiometricAuthenticator(this) }
+
+    // Deferred one-time app initialization (observers, permissions,
+    // background service). When the DB key is bound to unlock we can't
+    // touch the datastore until the ceremony populates the key holder,
+    // so this runs after the first unlock instead of in onCreate.
+    private var appInitialized = false
 
     // Full-screen Compose overlay that covers the fragment host while
     // the app is locked. Added on top of the activity's content view so
@@ -83,15 +99,34 @@ class MainActivity : AppCompatActivity() {
 
         setupToolbar()
         setupNavigation(isFreshLaunch = savedInstanceState == null)
+
+        // When the DB key is bound to unlock (Screen Lock on), the
+        // datastore can't be touched until the unlock ceremony fills
+        // the key holder — so defer the DB-touching init to the first
+        // successful unlock. Otherwise run it now, as before.
+        if (dbBindingActive() && !keyHolder.isUnlocked) {
+            Timber.d("DB key bound to unlock; deferring app init until unlocked")
+        } else {
+            runAppInit()
+        }
+    }
+
+    /** True when Screen Lock is on AND the DB key is stored auth-bound. */
+    private fun dbBindingActive(): Boolean =
+        appLockManager.isEnabled() && keyProvider.isAuthBindingEnabled()
+
+    /**
+     * One-time, DB-touching startup: observers, permissions, and the
+     * P2P foreground service. Idempotent — safe to call from onCreate
+     * (binding off) or from the first unlock (binding on).
+     */
+    private fun runAppInit() {
+        if (appInitialized) return
+        appInitialized = true
         setupObservers()
-        
-        // Check and request permissions
         checkPermissions()
-
-        // Start the P2P background service
         MessageService.start(this)
-
-        Timber.d("MainActivity created & Service started")
+        Timber.d("MainActivity app init complete & service started")
     }
 
     /**
@@ -258,6 +293,11 @@ class MainActivity : AppCompatActivity() {
             )
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        // Drop the in-memory DB secrets on lock (hygiene — shrinks the
+        // window the unwrapped key lives in RAM). The already-open DB
+        // connection persists for the process; the binding's at-rest
+        // guarantee is enforced on cold start, not by closing a live DB.
+        if (dbBindingActive()) keyHolder.clear()
         showUnlockPrompt()
     }
 
@@ -278,22 +318,73 @@ class MainActivity : AppCompatActivity() {
         if (promptInFlight) return
         if (!biometricAuthenticator.canAuthenticate()) {
             Timber.w("No biometric or device credential enrolled — unlocking without a gate")
-            appLockManager.unlock()
+            onUnlocked()
             return
         }
         promptInFlight = true
+
+        // When the DB key is bound, the unlock ceremony carries the
+        // auth-bound decrypt cipher in a CryptoObject so authenticating
+        // *is* what authorises unwrapping the key. Otherwise it's a
+        // plain presence check.
+        val challenge = if (dbBindingActive()) {
+            runCatching { keyProvider.beginUnlock() }.getOrElse { e ->
+                Timber.e(e, "Failed to prepare DB-unlock cipher")
+                null
+            }
+        } else {
+            null
+        }
+        val cryptoObject = challenge?.let {
+            androidx.biometric.BiometricPrompt.CryptoObject(it.cipher)
+        }
+
         biometricAuthenticator.authenticate(
             title = getString(R.string.app_lock_prompt_title),
             subtitle = getString(R.string.app_lock_prompt_subtitle),
-            onSuccess = {
+            cryptoObject = cryptoObject,
+            onSuccess = { result ->
                 promptInFlight = false
-                appLockManager.unlock()
+                if (challenge != null) {
+                    val authedCipher = result.cryptoObject?.cipher
+                    if (authedCipher == null) {
+                        lockError = getString(R.string.app_lock_error_no_cipher)
+                        return@authenticate
+                    }
+                    val ok = runCatching {
+                        val secrets = keyProvider.completeUnlock(
+                            SqlCipherKeyProvider.UnlockChallenge(authedCipher, challenge.ciphertext),
+                        )
+                        keyHolder.install(secrets.dbKey, secrets.corePassphraseHex)
+                        secrets.dbKey.fill(0)
+                        secrets.coreRaw.fill(0)
+                        secrets.corePassphraseHex.fill(0)
+                    }.isSuccess
+                    if (!ok) {
+                        lockError = getString(R.string.app_lock_error_unwrap)
+                        return@authenticate
+                    }
+                }
+                onUnlocked()
             },
             onFail = { reason ->
                 promptInFlight = false
                 lockError = reason
             },
         )
+    }
+
+    /**
+     * Post-unlock: mark unlocked, (re)initialise the Rust core now the
+     * core passphrase is available, and run the deferred DB-touching
+     * app init on the first unlock.
+     */
+    private fun onUnlocked() {
+        appLockManager.unlock()
+        lifecycleScope.launch {
+            runCatching { qubeeManager.initialize() }
+            runAppInit()
+        }
     }
 
     override fun onStart() {

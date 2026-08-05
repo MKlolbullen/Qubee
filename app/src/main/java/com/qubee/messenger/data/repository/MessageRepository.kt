@@ -14,9 +14,14 @@ import javax.inject.Singleton
 // Real Room-backed implementation — rev-3 priority 6.
 @Singleton
 class MessageRepository @Inject constructor(
-    private val messageDao: MessageDao,
-    private val conversationDao: ConversationDao,
+    // dagger.Lazy: defers SQLCipher open to first DAO use so the
+    // app-lock gate can hold DB access until unlock (no-op when Screen
+    // Lock is off).
+    private val messageDaoLazy: dagger.Lazy<MessageDao>,
+    private val conversationDaoLazy: dagger.Lazy<ConversationDao>,
 ) {
+    private val messageDao get() = messageDaoLazy.get()
+    private val conversationDao get() = conversationDaoLazy.get()
 
     /// Wire-compat alias kept for the rev-2 stub callers that named
     /// the conversation a "session". `ChatViewModel` and

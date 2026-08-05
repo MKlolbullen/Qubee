@@ -124,6 +124,167 @@ class SqlCipherKeyProvider(private val context: Context) {
         return raw.toHexAsciiBytes().also { raw.fill(0) }
     }
 
+    // ----- Auth-bound (Screen Lock) binding -------------------------
+    //
+    // When Screen Lock is enabled the DB key + core passphrase are
+    // re-wrapped under a SEPARATE, auth-bound Keystore key
+    // (per-use authentication, satisfied only by this app's unlock
+    // ceremony via a BiometricPrompt CryptoObject). The auth-free
+    // copies are then deleted, so the secrets literally cannot be
+    // unwrapped without a fresh biometric / device-credential auth.
+    // Both secrets ride one concatenated blob so a single CryptoObject
+    // unlocks both.
+
+    /** True when the secrets are stored auth-bound (Screen Lock on). */
+    fun isAuthBindingEnabled(): Boolean =
+        openEncryptedPrefs()?.contains(KEY_AUTH_BLOB_CIPHERTEXT) == true
+
+    /**
+     * Re-wrap the DB key + core passphrase under a fresh auth-bound
+     * Keystore key and delete the auth-free copies. Call while the app
+     * is unlocked (the auth-free secrets are still readable). Idempotent
+     * if already enabled. Throws on Keystore failure — caller reverts
+     * the toggle.
+     */
+    fun enableAuthBinding(holder: DatabaseKeyHolder) {
+        val prefs = openEncryptedPrefs()
+            ?: throw SecurityException("Keystore unavailable; cannot enable app-lock binding.")
+        if (prefs.contains(KEY_AUTH_BLOB_CIPHERTEXT)) return
+
+        val dbKey = getOrCreate()
+        val coreRaw = getOrCreateCoreRaw()
+        val blob = dbKey + coreRaw
+        try {
+            val authKey = generateAuthBoundKey()
+            val cipher = Cipher.getInstance(AES_GCM_NO_PADDING)
+            cipher.init(Cipher.ENCRYPT_MODE, authKey)
+            val ciphertext = cipher.doFinal(blob)
+            prefs.edit()
+                .putString(KEY_AUTH_BLOB_CIPHERTEXT, encodeBase64(ciphertext))
+                .putString(KEY_AUTH_BLOB_IV, encodeBase64(cipher.iv))
+                // Drop the auth-free copies — the auth-bound blob is now
+                // the sole custody of both secrets.
+                .remove(KEY_DB_KEY_CIPHERTEXT)
+                .remove(KEY_DB_KEY_IV)
+                .remove(KEY_CORE_PASS_CIPHERTEXT)
+                .remove(KEY_CORE_PASS_IV)
+                .apply()
+            // Keep the current (already-unlocked) session working: the
+            // DB is open and the core is initialised, but seed the
+            // holder so any fresh open in this session finds the key.
+            val coreHex = coreRaw.toHexAsciiBytes()
+            holder.install(dbKey, coreHex)
+            coreHex.fill(0)
+        } finally {
+            dbKey.fill(0)
+            coreRaw.fill(0)
+            blob.fill(0)
+        }
+    }
+
+    /**
+     * Re-wrap the (already-unlocked) secrets back under the auth-free
+     * hardware key and delete the auth-bound key. Call while unlocked
+     * with the in-memory secrets. Restores the headless-operation
+     * behaviour (Screen Lock off).
+     */
+    fun disableAuthBinding(holder: DatabaseKeyHolder) {
+        val prefs = openEncryptedPrefs()
+            ?: throw SecurityException("Keystore unavailable; cannot disable app-lock binding.")
+        val dbKey = holder.dbKeyCopy()
+            ?: throw IllegalStateException("Cannot disable app-lock binding while locked.")
+        val coreHex = holder.corePassphraseCopy()
+            ?: throw IllegalStateException("Cannot disable app-lock binding while locked.")
+        val coreRaw = hexAsciiToBytes(coreHex)
+        try {
+            val (dbCt, dbIv) = wrap(dbKey)
+            val (coreCt, coreIv) = wrap(coreRaw)
+            prefs.edit()
+                .putString(KEY_DB_KEY_CIPHERTEXT, encodeBase64(dbCt))
+                .putString(KEY_DB_KEY_IV, encodeBase64(dbIv))
+                .putString(KEY_CORE_PASS_CIPHERTEXT, encodeBase64(coreCt))
+                .putString(KEY_CORE_PASS_IV, encodeBase64(coreIv))
+                .remove(KEY_AUTH_BLOB_CIPHERTEXT)
+                .remove(KEY_AUTH_BLOB_IV)
+                .apply()
+            deleteKeystoreEntry(AUTH_MASTER_KEY_ALIAS)
+        } finally {
+            dbKey.fill(0)
+            coreHex.fill(0)
+            coreRaw.fill(0)
+        }
+    }
+
+    /** Parse 64 ASCII hex chars back into the 32 raw bytes. */
+    private fun hexAsciiToBytes(hexAscii: ByteArray): ByteArray {
+        val out = ByteArray(hexAscii.size / 2)
+        for (i in out.indices) {
+            val hi = Character.digit(hexAscii[i * 2].toInt().toChar(), 16)
+            val lo = Character.digit(hexAscii[i * 2 + 1].toInt().toChar(), 16)
+            out[i] = ((hi shl 4) or lo).toByte()
+        }
+        return out
+    }
+
+    /**
+     * Begin an unlock: returns a [Cipher] initialised for decryption
+     * under the auth-bound key (to hand to a [android.hardware.biometrics]
+     * `BiometricPrompt.CryptoObject`) paired with the stored ciphertext
+     * to feed [completeUnlock] once the prompt authorises it. `null`
+     * when binding isn't enabled.
+     */
+    fun beginUnlock(): UnlockChallenge? {
+        val prefs = openEncryptedPrefs() ?: return null
+        val ctB64 = prefs.getString(KEY_AUTH_BLOB_CIPHERTEXT, null) ?: return null
+        val ivB64 = prefs.getString(KEY_AUTH_BLOB_IV, null) ?: return null
+        val authKey = loadKeystoreKey(AUTH_MASTER_KEY_ALIAS)
+            ?: throw SecurityException("Auth-bound key missing from Keystore")
+        val cipher = Cipher.getInstance(AES_GCM_NO_PADDING)
+        cipher.init(Cipher.DECRYPT_MODE, authKey, GCMParameterSpec(GCM_TAG_BITS, decodeBase64(ivB64)))
+        return UnlockChallenge(cipher, decodeBase64(ctB64))
+    }
+
+    /**
+     * Complete an unlock: run the biometric-authorised [cipher] over
+     * the stored ciphertext to recover the DB key and core passphrase.
+     * The returned [UnlockedSecrets] carries the raw DB key, the raw
+     * core secret (for a future [disableAuthBinding]), and the
+     * hex-ASCII core passphrase in the form `nativeInitialize` expects.
+     */
+    fun completeUnlock(challenge: UnlockChallenge): UnlockedSecrets {
+        val blob = challenge.cipher.doFinal(challenge.ciphertext)
+        return try {
+            val dbKey = blob.copyOfRange(0, KEY_LENGTH_BYTES)
+            val coreRaw = blob.copyOfRange(KEY_LENGTH_BYTES, KEY_LENGTH_BYTES * 2)
+            UnlockedSecrets(dbKey, coreRaw, coreRaw.toHexAsciiBytes())
+        } finally {
+            blob.fill(0)
+        }
+    }
+
+    /** Raw (non-hex) core passphrase under the auth-free key. Used only
+     *  by [enableAuthBinding]; callers must zero it. */
+    private fun getOrCreateCoreRaw(): ByteArray {
+        // getOrCreateCoreKeystorePassphrase persists on first call; reuse
+        // it to guarantee the slot exists, then read the raw bytes back.
+        getOrCreateCoreKeystorePassphrase().fill(0)
+        val prefs = openEncryptedPrefs()
+            ?: throw SecurityException("Keystore unavailable; cannot read core passphrase.")
+        val ct = prefs.getString(KEY_CORE_PASS_CIPHERTEXT, null)
+            ?: throw SecurityException("Core passphrase slot missing after create.")
+        val iv = prefs.getString(KEY_CORE_PASS_IV, null)
+            ?: throw SecurityException("Core passphrase IV slot missing after create.")
+        return unwrap(decodeBase64(ct), decodeBase64(iv))
+    }
+
+    data class UnlockChallenge(val cipher: Cipher, val ciphertext: ByteArray)
+
+    data class UnlockedSecrets(
+        val dbKey: ByteArray,
+        val coreRaw: ByteArray,
+        val corePassphraseHex: ByteArray,
+    )
+
     /**
      * Drops the wrapped DB key, the wrapped core-keystore passphrase,
      * and the underlying Keystore master key. Use after a "Reset
@@ -132,20 +293,78 @@ class SqlCipherKeyProvider(private val context: Context) {
      * before that happens).
      */
     fun clear() {
-        try {
-            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            if (ks.containsAlias(MASTER_KEY_ALIAS)) {
-                ks.deleteEntry(MASTER_KEY_ALIAS)
-            }
-        } catch (e: Exception) {
-            Timber.w(e, "Failed to delete master key from Android Keystore")
-        }
+        deleteKeystoreEntry(MASTER_KEY_ALIAS)
+        deleteKeystoreEntry(AUTH_MASTER_KEY_ALIAS)
         openEncryptedPrefs()?.edit()
             ?.remove(KEY_DB_KEY_CIPHERTEXT)
             ?.remove(KEY_DB_KEY_IV)
             ?.remove(KEY_CORE_PASS_CIPHERTEXT)
             ?.remove(KEY_CORE_PASS_IV)
+            ?.remove(KEY_AUTH_BLOB_CIPHERTEXT)
+            ?.remove(KEY_AUTH_BLOB_IV)
             ?.apply()
+    }
+
+    private fun deleteKeystoreEntry(alias: String) {
+        try {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (ks.containsAlias(alias)) ks.deleteEntry(alias)
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to delete %s from Android Keystore", alias)
+        }
+    }
+
+    private fun loadKeystoreKey(alias: String): SecretKey? {
+        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        return (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+    }
+
+    /**
+     * Generate the auth-bound wrapping key: per-use authentication
+     * (`setUserAuthenticationValidityDurationSeconds(-1)` / the
+     * API-30+ equivalent), satisfiable by a strong biometric OR the
+     * device credential — so a PIN/pattern/password unlock is always
+     * an available fallback. StrongBox-backed where the hardware
+     * offers it, TEE otherwise. Regenerated fresh each time binding is
+     * enabled (the old one is deleted on disable).
+     */
+    private fun generateAuthBoundKey(): SecretKey {
+        deleteKeystoreEntry(AUTH_MASTER_KEY_ALIAS)
+        return try {
+            generateAuthBoundKeyInternal(strongBox = true)
+        } catch (e: android.security.keystore.StrongBoxUnavailableException) {
+            Timber.d("StrongBox unavailable; TEE-backing the auth-bound key")
+            deleteKeystoreEntry(AUTH_MASTER_KEY_ALIAS)
+            generateAuthBoundKeyInternal(strongBox = false)
+        }
+    }
+
+    private fun generateAuthBoundKeyInternal(strongBox: Boolean): SecretKey {
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        val builder = KeyGenParameterSpec.Builder(
+            AUTH_MASTER_KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(MASTER_KEY_SIZE_BITS)
+            .setRandomizedEncryptionRequired(true)
+            .setUserAuthenticationRequired(true)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            // Per-use (timeout 0), strong biometric OR device credential.
+            builder.setUserAuthenticationParameters(
+                0,
+                KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            builder.setUserAuthenticationValidityDurationSeconds(-1)
+        }
+        if (strongBox && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            builder.setIsStrongBoxBacked(true)
+        }
+        generator.init(builder.build())
+        return generator.generateKey()
     }
 
     /**
@@ -207,11 +426,7 @@ class SqlCipherKeyProvider(private val context: Context) {
     private fun getOrCreateMasterKey(): SecretKey =
         loadMasterKey() ?: generateMasterKey()
 
-    private fun loadMasterKey(): SecretKey? {
-        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        val entry = ks.getEntry(MASTER_KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
-        return entry?.secretKey
-    }
+    private fun loadMasterKey(): SecretKey? = loadKeystoreKey(MASTER_KEY_ALIAS)
 
     private fun generateMasterKey(): SecretKey {
         // Try a StrongBox-backed key first (dedicated hardware security
@@ -278,6 +493,11 @@ class SqlCipherKeyProvider(private val context: Context) {
     companion object {
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val MASTER_KEY_ALIAS = "qubee_sqlcipher_master_v1"
+        // Auth-bound wrapping key + concatenated (DB key || core
+        // passphrase) blob, present only while Screen Lock is on.
+        private const val AUTH_MASTER_KEY_ALIAS = "qubee_sqlcipher_auth_master_v1"
+        private const val KEY_AUTH_BLOB_CIPHERTEXT = "auth_blob_ciphertext_v1"
+        private const val KEY_AUTH_BLOB_IV = "auth_blob_iv_v1"
         private const val PREFS_NAME = "qubee_db_keys.enc"
         private const val KEY_DB_KEY_CIPHERTEXT = "db_key_ciphertext_v1"
         private const val KEY_DB_KEY_IV = "db_key_iv_v1"

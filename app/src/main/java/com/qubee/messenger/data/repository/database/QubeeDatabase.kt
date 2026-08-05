@@ -53,15 +53,20 @@ abstract class QubeeDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: QubeeDatabase? = null
 
-        fun getInstance(context: Context, keyProvider: SqlCipherKeyProvider): QubeeDatabase {
+        fun getInstance(
+            context: Context,
+            keyProvider: SqlCipherKeyProvider,
+            keyHolder: com.qubee.messenger.security.DatabaseKeyHolder,
+        ): QubeeDatabase {
             return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: build(context, keyProvider).also { INSTANCE = it }
+                INSTANCE ?: build(context, keyProvider, keyHolder).also { INSTANCE = it }
             }
         }
 
         private fun build(
             context: Context,
             keyProvider: SqlCipherKeyProvider,
+            keyHolder: com.qubee.messenger.security.DatabaseKeyHolder,
         ): QubeeDatabase {
             // SQLCipher's native library has to be loaded before the
             // first connection opens. The sqlcipher-android 4.6 rewrite
@@ -76,7 +81,19 @@ abstract class QubeeDatabase : RoomDatabase() {
             // README has always promised this.
             wipeIfLegacy(context, keyProvider.legacyPassphrase())
 
-            val key = keyProvider.getOrCreate()
+            // App-lock binding: when Screen Lock is on, the DB key is
+            // stored auth-bound and only available in memory after the
+            // unlock ceremony populated the holder. If a caller reaches
+            // here while still locked, fail closed — the caller (a
+            // repository DAO access, deferred via dagger.Lazy) surfaces
+            // it and the app stays on the unlock gate. With Screen Lock
+            // off the holder is unused and the key unwraps eagerly.
+            val key = if (keyProvider.isAuthBindingEnabled()) {
+                keyHolder.dbKeyCopy()
+                    ?: throw DatabaseLockedException()
+            } else {
+                keyProvider.getOrCreate()
+            }
             val factory = SupportOpenHelperFactory(key)
 
             return Room.databaseBuilder(
@@ -176,3 +193,12 @@ abstract class QubeeDatabase : RoomDatabase() {
         }
     }
 }
+
+/**
+ * Thrown when the database is asked to open while the app-lock (Screen
+ * Lock) binding is enabled but the unlock ceremony hasn't populated the
+ * in-memory key yet. Callers treat it as "still locked" — the UI stays
+ * on the unlock gate; the offending DAO access is retried after unlock.
+ */
+class DatabaseLockedException :
+    IllegalStateException("Database is locked; unlock the app to open it.")

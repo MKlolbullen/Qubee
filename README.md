@@ -90,7 +90,9 @@ The distinction between **implemented**, **enabled**, and **planned** matters. S
 | Direct libp2p networking | ✅ Active | TCP/WebSocket + Noise and QUIC are configured; the persistent libp2p key keeps `PeerId` stable across restarts. |
 | Encrypted 1:1 and group message envelopes | ✅ Active | Current default send path uses the established signed-envelope format. |
 | Group creation, invites, membership, roles, and state sync | ✅ Active | CSPRNG invitation codes, atomic use accounting, signed membership broadcasts, and offline snapshot resync. |
-| SQLCipher-backed Android storage | ✅ Active | Messages, contacts, and conversations are stored in encrypted Room tables. |
+| SQLCipher-backed Android storage | ✅ Active | Messages, contacts, and conversations are stored in encrypted Room tables under a hardware-Keystore-wrapped random key. |
+| App screen lock (biometric / device credential) | ✅ Active | Opt-in (Settings → Screen lock, default off). Biometric or PIN/pattern/password gate on cold start and foreground return, with `FLAG_SECURE`. |
+| Unlock-bound database key | 🟡 Wired, device-validation pending | When Screen Lock is on, the SQLCipher key + Rust-core passphrase are re-wrapped under an auth-bound Keystore key (per-use `CryptoObject`); a cold process can't open the datastore until unlocked. Builds green; needs real-hardware validation across API levels before relying on it. |
 | Delivery acknowledgements | 🟡 Partial | The protocol includes signed acknowledgements; UI semantics and end-to-end device validation remain pre-alpha. |
 | PQXDH + Double Ratchet for 1:1 messaging | 🟡 Dark-launched | Send and receive paths are both fully wired (prekey publication, fail-closed send, session persistence); emission is gated behind a rollout preference that is off by default pending two-device validation. |
 | Sender keys for groups | 🟡 Dark-launched | Wire format, receive path, and the flag-gated send path (sender-key distribution fan-out, post-rekey redistribution) are wired; default send traffic has not cut over pending two-device validation. |
@@ -315,8 +317,9 @@ The Rust keystore additionally uses:
 | Payload confidentiality on the network | Yes, using transport and application encryption |
 | Sender and control-frame authentication | Yes, with hybrid signatures on the active signed formats |
 | Post-quantum KEM/signature primitives | Yes, ML-KEM-768 and ML-DSA-44 |
-| Local database encryption | Yes, SQLCipher with a Keystore-wrapped random key |
+| Local database encryption | Yes, SQLCipher with a Keystore-wrapped random key; optionally re-wrapped under an unlock-bound key when Screen Lock is on |
 | Rust key-store encryption | Yes, authenticated encryption and Keystore-derived wrapping secret |
+| At-rest protection on a locked/stolen device | Partial; with Screen Lock on, a cold process can’t open the datastore without a biometric/PIN unlock (device-validation pending) |
 | Group rekey after member removal | Implemented |
 | Offline group state recovery | Implemented through signed snapshot resync |
 | Forward secrecy on the default send path | Not fully; ratchet rollout is still gated |
@@ -383,7 +386,14 @@ Design documentation and asset sources:
 - [`docs/branding/qubee_mark_master.svg`](docs/branding/qubee_mark_master.svg)
 - [`docs/screenshot-tests.md`](docs/screenshot-tests.md)
 
-Paparazzi snapshots are preferred over hand-drawn mockups for shipped UI because they render the real Composables and fail on visual drift.
+Paparazzi snapshots are preferred over hand-drawn mockups for shipped UI because they render the real Composables and fail on visual drift. The mockups below illustrate intended layout and flow; the committed Paparazzi baselines under `app/src/test/snapshots/` are the source of truth for what actually renders.
+
+### Mockups
+
+| | | |
+|---|---|---|
+| [<img src="docs/mockups/01-inbox.svg" width="200"/>](docs/mockups/01-inbox.svg)<br/>**Inbox** | [<img src="docs/mockups/02-group-chat.svg" width="200"/>](docs/mockups/02-group-chat.svg)<br/>**Group chat** | [<img src="docs/mockups/03-group-details.svg" width="200"/>](docs/mockups/03-group-details.svg)<br/>**Group details** |
+| [<img src="docs/mockups/04-role-picker.svg" width="200"/>](docs/mockups/04-role-picker.svg)<br/>**Role picker** | [<img src="docs/mockups/05-settings-identity.svg" width="200"/>](docs/mockups/05-settings-identity.svg)<br/>**Settings — identity** | [<img src="docs/mockups/06-screen-lock.svg" width="200"/>](docs/mockups/06-screen-lock.svg)<br/>**Screen lock** |
 
 ## Install
 

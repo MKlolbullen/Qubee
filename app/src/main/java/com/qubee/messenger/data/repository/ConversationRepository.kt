@@ -20,10 +20,14 @@ import javax.inject.Singleton
 // identity without a separate translation table.
 @Singleton
 class ConversationRepository @Inject constructor(
-    private val conversationDao: ConversationDao,
-    @Suppress("unused") private val messageDao: MessageDao,
+    // dagger.Lazy: defers SQLCipher open to first DAO use, so the
+    // app-lock gate can hold DB access until unlock (no-op when Screen
+    // Lock is off).
+    private val conversationDaoLazy: dagger.Lazy<ConversationDao>,
+    @Suppress("unused") private val messageDao: dagger.Lazy<MessageDao>,
     private val qubeeManager: QubeeManager,
 ) {
+    private val conversationDao get() = conversationDaoLazy.get()
 
     fun getAllConversations(): Flow<List<Conversation>> =
         conversationDao.getAllConversations()

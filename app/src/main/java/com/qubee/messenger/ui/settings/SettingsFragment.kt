@@ -180,7 +180,8 @@ private fun SettingsContent(
 }
 
 @Composable
-private fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
+@androidx.annotation.VisibleForTesting
+internal fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,

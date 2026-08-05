@@ -162,7 +162,8 @@ private fun LoadingConversations() {
 }
 
 @Composable
-private fun ConversationList(
+@androidx.annotation.VisibleForTesting
+internal fun ConversationList(
     conversations: List<ConversationSummaryUi>,
     onConversationClick: (ConversationSummaryUi) -> Unit,
     onStartContact: () -> Unit,

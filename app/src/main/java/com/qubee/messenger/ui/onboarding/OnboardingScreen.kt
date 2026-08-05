@@ -96,7 +96,8 @@ fun OnboardingScreen(
 }
 
 @Composable
-private fun IdentityBootstrapView(
+@androidx.annotation.VisibleForTesting
+internal fun IdentityBootstrapView(
     state: OnboardingState,
     nickname: String,
     onNicknameChange: (String) -> Unit,

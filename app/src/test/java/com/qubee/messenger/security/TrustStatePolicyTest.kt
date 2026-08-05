@@ -149,7 +149,7 @@ class TrustStatePolicyTest {
         )
 
         assertEquals(TrustLevel.VERIFIED, updated.trustLevel)
-        assertEquals(ContactVerificationStatus.VERIFIED, updated.verificationStatus)
+        assertEquals(ContactVerificationStatus.VERIFIED_ONCE, updated.verificationStatus)
         assertArrayEquals(key, updated.identityKey)
         assertEquals(5_555L, updated.updatedAt)
         assertTrue(TrustStatePolicy.canRenderAsVerified(updated))
@@ -174,7 +174,7 @@ class TrustStatePolicyTest {
         )
 
         assertEquals(TrustLevel.VERIFIED, updated.trustLevel)
-        assertEquals(ContactVerificationStatus.VERIFIED, updated.verificationStatus)
+        assertEquals(ContactVerificationStatus.VERIFIED_ONCE, updated.verificationStatus)
         assertArrayEquals(newKey, updated.identityKey)
         assertFalse(TrustStatePolicy.requiresKeyChangeWarning(updated))
     }

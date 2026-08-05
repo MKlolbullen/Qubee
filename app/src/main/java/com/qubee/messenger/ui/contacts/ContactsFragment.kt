@@ -142,7 +142,8 @@ private fun ContactsScreen(
 }
 
 @Composable
-private fun ContactsBody(
+@androidx.annotation.VisibleForTesting
+internal fun ContactsBody(
     active: List<ContactSummaryUi>,
     blocked: List<ContactSummaryUi>,
     onContactClick: (ContactSummaryUi) -> Unit,
@@ -266,7 +267,8 @@ private fun LoadingContacts() {
 }
 
 @Composable
-private fun EmptyContacts(onAddContactClick: () -> Unit) {
+@androidx.annotation.VisibleForTesting
+internal fun EmptyContacts(onAddContactClick: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.Center,

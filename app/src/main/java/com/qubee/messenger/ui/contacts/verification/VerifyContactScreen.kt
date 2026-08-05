@@ -156,7 +156,8 @@ private fun LoadErrorContent(message: String, onClose: () -> Unit) {
 }
 
 @Composable
-private fun VerifyContent(
+@androidx.annotation.VisibleForTesting
+internal fun VerifyContent(
     state: ContactVerificationUiState,
     onTypedFingerprintChange: (String) -> Unit,
     onConfirmFingerprint: () -> Unit,

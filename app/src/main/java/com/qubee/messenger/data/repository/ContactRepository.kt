@@ -21,10 +21,16 @@ import javax.inject.Singleton
 // leaves Rust.
 @Singleton
 class ContactRepository @Inject constructor(
-    private val contactDao: ContactDao,
-    @Suppress("unused") private val cryptoKeyDao: CryptoKeyDao,
+    // Injected as dagger.Lazy so constructing this repository does NOT
+    // build the SQLCipher database. The DB opens on first DAO *use*,
+    // which the app-lock startup gate keeps until after unlock (see
+    // DatabaseKeyHolder). With Screen Lock off this is a no-op — the
+    // key unwraps eagerly on first use exactly as before.
+    private val contactDaoLazy: dagger.Lazy<ContactDao>,
+    @Suppress("unused") private val cryptoKeyDao: dagger.Lazy<CryptoKeyDao>,
     private val qubeeManager: QubeeManager,
 ) {
+    private val contactDao get() = contactDaoLazy.get()
 
     fun getAllContactsFlow(): Flow<List<Contact>> = contactDao.getAllContacts()
 

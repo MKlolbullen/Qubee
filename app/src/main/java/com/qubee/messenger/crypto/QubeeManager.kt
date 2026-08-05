@@ -2,6 +2,7 @@ package com.qubee.messenger.crypto
 
 import android.content.Context
 import com.qubee.messenger.network.NetworkCallback
+import com.qubee.messenger.security.DatabaseKeyHolder
 import com.qubee.messenger.security.SqlCipherKeyProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -13,6 +14,8 @@ import javax.inject.Singleton
 @Singleton
 class QubeeManager @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val keyProvider: SqlCipherKeyProvider,
+    private val keyHolder: DatabaseKeyHolder,
 ) {
 
     // @Volatile: read/written from Dispatchers.IO by concurrent
@@ -35,8 +38,21 @@ class QubeeManager @Inject constructor(
             // String) so it can be zeroed after the native call — JVM
             // strings are immutable and would pin the secret in the
             // heap until GC, or forever if interned.
+            // App-lock binding: when Screen Lock is on, the core
+            // keystore passphrase is stored auth-bound and only lives
+            // in the holder after the unlock ceremony. If it's not
+            // there yet we're still locked — refuse to init (the
+            // caller retries after unlock). With Screen Lock off it
+            // unwraps directly under the auth-free hardware key.
             val passphrase = try {
-                SqlCipherKeyProvider(context).getOrCreateCoreKeystorePassphrase()
+                if (keyProvider.isAuthBindingEnabled()) {
+                    keyHolder.corePassphraseCopy() ?: run {
+                        Timber.d("App locked; deferring core init until unlock")
+                        return@withContext false
+                    }
+                } else {
+                    keyProvider.getOrCreateCoreKeystorePassphrase()
+                }
             } catch (e: SecurityException) {
                 Timber.e(e, "Keystore passphrase unavailable; refusing to init core")
                 return@withContext false

@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 950" width="460" height="950" font-family="Inter, system-ui, -apple-system, Segoe UI, sans-serif">
+  <!-- Galaxy S25 Ultra mock-up: Screen lock / biometric unlock gate -->
+  <defs>
+    <linearGradient id="frameGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a22"/>
+      <stop offset="1" stop-color="#050507"/>
+    </linearGradient>
+    <linearGradient id="screenGlare" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#12EAD8" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#12EAD8" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="screenClip">
+      <rect x="24" y="28" width="412" height="894" rx="42"/>
+    </clipPath>
+  </defs>
+
+  <!-- Phone body -->
+  <rect x="6" y="10" width="448" height="930" rx="56" fill="url(#frameGloss)"/>
+  <rect x="10" y="14" width="440" height="922" rx="54" fill="#0c0c10" stroke="#23232b" stroke-width="0.7"/>
+  <rect x="3" y="220" width="4" height="80" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="180" width="4" height="60" rx="2" fill="#1a1a22"/>
+  <rect x="453" y="260" width="4" height="100" rx="2" fill="#1a1a22"/>
+  <rect x="24" y="28" width="412" height="894" rx="42" fill="#040C16"/>
+
+  <g clip-path="url(#screenClip)">
+    <circle cx="80" cy="80" r="200" fill="url(#cyanGlow)"/>
+    <circle cx="380" cy="820" r="180" fill="url(#cyanGlow)" opacity="0.5"/>
+
+    <!-- Status bar -->
+    <g font-size="11" fill="#EAFBFF">
+      <text x="44" y="50" font-weight="600">21:49</text>
+      <g transform="translate(370,40)">
+        <rect x="0" y="6" width="2" height="4"/>
+        <rect x="3" y="4" width="2" height="6"/>
+        <rect x="6" y="2" width="2" height="8"/>
+        <rect x="9" y="0" width="2" height="10"/>
+        <path d="M16 8 q4 -5 10 0" stroke="#EAFBFF" fill="none" stroke-width="1.3"/>
+        <path d="M18 6 q3 -3 6 0" stroke="#EAFBFF" fill="none" stroke-width="1.3"/>
+        <circle cx="21" cy="9" r="0.9"/>
+        <rect x="32" y="2" width="22" height="9" rx="2" fill="none" stroke="#EAFBFF" stroke-width="1"/>
+        <rect x="34" y="4" width="14" height="5" fill="#12EAD8"/>
+        <rect x="54" y="5" width="2" height="3"/>
+        <text x="58" y="9" font-size="10">86%</text>
+      </g>
+    </g>
+    <circle cx="230" cy="46" r="7" fill="#000"/>
+
+    <!-- Hero mark -->
+    <g transform="translate(230,300)">
+      <circle cx="0" cy="0" r="52" fill="#0a1726" fill-opacity="0.9" stroke="#12EAD8" stroke-width="2"/>
+      <text x="0" y="17" text-anchor="middle" fill="#12EAD8" font-size="44" font-weight="900" font-family="ui-monospace, SFMono-Regular, monospace">Q</text>
+    </g>
+
+    <!-- DEVICE LOCKED pill -->
+    <g transform="translate(230,388)">
+      <rect x="-74" y="-16" width="148" height="30" rx="15" fill="#0a1726" fill-opacity="0.85" stroke="#12EAD8" stroke-opacity="0.55"/>
+      <text x="0" y="4" text-anchor="middle" fill="#12EAD8" font-size="11" letter-spacing="3" font-weight="700">DEVICE LOCKED</text>
+    </g>
+
+    <!-- Title + body -->
+    <text x="230" y="452" text-anchor="middle" fill="#EAFBFF" font-size="27" font-weight="800">Qubee is locked</text>
+    <text x="230" y="486" text-anchor="middle" fill="#A3BDCA" font-size="13">Verify with your fingerprint, face, or device</text>
+    <text x="230" y="506" text-anchor="middle" fill="#A3BDCA" font-size="13">PIN to open your conversations.</text>
+
+    <!-- Authenticator icons row: fingerprint + PIN -->
+    <g transform="translate(0,560)">
+      <!-- fingerprint -->
+      <g transform="translate(176,0)" stroke="#12EAD8" stroke-width="1.6" fill="none" stroke-linecap="round">
+        <path d="M8 22 a16 16 0 0 1 32 0"/>
+        <path d="M13 24 a11 11 0 0 1 22 0 v6"/>
+        <path d="M18 26 a6 6 0 0 1 12 0 v10"/>
+        <path d="M24 28 v12"/>
+      </g>
+      <text x="200" y="60" text-anchor="middle" fill="#A3BDCA" font-size="10">Biometric</text>
+      <!-- separator -->
+      <text x="248" y="26" text-anchor="middle" fill="#33526a" font-size="12">or</text>
+      <!-- PIN keypad glyph -->
+      <g transform="translate(276,4)" fill="#12EAD8">
+        <circle cx="4" cy="4" r="3"/><circle cx="16" cy="4" r="3"/><circle cx="28" cy="4" r="3"/>
+        <circle cx="4" cy="16" r="3"/><circle cx="16" cy="16" r="3"/><circle cx="28" cy="16" r="3"/>
+        <circle cx="4" cy="28" r="3"/><circle cx="16" cy="28" r="3"/><circle cx="28" cy="28" r="3"/>
+      </g>
+      <text x="292" y="60" text-anchor="middle" fill="#A3BDCA" font-size="10">PIN / password</text>
+    </g>
+
+    <!-- Unlock button -->
+    <g transform="translate(56,672)">
+      <rect width="348" height="52" rx="26" fill="#12EAD8"/>
+      <text x="174" y="33" text-anchor="middle" fill="#040C16" font-size="15" font-weight="800">Unlock</text>
+    </g>
+
+    <!-- Caption: what the lock protects -->
+    <g transform="translate(56,752)">
+      <rect width="348" height="70" rx="16" fill="#102234" fill-opacity="0.8" stroke="#152639"/>
+      <g transform="translate(18,22)" stroke="#8CFF72" stroke-width="1.5" fill="none">
+        <rect x="0" y="6" width="16" height="12" rx="2"/>
+        <path d="M3 6 v-3 a5 5 0 0 1 10 0 v3"/>
+      </g>
+      <text x="46" y="28" fill="#EAFBFF" font-size="12" font-weight="700">Database key bound to this unlock</text>
+      <text x="46" y="46" fill="#A3BDCA" font-size="11">A locked cold start can’t open the local store.</text>
+    </g>
+
+    <rect x="170" y="900" width="120" height="4" rx="2" fill="#A3BDCA" fill-opacity="0.6"/>
+    <rect x="24" y="28" width="412" height="894" rx="42" fill="url(#screenGlare)" pointer-events="none"/>
+  </g>
+</svg>

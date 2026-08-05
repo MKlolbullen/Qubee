@@ -6,6 +6,7 @@ import com.qubee.messenger.data.repository.database.dao.ContactDao
 import com.qubee.messenger.data.repository.database.dao.ConversationDao
 import com.qubee.messenger.data.repository.database.dao.CryptoKeyDao
 import com.qubee.messenger.data.repository.database.dao.MessageDao
+import com.qubee.messenger.security.DatabaseKeyHolder
 import com.qubee.messenger.security.SqlCipherKeyProvider
 import dagger.Module
 import dagger.Provides
@@ -29,7 +30,8 @@ object DatabaseModule {
     fun provideQubeeDatabase(
         @ApplicationContext context: Context,
         keyProvider: SqlCipherKeyProvider,
-    ): QubeeDatabase = QubeeDatabase.getInstance(context, keyProvider)
+        keyHolder: DatabaseKeyHolder,
+    ): QubeeDatabase = QubeeDatabase.getInstance(context, keyProvider, keyHolder)
 
     @Provides
     fun provideContactDao(database: QubeeDatabase): ContactDao = database.contactDao()

@@ -56,6 +56,28 @@ class BiometricAuthenticator(private val activity: AppCompatActivity) {
         subtitle: String,
         onSuccess: () -> Unit,
         onFail: (reason: String) -> Unit,
+    ) = authenticate(title, subtitle, cryptoObject = null, onSuccess = { onSuccess() }, onFail = onFail)
+
+    /**
+     * Prompt variant that carries a [BiometricPrompt.CryptoObject] — the
+     * database-binding unlock passes the auth-bound decrypt cipher so
+     * the ceremony itself authorises the key use. [onSuccess] receives
+     * the authorised result (its `cryptoObject.cipher` can then unwrap
+     * the DB key).
+     *
+     * Platform note: a `CryptoObject` prompt supports the device
+     * credential (PIN/pattern/password) fallback only on API 30+. On
+     * API 24–29 a crypto-bound prompt is biometric-only — the auth-bound
+     * key there uses a per-use validity that the framework satisfies via
+     * biometric. Callers that need the PIN fallback on old devices fall
+     * back to the non-crypto prompt.
+     */
+    fun authenticate(
+        title: String,
+        subtitle: String,
+        cryptoObject: BiometricPrompt.CryptoObject?,
+        onSuccess: (BiometricPrompt.AuthenticationResult) -> Unit,
+        onFail: (reason: String) -> Unit,
     ) {
         val executor = ContextCompat.getMainExecutor(activity)
         val prompt = BiometricPrompt(
@@ -63,7 +85,7 @@ class BiometricAuthenticator(private val activity: AppCompatActivity) {
             executor,
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    onSuccess()
+                    onSuccess(result)
                 }
 
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
@@ -76,18 +98,25 @@ class BiometricAuthenticator(private val activity: AppCompatActivity) {
             .setTitle(title)
             .setSubtitle(subtitle)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // A CryptoObject prompt can only offer the device credential on
+        // API 30+; below that it must be biometric-only, and a negative
+        // button is required.
+        val credentialAllowed = cryptoObject == null || Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+        if (credentialAllowed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             builder.setAllowedAuthenticators(allowedAuthenticators())
-        } else {
-            // API 24–29: combined authenticators aren't supported by
-            // setAllowedAuthenticators; this is the equivalent path.
+        } else if (credentialAllowed) {
             @Suppress("DEPRECATION")
             builder.setDeviceCredentialAllowed(true)
+        } else {
+            builder.setAllowedAuthenticators(BIOMETRIC_STRONG)
+            builder.setNegativeButtonText(activity.getString(android.R.string.cancel))
         }
-        // A negative button is disallowed when a device credential is
-        // offered — the credential screen is the fallback path.
 
-        prompt.authenticate(builder.build())
+        if (cryptoObject != null) {
+            prompt.authenticate(builder.build(), cryptoObject)
+        } else {
+            prompt.authenticate(builder.build())
+        }
     }
 
     private fun allowedAuthenticators(): Int =

@@ -27,6 +27,8 @@
     <string name="notification_channel_service_description">Keeps the peer-to-peer node running while the app is in the background.</string>
     <string name="app_lock_prompt_title">Unlock Qubee</string>
     <string name="app_lock_prompt_subtitle">Verify to open your conversations</string>
+    <string name="app_lock_error_no_cipher">Unlock did not return a usable key. Try again.</string>
+    <string name="app_lock_error_unwrap">Couldn\'t decrypt the local database key. Try again.</string>
     <string name="unlock_screen_status">DEVICE LOCKED</string>
     <string name="unlock_screen_title">Qubee is locked</string>
     <string name="unlock_screen_body">Verify with your fingerprint, face, or device PIN to open your conversations.</string>

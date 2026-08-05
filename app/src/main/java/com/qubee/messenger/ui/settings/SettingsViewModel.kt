@@ -4,8 +4,15 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.repository.PreferenceRepository
+import android.content.Context
+import androidx.biometric.BiometricManager
 import com.qubee.messenger.identity.IdentityBundle
 import com.qubee.messenger.security.AppLockManager
+import com.qubee.messenger.security.DatabaseKeyHolder
+import com.qubee.messenger.security.SqlCipherKeyProvider
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,9 +29,12 @@ import timber.log.Timber
  */
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val qubeeManager: QubeeManager,
     private val preferences: PreferenceRepository,
     private val appLockManager: AppLockManager,
+    private val keyProvider: SqlCipherKeyProvider,
+    private val keyHolder: DatabaseKeyHolder,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow<SettingsResetState>(SettingsResetState.Idle)
@@ -36,21 +46,51 @@ class SettingsViewModel @Inject constructor(
     private val _appLockEnabled = MutableStateFlow(preferences.appLockEnabled())
     val appLockEnabled: StateFlow<Boolean> = _appLockEnabled.asStateFlow()
 
+    private val _appLockNotice = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val appLockNotice = _appLockNotice.asSharedFlow()
+
     init {
         loadIdentity()
     }
 
     /**
-     * Toggle the screen lock. Persists the preference and re-evaluates
-     * the live lock state — turning it off clears any pending gate;
-     * turning it on takes effect on the next background→foreground
-     * transition (the user is present now, so we don't slam the gate
-     * up under them).
+     * Toggle the screen lock. Enabling also re-wraps the SQLCipher DB
+     * key + Rust-core passphrase under an auth-bound Keystore key
+     * (binding the local datastore to the unlock); disabling reverts
+     * that. Enabling is refused when the device has no biometric AND no
+     * device credential — an auth-bound key nobody can satisfy would
+     * lock the user out of their own database.
      */
     fun setAppLockEnabled(enabled: Boolean) {
+        if (enabled) {
+            if (!deviceCanAuthenticate()) {
+                _appLockNotice.tryEmit(
+                    "Set a screen lock (PIN, pattern, password, or biometric) on your device first.",
+                )
+                _appLockEnabled.value = false
+                return
+            }
+            val bound = runCatching { keyProvider.enableAuthBinding(keyHolder) }
+            if (bound.isFailure) {
+                Timber.e(bound.exceptionOrNull(), "Failed to bind DB key to unlock")
+                _appLockNotice.tryEmit("Couldn't enable Screen Lock. Try again.")
+                _appLockEnabled.value = false
+                return
+            }
+        } else {
+            runCatching { keyProvider.disableAuthBinding(keyHolder) }
+                .onFailure { Timber.e(it, "Failed to unbind DB key; leaving binding in place") }
+        }
         preferences.setAppLockEnabled(enabled)
         _appLockEnabled.value = enabled
         appLockManager.onPreferenceChanged()
+    }
+
+    private fun deviceCanAuthenticate(): Boolean {
+        val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
+            BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        return BiometricManager.from(context).canAuthenticate(authenticators) ==
+            BiometricManager.BIOMETRIC_SUCCESS
     }
 
     /// Pull the active onboarding bundle (display name, fingerprint,

@@ -26,7 +26,7 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
 | **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
 | ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
-| ~~**Group identity**~~ | ✅ *Closed.* Topic is now a blinded rotating hash (`blake3(domain ‖ group_id ‖ epoch)`), not the group id in the clear | ~~Anyone who observes the topic string~~ — an observer sees an opaque, rotating label |
+| **Group identity** | 🟡 *Reduced, not closed.* The topic is now a blinded rotating hash, but the outer group-message envelope still carries `group_id` in the clear (32 bytes at a fixed offset after `QUBEE_GMS\x02`) | Topic-string watchers see only an opaque rotating label; anyone who captures a message payload still reads the group id |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
 What is **not** leaked: message content (sealed), and — usefully —
@@ -114,9 +114,9 @@ Cheap, self-contained, ships without a new network dependency. Does
   the ratchet cutover, when its format changes once anyway.
 - **Blinded topic ids.** ✅ *Landed.* The topic is now
   `qubee-g-<blake3(domain ‖ group_id_hex ‖ epoch)[..16]>` instead of
-  `qubee-group-<group_id_hex>`, so the group id no longer rides on the
-  wire and an observer gets no stable handle to follow a group across
-  time. The shared epoch clock is wall-clock time floored to
+  `qubee-group-<group_id_hex>`, so the group id is no longer readable
+  *from the topic string* and an observer gets no stable handle to
+  follow a topic across time. The shared epoch clock is wall-clock time floored to
   `TOPIC_EPOCH_SECS` (24 h). Skew is absorbed by *subscribing to a
   window* rather than a point: a member follows `{e-1, e, e+1}` and
   publishes on `e`, so a peer whose clock is up to a full epoch off

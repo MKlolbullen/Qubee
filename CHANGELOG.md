@@ -143,8 +143,11 @@ between minor versions.
   bumped to `MAGIC_GROUP_MESSAGE \x02` and now wraps the existing
   signed envelope in a second ChaCha20-Poly1305 layer keyed off
   `BLAKE3::derive_key("qubee outer envelope v1", group_key)` with the
-  `group_id` as AEAD associated data. Only `group_id` (already
-  revealed by the topic name) and the outer nonce stay plaintext.
+  `group_id` as AEAD associated data. Only `group_id` and the outer
+  nonce stay plaintext — free at the time, since the gossipsub topic
+  name carried the group id anyway. Topic blinding (below, same
+  release) changes that calculus: this field is now the remaining
+  plaintext group identifier on the wire.
   Inner signature verification + generation gate are unchanged. New
   tests pin (a) sender_id is not byte-recoverable from the wire, (b)
   any tampering past the magic prefix is rejected by the outer AEAD,
@@ -172,6 +175,33 @@ between minor versions.
   so a mistimed background start degrades to "service not started"
   instead of crashing the process. `MessageService.start()` guards
   the same case at the call site.
+
+- **Blinded gossip topic ids + opt-in Kademlia client mode (network
+  privacy Tier 1 complete).** The per-group topic was
+  `qubee-group-<group_id_hex>`, putting the group id on the wire in
+  the clear and handing any passive observer a stable handle to follow
+  a group for its whole lifetime. It is now
+  `qubee-g-<blake3(domain ‖ group_id_hex ‖ epoch)[..16]>`, rotating
+  daily. Every member derives the same value from wall-clock time
+  floored to `TOPIC_EPOCH_SECS`; skew is absorbed by subscribing to a
+  window `{e-1, e, e+1}` and publishing on `e`, so a peer whose clock
+  is up to a full epoch off still shares a topic and frames in flight
+  across a rotation boundary still land. Because that window has to be
+  re-derived as epochs roll, callers now follow group *ids*
+  (`P2PCommand::SubscribeGroup` / `UnsubscribeGroup`) with the node
+  re-syncing subscriptions on a five-minute ticker — a caller pinned
+  to a fixed topic string would have silently fallen off the group at
+  the first rotation. `kademlia_client_mode` adds an opt-in
+  `kad::Mode::Client` (query the DHT without advertising our own
+  addresses into it); the default stays `Server`, because a network of
+  only clients has no DHT left to query. **Scope, precisely:** this
+  hides group identity from an observer watching *topic strings*. It
+  does not hide it from one who captures a message payload — the outer
+  envelope still carries `group_id` in the clear — and closing that is
+  a `QUBEE_GMS\x03` wire bump that has not been done. Tests pin that
+  the group id is not recoverable from the topic at any epoch.
+  **Breaking:** the topic string changes, so this build does not meet
+  pre-blinded builds on the same group.
 
 ### Fixed
 
@@ -243,6 +273,28 @@ between minor versions.
   tree. `MIGRATION_2_3` itself is reviewed by inspection until
   the second real migration lands and we set up the snapshot
   workflow. `app/schemas/` is gitignored in the meantime.
+
+- **Compose UI drift from the design source.** Five gaps between the
+  shipped screens and the design they were built from, one of them bad
+  enough to make a control unreachable:
+  - **Group chat showed no sender.** `MessageDao` already joined
+    `COALESCE(c.displayName, m.senderId) as senderName` precisely so
+    the chat surface wouldn't need a per-row contact lookup, but
+    `ChatViewModel.toUi()` dropped the column — so every incoming
+    group message rendered unattributed. Now carried on `UiMessage`
+    and rendered above the bubble for incoming group messages only;
+    senders that don't resolve to a contact collapse to an 8-char
+    prefix instead of a 64-char identity hex.
+  - **Settings could not scroll.** The content ran well past the
+    viewport on a 412×892 device, putting the share buttons and the
+    whole "Destroy local identity" button out of reach.
+  - **The empty inbox could not scroll**, clipping most of the
+    security-baseline panel.
+  - **Add contact was never wrapped in `QubeeTheme`** — the only
+    surface that wasn't — so it rendered on the default Material
+    ground rather than Void.
+  - The onboarding-success fingerprint set in the sans face, while
+    every other fingerprint in the app is monospace.
 
 ### Foundational
 

@@ -159,10 +159,11 @@ pub fn seal_outer_envelope(
 /// `group_key_lookup` is a closure that takes the parsed `group_id`
 /// and returns the current 32-byte group key for it, or `None` if the
 /// receiver isn't a member. Two-stage because the wire carries
-/// `group_id` in the clear (it's identical to the gossipsub topic
-/// name), but the inner ciphertext can only be opened with the right
-/// group key — so the parser first reads `group_id`, asks the caller
-/// which key to use, then attempts AEAD.
+/// `group_id` in the clear — since the gossip topic became a blinded
+/// rotating hash this is the one place group identity is still
+/// readable on the wire — but the inner ciphertext can only be opened
+/// with the right group key — so the parser first reads `group_id`,
+/// asks the caller which key to use, then attempts AEAD.
 pub fn open_outer_envelope(
     wire: &[u8],
     group_key_lookup: impl FnOnce(&GroupId) -> Option<[u8; 32]>,

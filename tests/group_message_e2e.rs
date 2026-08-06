@@ -65,6 +65,7 @@ fn join_bob_to_alice(
             joiner_public_key: bob_kp.public_key(),
             joiner_display_name: "Bob".to_string(),
             joiner_kyber_pub: kyber_pub,
+            joiner_peer_id: String::new(),
         },
     )
     .unwrap()

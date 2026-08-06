@@ -90,6 +90,7 @@ fn invite_handshake_converges_on_shared_group_state() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed_request = sign_request_join(&bob_kp, request_body.clone()).expect("sign request");
     let request_wire = signed_request.to_wire().expect("wire");
@@ -186,6 +187,7 @@ fn forged_request_join_is_rejected() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob (impersonated)".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed = sign_request_join(&mallory_kp, body.clone()).unwrap();
     let (decoded_body, decoded_sig) = match signed {
@@ -229,6 +231,7 @@ fn unknown_invitation_returns_silent_no_op() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed = sign_request_join(&bob_kp, body.clone()).unwrap();
     let (req_body, req_sig) = match signed {
@@ -288,6 +291,7 @@ fn key_rotation_after_removal_converges_on_new_key() {
             joiner_public_key: bob_kp.public_key(),
             joiner_display_name: "Bob".to_string(),
             joiner_kyber_pub: bob_kyber_pub,
+            joiner_peer_id: String::new(),
         },
     )
     .unwrap()
@@ -332,6 +336,7 @@ fn key_rotation_after_removal_converges_on_new_key() {
             joiner_public_key: carol_kp.public_key(),
             joiner_display_name: "Carol".to_string(),
             joiner_kyber_pub: carol_kyber_pub,
+            joiner_peer_id: String::new(),
         },
     )
     .unwrap()
@@ -461,6 +466,7 @@ fn enforces_sixteen_member_cap_via_handshake() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed = sign_request_join(&bob_kp, body.clone()).unwrap();
     let (req_body, req_sig) = match signed {
@@ -523,6 +529,7 @@ fn reissued_request_join_is_idempotent() {
             joiner_public_key: bob_kp.public_key(),
             joiner_display_name: "Bob".to_string(),
             joiner_kyber_pub: kyber_pub,
+            joiner_peer_id: String::new(),
         };
         match sign_request_join(&bob_kp, body).unwrap() {
             GroupHandshake::RequestJoin { body, signature } => (body, signature),

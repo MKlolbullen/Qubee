@@ -218,6 +218,7 @@ async fn p2p_two_node_e2e() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: bob_node.peer_id.clone(),
     };
     let signed_request =
         sign_request_join(&bob_kp, request_body.clone()).expect("sign RequestJoin");
@@ -390,6 +391,7 @@ async fn p2p_key_rotation_e2e() {
                 joiner_public_key: joiner_kp.public_key(),
                 joiner_display_name: joiner_name.to_string(),
                 joiner_kyber_pub: kyber_pub,
+                joiner_peer_id: format!("12D3KooW{joiner_name}"),
             },
         )
         .unwrap();

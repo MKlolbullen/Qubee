@@ -121,6 +121,14 @@ lazy_static! {
     /// miss means we can't direct-deliver to that member, and they
     /// re-sync the key via `StateSyncResponse` instead.
     static ref PEER_DIRECTORY: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+
+    /// This device's own libp2p PeerId (base58), captured when the P2P
+    /// node starts. A joiner stamps it into the signed `RequestJoinBody`
+    /// so the inviter can route the direct `JoinAccepted` reply from the
+    /// authenticated frame rather than the gossip author — removing the
+    /// join handshake's dependency on gossipsub broadcasting the author
+    /// PeerId. `None` until `nativeStartNetwork` has loaded the node key.
+    static ref LOCAL_PEER_ID: Mutex<Option<String>> = Mutex::new(None);
 }
 
 /// Max entries retained in [`SEEN_MESSAGE_IDS`]. Bounds memory; oldest
@@ -425,8 +433,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         return;
                     }
                 };
+                let local_peer_id = libp2p::PeerId::from(id_keys.public());
+                *LOCAL_PEER_ID.lock().unwrap() = Some(local_peer_id.to_string());
                 tracing::info!(
-                    peer_id = %libp2p::PeerId::from(id_keys.public()),
+                    peer_id = %local_peer_id,
                     "Starting P2P Node",
                 );
 
@@ -1424,12 +1434,19 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
         }
     }
 
+    // Stamp our own PeerId into the signed body so the inviter can route
+    // the direct JoinAccepted from the authenticated frame instead of the
+    // gossip author. Empty if the node key hasn't been captured yet — the
+    // inviter then can't direct-reply and the joiner retries once the
+    // network is up.
+    let joiner_peer_id = LOCAL_PEER_ID.lock().unwrap().clone().unwrap_or_default();
     let body = RequestJoinBody {
         group_id: payload.group_id,
         invitation_code: payload.invitation_code.clone(),
         joiner_public_key: identity.public_key(),
         joiner_display_name: active_display_name().unwrap_or_default(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id,
     };
     let signed = sign_request_join(identity.as_ref(), body)?;
     let wire = signed.to_wire()?;
@@ -1651,10 +1668,19 @@ fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
 fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::Result<()> {
     match frame {
         GroupHandshake::RequestJoin { body, signature } => {
-            // The joiner's authenticated PeerId is the delivering peer —
-            // gossipsub runs Signed+Strict, so this is the RequestJoin
-            // author. Reply to it directly instead of broadcasting.
-            on_request_join(body, signature, sender_peer_id)?;
+            // Route the direct reply to the joiner's PeerId from the
+            // *signed body*, not the gossip author. The whole frame is
+            // signature-checked in `process_request_join`, so a tampered
+            // peer id fails verification before we reply. Falling back to
+            // the gossip source keeps older joiners (empty peer id) working
+            // while gossipsub still runs Signed+Strict. `body` is consumed
+            // by `on_request_join`, so read the routing target first.
+            let reply_peer_id = if body.joiner_peer_id.is_empty() {
+                sender_peer_id
+            } else {
+                body.joiner_peer_id.clone()
+            };
+            on_request_join(body, signature, reply_peer_id)?;
         }
         GroupHandshake::JoinAccepted { body, signature } => {
             on_join_accepted(body, signature)?;

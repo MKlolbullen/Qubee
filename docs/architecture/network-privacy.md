@@ -51,13 +51,34 @@ Cheap, self-contained, ships without a new network dependency. Does
   layer — v2 carries a hybrid identity signature, v3 carries the
   ephemeral sender-key signature — so transport-level author
   attribution is redundant for security but is the direct cause of the
-  social-graph leak. **Caveat:** the receive path currently derives the
-  PeerId↔IdentityId TOFU linkage from `message.source`
-  (`p2p_node.rs`), and that linkage is a documented trust invariant;
-  going anonymous requires re-deriving it from the inner frame's
-  identity instead. Also loses gossipsub's own signature-based spam
-  gate (app-layer signatures still hold). Medium effort, security-
-  sensitive — the single highest-value metadata win in our control.
+  social-graph leak. Investigation showed this is **not** a config flip:
+  `message.source` is the *only* way peers learn each other's network
+  PeerId today, and it feeds both the PeerId↔IdentityId trust linkage
+  (a documented invariant) *and* all direct-message routing
+  (`PEER_DIRECTORY` → JoinAccepted/KeyDelivery). Going anonymous forces
+  distributing **authenticated PeerIds in-band** across the signed
+  frames, plus flipping `ValidationMode::Strict`→`None` (which changes
+  gossipsub's own dedup/spam gate — app-layer signatures still hold).
+  So this lands as a *sequenced* change, not one edit:
+  - **Step 1 (✅ landed).** `RequestJoinBody` now carries the joiner's
+    own `joiner_peer_id`, self-attested and covered by the frame
+    signature (`_v2` tag + pinned vector). The inviter routes the direct
+    `JoinAccepted`/`JoinRejected` reply from the authenticated body
+    rather than the gossip author, with a fallback to `message.source`
+    for empty (legacy) peer ids while gossip is still Signed. This
+    removes the join handshake's dependency on the broadcast author
+    PeerId and makes that linkage authenticated instead of transport
+    TOFU. Correction to an earlier note: this needs **no** invite-link
+    change — the joiner knows its own PeerId; the invite is untouched.
+  - **Step 2 (next).** Distribute member PeerIds in-band (an
+    authenticated field on `GroupMemberSummary`, carried by
+    MemberAdded / JoinAccepted / StateSync) so members can direct-route
+    to *each other* for rotations without the gossip author.
+  - **Step 3.** Flip group publishing to `Anonymous` +
+    `ValidationMode::None`, and re-derive the receive-path TOFU linkage
+    from the inner signed frame rather than `message.source`.
+  Medium effort overall, security-sensitive — the single highest-value
+  metadata win in our control.
 - **Fixed-size padding buckets.** ✅ *Landed (whole forward-secret path).*
   `security::padding` (length-prefix + zero-pad to a geometric size
   class: 256 / 1 K / 4 K / 16 K / 64 K, then 64 K steps) is applied to

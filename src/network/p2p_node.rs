@@ -10,6 +10,7 @@ use libp2p::{
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -122,6 +123,13 @@ pub enum P2PCommand {
     Subscribe { topic: String },
     /// Stop receiving traffic on a named gossipsub topic.
     Unsubscribe { topic: String },
+    /// Follow a group by id rather than by topic string. Topics are
+    /// blinded and rotate per epoch, so a caller that subscribed to a
+    /// fixed string would fall off the group at the next rotation; the
+    /// node owns the window and re-derives it as epochs roll.
+    SubscribeGroup { group_id_hex: String },
+    /// Stop following a group and drop its whole topic window.
+    UnsubscribeGroup { group_id_hex: String },
     /// Publish bytes on a named gossipsub topic. The local node must be
     /// subscribed for the publish to actually go out — gossipsub
     /// silently drops publishes on topics with no local subscription.
@@ -132,10 +140,66 @@ pub enum P2PCommand {
     Dial { multiaddr: String },
 }
 
+/// Rotation period for blinded group topics. All members derive the
+/// same epoch from wall-clock time, so this doubles as the tolerated
+/// clock skew budget: a day is long enough that a badly-set phone
+/// still lands inside the subscribed window (see [`TOPIC_EPOCH_SKEW`]).
+pub const TOPIC_EPOCH_SECS: u64 = 86_400;
+
+/// How many epochs either side of the current one a member stays
+/// subscribed to. 1 means the live window is {e-1, e, e+1}: a peer
+/// whose clock is up to a full epoch fast or slow still shares a topic
+/// with us, and messages in flight across a rotation boundary land.
+pub const TOPIC_EPOCH_SKEW: u64 = 1;
+
+const TOPIC_BLIND_DOMAIN: &[u8] = b"qubee-group-topic-blind-v1";
+
+/// How often the node re-derives its topic window. Independent of the
+/// epoch length: it only has to be fine-grained enough that a rotation
+/// is picked up promptly, and cheap enough to run forever.
+const TOPIC_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Current topic epoch. Saturates rather than panicking if the system
+/// clock is before the Unix epoch.
+pub fn topic_epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / TOPIC_EPOCH_SECS)
+        .unwrap_or(0)
+}
+
+/// Blinded per-group topic for an explicit epoch.
+///
+/// The raw group id used to ride on the wire as the topic string, so
+/// any passive observer could read it and correlate a group across its
+/// whole lifetime. Hashing it under a rotating epoch keeps the value
+/// derivable by every member while giving an observer neither the id
+/// nor a stable handle to follow.
+pub fn group_topic_for_epoch(group_id_hex: &str, epoch: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TOPIC_BLIND_DOMAIN);
+    hasher.update(group_id_hex.as_bytes());
+    hasher.update(&epoch.to_be_bytes());
+    format!(
+        "qubee-g-{}",
+        hex::encode(&hasher.finalize().as_bytes()[..16])
+    )
+}
+
 /// Public helper so callers (JNI, tests) build the per-group topic
-/// name in exactly one place.
+/// name in exactly one place. Publishes always target the current
+/// epoch; subscribers cover a window around it.
 pub fn group_topic(group_id_hex: &str) -> String {
-    format!("qubee-group-{group_id_hex}")
+    group_topic_for_epoch(group_id_hex, topic_epoch_now())
+}
+
+/// Every topic a member should be subscribed to for `group_id_hex`
+/// right now.
+pub fn group_topic_window(group_id_hex: &str) -> Vec<String> {
+    let now = topic_epoch_now();
+    (now.saturating_sub(TOPIC_EPOCH_SKEW)..=now.saturating_add(TOPIC_EPOCH_SKEW))
+        .map(|epoch| group_topic_for_epoch(group_id_hex, epoch))
+        .collect()
 }
 
 /// Events sent from Rust -> Android (Kotlin)
@@ -173,6 +237,13 @@ pub struct P2PNodeConfig {
     pub gossipsub_heartbeat: Duration,
     pub gossipsub_validation_mode: gossipsub::ValidationMode,
     pub idle_connection_timeout: Duration,
+    /// Run Kademlia as a client: query the DHT without advertising our
+    /// own addresses into it. Costs discoverability — a client-mode node
+    /// can find peers but cannot be found through the DHT, and serves no
+    /// routing for anyone else — so it stays opt-in for privacy-sensitive
+    /// profiles rather than becoming the default. If every node ran as a
+    /// client there would be no DHT left to query.
+    pub kademlia_client_mode: bool,
 }
 
 impl Default for P2PNodeConfig {
@@ -197,6 +268,7 @@ impl Default for P2PNodeConfig {
             // frame; see the gossipsub behaviour build.
             gossipsub_validation_mode: gossipsub::ValidationMode::None,
             idle_connection_timeout: Duration::from_secs(60),
+            kademlia_client_mode: false,
         }
     }
 }
@@ -217,6 +289,7 @@ impl P2PNodeConfig {
             // Match production: anonymous authorship needs None.
             gossipsub_validation_mode: gossipsub::ValidationMode::None,
             idle_connection_timeout: Duration::from_secs(60),
+            kademlia_client_mode: false,
         }
     }
 }
@@ -238,6 +311,8 @@ struct QubeeBehaviour {
 pub struct P2PNode {
     swarm: Swarm<QubeeBehaviour>,
     command_receiver: mpsc::Receiver<P2PCommand>,
+    followed_groups: HashSet<String>,
+    live_group_topics: HashSet<String>,
 }
 
 const GLOBAL_TOPIC: &str = "qubee-global";
@@ -306,7 +381,11 @@ impl P2PNode {
 
                 let kad_store = kad::store::MemoryStore::new(peer_id);
                 let mut kademlia = kad::Behaviour::new(peer_id, kad_store);
-                kademlia.set_mode(Some(kad::Mode::Server));
+                kademlia.set_mode(Some(if cfg_for_behaviour.kademlia_client_mode {
+                    kad::Mode::Client
+                } else {
+                    kad::Mode::Server
+                }));
 
                 let mdns: Toggle<mdns::tokio::Behaviour> = if cfg_for_behaviour.enable_mdns {
                     Some(mdns::tokio::Behaviour::new(
@@ -342,7 +421,32 @@ impl P2PNode {
         Ok(Self {
             swarm,
             command_receiver,
+            followed_groups: HashSet::new(),
+            live_group_topics: HashSet::new(),
         })
+    }
+
+    /// Bring the subscribed topic set in line with the current epoch
+    /// window for every followed group.
+    fn resync_group_topics(&mut self) {
+        let desired: HashSet<String> = self
+            .followed_groups
+            .iter()
+            .flat_map(|g| group_topic_window(g))
+            .collect();
+
+        for topic in desired.difference(&self.live_group_topics) {
+            let ident = gossipsub::IdentTopic::new(topic.clone());
+            if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&ident) {
+                eprintln!("Subscribe error for {topic}: {e:?}");
+            }
+        }
+        for topic in self.live_group_topics.difference(&desired) {
+            let ident = gossipsub::IdentTopic::new(topic.clone());
+            self.swarm.behaviour_mut().gossipsub.unsubscribe(&ident);
+        }
+
+        self.live_group_topics = desired;
     }
 
     /// Main event loop. Drives the swarm forward and translates
@@ -353,8 +457,14 @@ impl P2PNode {
             eprintln!("Failed to subscribe to topic: {e:?}");
         }
 
+        let mut topic_resync = tokio::time::interval(TOPIC_RESYNC_INTERVAL);
+        topic_resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = topic_resync.tick() => {
+                    self.resync_group_topics();
+                }
                 command = self.command_receiver.recv() => match command {
                     Some(P2PCommand::SendMessage { peer_id: _, data }) => {
                         if let Err(e) = self
@@ -406,6 +516,16 @@ impl P2PNode {
                         // intent is still observable.
                         if !self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
                             eprintln!("Unsubscribe no-op for {topic} (not subscribed)");
+                        }
+                    }
+                    Some(P2PCommand::SubscribeGroup { group_id_hex }) => {
+                        if self.followed_groups.insert(group_id_hex) {
+                            self.resync_group_topics();
+                        }
+                    }
+                    Some(P2PCommand::UnsubscribeGroup { group_id_hex }) => {
+                        if self.followed_groups.remove(&group_id_hex) {
+                            self.resync_group_topics();
                         }
                     }
                     Some(P2PCommand::PublishToTopic { topic, data }) => {
@@ -518,6 +638,70 @@ impl P2PNode {
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GROUP_A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const GROUP_B: &str = "ffeeddccbbaa99887766554433221100";
+
+    /// The whole point of blinding: the group id must not be readable
+    /// off the topic string by a passive observer.
+    #[test]
+    fn blinded_topic_never_contains_the_group_id() {
+        for epoch in [0u64, 1, 20_000, u64::MAX] {
+            let topic = group_topic_for_epoch(GROUP_A, epoch);
+            assert!(!topic.contains(GROUP_A));
+            // Any run of the id long enough to be recognisable.
+            for window in GROUP_A.as_bytes().windows(8) {
+                let frag = std::str::from_utf8(window).unwrap();
+                assert!(!topic.contains(frag), "leaked {frag} in {topic}");
+            }
+        }
+    }
+
+    #[test]
+    fn topic_is_stable_within_an_epoch_and_rotates_across_them() {
+        assert_eq!(
+            group_topic_for_epoch(GROUP_A, 42),
+            group_topic_for_epoch(GROUP_A, 42),
+        );
+        assert_ne!(
+            group_topic_for_epoch(GROUP_A, 42),
+            group_topic_for_epoch(GROUP_A, 43),
+        );
+    }
+
+    #[test]
+    fn distinct_groups_get_distinct_topics_in_the_same_epoch() {
+        assert_ne!(
+            group_topic_for_epoch(GROUP_A, 7),
+            group_topic_for_epoch(GROUP_B, 7),
+        );
+    }
+
+    /// The publish target must always sit inside the subscribed window,
+    /// or members would publish into a topic nobody listens on.
+    #[test]
+    fn window_covers_the_current_publish_topic() {
+        let window = group_topic_window(GROUP_A);
+        assert_eq!(window.len() as u64, TOPIC_EPOCH_SKEW * 2 + 1);
+        assert!(window.contains(&group_topic(GROUP_A)));
+    }
+
+    /// A peer whose clock is a full epoch off still shares a topic with
+    /// us — that overlap is what makes the skew budget real.
+    #[test]
+    fn windows_overlap_across_one_epoch_of_clock_skew() {
+        let now = topic_epoch_now();
+        let ours: HashSet<String> = group_topic_window(GROUP_A).into_iter().collect();
+        for skewed in [now - 1, now + 1] {
+            let theirs = group_topic_for_epoch(GROUP_A, skewed);
+            assert!(ours.contains(&theirs));
         }
     }
 }

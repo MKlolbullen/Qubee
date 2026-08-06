@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -349,7 +351,12 @@ private fun EmptyConversations(
     onOpenInvites: () -> Unit,
 ) {
     Column(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            // Two stacked panels overrun the viewport on a 412×892
+            // device once the toolbar and bottom nav take their cut,
+            // so the security baseline needs to be scrollable to.
+            .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         QubeePanel {

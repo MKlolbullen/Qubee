@@ -771,7 +771,22 @@ class ChatViewModel @Inject constructor(
             timestamp = msg.timestamp,
             type = msg.contentType.toUiType(),
             status = msg.status.toUiStatus(msg.isFromMe),
+            senderName = senderName.toSenderLabel(),
         )
+    }
+
+    /**
+     * The DAO's `COALESCE(c.displayName, m.senderId)` join falls back
+     * to the raw 64-char identity hex whenever the sender isn't in
+     * `contacts` yet — a group member we've never paired with 1:1.
+     * A hex wall doesn't belong above a bubble, so unresolved ids
+     * collapse to an 8-char prefix, the same shape
+     * `ChatViewModel.init` uses for unnamed 1:1 peers.
+     */
+    private fun String.toSenderLabel(): String {
+        val trimmed = trim()
+        val looksLikeRawId = trimmed.length > 16 && trimmed.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+        return if (looksLikeRawId) trimmed.take(8) else trimmed
     }
 
     private companion object {
@@ -864,6 +879,12 @@ data class UiMessage(
     val timestamp: Long = 0L,
     val type: UiMessageType = UiMessageType.TEXT,
     val status: MessageDeliveryState = MessageDeliveryState.Sent,
+    /// Display name of whoever sent this, resolved by the
+    /// `MessageDao` join against `contacts`. Only rendered for
+    /// *incoming* messages in *group* conversations — a 1:1 chat
+    /// already names the peer in the top bar, and our own bubbles
+    /// don't need attributing.
+    val senderName: String = "",
 )
 
 enum class UiMessageType { TEXT, IMAGE, FILE, AUDIO }

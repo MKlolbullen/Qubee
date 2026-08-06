@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -230,6 +231,10 @@ private fun SuccessView(
             bundle.fingerprint,
             color = QubeePalette.Cyan,
             style = MaterialTheme.typography.bodySmall,
+            // Fingerprints set monospace everywhere they're meant to
+            // be read digit-by-digit — Settings, Verify, the details
+            // sheet. This one was the odd one out.
+            fontFamily = FontFamily.Monospace,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )

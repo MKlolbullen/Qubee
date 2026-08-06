@@ -154,6 +154,62 @@ pub enum NodeEvent {
     Listening { multiaddr: String },
 }
 
+/// Transport privacy posture for the node.
+///
+/// `Direct` is the shipped behaviour: plain TCP/QUIC dials, so peers you
+/// connect to (and on-path observers) learn your IP. `TorOnion` is the
+/// Tier-2 target — reach and be reached as a Tor onion service so your
+/// network location is hidden — but the transport is **not built yet**;
+/// selecting it today fails closed (see [`P2PNode::with_config`]) rather
+/// than silently falling back to `Direct` and leaking the IP the mode
+/// exists to hide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TransportPrivacy {
+    /// Plain TCP/QUIC. Peers learn your IP. (Current shipped behaviour.)
+    #[default]
+    Direct,
+    /// Tor onion-service transport. Foundation only today — not yet
+    /// functional; `with_config` refuses to start in this mode.
+    TorOnion,
+}
+
+impl TransportPrivacy {
+    fn is_tor(self) -> bool {
+        matches!(self, TransportPrivacy::TorOnion)
+    }
+}
+
+/// Effective discovery settings once the transport-privacy posture is
+/// applied. Tor mode is *leaky-by-default* if you don't also silence the
+/// address-advertising behaviours: mDNS broadcasts your LAN IP, and a
+/// Kademlia server advertises its addresses to the DHT — both would
+/// publish the real address Tor is meant to hide. So Tor forces mDNS off
+/// and Kademlia into client mode (query the DHT without advertising).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedDiscovery {
+    mdns_enabled: bool,
+    kademlia_client_mode: bool,
+}
+
+/// Resolve discovery behaviour from the requested mDNS setting and the
+/// transport-privacy posture. Pure + unit-tested so the leaky-by-default
+/// guards are pinned independently of the (not-yet-built) Tor transport.
+fn resolve_discovery(privacy: TransportPrivacy, enable_mdns: bool) -> ResolvedDiscovery {
+    if privacy.is_tor() {
+        // Force the address-leaking behaviours off regardless of the
+        // caller's mDNS request — under Tor they would defeat the point.
+        ResolvedDiscovery {
+            mdns_enabled: false,
+            kademlia_client_mode: true,
+        }
+    } else {
+        ResolvedDiscovery {
+            mdns_enabled: enable_mdns,
+            kademlia_client_mode: false,
+        }
+    }
+}
+
 /// Tunables for `P2PNode`. Production callers should use
 /// [`P2PNodeConfig::default`]; tests should use
 /// [`P2PNodeConfig::for_testing`] which (a) disables mDNS so two
@@ -164,6 +220,10 @@ pub enum NodeEvent {
 #[derive(Clone)]
 pub struct P2PNodeConfig {
     pub enable_mdns: bool,
+    /// Transport privacy posture. Defaults to [`TransportPrivacy::Direct`];
+    /// [`TransportPrivacy::TorOnion`] is Tier-2 foundation-only and
+    /// currently refuses to start.
+    pub transport_privacy: TransportPrivacy,
     pub listen_addr: Multiaddr,
     /// Optional QUIC (UDP) listen address, bound *in addition to*
     /// `listen_addr` (TCP). `None` disables QUIC listening. QUIC dials
@@ -184,6 +244,7 @@ impl Default for P2PNodeConfig {
             // opt-in local-discovery convenience, not a requirement —
             // default it OFF and let a caller re-enable it explicitly.
             enable_mdns: false,
+            transport_privacy: TransportPrivacy::Direct,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/0.0.0.0/udp/0/quic-v1"
@@ -207,6 +268,7 @@ impl P2PNodeConfig {
     pub fn for_testing() -> Self {
         Self {
             enable_mdns: false,
+            transport_privacy: TransportPrivacy::Direct,
             listen_addr: "/ip4/127.0.0.1/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/127.0.0.1/udp/0/quic-v1"
@@ -218,6 +280,30 @@ impl P2PNodeConfig {
             gossipsub_validation_mode: gossipsub::ValidationMode::None,
             idle_connection_timeout: Duration::from_secs(60),
         }
+    }
+}
+
+/// Error for a [`TransportPrivacy::TorOnion`] request that can't be
+/// honoured yet. Feature-aware so the message states the real reason,
+/// but the outcome is the same either way: fail closed, never downgrade
+/// to a direct transport that would expose the IP the caller asked to
+/// hide.
+fn tor_transport_unavailable() -> anyhow::Error {
+    #[cfg(feature = "tor")]
+    {
+        anyhow!(
+            "TransportPrivacy::TorOnion selected, but the onion-service transport is not \
+             implemented yet (Tier-2 foundation). Refusing to start rather than fall back to a \
+             direct transport that would expose your IP."
+        )
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        anyhow!(
+            "TransportPrivacy::TorOnion requires the `tor` Cargo feature — and the onion transport \
+             itself is not implemented yet. Refusing to fall back to a direct transport that would \
+             expose your IP."
+        )
     }
 }
 
@@ -258,6 +344,17 @@ impl P2PNode {
         command_receiver: mpsc::Receiver<P2PCommand>,
         config: P2PNodeConfig,
     ) -> Result<Self> {
+        // Tier-2 foundation: the Tor onion-service transport isn't wired
+        // yet. Fail CLOSED rather than fall back to a direct TCP/QUIC
+        // node — a caller who asked for Tor did so to hide their IP, and
+        // silently giving them a direct transport would expose the very
+        // address they meant to protect. The `resolve_discovery` guards
+        // (mDNS off, Kademlia client mode) are already in place for when
+        // the transport lands; see docs/architecture/network-privacy.md.
+        if config.transport_privacy.is_tor() {
+            return Err(tor_transport_unavailable());
+        }
+
         let cfg_for_behaviour = config.clone();
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
             .with_tokio()
@@ -304,11 +401,22 @@ impl P2PNode {
                 )
                 .map_err(std::io::Error::other)?;
 
+                let discovery = resolve_discovery(
+                    cfg_for_behaviour.transport_privacy,
+                    cfg_for_behaviour.enable_mdns,
+                );
+
                 let kad_store = kad::store::MemoryStore::new(peer_id);
                 let mut kademlia = kad::Behaviour::new(peer_id, kad_store);
-                kademlia.set_mode(Some(kad::Mode::Server));
+                // Client mode under Tor: query the DHT without advertising
+                // our own addresses (which would leak past the onion).
+                kademlia.set_mode(Some(if discovery.kademlia_client_mode {
+                    kad::Mode::Client
+                } else {
+                    kad::Mode::Server
+                }));
 
-                let mdns: Toggle<mdns::tokio::Behaviour> = if cfg_for_behaviour.enable_mdns {
+                let mdns: Toggle<mdns::tokio::Behaviour> = if discovery.mdns_enabled {
                     Some(mdns::tokio::Behaviour::new(
                         mdns::Config::default(),
                         peer_id,
@@ -519,5 +627,81 @@ impl P2PNode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_mode_preserves_discovery_settings() {
+        // Direct: honour the caller's mDNS choice, Kademlia stays in
+        // server mode (advertise addresses to the DHT).
+        let on = resolve_discovery(TransportPrivacy::Direct, true);
+        assert_eq!(
+            on,
+            ResolvedDiscovery {
+                mdns_enabled: true,
+                kademlia_client_mode: false,
+            }
+        );
+        let off = resolve_discovery(TransportPrivacy::Direct, false);
+        assert_eq!(
+            off,
+            ResolvedDiscovery {
+                mdns_enabled: false,
+                kademlia_client_mode: false,
+            }
+        );
+    }
+
+    #[test]
+    fn tor_mode_forces_address_leaking_behaviours_off() {
+        // Tor forces mDNS off and Kademlia into client mode even when the
+        // caller explicitly asked for mDNS — both would publish the real
+        // address the onion is meant to hide.
+        let resolved = resolve_discovery(TransportPrivacy::TorOnion, true);
+        assert_eq!(
+            resolved,
+            ResolvedDiscovery {
+                mdns_enabled: false,
+                kademlia_client_mode: true,
+            },
+            "Tor mode must silence mDNS and DHT address advertisement",
+        );
+    }
+
+    #[tokio::test]
+    async fn tor_transport_fails_closed_until_implemented() {
+        // Selecting Tor must refuse to start — never silently fall back to
+        // a direct transport that would expose the IP the caller asked to
+        // hide. This is the fail-closed seam for the not-yet-built Tier-2
+        // onion transport.
+        let id_keys = libp2p::identity::Keypair::generate_ed25519();
+        let (_tx, rx) = mpsc::channel(1);
+        let config = P2PNodeConfig {
+            transport_privacy: TransportPrivacy::TorOnion,
+            ..P2PNodeConfig::for_testing()
+        };
+        let result = P2PNode::with_config(id_keys, rx, config).await;
+        assert!(
+            result.is_err(),
+            "TorOnion must fail closed until the onion transport is wired",
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("expose your IP"),
+            "error must explain the fail-closed rationale, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_transport_still_builds() {
+        // The default posture is unchanged: a Direct node builds fine.
+        let id_keys = libp2p::identity::Keypair::generate_ed25519();
+        let (_tx, rx) = mpsc::channel(1);
+        let result = P2PNode::with_config(id_keys, rx, P2PNodeConfig::for_testing()).await;
+        assert!(result.is_ok(), "Direct transport must still build");
     }
 }

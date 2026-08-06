@@ -140,6 +140,15 @@ legacy = []
 # Android JNI build picks the module up via `cfg(target_os = "android")`.
 # Used by CI and during refactors of the JNI bridge.
 _typecheck_jni = []
+# Tier-2 network privacy: onion-service transport over Tor (Arti). This
+# is the FOUNDATION only today — the config surface, the leaky-by-default
+# discovery guards, and a fail-closed seam are in place, but the actual
+# arti-client transport is not wired yet, so selecting Tor still refuses
+# to start rather than silently exposing your IP. The flag exists so the
+# eventual `arti-client` dependency and transport code compile *only*
+# when explicitly enabled; it pulls no extra dependencies today. See
+# docs/architecture/network-privacy.md (Tier 2).
+tor = []
 
 [dev-dependencies]
 tempfile = "3.27"

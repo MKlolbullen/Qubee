@@ -130,6 +130,27 @@ Hides your IP/location. The mature-enough Rust path is
 which since its #21 supports **listening as an onion service** — both
 endpoints anonymous, and no router port-forwarding needed.
 
+**Status: foundation landed; onion transport not yet wired.** The config
+surface and the leaky-by-default guards are in place, behind a `tor`
+Cargo feature (off by default, pulls no dependencies yet):
+
+- `P2PNodeConfig::transport_privacy: TransportPrivacy` — `Direct`
+  (shipped default) or `TorOnion`.
+- Selecting `TorOnion` today **fails closed**: `P2PNode::with_config`
+  returns an error rather than silently building a direct transport that
+  would expose the IP the caller asked to hide. This is the seam the
+  actual `arti-client` transport slots into.
+- `resolve_discovery` forces the address-leaking behaviours off under
+  Tor — **mDNS off** and **Kademlia `Mode::Client`** (query the DHT
+  without advertising our addresses) — independently of the caller's
+  mDNS request. Unit-tested so the guards are pinned before the
+  transport exists.
+
+Remaining (the heavy part): embed `arti-client`, implement a libp2p
+`Transport` over Arti's `DataStream`, and wire onion-service listening —
+gated on the `tor` feature. The confirmed version gap below is why this
+is a from-scratch integration rather than a drop-in.
+
 Honest costs and caveats (from the crate's own warnings + Arti's
 status, 2025–26):
 
@@ -143,12 +164,16 @@ status, 2025–26):
 - **Latency.** Bootstrapping a Tor client takes ~20–60 s; per-message
   latency rises. gossipsub over circuit-switched Tor is workable for
   small groups but is not what Tor is optimised for.
-- **Version gap.** The crate currently pins `libp2p ^0.53` / `arti
-  ^0.24`; we're on libp2p 0.56. Adoption means either waiting for /
-  contributing a 0.56 bump, or embedding `arti-client` directly and
+- **Version gap (confirmed).** `libp2p-community-tor` 0.4.1 (latest, Nov
+  2024) pins `libp2p ^0.53` / `arti-client 0.24`; we're on libp2p 0.56,
+  and the merged anonymous-authorship work depends on 0.56 APIs (plus
+  the gossipsub 0.49.4 security floor), so downgrading is a non-starter.
+  Adoption therefore means either carrying a patched fork of the crate
+  bumped to 0.56 + current Arti, or embedding `arti-client` directly and
   wiring a custom `Transport` (the arti-client API is stable enough —
-  `TorClient::create_bootstrapped`, `launch_onion_service`,
-  `connect`).
+  `TorClient::create_bootstrapped`, `launch_onion_service`, `connect`).
+  The foundation above is deliberately transport-agnostic so either
+  approach drops into the same `with_config` seam.
 - **What it does *not* do:** Tor is low-latency with no mixing or cover
   traffic, so it does **not** defeat traffic-analysis (timing/volume
   correlation) by a global passive adversary. It hides *where* you are,

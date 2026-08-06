@@ -132,10 +132,63 @@ pub enum P2PCommand {
     Dial { multiaddr: String },
 }
 
-/// Public helper so callers (JNI, tests) build the per-group topic
-/// name in exactly one place.
+/// Epoch length for blinded group topics. The gossip topic rotates once
+/// per epoch so the raw group id never appears on the wire and a passive
+/// observer can't correlate a group's traffic across epochs. One day
+/// balances that decorrelation against re-subscription churn — a node
+/// stays subscribed to a 3-epoch window and refreshes it periodically.
+pub const TOPIC_EPOCH_SECS: u64 = 24 * 60 * 60;
+
+/// Domain-separation tag for the blinded-topic hash. Bumping this rolls
+/// every group onto fresh topic strings (a coordinated, all-members
+/// change) — treat it like a wire-format version.
+const BLINDED_TOPIC_DOMAIN: &[u8] = b"qubee_blinded_group_topic_v1";
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Epoch index for a Unix timestamp.
+pub fn topic_epoch(now_unix_secs: u64) -> u64 {
+    now_unix_secs / TOPIC_EPOCH_SECS
+}
+
+/// Blinded gossip topic for a group at a specific epoch: a domain-
+/// separated BLAKE3 over the group id + epoch. All members derive the
+/// same value from the shared wall clock, so no group id or stable
+/// per-group identifier appears on the wire.
+pub fn blinded_group_topic(group_id_hex: &str, epoch: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BLINDED_TOPIC_DOMAIN);
+    hasher.update(group_id_hex.as_bytes());
+    hasher.update(&epoch.to_le_bytes());
+    format!(
+        "qubee-g-{}",
+        hex::encode(&hasher.finalize().as_bytes()[..16])
+    )
+}
+
+/// The current-epoch blinded topic — used when **publishing**, a
+/// point-in-time action. Callers (JNI, tests) build the per-group topic
+/// name through here so blinding lives in exactly one place.
 pub fn group_topic(group_id_hex: &str) -> String {
-    format!("qubee-group-{group_id_hex}")
+    blinded_group_topic(group_id_hex, topic_epoch(now_unix()))
+}
+
+/// The window of blinded topics a member **subscribes** to: previous,
+/// current, and next epoch. Subscribing to the neighbours absorbs clock
+/// skew (up to ~one epoch) and makes rollover seamless — the next
+/// epoch's mesh is pre-warmed before it becomes current. Returned oldest
+/// to newest.
+pub fn group_topic_window(group_id_hex: &str) -> Vec<String> {
+    let e = topic_epoch(now_unix());
+    [e.saturating_sub(1), e, e + 1]
+        .into_iter()
+        .map(|epoch| blinded_group_topic(group_id_hex, epoch))
+        .collect()
 }
 
 /// Events sent from Rust -> Android (Kotlin)
@@ -633,6 +686,41 @@ impl P2PNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blinded_topic_hides_group_id_and_rotates_by_epoch() {
+        let gid = "aabbccddeeff00112233445566778899";
+        let t0 = blinded_group_topic(gid, 100);
+        // The raw group id must not appear anywhere in the topic string.
+        assert!(!t0.contains(gid), "topic leaks the raw group id: {t0}");
+        assert!(t0.starts_with("qubee-g-"));
+        // Deterministic for the same (group, epoch).
+        assert_eq!(t0, blinded_group_topic(gid, 100));
+        // Different epoch → different topic (cross-time decorrelation).
+        assert_ne!(t0, blinded_group_topic(gid, 101));
+        // Different group → different topic.
+        assert_ne!(
+            t0,
+            blinded_group_topic("00112233445566778899aabbccddeeff", 100)
+        );
+    }
+
+    #[test]
+    fn topic_window_is_prev_current_next() {
+        let gid = "deadbeef";
+        let e = topic_epoch(now_unix());
+        let window = group_topic_window(gid);
+        assert_eq!(window.len(), 3);
+        assert_eq!(window[0], blinded_group_topic(gid, e - 1));
+        assert_eq!(window[1], blinded_group_topic(gid, e));
+        assert_eq!(window[2], blinded_group_topic(gid, e + 1));
+        // The publish topic (current epoch) is the middle of the window a
+        // subscriber joins, so a publisher and subscriber rendezvous.
+        assert_eq!(group_topic(gid), window[1]);
+        // Three distinct strings.
+        assert_ne!(window[0], window[1]);
+        assert_ne!(window[1], window[2]);
+    }
 
     #[test]
     fn direct_mode_preserves_discovery_settings() {

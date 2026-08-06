@@ -23,7 +23,7 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
 | **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
 | ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
-| **Group identity** | Topic name = `group_topic(group_id_hex)` — the group id in the clear | Anyone who observes the topic string |
+| ~~**Group identity**~~ | ✅ *Closed.* Topic is now a daily-rotating `BLAKE3(domain ‖ group_id ‖ epoch)` (blinded topic ids, landed) — the group id is no longer on the wire and the topic string decorrelates across epochs | ~~Anyone who observes the topic string~~ — only sees an opaque, rotating id |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
 What is **not** leaked: message content (sealed), and — usefully —
@@ -109,11 +109,20 @@ Cheap, self-contained, ships without a new network dependency. Does
   length. Scoped to the dark-launched ratchet paths (no live-wire /
   compat impact); the legacy v2 group path adopts the same primitive at
   the ratchet cutover, when its format changes once anyway.
-- **Blinded topic ids.** Derive the gossip topic from a rotating hash
-  of the group id + an epoch (all members derive the same value)
-  instead of the raw hex, so a passive observer can't read group ids
-  or trivially correlate a topic across time. Medium; needs a shared
-  epoch clock among members.
+- **Blinded topic ids.** ✅ *Landed (daily rotation).* The gossip topic
+  is now `BLAKE3(domain ‖ group_id_hex ‖ epoch)` (`blinded_group_topic`,
+  `TOPIC_EPOCH_SECS = 1 day`) instead of the raw `qubee-group-<hex>`, so
+  the group id never appears on the wire and the topic string changes
+  every epoch — a passive observer can't read group ids or correlate a
+  group's traffic across days. Members **publish** to the current-epoch
+  topic and **subscribe** to a `{epoch-1, epoch, epoch+1}` window
+  (`group_topic_window`), which absorbs up to ~one epoch of clock skew
+  and makes rollover seamless; a periodic refresh (`refresh_group_-`
+  `subscriptions`, hourly) advances the window and drops stale epochs.
+  Live-topic change (all members must run the same derivation — treat
+  `BLINDED_TOPIC_DOMAIN` like a wire version); pre-alpha, so no
+  compatibility shim. Still visible to an observer: *that* some blinded
+  topic has traffic and its rough volume/timing — hiding those is Tier 3.
 - **Tighter discovery defaults.** ✅ *mDNS default off (landed).*
   `P2PNodeConfig::default` now sets `enable_mdns: false`, so a device no
   longer broadcasts its presence + LAN IP by default (Kademlia /
@@ -208,13 +217,14 @@ Costs (from Nym's own measurements):
 
 ## 3. Recommended order
 
-1. **Tier 1 first**, because it's in our control, needs no new overlay,
-   and closes the *social-graph* leak that a plain VPN/Tor would not
-   even address. Start with the two lowest-risk pieces — **fixed-size
-   padding buckets** and **tighter discovery defaults** — then take on
-   **anonymous gossipsub authorship** as a focused, separately-reviewed
-   change (it touches the trust-linkage invariant). Blinded topic ids
-   last within the tier.
+1. **Tier 1 — ✅ complete.** All in-tree metadata reductions have
+   landed: fixed-size padding buckets (forward-secret paths), tighter
+   discovery defaults (mDNS off), anonymous gossipsub authorship, and
+   blinded rotating topic ids. This closed the *social-graph* and
+   *group-identity* leaks a plain VPN/Tor would not even address. (The
+   one parked item is padding on the *legacy v2* group path, which
+   adopts the same primitive at the ratchet cutover when its format
+   changes anyway.)
 2. **Tier 2 (Tor/Arti)** as the first *IP*-anonymisation step: an
    opt-in onion-service transport, defaulted **off**, gated behind the
    same "experimental, device-validation-pending" discipline as the

@@ -30,7 +30,10 @@ use crate::groups::handshake_handlers::{
     process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
-use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
+use crate::network::p2p_node::{
+    blinded_group_topic, group_topic, group_topic_window, topic_epoch, NodeEvent, P2PCommand,
+    P2PNode, TOPIC_EPOCH_SECS,
+};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text,
@@ -457,6 +460,25 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         // rides out in the roster snapshots we build.
                         stamp_local_peer_id_in_groups();
 
+                        // Blinded group topics rotate each epoch. Refresh
+                        // the subscribed window periodically (well inside
+                        // one epoch) so rollover is seamless: the next
+                        // epoch's mesh is joined and pre-warmed before it
+                        // becomes current, and stale epochs are dropped.
+                        tokio::spawn(async move {
+                            let mut ticker = tokio::time::interval(
+                                std::time::Duration::from_secs(TOPIC_EPOCH_SECS / 24),
+                            );
+                            // The first tick fires immediately; skip it —
+                            // resubscribe_known_groups already joined the
+                            // window at startup.
+                            ticker.tick().await;
+                            loop {
+                                ticker.tick().await;
+                                refresh_group_subscriptions();
+                            }
+                        });
+
                         tokio::spawn(async move {
                             while let Some(event) = rx_event.recv().await {
                                 // Intercept group-handshake traffic before
@@ -816,7 +838,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // `resubscribe_known_groups()` picks it up on the next
             // bootstrap because `gm.create_group` already persisted
             // the group through `store_group_securely`.
-            let _ = subscribe_topic(group_topic(&hex::encode(group_id.as_ref())));
+            subscribe_group(&hex::encode(group_id.as_ref()));
 
             // Stamp our own PeerId onto the owner membership so it rides
             // out in JoinAccepted/MemberAdded snapshots. No-op if the node
@@ -1461,13 +1483,13 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
     let signed = sign_request_join(identity.as_ref(), body)?;
     let wire = signed.to_wire()?;
 
-    // Subscribe to the per-group topic so we receive the inviter's
-    // JoinAccepted reply. Then publish the RequestJoin on the same
-    // topic — every other peer not in the group is unsubscribed and
-    // never sees the handshake.
-    let topic = group_topic(&hex::encode(payload.group_id.as_ref()));
-    let _ = subscribe_topic(topic.clone());
-    Ok(publish_to_topic(topic, wire))
+    // Subscribe to the group's blinded-topic window so we stay on the
+    // mesh across epoch rollover, then publish the RequestJoin on the
+    // current-epoch topic. Peers not in the group derive different
+    // blinded topics and never see the handshake.
+    let group_hex = hex::encode(payload.group_id.as_ref());
+    subscribe_group(&group_hex);
+    Ok(publish_to_topic(group_topic(&group_hex), wire))
 }
 
 /// Pop the cached Kyber secret for an invitation, returning ownership
@@ -1487,23 +1509,52 @@ fn take_pending_kyber_secret(invitation_code: &str) -> Option<Vec<u8>> {
 /// we need to re-establish (e.g. a network reset). Best-effort: a
 /// failure to subscribe is logged but doesn't take the node down.
 fn resubscribe_known_groups() {
+    for hex_id in member_group_hex_ids() {
+        subscribe_group(&hex_id);
+    }
+}
+
+/// Collect the hex-encoded ids of every group the active identity is a
+/// member of. Shared by the subscription refresh paths.
+fn member_group_hex_ids() -> Vec<String> {
     let mut gm_guard = GROUP_MANAGER.lock().unwrap();
     let gm = match gm_guard.as_mut() {
         Some(g) => g,
-        None => return,
+        None => return Vec::new(),
     };
     let active = match active_identity() {
         Ok(Some(id)) => id,
-        _ => return,
+        _ => return Vec::new(),
     };
-    let groups: Vec<_> = gm
-        .get_member_groups(&active.identity_id())
+    gm.get_member_groups(&active.identity_id())
         .iter()
         .map(|g| hex::encode(g.id.as_ref()))
-        .collect();
-    drop(gm_guard);
-    for hex_id in groups {
-        let _ = subscribe_topic(group_topic(&hex_id));
+        .collect()
+}
+
+/// Subscribe to a group's blinded-topic *window* ({epoch-1, epoch,
+/// epoch+1}) so the node keeps receiving across epoch rollover and
+/// tolerates up to ~one epoch of clock skew between members.
+fn subscribe_group(group_id_hex: &str) {
+    for topic in group_topic_window(group_id_hex) {
+        let _ = subscribe_topic(topic);
+    }
+}
+
+/// Periodic maintenance for blinded topics: as wall-clock epochs advance,
+/// re-subscribe every known group to its current window and drop the
+/// topics that have fallen out of it. Idempotent and self-correcting —
+/// subscribing to a topic we already hold, or unsubscribing one we don't,
+/// is a harmless no-op. Bounds each group to its 3-epoch window without
+/// tracking per-topic state: at each tick we (re)join {E-1, E, E+1} and
+/// leave the immediate neighbours {E-2, E+2}. The refresh runs well
+/// inside one epoch, so at most one boundary is crossed between ticks.
+fn refresh_group_subscriptions() {
+    let e = topic_epoch(now_secs());
+    for hex_id in member_group_hex_ids() {
+        subscribe_group(&hex_id);
+        let _ = unsubscribe_topic(blinded_group_topic(&hex_id, e.saturating_sub(2)));
+        let _ = unsubscribe_topic(blinded_group_topic(&hex_id, e + 2));
     }
 }
 
@@ -1516,6 +1567,20 @@ fn subscribe_topic(topic: String) -> bool {
         None => return false,
     };
     matches!(commander.try_send(P2PCommand::Subscribe { topic }), Ok(()))
+}
+
+/// Unsubscribe from a named gossipsub topic. No-op (returns false) if the
+/// network thread hasn't started yet.
+fn unsubscribe_topic(topic: String) -> bool {
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return false,
+    };
+    matches!(
+        commander.try_send(P2PCommand::Unsubscribe { topic }),
+        Ok(())
+    )
 }
 
 /// Publish bytes on a named gossipsub topic. The local node must be

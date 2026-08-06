@@ -124,10 +124,22 @@ the pre-alpha:
   is cut over, treat live messages as non-repudiable.
 - **Network metadata / IP exposure.** The libp2p transport uses direct
   TCP (+ Noise), so every peer you connect to or gossip with learns
-  your IP address. There is no onion routing or mixnet. Traffic
-  timing and (padded-only-at-the-envelope) message sizes are also
-  observable to a network adversary. An optional Tor transport is
-  roadmap, not shipped.
+  your IP address. There is no onion routing or mixnet, and an
+  optional Tor transport is roadmap, not shipped. Traffic timing
+  stays observable to a network adversary.
+
+  The in-tree metadata reductions that *have* landed
+  (`docs/architecture/network-privacy.md`, Tier 1): gossip authorship
+  is anonymous, so a topic subscriber learns that a group has traffic
+  but not which `PeerId` authored a frame; plaintext on the
+  forward-secret paths (v3 sender-key and the 1:1 Double Ratchet) is
+  padded to fixed size classes, though the live v2 path is still
+  padded only at the envelope; mDNS is off by default; and the gossip
+  topic is a blinded rotating hash instead of the group id in the
+  clear. **Group identity is reduced, not hidden** — the outer
+  group-message envelope still carries `group_id` in plaintext, so an
+  observer who captures a payload, rather than only watching topic
+  strings, can still tell which group it belongs to.
 - The Android Keystore master key that wraps both the SQLCipher
   passphrase *and* the Rust core keystore passphrase is configured
   with `setUserAuthenticationRequired(false)`, meaning local data
@@ -193,7 +205,7 @@ the pre-alpha:
 - `MessageStatus.SENT` means "encrypted bytes left this device", not
   "the peer acked". `DELIVERED` lands when the first signed
   `MessageAck` arrives (delivery confirmation shipped in
-  `[Unreleased]`).
+  `0.1.0-alpha`).
 - Local DB migrations run through a real `MIGRATION_*` chain
   (`Migrations.kt`); `fallbackToDestructiveMigration` is retained only
   as the safety net for version pairs the chain doesn't cover. Until

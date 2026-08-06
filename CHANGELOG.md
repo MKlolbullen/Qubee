@@ -300,10 +300,9 @@ between minor versions.
 
 The baseline feature set the entries above build on. Listed here so
 the first release's notes read as a complete picture rather than only
-the most recent deltas. (Nothing has shipped yet, so there is no
-prior released version — `[Unreleased]` *is* the upcoming
-`v0.1.0-alpha`; the maintainer renames this single heading at tag
-time per `RELEASE.md`.)
+the most recent deltas. (Nothing had shipped before this, so there is
+no prior released version to diff against — `v0.1.0-alpha` is the
+first tag.)
 
 - Cryptography: ML-KEM-768 (FIPS 203, `pqcrypto-mlkem`) + ML-DSA-44
   (FIPS 204, `pqcrypto-mldsa`); hybrid Ed25519 ⊕ ML-DSA-44 signature

@@ -452,6 +452,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         // restart doesn't drop us off the topic mesh.
                         resubscribe_known_groups();
 
+                        // Now that the node's PeerId is known, stamp it
+                        // onto our own membership in each group so it
+                        // rides out in the roster snapshots we build.
+                        stamp_local_peer_id_in_groups();
+
                         tokio::spawn(async move {
                             while let Some(event) = rx_event.recv().await {
                                 // Intercept group-handshake traffic before
@@ -812,6 +817,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // bootstrap because `gm.create_group` already persisted
             // the group through `store_group_securely`.
             let _ = subscribe_topic(group_topic(&hex::encode(group_id.as_ref())));
+
+            // Stamp our own PeerId onto the owner membership so it rides
+            // out in JoinAccepted/MemberAdded snapshots. No-op if the node
+            // isn't up yet — network start re-stamps every group then.
+            stamp_local_peer_id_in_groups();
 
             Ok(json!({
                 "group_id_hex": hex::encode(group_id.as_ref()),
@@ -1600,6 +1610,54 @@ fn resolve_peer_id(identity_hex: &str) -> Option<String> {
     PEER_DIRECTORY.lock().unwrap().get(identity_hex).cloned()
 }
 
+/// Ingest the in-band PeerIds carried by a roster snapshot into
+/// [`PEER_DIRECTORY`]. This is the authenticated, gossip-independent
+/// source of the IdentityId→PeerId linkage (frames are signature-checked
+/// before we get here): as anonymous gossip authorship lands, it replaces
+/// deriving peers from `message.source`. Empty peer ids are skipped —
+/// we never overwrite a known PeerId with "unknown".
+fn ingest_summary_peer_ids(members: &[crate::groups::group_handshake::GroupMemberSummary]) {
+    let mut dir = PEER_DIRECTORY.lock().unwrap();
+    for m in members {
+        if !m.peer_id.is_empty() {
+            dir.insert(
+                hex::encode(m.identity_id.as_ref() as &[u8]),
+                m.peer_id.clone(),
+            );
+        }
+    }
+}
+
+/// Stamp this device's own PeerId onto its `GroupMember` record in every
+/// group it belongs to, so the local user's PeerId rides out in the
+/// roster snapshots this device builds (`JoinAccepted` / `MemberAdded` /
+/// `StateSyncResponse`). Called once the node's PeerId is known (network
+/// start) and after creating/joining a group. Best-effort.
+fn stamp_local_peer_id_in_groups() {
+    let peer_id = match LOCAL_PEER_ID.lock().unwrap().clone() {
+        Some(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let active = match active_identity() {
+        Ok(Some(id)) => id,
+        _ => return,
+    };
+    let self_id = active.identity_id();
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = match gm_guard.as_mut() {
+        Some(g) => g,
+        None => return,
+    };
+    let group_ids: Vec<_> = gm
+        .get_member_groups(&self_id)
+        .iter()
+        .map(|g| g.id)
+        .collect();
+    for group_id in group_ids {
+        let _ = gm.set_member_peer_id(group_id, self_id, peer_id.clone());
+    }
+}
+
 /// Pull the sender's `IdentityId` out of a handshake frame, hex-
 /// encoded. `None` for variants where the sender's identity isn't
 /// directly in the body (`JoinAccepted` / `JoinRejected` — both
@@ -1721,6 +1779,8 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             crate::groups::handshake_handlers::process_member_added(gm, &body, &signature)?;
+            drop(gm_guard);
+            ingest_summary_peer_ids(std::slice::from_ref(&body.new_member));
         }
         GroupHandshake::RoleChange { body, signature } => {
             let mut gm_guard = GROUP_MANAGER.lock().unwrap();
@@ -1800,6 +1860,8 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
                 &body,
                 &signature,
             )?;
+            drop(gm_guard);
+            ingest_summary_peer_ids(&body.members);
         }
         GroupHandshake::PrekeyBundle { body, signature } => {
             // Stage 2: verify + cache a peer's published prekey bundle.
@@ -2048,6 +2110,14 @@ fn on_join_accepted(
         process_join_accepted(gm, expected_inviter_id, &body, &signature, &kyber_secret)
     };
     kyber_secret.zeroize();
+    if result.is_ok() {
+        // The snapshot carries every current member's PeerId — record
+        // them for gossip-independent direct routing, and stamp our own
+        // PeerId onto our fresh membership so it rides out in any roster
+        // snapshot we later build.
+        ingest_summary_peer_ids(&body.members);
+        stamp_local_peer_id_in_groups();
+    }
     result
 }
 

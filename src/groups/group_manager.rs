@@ -82,6 +82,16 @@ pub struct GroupMember {
     /// re-join, and `rotate_group_key_after_removal` filters them out.
     #[serde(default)]
     pub kyber_pub: Vec<u8>,
+    /// The member's last-known libp2p PeerId (base58). Captured for a
+    /// joiner from the authenticated `RequestJoinBody::joiner_peer_id`,
+    /// for the local user from the node's own PeerId, and refreshed from
+    /// inbound roster snapshots. Distributed in-band via
+    /// `GroupMemberSummary` so members can direct-route to each other
+    /// without learning peers from the gossip author. Empty when unknown;
+    /// routing falls back accordingly. Not part of the generation gate —
+    /// updating it must never bump `group.version`.
+    #[serde(default)]
+    pub peer_id: String,
 }
 
 /// Member status in the group
@@ -212,6 +222,10 @@ impl GroupManager {
             member_status: MemberStatus::Active,
             custom_permissions: None,
             kyber_pub: owner_kyber_pub,
+            // Stamped by the JNI layer once the node's own PeerId is
+            // known (network start / post-create) — see
+            // `stamp_local_peer_id_in_groups` in `jni_api.rs`.
+            peer_id: String::new(),
         };
 
         let mut members = HashMap::new();
@@ -308,6 +322,9 @@ impl GroupManager {
             member_status: MemberStatus::Active,
             custom_permissions: None,
             kyber_pub: Vec::new(),
+            // Set separately from the authenticated RequestJoin via
+            // `set_member_peer_id` (mirrors the kyber_pub stamp).
+            peer_id: String::new(),
         };
 
         group.members.insert(new_member_id, new_member);
@@ -780,6 +797,9 @@ impl GroupManager {
                     if !summary.kyber_pub.is_empty() {
                         existing.kyber_pub = summary.kyber_pub.clone();
                     }
+                    if !summary.peer_id.is_empty() {
+                        existing.peer_id = summary.peer_id.clone();
+                    }
                     existing.member_status = MemberStatus::Active;
                 }
                 None => {
@@ -796,6 +816,7 @@ impl GroupManager {
                             member_status: MemberStatus::Active,
                             custom_permissions: None,
                             kyber_pub: summary.kyber_pub.clone(),
+                            peer_id: summary.peer_id.clone(),
                         },
                     );
                     self.member_groups
@@ -939,6 +960,40 @@ impl GroupManager {
         member.kyber_pub = kyber_pub;
         group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         group.version += 1;
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
+    /// Record a member's libp2p PeerId for gossip-independent direct
+    /// routing. Unlike [`set_member_kyber_pub`], this deliberately does
+    /// **not** bump `group.version`: `peer_id` is transport-routing
+    /// metadata, not membership state, and a version bump would trip the
+    /// strict generation gate in `decrypt_group_message`. A no-op (still
+    /// `Ok`) if the value is unchanged, so repeated stamps from every
+    /// inbound frame don't thrash the keystore. Empty `peer_id` is
+    /// ignored — we never overwrite a known PeerId with "unknown".
+    pub fn set_member_peer_id(
+        &mut self,
+        group_id: GroupId,
+        member_id: IdentityId,
+        peer_id: String,
+    ) -> Result<()> {
+        if peer_id.is_empty() {
+            return Ok(());
+        }
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| anyhow::anyhow!("Member not in group"))?;
+        if member.peer_id == peer_id {
+            return Ok(());
+        }
+        member.peer_id = peer_id;
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         self.store_group_securely(&group_id)?;
         Ok(())
     }
@@ -1709,6 +1764,46 @@ mod tests {
         assert_eq!(group.members.len(), 1);
         assert!(group.members.contains_key(&creator_id));
         assert_eq!(group.members[&creator_id].role, Role::Owner);
+    }
+
+    #[test]
+    fn set_member_peer_id_records_without_bumping_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let keystore =
+            SecureKeystore::new(temp_dir.path().join("gm.db"), b"test-keystore-passphrase")
+                .unwrap();
+        let mut gm = GroupManager::new(keystore).unwrap();
+        let kp = IdentityKeyPair::generate().unwrap();
+        let id = kp.identity_id();
+        let group_id = gm
+            .create_group(
+                id,
+                kp.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .unwrap();
+
+        let version_before = gm.get_group(&group_id).unwrap().version;
+        gm.set_member_peer_id(group_id, id, "12D3KooWPeer".to_string())
+            .unwrap();
+
+        let group = gm.get_group(&group_id).unwrap();
+        assert_eq!(group.members[&id].peer_id, "12D3KooWPeer");
+        // Routing metadata must NOT advance the generation counter — a
+        // bump here would bounce every subsequent group message on the
+        // strict generation gate.
+        assert_eq!(group.version, version_before);
+
+        // Empty peer id is ignored; a known value is never overwritten
+        // with "unknown".
+        gm.set_member_peer_id(group_id, id, String::new()).unwrap();
+        assert_eq!(
+            gm.get_group(&group_id).unwrap().members[&id].peer_id,
+            "12D3KooWPeer",
+        );
     }
 
     #[test]

@@ -70,13 +70,21 @@ Cheap, self-contained, ships without a new network dependency. Does
     PeerId and makes that linkage authenticated instead of transport
     TOFU. Correction to an earlier note: this needs **no** invite-link
     change — the joiner knows its own PeerId; the invite is untouched.
-  - **Step 2 (next).** Distribute member PeerIds in-band (an
-    authenticated field on `GroupMemberSummary`, carried by
-    MemberAdded / JoinAccepted / StateSync) so members can direct-route
-    to *each other* for rotations without the gossip author.
-  - **Step 3.** Flip group publishing to `Anonymous` +
+  - **Step 2 (✅ landed).** Member PeerIds are distributed in-band: an
+    authenticated `peer_id` on `GroupMemberSummary` (so the three tags
+    bump — `join_accepted_v3`, `member_added_v2`,
+    `state_sync_response_v3` — with pinned-vector updates), plus a
+    durable `GroupMember::peer_id` set from the joiner's authenticated
+    RequestJoin and from the local node's own PeerId. Receivers ingest
+    each snapshot's PeerIds into the peer directory. `set_member_peer_id`
+    deliberately does **not** bump `group.version` (routing metadata,
+    not membership — a bump would trip the strict generation gate). Now
+    every member can direct-route to every other member without the
+    gossip author.
+  - **Step 3 (next).** Flip group publishing to `Anonymous` +
     `ValidationMode::None`, and re-derive the receive-path TOFU linkage
-    from the inner signed frame rather than `message.source`.
+    from the inner signed frame rather than `message.source` (the
+    in-band directory from steps 1–2 is now the authenticated source).
   Medium effort overall, security-sensitive — the single highest-value
   metadata win in our control.
 - **Fixed-size padding buckets.** ✅ *Landed (whole forward-secret path).*

@@ -58,6 +58,15 @@ pub struct GroupMemberSummary {
     pub role: Role,
     pub joined_at: u64,
     pub kyber_pub: Vec<u8>,
+    /// The member's last-known libp2p PeerId (base58), distributed
+    /// in-band so every member can direct-route to every other member
+    /// (e.g. a promoted admin's key rotation) without learning peers
+    /// from the gossip author. Empty for members enrolled before this
+    /// field existed or whose PeerId the snapshot builder doesn't know;
+    /// receivers ingest only non-empty values into their peer directory.
+    /// Authenticated as part of the enclosing frame's signature.
+    #[serde(default)]
+    pub peer_id: String,
 }
 
 /// Body of a `RequestJoin` payload that gets bundled into the wire
@@ -571,15 +580,19 @@ pub(crate) fn bounded_bincode_deserialize<T: serde::de::DeserializeOwned>(
 // gossip author. Old-tag devices fail signature verification on the new
 // bytes (and vice versa) — a deliberate wire bump, not enforcement.
 const REQUEST_JOIN_TAG: &[u8] = b"qubee_handshake_request_join_v2";
-// _v2 because GroupMemberSummary now carries kyber_pub — the canonical
-// bytes of every JoinAccepted body changed in plan revision 2 priority
-// 5b. Other handshake tags didn't grow new fields and stay at _v1.
-const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v2";
+// _v3 because GroupMemberSummary now carries `peer_id` (in-band member
+// PeerId distribution for gossip-independent direct routing). It was _v2
+// when the summary grew kyber_pub in plan revision 2 priority 5b. Every
+// frame that bincode-serialises a summary (JoinAccepted / MemberAdded /
+// StateSyncResponse) bumps together for the same reason.
+const JOIN_ACCEPTED_TAG: &[u8] = b"qubee_handshake_join_accepted_v3";
 const JOIN_REJECTED_TAG: &[u8] = b"qubee_handshake_join_rejected_v1";
 const KEY_ROTATION_TAG: &[u8] = b"qubee_handshake_key_rotation_v1";
 const KEY_ROTATION_ANNOUNCE_TAG: &[u8] = b"qubee_handshake_key_rotation_announce_v1";
 const KEY_DELIVERY_TAG: &[u8] = b"qubee_handshake_key_delivery_v1";
-const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v1";
+// _v2: GroupMemberSummary grew `peer_id` (in-band member PeerId
+// distribution) — the new_member summary bincodes into these bytes.
+const MEMBER_ADDED_TAG: &[u8] = b"qubee_handshake_member_added_v2";
 const ROLE_CHANGE_TAG: &[u8] = b"qubee_handshake_role_change_v1";
 const OWNERSHIP_TRANSFER_TAG: &[u8] = b"qubee_handshake_ownership_transfer_v1";
 const MESSAGE_ACK_TAG: &[u8] = b"qubee_handshake_message_ack_v1";
@@ -591,12 +604,12 @@ const PREKEY_BUNDLE_TAG: &[u8] = b"qubee_handshake_prekey_bundle_v1";
 /// freshness here is enforced by rotation, not by the signature age.
 pub const PREKEY_BUNDLE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const REQUEST_STATE_SYNC_TAG: &[u8] = b"qubee_handshake_request_state_sync_v1";
-// _v2: the body grew an `Option<WrappedGroupKey>` for KeyRotation
-// re-send (extends the rev-4 P1 resync flow to also recover the
-// current group key). Devices on _v1 will fail signature verify
-// on the new bytes — the version bump is a labeling correction,
-// not enforcement.
-const STATE_SYNC_RESPONSE_TAG: &[u8] = b"qubee_handshake_state_sync_response_v2";
+// _v3: GroupMemberSummary grew `peer_id` (in-band member PeerId
+// distribution) — every roster row bincodes into these bytes. It was
+// _v2 when the body grew an `Option<WrappedGroupKey>` for KeyRotation
+// re-send (rev-4 P1 resync flow). Devices on an older tag fail signature
+// verification on the new bytes — a labeling correction, not enforcement.
+const STATE_SYNC_RESPONSE_TAG: &[u8] = b"qubee_handshake_state_sync_response_v3";
 
 pub fn canonical_request_join(body: &RequestJoinBody) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2048);

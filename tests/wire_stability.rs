@@ -138,10 +138,11 @@ fn canonical_join_accepted_starts_with_versioned_tag() {
         snapshot_version: 1,
     };
     let canonical = canonical_join_accepted(&body).unwrap();
-    // _v2 — GroupMemberSummary grew a kyber_pub field in plan revision 2
-    // priority 5b. Devices on the old tag will fail signature
+    // _v3 — GroupMemberSummary grew `peer_id` (in-band member PeerId
+    // distribution). It was _v2 when the summary grew kyber_pub in plan
+    // revision 2 priority 5b. Devices on an old tag fail signature
     // verification for new-format frames and vice versa.
-    assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v2"));
+    assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v3"));
 }
 
 #[test]
@@ -286,6 +287,7 @@ fn canonical_member_added_starts_with_versioned_tag() {
         role: Role::Member,
         joined_at: 0,
         kyber_pub,
+        peer_id: String::new(),
     };
     let body = MemberAddedBody {
         group_id: GroupId::from_bytes([0u8; 32]),
@@ -295,7 +297,8 @@ fn canonical_member_added_starts_with_versioned_tag() {
         timestamp: 0,
     };
     let canonical = canonical_member_added(&body).unwrap();
-    assert!(canonical.starts_with(b"qubee_handshake_member_added_v1"));
+    // _v2 — GroupMemberSummary grew `peer_id` (bincoded into these bytes).
+    assert!(canonical.starts_with(b"qubee_handshake_member_added_v2"));
 }
 
 #[test]
@@ -342,8 +345,9 @@ fn canonical_state_sync_response_starts_with_versioned_tag() {
         timestamp: 0,
     };
     let canonical = canonical_state_sync_response(&body).unwrap();
-    // _v2: body grew an Option<WrappedGroupKey> in this batch.
-    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v2"));
+    // _v3: GroupMemberSummary grew `peer_id` (in-band member PeerId
+    // distribution); it was _v2 when the body grew Option<WrappedGroupKey>.
+    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v3"));
 }
 
 #[test]

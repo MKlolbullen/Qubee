@@ -143,7 +143,11 @@ pub fn encrypt_direct(
         None => None,
     };
 
-    let (header, ciphertext) = session.encrypt(plaintext)?;
+    // Length-hiding: pad before the ratchet AEAD so distinct 1:1
+    // messages (and the sender-key distributions that ride these
+    // sessions) present one of a small set of on-wire lengths.
+    let padded = crate::security::padding::pad(plaintext);
+    let (header, ciphertext) = session.encrypt(&padded)?;
     store_session(ks, &session)?;
     DirectMessage {
         sender_id: local_id,
@@ -171,12 +175,12 @@ pub fn decrypt_direct(
 
     if let Some(mut session) = load_session(ks, &peer_id)? {
         match session.decrypt(&dm.header, &dm.ciphertext) {
-            Ok(plaintext) => {
+            Ok(padded) => {
                 store_session(ks, &session)?;
                 // Receiving on this session proves the peer holds it too:
                 // stop attaching our own initial (if we were initiator).
                 ks.delete_key(&pending_initial_key(&peer_id))?;
-                return Ok((peer_id, plaintext));
+                return Ok((peer_id, crate::security::padding::unpad(&padded)?));
             }
             Err(e) => {
                 // Simultaneous-open: yield our initiator session only to
@@ -210,7 +214,7 @@ pub fn decrypt_direct(
     let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
     let mut session =
         Session::establish_responder(local_id, peer_id, &local_secret, &initial.to_message()?)?;
-    let plaintext = session.decrypt(&dm.header, &dm.ciphertext)?;
+    let padded = session.decrypt(&dm.header, &dm.ciphertext)?;
     store_session(ks, &session)?;
     // The handshake is now AEAD-verified. If it consumed our one-time
     // prekey, rotate it so it's never reused (single-use forward
@@ -233,7 +237,7 @@ pub fn decrypt_direct(
         KeyType::EphemeralKey,
         marker_metadata(),
     )?;
-    Ok((peer_id, plaintext))
+    Ok((peer_id, crate::security::padding::unpad(&padded)?))
 }
 
 /// Cheap sender extraction for dispatcher routing — parses the frame
@@ -633,6 +637,31 @@ mod tests {
         let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &w, 1).unwrap();
         assert_eq!(sender, aid);
         assert_eq!(payload, DirectPayload::Text("tagged hello".to_string()));
+    }
+
+    #[test]
+    fn padding_collapses_distinct_message_lengths_to_one_wire_size() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+
+        // The first frame carries the PQXDH initial, so compare two
+        // established-session frames: both distinct short lengths must
+        // present the same on-wire size.
+        let w0 = encrypt_direct(&mut a.ks, aid, bid, b"prime the session", 1).unwrap();
+        decrypt_direct(&mut b.ks, bid, &w0, 1).unwrap();
+        let short = encrypt_direct(&mut a.ks, aid, bid, b"hi", 2).unwrap();
+        let long = encrypt_direct(&mut a.ks, aid, bid, &[0x5a; 180], 3).unwrap();
+        assert_eq!(
+            short.len(),
+            long.len(),
+            "1:1 frames must share one on-wire size"
+        );
+        // And they still decrypt to the original plaintext.
+        assert_eq!(decrypt_direct(&mut b.ks, bid, &short, 2).unwrap().1, b"hi");
+        assert_eq!(
+            decrypt_direct(&mut b.ks, bid, &long, 3).unwrap().1,
+            vec![0x5a; 180]
+        );
     }
 
     #[test]

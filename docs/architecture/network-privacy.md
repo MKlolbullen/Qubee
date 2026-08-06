@@ -58,14 +58,15 @@ Cheap, self-contained, ships without a new network dependency. Does
   identity instead. Also loses gossipsub's own signature-based spam
   gate (app-layer signatures still hold). Medium effort, security-
   sensitive — the single highest-value metadata win in our control.
-- **Fixed-size padding buckets.** ✅ *Landed (v3 path).*
+- **Fixed-size padding buckets.** ✅ *Landed (whole forward-secret path).*
   `security::padding` (length-prefix + zero-pad to a geometric size
   class: 256 / 1 K / 4 K / 16 K / 64 K, then 64 K steps) is applied to
-  the v3 sender-key message plaintext before sealing, so distinct small
-  messages share one on-wire length. Scoped to the dark-launched v3
-  path (no live-wire/compat impact); the v2 and 1:1 paths adopt the
-  same primitive at the ratchet cutover, when their formats change once
-  anyway.
+  the v3 sender-key message plaintext **and** the 1:1 Double-Ratchet
+  plaintext (which also carries the sender-key distributions), so
+  distinct messages across the forward-secret path share one on-wire
+  length. Scoped to the dark-launched ratchet paths (no live-wire /
+  compat impact); the legacy v2 group path adopts the same primitive at
+  the ratchet cutover, when its format changes once anyway.
 - **Blinded topic ids.** Derive the gossip topic from a rotating hash
   of the group id + an epoch (all members derive the same value)
   instead of the raw hex, so a passive observer can't read group ids

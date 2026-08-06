@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/branding/logo.svg" alt="Qubee logo — a quantum Q, bee wings, and key-shaped stinger" width="180" />
+  <img src="docs/branding/qubee_mark_master.svg" alt="Qubee logo — a quantum Q, bee wings, and key-shaped stinger" width="180" />
 </p>
 
 <h1 align="center">Qubee</h1>

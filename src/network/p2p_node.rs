@@ -178,7 +178,12 @@ pub struct P2PNodeConfig {
 impl Default for P2PNodeConfig {
     fn default() -> Self {
         Self {
-            enable_mdns: true,
+            // Privacy default: mDNS broadcasts the device's presence and
+            // LAN IP to every host on the local network. Production peers
+            // find each other via Kademlia / bootstrap, so mDNS is an
+            // opt-in local-discovery convenience, not a requirement —
+            // default it OFF and let a caller re-enable it explicitly.
+            enable_mdns: false,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/0.0.0.0/udp/0/quic-v1"
@@ -186,7 +191,11 @@ impl Default for P2PNodeConfig {
                     .expect("hardcoded multiaddr"),
             ),
             gossipsub_heartbeat: Duration::from_secs(10),
-            gossipsub_validation_mode: gossipsub::ValidationMode::Strict,
+            // Anonymous authorship (no broadcast author PeerId) requires
+            // ValidationMode::None — there is no transport-level signature
+            // to verify. App-layer signatures still authenticate every
+            // frame; see the gossipsub behaviour build.
+            gossipsub_validation_mode: gossipsub::ValidationMode::None,
             idle_connection_timeout: Duration::from_secs(60),
         }
     }
@@ -205,7 +214,8 @@ impl P2PNodeConfig {
                     .expect("hardcoded multiaddr"),
             ),
             gossipsub_heartbeat: Duration::from_millis(100),
-            gossipsub_validation_mode: gossipsub::ValidationMode::Strict,
+            // Match production: anonymous authorship needs None.
+            gossipsub_validation_mode: gossipsub::ValidationMode::None,
             idle_connection_timeout: Duration::from_secs(60),
         }
     }
@@ -264,10 +274,32 @@ impl P2PNode {
                 let gossipsub_cfg = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(cfg_for_behaviour.gossipsub_heartbeat)
                     .validation_mode(cfg_for_behaviour.gossipsub_validation_mode.clone())
+                    // Anonymous authorship carries no source PeerId or
+                    // sequence number, so gossipsub's default message-id
+                    // (source + seqno) would collapse every message to one
+                    // id and dedupe all but the first away. Derive the id
+                    // from the frame content instead so distinct frames
+                    // stay distinct while identical re-broadcasts still
+                    // dedupe. BLAKE3 over topic + payload, truncated.
+                    .message_id_fn(|message: &gossipsub::Message| {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(message.topic.as_str().as_bytes());
+                        hasher.update(&message.data);
+                        gossipsub::MessageId::from(hasher.finalize().as_bytes()[..20].to_vec())
+                    })
                     .build()
                     .map_err(std::io::Error::other)?;
+                // Anonymous authorship: group frames are already
+                // authenticated at the app layer (hybrid identity / sender-
+                // key signatures), and the PeerId<->IdentityId linkage now
+                // comes from the in-band member directory (RequestJoin +
+                // roster snapshots) rather than gossipsub's `message.source`.
+                // Publishing anonymously stops broadcasting the author
+                // PeerId to every topic subscriber — the social-graph leak.
+                // Requires ValidationMode::None (no transport signature to
+                // check); the app-layer signatures remain the real gate.
                 let gossipsub = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub::MessageAuthenticity::Anonymous,
                     gossipsub_cfg,
                 )
                 .map_err(std::io::Error::other)?;
@@ -462,25 +494,22 @@ impl P2PNode {
                             .await;
                     }
                     SwarmEvent::Behaviour(QubeeBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source,
                         message,
                         ..
                     })) => {
-                        // Attribute the message to its author, not the relay
-                        // hop. `propagation_source` is merely the peer that
-                        // forwarded this frame to us; the PeerId a receiver
-                        // links to a verified IdentityId must be the original
-                        // publisher. Gossipsub runs Signed + Strict here, so
-                        // `message.source` is the authenticated author PeerId
-                        // and is always present on a delivered message; fall
-                        // back to the relay only defensively.
-                        let author = message
-                            .source
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| propagation_source.to_string());
+                        // Gossip publishing is Anonymous: `message.source`
+                        // is absent and `propagation_source` is only the
+                        // relay hop, so neither is a trustworthy author.
+                        // Emit an EMPTY sender to mark the peer as
+                        // unauthenticated — downstream trust linkage
+                        // (PeerId<->IdentityId) must come from the in-band
+                        // member directory or the authenticated direct
+                        // channel, never from a gossip peer. Frame
+                        // authenticity itself is the app-layer signature,
+                        // checked when the frame is decoded/verified.
                         let _ = event_sender
                             .send(NodeEvent::MessageReceived {
-                                sender: author,
+                                sender: String::new(),
                                 topic: message.topic.into_string(),
                                 data: message.data,
                             })

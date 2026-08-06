@@ -323,13 +323,39 @@ class MessageService : Service(), NetworkCallback {
                 // identity spaces (libp2p PeerId vs application
                 // IdentityId), exposed by
                 // `qubeeManager.inspectEnvelopeSender`.
-                var mappedContact = contactRepository.getContactByPeerId(senderId)
-                val routedSenderId = mappedContact?.id ?: senderId
+                // Group gossip publishing is Anonymous, so a gossip-
+                // delivered frame arrives with an EMPTY senderId (the
+                // transport can no longer tell us the author's PeerId).
+                // Route such frames by the envelope's *authenticated*
+                // sender_id instead, and never stamp/trust the (unknown)
+                // gossip peer. A non-empty senderId only comes from the
+                // authenticated direct channel, where PeerId linkage is
+                // sound.
+                val authenticatedPeer = senderId.isNotEmpty()
+                // For anonymous gossip we route by the envelope's
+                // authenticated sender_id. Inspecting it crosses the JNI
+                // boundary and re-parses the envelope, so do it once and
+                // reuse for both the contact lookup and the routing
+                // fallback.
+                val envelopeIdentity =
+                    if (authenticatedPeer) null else qubeeManager.inspectEnvelopeSender(data)
+                var mappedContact =
+                    if (authenticatedPeer) {
+                        contactRepository.getContactByPeerId(senderId)
+                    } else {
+                        envelopeIdentity?.let { contactRepository.getContactByIdentityId(it) }
+                    }
+                val routedSenderId = mappedContact?.id
+                    ?: if (authenticatedPeer) senderId else envelopeIdentity
+                if (routedSenderId.isNullOrEmpty()) {
+                    Timber.w("Cannot route inbound: no authenticated sender (anonymous gossip, unknown identity)")
+                    return@launch
+                }
                 val conversationId = conversationRepository.getOrCreateConversationId(routedSenderId)
                 if (conversationId.isEmpty()) {
                     Timber.w(
                         "Cannot route inbound from %s: conversation setup failed (onboarding?)",
-                        senderId,
+                        routedSenderId,
                     )
                     return@launch
                 }
@@ -348,8 +374,12 @@ class MessageService : Service(), NetworkCallback {
                 // envelope's authenticated `sender_id` field. Best-
                 // effort — failure (no matching contact, malformed
                 // envelope, etc.) leaves the routing fallback in
-                // place and processing continues.
-                if (mappedContact == null) {
+                // place and processing continues. Only when the peer
+                // itself is authenticated (direct channel): under
+                // Anonymous gossip the peer is unknown, and stamping an
+                // empty PeerId would corrupt the PeerId<->IdentityId
+                // trust linkage (and could spuriously trip KeyChanged).
+                if (mappedContact == null && authenticatedPeer) {
                     mappedContact = populateContactPeerId(senderId, data)
                 }
 
@@ -506,8 +536,18 @@ class MessageService : Service(), NetworkCallback {
                     // but from the channel-authenticated sender rather
                     // than an envelope field — the trust policy still
                     // sees every (peerId, identityId) observation.
+                    // Only observe the PeerId<->IdentityId linkage when the
+                    // peer is authenticated (direct channel). Anonymous
+                    // gossip delivers an empty peerId; feeding that to the
+                    // trust policy would stamp an empty PeerId and could
+                    // spuriously trip KeyChanged. Fall back to identity-only
+                    // resolution in that case.
                     val contact =
-                        contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
+                        if (peerId.isNotEmpty()) {
+                            contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
+                        } else {
+                            contactRepository.getContactByIdentityId(senderIdentityHex)
+                        }
                     val routedSenderId = contact?.id ?: senderIdentityHex
                     val conversationId =
                         conversationRepository.getOrCreateConversationId(routedSenderId)

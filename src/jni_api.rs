@@ -121,6 +121,14 @@ lazy_static! {
     /// miss means we can't direct-deliver to that member, and they
     /// re-sync the key via `StateSyncResponse` instead.
     static ref PEER_DIRECTORY: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+
+    /// This device's own libp2p PeerId (base58), captured when the P2P
+    /// node starts. A joiner stamps it into the signed `RequestJoinBody`
+    /// so the inviter can route the direct `JoinAccepted` reply from the
+    /// authenticated frame rather than the gossip author — removing the
+    /// join handshake's dependency on gossipsub broadcasting the author
+    /// PeerId. `None` until `nativeStartNetwork` has loaded the node key.
+    static ref LOCAL_PEER_ID: Mutex<Option<String>> = Mutex::new(None);
 }
 
 /// Max entries retained in [`SEEN_MESSAGE_IDS`]. Bounds memory; oldest
@@ -425,8 +433,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         return;
                     }
                 };
+                let local_peer_id = libp2p::PeerId::from(id_keys.public());
+                *LOCAL_PEER_ID.lock().unwrap() = Some(local_peer_id.to_string());
                 tracing::info!(
-                    peer_id = %libp2p::PeerId::from(id_keys.public()),
+                    peer_id = %local_peer_id,
                     "Starting P2P Node",
                 );
 
@@ -441,6 +451,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         // identity already belongs to so a process
                         // restart doesn't drop us off the topic mesh.
                         resubscribe_known_groups();
+
+                        // Now that the node's PeerId is known, stamp it
+                        // onto our own membership in each group so it
+                        // rides out in the roster snapshots we build.
+                        stamp_local_peer_id_in_groups();
 
                         tokio::spawn(async move {
                             while let Some(event) = rx_event.recv().await {
@@ -802,6 +817,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // bootstrap because `gm.create_group` already persisted
             // the group through `store_group_securely`.
             let _ = subscribe_topic(group_topic(&hex::encode(group_id.as_ref())));
+
+            // Stamp our own PeerId onto the owner membership so it rides
+            // out in JoinAccepted/MemberAdded snapshots. No-op if the node
+            // isn't up yet — network start re-stamps every group then.
+            stamp_local_peer_id_in_groups();
 
             Ok(json!({
                 "group_id_hex": hex::encode(group_id.as_ref()),
@@ -1424,12 +1444,19 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
         }
     }
 
+    // Stamp our own PeerId into the signed body so the inviter can route
+    // the direct JoinAccepted from the authenticated frame instead of the
+    // gossip author. Empty if the node key hasn't been captured yet — the
+    // inviter then can't direct-reply and the joiner retries once the
+    // network is up.
+    let joiner_peer_id = LOCAL_PEER_ID.lock().unwrap().clone().unwrap_or_default();
     let body = RequestJoinBody {
         group_id: payload.group_id,
         invitation_code: payload.invitation_code.clone(),
         joiner_public_key: identity.public_key(),
         joiner_display_name: active_display_name().unwrap_or_default(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id,
     };
     let signed = sign_request_join(identity.as_ref(), body)?;
     let wire = signed.to_wire()?;
@@ -1564,14 +1591,20 @@ fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
         return;
     }
     if let Some(identity_hex) = extracted_identity {
-        // Record the IdentityId -> PeerId mapping so the split
-        // key-rotation fan-out can address this member's KeyDelivery
-        // directly later. Same TOFU signal as the onPeerLinked dispatch.
-        PEER_DIRECTORY
-            .lock()
-            .unwrap()
-            .insert(identity_hex.clone(), sender_peer_id.clone());
-        dispatch_peer_linked(sender_peer_id, identity_hex);
+        // Only an authenticated delivering peer is a trustworthy source
+        // of the IdentityId -> PeerId linkage. Gossip publishing is
+        // Anonymous, so gossip frames arrive with an EMPTY `sender_peer_id`
+        // — skip the linkage for those; their PeerIds are learned in-band
+        // (RequestJoin body + roster snapshots, see `ingest_summary_peer_ids`
+        // and the RequestJoin branch below). A non-empty sender only comes
+        // from the authenticated `/qubee/direct/1` channel.
+        if !sender_peer_id.is_empty() {
+            PEER_DIRECTORY
+                .lock()
+                .unwrap()
+                .insert(identity_hex.clone(), sender_peer_id.clone());
+            dispatch_peer_linked(sender_peer_id, identity_hex);
+        }
     }
 }
 
@@ -1581,6 +1614,54 @@ fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
 /// StateSyncResponse) rather than broadcast a directed frame.
 fn resolve_peer_id(identity_hex: &str) -> Option<String> {
     PEER_DIRECTORY.lock().unwrap().get(identity_hex).cloned()
+}
+
+/// Ingest the in-band PeerIds carried by a roster snapshot into
+/// [`PEER_DIRECTORY`]. This is the authenticated, gossip-independent
+/// source of the IdentityId→PeerId linkage (frames are signature-checked
+/// before we get here): as anonymous gossip authorship lands, it replaces
+/// deriving peers from `message.source`. Empty peer ids are skipped —
+/// we never overwrite a known PeerId with "unknown".
+fn ingest_summary_peer_ids(members: &[crate::groups::group_handshake::GroupMemberSummary]) {
+    let mut dir = PEER_DIRECTORY.lock().unwrap();
+    for m in members {
+        if !m.peer_id.is_empty() {
+            dir.insert(
+                hex::encode(m.identity_id.as_ref() as &[u8]),
+                m.peer_id.clone(),
+            );
+        }
+    }
+}
+
+/// Stamp this device's own PeerId onto its `GroupMember` record in every
+/// group it belongs to, so the local user's PeerId rides out in the
+/// roster snapshots this device builds (`JoinAccepted` / `MemberAdded` /
+/// `StateSyncResponse`). Called once the node's PeerId is known (network
+/// start) and after creating/joining a group. Best-effort.
+fn stamp_local_peer_id_in_groups() {
+    let peer_id = match LOCAL_PEER_ID.lock().unwrap().clone() {
+        Some(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let active = match active_identity() {
+        Ok(Some(id)) => id,
+        _ => return,
+    };
+    let self_id = active.identity_id();
+    let mut gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = match gm_guard.as_mut() {
+        Some(g) => g,
+        None => return,
+    };
+    let group_ids: Vec<_> = gm
+        .get_member_groups(&self_id)
+        .iter()
+        .map(|g| g.id)
+        .collect();
+    for group_id in group_ids {
+        let _ = gm.set_member_peer_id(group_id, self_id, peer_id.clone());
+    }
 }
 
 /// Pull the sender's `IdentityId` out of a handshake frame, hex-
@@ -1651,10 +1732,32 @@ fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
 fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::Result<()> {
     match frame {
         GroupHandshake::RequestJoin { body, signature } => {
-            // The joiner's authenticated PeerId is the delivering peer —
-            // gossipsub runs Signed+Strict, so this is the RequestJoin
-            // author. Reply to it directly instead of broadcasting.
-            on_request_join(body, signature, sender_peer_id)?;
+            // Route the direct reply to the joiner's PeerId from the
+            // *signed body*, not the gossip author. The whole frame is
+            // signature-checked in `process_request_join`, so a tampered
+            // peer id fails verification before we reply. Falling back to
+            // the gossip source keeps older joiners (empty peer id) working
+            // while gossipsub still runs Signed+Strict. `body` is consumed
+            // by `on_request_join`, so read the routing target first.
+            let reply_peer_id = if body.joiner_peer_id.is_empty() {
+                sender_peer_id
+            } else {
+                body.joiner_peer_id.clone()
+            };
+            // Record the joiner's authenticated IdentityId -> PeerId in the
+            // routing directory so a later KeyDelivery to them can be
+            // addressed directly. Under Anonymous gossip this is the
+            // owner's only in-band source for the joiner's PeerId (the
+            // gossip author is gone); the frame is signature-checked in
+            // `process_request_join`, so the mapping is authenticated.
+            if !reply_peer_id.is_empty() {
+                let joiner_hex = hex::encode(body.joiner_public_key.identity_id.as_ref() as &[u8]);
+                PEER_DIRECTORY
+                    .lock()
+                    .unwrap()
+                    .insert(joiner_hex, reply_peer_id.clone());
+            }
+            on_request_join(body, signature, reply_peer_id)?;
         }
         GroupHandshake::JoinAccepted { body, signature } => {
             on_join_accepted(body, signature)?;
@@ -1695,6 +1798,8 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
             crate::groups::handshake_handlers::process_member_added(gm, &body, &signature)?;
+            drop(gm_guard);
+            ingest_summary_peer_ids(std::slice::from_ref(&body.new_member));
         }
         GroupHandshake::RoleChange { body, signature } => {
             let mut gm_guard = GROUP_MANAGER.lock().unwrap();
@@ -1774,6 +1879,8 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
                 &body,
                 &signature,
             )?;
+            drop(gm_guard);
+            ingest_summary_peer_ids(&body.members);
         }
         GroupHandshake::PrekeyBundle { body, signature } => {
             // Stage 2: verify + cache a peer's published prekey bundle.
@@ -2022,6 +2129,14 @@ fn on_join_accepted(
         process_join_accepted(gm, expected_inviter_id, &body, &signature, &kyber_secret)
     };
     kyber_secret.zeroize();
+    if result.is_ok() {
+        // The snapshot carries every current member's PeerId — record
+        // them for gossip-independent direct routing, and stamp our own
+        // PeerId onto our fresh membership so it rides out in any roster
+        // snapshot we later build.
+        ingest_summary_peer_ids(&body.members);
+        stamp_local_peer_id_in_groups();
+    }
     result
 }
 

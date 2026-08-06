@@ -115,6 +115,11 @@ pub fn process_request_join(
             body.joiner_public_key.identity_id,
             body.joiner_kyber_pub.clone(),
         );
+        let _ = gm.set_member_peer_id(
+            body.group_id,
+            body.joiner_public_key.identity_id,
+            body.joiner_peer_id.clone(),
+        );
         let (accepted_body, accepted_signature) = build_join_accepted(gm, inviter_identity, body)?;
         return Ok(HandshakeOutcome::ReIssueAccept {
             body: accepted_body,
@@ -161,6 +166,15 @@ pub fn process_request_join(
         body.group_id,
         body.joiner_public_key.identity_id,
         body.joiner_kyber_pub.clone(),
+    );
+    // Stamp the joiner's authenticated PeerId (from the signed
+    // RequestJoin) so it flows into the JoinAccepted snapshot and the
+    // MemberAdded broadcast, distributing it to every member for
+    // gossip-independent direct routing.
+    let _ = gm.set_member_peer_id(
+        body.group_id,
+        body.joiner_public_key.identity_id,
+        body.joiner_peer_id.clone(),
     );
 
     // Build the signed JoinAccepted (roster snapshot + the group key
@@ -226,6 +240,7 @@ fn build_join_accepted(
                 role: m.role.clone(),
                 joined_at: m.joined_at,
                 kyber_pub: m.kyber_pub.clone(),
+                peer_id: m.peer_id.clone(),
             })
             .collect();
         (members, group.name.clone(), group.version)
@@ -296,6 +311,7 @@ pub fn process_join_accepted(
                 role: m.role.clone(),
                 joined_at: m.joined_at,
                 last_seen: now,
+                peer_id: m.peer_id.clone(),
                 invited_by: Some(expected_inviter_id),
                 member_status: MemberStatus::Active,
                 custom_permissions: None,
@@ -366,6 +382,7 @@ pub fn process_member_added(
         member_status: MemberStatus::Active,
         custom_permissions: None,
         kyber_pub: body.new_member.kyber_pub.clone(),
+        peer_id: body.new_member.peer_id.clone(),
     };
     gm.apply_member_added(body.group_id, new_member, body.new_version)
 }
@@ -515,6 +532,7 @@ pub fn process_request_state_sync(
             role: m.role.clone(),
             joined_at: m.joined_at,
             kyber_pub: m.kyber_pub.clone(),
+            peer_id: m.peer_id.clone(),
         })
         .collect();
 

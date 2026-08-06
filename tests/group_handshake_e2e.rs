@@ -90,6 +90,7 @@ fn invite_handshake_converges_on_shared_group_state() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed_request = sign_request_join(&bob_kp, request_body.clone()).expect("sign request");
     let request_wire = signed_request.to_wire().expect("wire");
@@ -156,6 +157,104 @@ fn invite_handshake_converges_on_shared_group_state() {
 }
 
 #[test]
+fn joiner_peer_id_propagates_into_snapshot_and_member_added() {
+    // Anon-authorship step 2: the joiner's authenticated PeerId (from the
+    // signed RequestJoin) must land in Alice's local roster, ride out in
+    // the JoinAccepted snapshot, ride out in the MemberAdded broadcast,
+    // and be present on Bob's side after he processes the acceptance —
+    // so every member can direct-route to Bob without the gossip author.
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Peers".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invitation = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+
+    let (_bob_dir, bob_kp, mut bob_gm) = fresh_device("bob");
+    let bob_id = bob_kp.identity_id();
+    bob_gm
+        .record_external_invite_acceptance(
+            group_id,
+            "Peers",
+            alice_id,
+            "Alice",
+            &invitation.invitation_code,
+        )
+        .unwrap();
+
+    let bob_peer_id = "12D3KooWBobConcretePeerId".to_string();
+    let (kyber_pub, kyber_secret) = generate_ephemeral_kyber();
+    let signed = sign_request_join(
+        &bob_kp,
+        RequestJoinBody {
+            group_id,
+            invitation_code: invitation.invitation_code.clone(),
+            joiner_public_key: bob_kp.public_key(),
+            joiner_display_name: "Bob".to_string(),
+            joiner_kyber_pub: kyber_pub,
+            joiner_peer_id: bob_peer_id.clone(),
+        },
+    )
+    .unwrap();
+    let (rb, rs) = match signed {
+        GroupHandshake::RequestJoin { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+
+    let outcome = process_request_join(&mut alice_gm, &alice_kp, &rb, &rs).unwrap();
+    let (accepted_body, accepted_sig, member_added_body) = match outcome {
+        HandshakeOutcome::Accept {
+            body,
+            signature,
+            member_added_body,
+            ..
+        } => (body, signature, member_added_body),
+        other => panic!("expected Accept, got {other:?}"),
+    };
+
+    // Alice's local view of Bob carries his authenticated PeerId.
+    assert_eq!(
+        alice_gm.get_group(&group_id).unwrap().members[&bob_id].peer_id,
+        bob_peer_id,
+    );
+    // It rides out in the JoinAccepted roster snapshot...
+    let bob_in_snapshot = accepted_body
+        .members
+        .iter()
+        .find(|m| m.identity_id == bob_id)
+        .expect("bob in snapshot");
+    assert_eq!(bob_in_snapshot.peer_id, bob_peer_id);
+    // ...and in the MemberAdded broadcast to existing members.
+    assert_eq!(member_added_body.new_member.peer_id, bob_peer_id);
+
+    // After Bob confirms the acceptance, his own local view records his
+    // PeerId too — so a StateSyncResponse he later answers re-broadcasts
+    // it to peers that missed the original MemberAdded.
+    process_join_accepted(
+        &mut bob_gm,
+        alice_id,
+        &accepted_body,
+        &accepted_sig,
+        &kyber_secret,
+    )
+    .unwrap();
+    assert_eq!(
+        bob_gm.get_group(&group_id).unwrap().members[&bob_id].peer_id,
+        bob_peer_id,
+    );
+}
+
+#[test]
 fn forged_request_join_is_rejected() {
     let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
     let alice_id = alice_kp.identity_id();
@@ -186,6 +285,7 @@ fn forged_request_join_is_rejected() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob (impersonated)".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed = sign_request_join(&mallory_kp, body.clone()).unwrap();
     let (decoded_body, decoded_sig) = match signed {
@@ -229,6 +329,7 @@ fn unknown_invitation_returns_silent_no_op() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed = sign_request_join(&bob_kp, body.clone()).unwrap();
     let (req_body, req_sig) = match signed {
@@ -288,6 +389,7 @@ fn key_rotation_after_removal_converges_on_new_key() {
             joiner_public_key: bob_kp.public_key(),
             joiner_display_name: "Bob".to_string(),
             joiner_kyber_pub: bob_kyber_pub,
+            joiner_peer_id: String::new(),
         },
     )
     .unwrap()
@@ -332,6 +434,7 @@ fn key_rotation_after_removal_converges_on_new_key() {
             joiner_public_key: carol_kp.public_key(),
             joiner_display_name: "Carol".to_string(),
             joiner_kyber_pub: carol_kyber_pub,
+            joiner_peer_id: String::new(),
         },
     )
     .unwrap()
@@ -461,6 +564,7 @@ fn enforces_sixteen_member_cap_via_handshake() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: String::new(),
     };
     let signed = sign_request_join(&bob_kp, body.clone()).unwrap();
     let (req_body, req_sig) = match signed {
@@ -523,6 +627,7 @@ fn reissued_request_join_is_idempotent() {
             joiner_public_key: bob_kp.public_key(),
             joiner_display_name: "Bob".to_string(),
             joiner_kyber_pub: kyber_pub,
+            joiner_peer_id: String::new(),
         };
         match sign_request_join(&bob_kp, body).unwrap() {
             GroupHandshake::RequestJoin { body, signature } => (body, signature),

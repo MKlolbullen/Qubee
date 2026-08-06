@@ -115,9 +115,12 @@ fn canonical_request_join_starts_with_versioned_tag() {
         joiner_public_key: kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: "12D3KooWBob".to_string(),
     };
     let canonical = canonical_request_join(&body).unwrap();
-    assert!(canonical.starts_with(b"qubee_handshake_request_join_v1"));
+    // _v2 — the body grew `joiner_peer_id` so the inviter can route the
+    // direct reply from the authenticated frame, not the gossip author.
+    assert!(canonical.starts_with(b"qubee_handshake_request_join_v2"));
 }
 
 #[test]
@@ -135,10 +138,11 @@ fn canonical_join_accepted_starts_with_versioned_tag() {
         snapshot_version: 1,
     };
     let canonical = canonical_join_accepted(&body).unwrap();
-    // _v2 — GroupMemberSummary grew a kyber_pub field in plan revision 2
-    // priority 5b. Devices on the old tag will fail signature
+    // _v3 — GroupMemberSummary grew `peer_id` (in-band member PeerId
+    // distribution). It was _v2 when the summary grew kyber_pub in plan
+    // revision 2 priority 5b. Devices on an old tag fail signature
     // verification for new-format frames and vice versa.
-    assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v2"));
+    assert!(canonical.starts_with(b"qubee_handshake_join_accepted_v3"));
 }
 
 #[test]
@@ -283,6 +287,7 @@ fn canonical_member_added_starts_with_versioned_tag() {
         role: Role::Member,
         joined_at: 0,
         kyber_pub,
+        peer_id: String::new(),
     };
     let body = MemberAddedBody {
         group_id: GroupId::from_bytes([0u8; 32]),
@@ -292,7 +297,8 @@ fn canonical_member_added_starts_with_versioned_tag() {
         timestamp: 0,
     };
     let canonical = canonical_member_added(&body).unwrap();
-    assert!(canonical.starts_with(b"qubee_handshake_member_added_v1"));
+    // _v2 — GroupMemberSummary grew `peer_id` (bincoded into these bytes).
+    assert!(canonical.starts_with(b"qubee_handshake_member_added_v2"));
 }
 
 #[test]
@@ -339,8 +345,9 @@ fn canonical_state_sync_response_starts_with_versioned_tag() {
         timestamp: 0,
     };
     let canonical = canonical_state_sync_response(&body).unwrap();
-    // _v2: body grew an Option<WrappedGroupKey> in this batch.
-    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v2"));
+    // _v3: GroupMemberSummary grew `peer_id` (in-band member PeerId
+    // distribution); it was _v2 when the body grew Option<WrappedGroupKey>.
+    assert!(canonical.starts_with(b"qubee_handshake_state_sync_response_v3"));
 }
 
 #[test]
@@ -381,11 +388,12 @@ fn canonical_payload_uses_explicit_length_prefixes_not_bincode() {
         joiner_public_key: kp.public_key(),
         joiner_display_name: "x".to_string(),
         joiner_kyber_pub: kyber_pub.clone(),
+        joiner_peer_id: "12D3KooWx".to_string(),
     };
     let canonical = canonical_request_join(&body).unwrap();
 
     // Tag prefix
-    assert_eq!(&canonical[..31], b"qubee_handshake_request_join_v1");
+    assert_eq!(&canonical[..31], b"qubee_handshake_request_join_v2");
     // First separator
     assert_eq!(canonical[31], 0u8);
     // group_id
@@ -486,6 +494,7 @@ proptest! {
         group_seed in any::<[u8; 32]>(),
         invitation_code in "[A-Za-z0-9_-]{0,32}",
         joiner_display_name in "[\\PC]{0,64}",
+        joiner_peer_id in "[A-Za-z0-9]{0,52}",
     ) {
         let kp = IdentityKeyPair::generate().unwrap();
         let (kyber_pub, _) = generate_ephemeral_kyber();
@@ -495,6 +504,7 @@ proptest! {
             joiner_public_key: kp.public_key(),
             joiner_display_name: joiner_display_name.clone(),
             joiner_kyber_pub: kyber_pub.clone(),
+            joiner_peer_id: joiner_peer_id.clone(),
         };
         let signed = sign_request_join(&kp, body).unwrap();
         let wire = signed.to_wire().expect("handshake to_wire");
@@ -506,6 +516,7 @@ proptest! {
                 prop_assert_eq!(body.invitation_code, invitation_code);
                 prop_assert_eq!(body.joiner_display_name, joiner_display_name);
                 prop_assert_eq!(body.joiner_kyber_pub, kyber_pub);
+                prop_assert_eq!(body.joiner_peer_id, joiner_peer_id);
             }
             other => prop_assert!(false, "expected RequestJoin variant, got {:?}", other),
         }

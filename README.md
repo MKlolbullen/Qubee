@@ -84,7 +84,7 @@ The project currently focuses on Android, small trusted groups, QR/deep-link onb
 | **Classical key agreement** | X25519 where used by the ratchet/prekey design |
 | **Payload encryption** | ChaCha20-Poly1305 |
 | **Hashing and derivation** | BLAKE3, HKDF, SHA-2, Argon2id for keystore wrapping |
-| **P2P networking** | libp2p over TCP, WebSocket, and QUIC; Noise XX/TLS, Yamux, gossipsub, Kademlia, mDNS, DNS |
+| **P2P networking** | libp2p over TCP, WebSocket, and QUIC; Noise XX/TLS, Yamux, anonymous gossipsub, Kademlia, DNS (mDNS present but off by default so a device doesn't broadcast its LAN presence) |
 | **Android database** | Room over SQLCipher; per-install database key wrapped by Android Keystore |
 | **Rust key storage** | Encrypted keystore with authenticated entries, atomic writes, crash-safe master-key rotation, zeroization |
 | **Group model** | Maximum 16 members; Owner, Admin, Moderator, Member, Observer roles |
@@ -272,7 +272,7 @@ libp2p establishes authenticated encrypted transport using:
 - Noise XX over TCP/WebSocket transports.
 - QUIC with TLS 1.3 as an additional direct transport.
 - Yamux stream multiplexing.
-- Signed gossipsub messages with strict validation.
+- **Anonymous** gossipsub authorship: group frames are authenticated at the application layer (hybrid identity / sender-key signatures), so the transport no longer broadcasts an author `PeerId` to every topic subscriber. The `PeerId`↔identity linkage is learned only from authenticated in-band membership frames or the direct request/response channel, never from the gossip author.
 
 Transport encryption prevents passive observers from reading payloads in flight. Application-layer encryption remains necessary because group gossip and stored envelopes have a different trust boundary.
 
@@ -338,8 +338,9 @@ The Rust keystore additionally uses:
 | Forward secrecy on the default send path | Not fully; ratchet rollout is still gated |
 | Post-compromise security | Not guaranteed on the default path |
 | Deniability | Ratcheted formats are designed for it; the active signed legacy envelope is non-repudiable |
-| IP-address privacy | No; direct peers can observe each other’s network addresses |
-| Traffic-analysis resistance | No onion routing, mixnet, or robust cover-traffic system is shipped |
+| Group authorship metadata on the network | Not broadcast; gossip authorship is anonymous, so a topic subscriber can see that a group has traffic but not which `PeerId` authored a given message |
+| IP-address privacy | No; direct peers can observe each other’s network addresses (Tor/onion transport is a planned opt-in, not shipped) |
+| Traffic-analysis resistance | Partial and narrow; fixed-size length-padding buckets are applied on the forward-secret ratchet paths, but there is no onion routing, mixnet, or cover-traffic system |
 | Protection after full device compromise | No |
 | Independent audit | No |
 
@@ -714,7 +715,9 @@ See [`docs/perf/baseline.md`](docs/perf/baseline.md) for the recorded baseline a
 - [ ] Multi-device identity and session synchronization.
 - [ ] Secure backup/export with explicit recovery-key design.
 - [ ] Rebuilt file transfer and media calling on current dependencies.
-- [ ] Stronger traffic-analysis resistance and padding strategies.
+- [ ] Stronger traffic-analysis resistance beyond the length-padding buckets already applied on the ratchet paths (blinded topic ids, cover traffic).
+
+The in-tree metadata reductions — anonymous gossip authorship, mDNS off by default, and length-padding buckets on the forward-secret paths — have landed; see [`docs/architecture/network-privacy.md`](docs/architecture/network-privacy.md) for the full assessment and the tiered plan toward IP anonymisation.
 
 ## Contributing
 

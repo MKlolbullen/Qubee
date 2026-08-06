@@ -218,6 +218,7 @@ async fn p2p_two_node_e2e() {
         joiner_public_key: bob_kp.public_key(),
         joiner_display_name: "Bob".to_string(),
         joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: bob_node.peer_id.clone(),
     };
     let signed_request =
         sign_request_join(&bob_kp, request_body.clone()).expect("sign RequestJoin");
@@ -390,6 +391,7 @@ async fn p2p_key_rotation_e2e() {
                 joiner_public_key: joiner_kp.public_key(),
                 joiner_display_name: joiner_name.to_string(),
                 joiner_kyber_pub: kyber_pub,
+                joiner_peer_id: format!("12D3KooW{joiner_name}"),
             },
         )
         .unwrap();
@@ -584,5 +586,69 @@ async fn direct_delivery_reaches_only_the_addressed_peer() {
     assert!(
         topic.is_empty(),
         "a direct frame carries no gossip topic (got {topic:?})",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — gossip authorship is anonymous
+// ---------------------------------------------------------------------------
+
+/// A gossip-delivered frame must arrive with an EMPTY sender: group
+/// publishing runs `MessageAuthenticity::Anonymous`, so the transport no
+/// longer broadcasts the author's PeerId to topic subscribers (the
+/// social-graph metadata leak). Contrast with the direct-channel test
+/// above, where the sender IS the authenticated peer. This pins the
+/// anonymity guarantee against an accidental revert to `Signed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gossip_authorship_is_anonymous() {
+    let mut alice_node = spawn_test_node("alice").await;
+    let bob_node = spawn_test_node("bob").await;
+
+    send_cmd(
+        &bob_node,
+        P2PCommand::Dial {
+            multiaddr: alice_node.listen_addr.clone(),
+        },
+        "bob",
+    )
+    .await;
+
+    let topic = "qubee/anon-test".to_string();
+    for (node, label) in [(&alice_node, "alice"), (&bob_node, "bob")] {
+        send_cmd(
+            node,
+            P2PCommand::Subscribe {
+                topic: topic.clone(),
+            },
+            label,
+        )
+        .await;
+    }
+    // Let the mesh form.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let payload = b"anonymous-gossip-frame".to_vec();
+    send_cmd(
+        &bob_node,
+        P2PCommand::PublishToTopic {
+            topic: topic.clone(),
+            data: payload.clone(),
+        },
+        "bob",
+    )
+    .await;
+
+    let received = next_matching(&mut alice_node, Duration::from_secs(5), |evt| {
+        matches!(evt, NodeEvent::MessageReceived { .. })
+    })
+    .await;
+    let NodeEvent::MessageReceived { sender, data, .. } = received else {
+        unreachable!("predicate guarantees MessageReceived")
+    };
+
+    assert_eq!(data, payload, "Alice must receive the gossip payload");
+    assert!(
+        sender.is_empty(),
+        "gossip authorship must be anonymous — no author PeerId on the wire (got {sender:?})",
     );
 }

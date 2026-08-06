@@ -65,6 +65,7 @@ fn join_bob_to_alice(
             joiner_public_key: bob_kp.public_key(),
             joiner_display_name: "Bob".to_string(),
             joiner_kyber_pub: kyber_pub,
+            joiner_peer_id: String::new(),
         },
     )
     .unwrap()
@@ -177,6 +178,7 @@ fn rejects_message_from_non_member() {
             member_status: MemberStatus::Active,
             custom_permissions: None,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
     );
     mallory_gm
@@ -1181,6 +1183,7 @@ fn state_sync_from_non_privileged_member_is_rejected() {
             role: Role::Owner,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
         GroupMemberSummary {
             identity_id: alice_id,
@@ -1189,6 +1192,7 @@ fn state_sync_from_non_privileged_member_is_rejected() {
             role: Role::Member,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
         GroupMemberSummary {
             identity_id: carol_id,
@@ -1197,6 +1201,7 @@ fn state_sync_from_non_privileged_member_is_rejected() {
             role: Role::Member,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
     ];
     let alice_version = alice_gm.get_group(&group_id).unwrap().version;
@@ -1271,6 +1276,7 @@ fn state_sync_owner_pin_blocks_ownership_change_from_non_owner() {
             role: Role::Owner,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
         GroupMemberSummary {
             identity_id: mallory_id,
@@ -1279,6 +1285,7 @@ fn state_sync_owner_pin_blocks_ownership_change_from_non_owner() {
             role: Role::Member,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
     ];
     let base_version = alice_gm.get_group(&group_id).unwrap().version;
@@ -1296,6 +1303,7 @@ fn state_sync_owner_pin_blocks_ownership_change_from_non_owner() {
             role: Role::Member,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
         GroupMemberSummary {
             identity_id: mallory_id,
@@ -1304,6 +1312,7 @@ fn state_sync_owner_pin_blocks_ownership_change_from_non_owner() {
             role: Role::Owner,
             joined_at: 0,
             kyber_pub: Vec::new(),
+            peer_id: String::new(),
         },
     ];
     let result =

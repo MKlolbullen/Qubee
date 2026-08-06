@@ -19,8 +19,10 @@ ignore = [
     # advisories are network-side DoS-style issues, mitigated in
     # practice because:
     #
-    # - mDNS is opt-in via `enable_mdns: bool` in `P2PNodeConfig`
-    #   (default off in tests, only on for local discovery).
+    # - mDNS is opt-in via `enable_mdns: bool` in `P2PNodeConfig`,
+    #   defaulting off in production as well as tests, so the mdns
+    #   resolver only runs when a caller explicitly enables it for
+    #   local discovery.
     # - DNS resolution happens once per dialed multiaddr, not on
     #   every packet, so an attacker can't trivially feed us
     #   compressed names at sustained rate.

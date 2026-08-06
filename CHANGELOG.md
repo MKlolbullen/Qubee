@@ -176,6 +176,27 @@ between minor versions.
   instead of crashing the process. `MessageService.start()` guards
   the same case at the call site.
 
+- **`QUBEE_GMS\x04`: no plaintext group id on the wire.** Blinding the
+  gossip topic (below) left the group-message envelope as the one
+  place group identity was still readable — `\x02` carried a 32-byte
+  `group_id` at a fixed offset so the receiver could pick a key, which
+  was defensible only while the topic name revealed it anyway. `\x04`
+  drops it for a per-message keyed selector,
+  `blake3::keyed_hash(derive_key("qubee group selector v1",
+  group_key), nonce)[..8]`, and the receiver selects a key by
+  recomputing the selector for each group it holds. Salting by the
+  frame's own nonce is the point: a static per-group tag would have
+  been a stable handle an observer could bucket traffic by, exactly
+  the property being removed. The selector is the AEAD's associated
+  data, so it can't be swapped onto another frame. `\x03` is
+  deliberately skipped — it is already the ratchet sender-key frame
+  (`MAGIC_GROUP_MESSAGE_V3`), and reusing it would make the two frame
+  checks match the same bytes and route frames to the wrong decoder.
+  Tests pin that the group id is not recoverable from the wire, that
+  the selector differs across frames of one group, and that it
+  resolves to the right group among several. **Breaking:** group
+  messages from older builds are rejected.
+
 - **Blinded gossip topic ids + opt-in Kademlia client mode (network
   privacy Tier 1 complete).** The per-group topic was
   `qubee-group-<group_id_hex>`, putting the group id on the wire in

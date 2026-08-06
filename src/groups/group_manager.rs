@@ -1454,6 +1454,17 @@ impl GroupManager {
     }
 
     /// Get a group by ID
+    /// Every `(group_id, group_key)` this manager can currently
+    /// unseal with. The `\x03` group-message envelope names no group,
+    /// so the receive path recomputes the selector over these to find
+    /// which key a frame belongs to.
+    pub fn group_key_candidates(&self) -> Vec<(GroupId, [u8; 32])> {
+        self.groups
+            .keys()
+            .filter_map(|gid| self.export_group_key(gid).map(|key| (*gid, key)))
+            .collect()
+    }
+
     pub fn get_group(&self, group_id: &GroupId) -> Option<&Group> {
         self.groups.get(group_id)
     }

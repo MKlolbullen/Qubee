@@ -26,7 +26,7 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
 | **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
 | ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
-| **Group identity** | 🟡 *Reduced, not closed.* The topic is now a blinded rotating hash, but the outer group-message envelope still carries `group_id` in the clear (32 bytes at a fixed offset after `QUBEE_GMS\x02`) | Topic-string watchers see only an opaque rotating label; anyone who captures a message payload still reads the group id |
+| ~~**Group identity**~~ | ✅ *Closed.* The topic is a blinded rotating hash, and `QUBEE_GMS\x04` replaced the envelope's plaintext `group_id` with a per-message keyed selector | ~~Anyone who observes the topic string~~ — neither the topic nor the payload names the group, and neither is stable across messages |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
 What is **not** leaked: message content (sealed), and — usefully —
@@ -127,9 +127,18 @@ Cheap, self-contained, ships without a new network dependency. Does
   re-syncing its subscriptions on a 5-minute ticker. The receive path
   was already topic-agnostic (group id comes from the signed frame), so
   nothing downstream had to change.
-  *Compatibility:* this changes the topic string, so blinded and
-  pre-blinded builds do not meet on the same group. Pre-alpha, no
-  migration.
+  The envelope half followed: `QUBEE_GMS\x04` drops the plaintext
+  `group_id` in favour of a per-message keyed selector
+  (`blake3::keyed_hash(derive_key("qubee group selector v1",
+  group_key), nonce)[..8]`), so the receiver picks a key by
+  recomputing the selector per candidate group rather than being told
+  which group the frame belongs to. Salting by the frame nonce is what
+  keeps it from becoming a stable per-group handle. `\x03` is skipped
+  — it is already the ratchet sender-key frame, and reusing it would
+  route frames to the wrong decoder.
+  *Compatibility:* both the topic string and the group-message frame
+  change, so this build does not meet older ones on a group.
+  Pre-alpha, no migration.
 - **Tighter discovery defaults.** ✅ *Landed.* `P2PNodeConfig::default`
   sets `enable_mdns: false`, so a device no longer broadcasts its
   presence + LAN IP by default (Kademlia / bootstrap remain the

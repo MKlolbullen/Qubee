@@ -237,7 +237,7 @@ fn forge_message_with_generation(
     };
     let inner = envelope.to_inner_bincode().unwrap();
     let group_key = gm.export_group_key(&group_id).expect("group key installed");
-    seal_outer_envelope(&group_id, &group_key, &inner).unwrap()
+    seal_outer_envelope(&group_key, &inner).unwrap()
 }
 
 #[test]
@@ -331,7 +331,7 @@ fn future_generation_is_rejected() {
 #[test]
 fn wire_format_magic_prefix_is_stable() {
     // Stability check: a sealed GroupMessageEnvelope frame begins with
-    // exactly the bytes `QUBEE_GMS\x02`. `\x01` was the pre-sealing
+    // exactly the bytes `QUBEE_GMS\x04`. `\x01` was the pre-sealing
     // format; any further change is a wire break needing a version
     // bump and migration. The pinned-magic check in `wire_stability.rs`
     // mirrors this assertion.
@@ -350,7 +350,7 @@ fn wire_format_magic_prefix_is_stable() {
     alice_gm.ensure_group_key(group_id).unwrap();
 
     let wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();
-    assert!(wire.starts_with(b"QUBEE_GMS\x02"));
+    assert!(wire.starts_with(b"QUBEE_GMS\x04"));
 }
 
 // ---------------------------------------------------------------------
@@ -801,8 +801,7 @@ fn message_older_than_max_age_is_rejected() {
         .export_group_key(&group_id)
         .expect("alice has the group key");
     let wire =
-        qubee_crypto::groups::group_message::seal_outer_envelope(&group_id, &group_key, &inner)
-            .unwrap();
+        qubee_crypto::groups::group_message::seal_outer_envelope(&group_key, &inner).unwrap();
 
     let result = decrypt_group_message(&bob_gm, &wire);
     assert!(
@@ -1745,20 +1744,96 @@ fn sealed_envelope_hides_sender_id_from_observer() {
     );
 
     // An observer without the group key gets back None.
-    let observer_lookup =
-        |_gid: &qubee_crypto::groups::group_manager::GroupId| -> Option<[u8; 32]> { None };
+    let no_keys: Vec<(qubee_crypto::groups::group_manager::GroupId, [u8; 32])> = Vec::new();
     assert!(
-        open_outer_envelope(&wire, observer_lookup).is_err(),
+        open_outer_envelope(&wire, no_keys).is_err(),
         "observer without group key must not be able to open outer envelope",
     );
 
-    // The group_id stays on the wire (it's the topic name anyway, so
-    // this is by design — sealing it would require an additional
-    // routing layer and gain nothing privacy-wise).
+    // The group id must NOT be on the wire. Under \x02 it was, and
+    // that was defended as free because the gossipsub topic name
+    // carried it anyway; blinding the topic removed that defence, so
+    // \x04 replaced it with a per-message keyed selector.
     assert!(
-        wire.windows(group_id.as_ref().len())
+        !wire
+            .windows(group_id.as_ref().len())
             .any(|w| w == group_id.as_ref()),
-        "group_id is expected to be in the clear (matches topic name)",
+        "group_id is recoverable from the wire — \\x04 selector is broken",
+    );
+}
+
+/// The `\x04` selector must not become a stable per-group handle. It
+/// is salted by the frame nonce precisely so an observer can't bucket
+/// a stream of frames by group the way the old plaintext group id let
+/// them — pinned here because a "simplification" to a static
+/// per-group tag would silently reintroduce that leak.
+#[test]
+fn selector_differs_across_frames_of_the_same_group() {
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+
+    let selector_of = |wire: &[u8]| {
+        let start = b"QUBEE_GMS\x04".len() + 12;
+        wire[start..start + 8].to_vec()
+    };
+    let a = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"one").unwrap();
+    let b = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"two").unwrap();
+    assert_ne!(
+        selector_of(&a),
+        selector_of(&b),
+        "selector is stable across frames — it has become a linkable per-group handle",
+    );
+}
+
+/// With several groups in play the selector must pick the right key,
+/// and a holder of only the *wrong* key must not open the frame.
+#[test]
+fn selector_picks_the_right_group_among_several() {
+    use qubee_crypto::groups::group_message::open_outer_envelope;
+
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let mut ids = Vec::new();
+    for name in ["one", "two", "three"] {
+        let gid = alice_gm
+            .create_group(
+                alice_id,
+                alice_kp.public_key(),
+                name.to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .unwrap();
+        alice_gm.ensure_group_key(gid).unwrap();
+        ids.push(gid);
+    }
+    let target = ids[1];
+    let wire = encrypt_group_message(&alice_gm, &alice_kp, target, b"payload").unwrap();
+
+    let (picked, _inner) = open_outer_envelope(&wire, alice_gm.group_key_candidates())
+        .expect("a member of the group must open its own frame");
+    assert_eq!(picked, target, "selector resolved to the wrong group");
+
+    let others: Vec<_> = alice_gm
+        .group_key_candidates()
+        .into_iter()
+        .filter(|(gid, _)| *gid != target)
+        .collect();
+    assert!(
+        open_outer_envelope(&wire, others).is_err(),
+        "a frame opened against only non-matching group keys must fail",
     );
 }
 
@@ -1784,16 +1859,10 @@ fn sealed_envelope_tampering_is_detected() {
         .unwrap();
     alice_gm.ensure_group_key(group_id).unwrap();
     let group_key = alice_gm.export_group_key(&group_id).unwrap();
-    let lookup = |gid: &qubee_crypto::groups::group_manager::GroupId| {
-        if *gid == group_id {
-            Some(group_key)
-        } else {
-            None
-        }
-    };
+    let lookup = vec![(group_id, group_key)];
 
     let mut wire = encrypt_group_message(&alice_gm, &alice_kp, group_id, b"hi").unwrap();
-    // Flip a bit deep in the ciphertext (past magic + group_id + nonce).
+    // Flip a bit deep in the ciphertext (past magic + nonce + selector).
     let target = wire.len() - 4;
     wire[target] ^= 0x01;
     assert!(

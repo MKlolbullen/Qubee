@@ -22,7 +22,7 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | **Your IP address** | Direct TCP/QUIC dials; no relay or onion layer | Every peer you connect to or gossip with; any on-path network observer |
 | **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
 | **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
-| **Social graph + authorship** | gossipsub `MessageAuthenticity::Signed` + `ValidationMode::Strict`: `message.source` is the **authenticated author PeerId**, delivered to every topic subscriber | Every member of a group topic (and any node that joins it) |
+| ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
 | **Group identity** | Topic name = `group_topic(group_id_hex)` — the group id in the clear | Anyone who observes the topic string |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
@@ -30,9 +30,13 @@ What is **not** leaked: message content (sealed), and — usefully —
 there is **no libp2p `identify` behaviour**, which is one of the most
 common accidental IP/agent leakers in libp2p stacks.
 
-The two headline problems are **(A) IP exposure** (any peer learns your
+The two headline problems were **(A) IP exposure** (any peer learns your
 network location) and **(B) the gossipsub social graph** (any topic
 subscriber learns which PeerId authored which message in which group).
+**(B) is now closed** by anonymous gossip authorship (Tier 1, landed —
+see §2); a topic subscriber still sees *that* a group topic has traffic,
+but no longer *who* authored it. **(A) remains** and is Tier 2 (Tor)
+work.
 
 ## 2. The spectrum of mitigations
 
@@ -81,12 +85,21 @@ Cheap, self-contained, ships without a new network dependency. Does
     not membership — a bump would trip the strict generation gate). Now
     every member can direct-route to every other member without the
     gossip author.
-  - **Step 3 (next).** Flip group publishing to `Anonymous` +
-    `ValidationMode::None`, and re-derive the receive-path TOFU linkage
-    from the inner signed frame rather than `message.source` (the
-    in-band directory from steps 1–2 is now the authenticated source).
-  Medium effort overall, security-sensitive — the single highest-value
-  metadata win in our control.
+  - **Step 3 (✅ landed).** Group publishing is now
+    `MessageAuthenticity::Anonymous` with `ValidationMode::None` and a
+    content-based `message_id_fn` (BLAKE3 over topic + payload — required
+    so anonymous frames, which carry no source/seqno, don't all collapse
+    to one gossipsub message-id and get deduped away). The gossip receive
+    path emits an **empty** sender, and every PeerId↔IdentityId linkage —
+    Rust `PEER_DIRECTORY` and the Kotlin trust policy
+    (`observePeerIdentityLink`) — now ignores gossip senders, taking peers
+    only from the authenticated in-band directory (steps 1–2) or the
+    authenticated `/qubee/direct/1` channel. A regression test pins that a
+    gossip frame arrives with no author PeerId. App-layer hybrid /
+    sender-key signatures remain the real authenticity gate; gossipsub's
+    own signature spam-gate is gone (accepted trade-off).
+  Security-sensitive — the single highest-value metadata win in our
+  control, now shipped.
 - **Fixed-size padding buckets.** ✅ *Landed (whole forward-secret path).*
   `security::padding` (length-prefix + zero-pad to a geometric size
   class: 256 / 1 K / 4 K / 16 K / 64 K, then 64 K steps) is applied to

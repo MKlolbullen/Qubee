@@ -1591,14 +1591,20 @@ fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
         return;
     }
     if let Some(identity_hex) = extracted_identity {
-        // Record the IdentityId -> PeerId mapping so the split
-        // key-rotation fan-out can address this member's KeyDelivery
-        // directly later. Same TOFU signal as the onPeerLinked dispatch.
-        PEER_DIRECTORY
-            .lock()
-            .unwrap()
-            .insert(identity_hex.clone(), sender_peer_id.clone());
-        dispatch_peer_linked(sender_peer_id, identity_hex);
+        // Only an authenticated delivering peer is a trustworthy source
+        // of the IdentityId -> PeerId linkage. Gossip publishing is
+        // Anonymous, so gossip frames arrive with an EMPTY `sender_peer_id`
+        // — skip the linkage for those; their PeerIds are learned in-band
+        // (RequestJoin body + roster snapshots, see `ingest_summary_peer_ids`
+        // and the RequestJoin branch below). A non-empty sender only comes
+        // from the authenticated `/qubee/direct/1` channel.
+        if !sender_peer_id.is_empty() {
+            PEER_DIRECTORY
+                .lock()
+                .unwrap()
+                .insert(identity_hex.clone(), sender_peer_id.clone());
+            dispatch_peer_linked(sender_peer_id, identity_hex);
+        }
     }
 }
 
@@ -1738,6 +1744,19 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
             } else {
                 body.joiner_peer_id.clone()
             };
+            // Record the joiner's authenticated IdentityId -> PeerId in the
+            // routing directory so a later KeyDelivery to them can be
+            // addressed directly. Under Anonymous gossip this is the
+            // owner's only in-band source for the joiner's PeerId (the
+            // gossip author is gone); the frame is signature-checked in
+            // `process_request_join`, so the mapping is authenticated.
+            if !reply_peer_id.is_empty() {
+                let joiner_hex = hex::encode(body.joiner_public_key.identity_id.as_ref() as &[u8]);
+                PEER_DIRECTORY
+                    .lock()
+                    .unwrap()
+                    .insert(joiner_hex, reply_peer_id.clone());
+            }
             on_request_join(body, signature, reply_peer_id)?;
         }
         GroupHandshake::JoinAccepted { body, signature } => {

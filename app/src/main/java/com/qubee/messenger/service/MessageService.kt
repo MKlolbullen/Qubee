@@ -332,15 +332,21 @@ class MessageService : Service(), NetworkCallback {
                 // authenticated direct channel, where PeerId linkage is
                 // sound.
                 val authenticatedPeer = senderId.isNotEmpty()
+                // For anonymous gossip we route by the envelope's
+                // authenticated sender_id. Inspecting it crosses the JNI
+                // boundary and re-parses the envelope, so do it once and
+                // reuse for both the contact lookup and the routing
+                // fallback.
+                val envelopeIdentity =
+                    if (authenticatedPeer) null else qubeeManager.inspectEnvelopeSender(data)
                 var mappedContact =
                     if (authenticatedPeer) {
                         contactRepository.getContactByPeerId(senderId)
                     } else {
-                        qubeeManager.inspectEnvelopeSender(data)
-                            ?.let { contactRepository.getContactByIdentityId(it) }
+                        envelopeIdentity?.let { contactRepository.getContactByIdentityId(it) }
                     }
                 val routedSenderId = mappedContact?.id
-                    ?: if (authenticatedPeer) senderId else qubeeManager.inspectEnvelopeSender(data)
+                    ?: if (authenticatedPeer) senderId else envelopeIdentity
                 if (routedSenderId.isNullOrEmpty()) {
                     Timber.w("Cannot route inbound: no authenticated sender (anonymous gossip, unknown identity)")
                     return@launch

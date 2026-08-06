@@ -45,6 +45,9 @@ class RatchetSender @Inject constructor(
      */
     private var pendingDistribution: MutableMap<String, MutableSet<String>>? = null
     private val pendingLock = Mutex()
+    private val gson = Gson()
+    private val pendingType =
+        object : TypeToken<MutableMap<String, MutableSet<String>>>() {}.type
 
     fun enabled(): Boolean = preferenceRepository.ratchetSendEnabled()
 
@@ -52,8 +55,7 @@ class RatchetSender @Inject constructor(
         pendingDistribution?.let { return it }
         val loaded: MutableMap<String, MutableSet<String>> = runCatching {
             preferenceRepository.loadPendingDistribution()?.let { json ->
-                val type = object : TypeToken<MutableMap<String, MutableSet<String>>>() {}.type
-                Gson().fromJson<MutableMap<String, MutableSet<String>>>(json, type)
+                gson.fromJson<MutableMap<String, MutableSet<String>>>(json, pendingType)
             }
         }.getOrNull() ?: mutableMapOf()
         pendingDistribution = loaded
@@ -62,7 +64,9 @@ class RatchetSender @Inject constructor(
 
     private fun persistPending() {
         runCatching {
-            preferenceRepository.savePendingDistribution(Gson().toJson(pendingDistribution))
+            // Always persist a concrete map — never a JSON `null` if the
+            // field somehow hasn't been loaded yet.
+            preferenceRepository.savePendingDistribution(gson.toJson(pending()))
         }.onFailure { Timber.w(it, "Failed to persist pending-distribution set") }
     }
 

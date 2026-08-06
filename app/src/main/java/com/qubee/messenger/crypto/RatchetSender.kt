@@ -6,8 +6,10 @@ import com.qubee.messenger.data.repository.GroupRepository
 import com.qubee.messenger.data.repository.PreferenceRepository
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import timber.log.Timber
 
 /**
@@ -62,12 +64,19 @@ class RatchetSender @Inject constructor(
         return loaded
     }
 
-    private fun persistPending() {
-        runCatching {
-            // Always persist a concrete map — never a JSON `null` if the
-            // field somehow hasn't been loaded yet.
-            preferenceRepository.savePendingDistribution(gson.toJson(pending()))
-        }.onFailure { Timber.w(it, "Failed to persist pending-distribution set") }
+    /**
+     * Durably persist the pending map (synchronous `commit()`, off the
+     * main thread). Returns whether the write was acknowledged so the
+     * send path can refuse to advance the sender chain when the set of
+     * members still owed the key couldn't be recorded. Always writes a
+     * concrete map, never a JSON `null`.
+     */
+    private suspend fun persistPending(): Boolean = withContext(Dispatchers.IO) {
+        runCatching { preferenceRepository.savePendingDistribution(gson.toJson(pending())) }
+            .getOrElse {
+                Timber.w(it, "Failed to persist pending-distribution set")
+                false
+            }
     }
 
     /** Encrypt a 1:1 text as a QUBEE_DMS frame, or null (fail-closed). */
@@ -119,7 +128,15 @@ class RatchetSender @Inject constructor(
                 deliverDistributions(groupIdHex, group)
             }
             if (group.isEmpty()) map.remove(groupIdHex)
-            persistPending()
+            // Fail closed: the encrypt below advances the sender chain
+            // (persisted synchronously in the Rust keystore). If we
+            // couldn't durably record who's still owed the key, a crash
+            // here would leave those members unable to decrypt — so
+            // don't produce the frame until the pending set is on disk.
+            if (!persistPending()) {
+                Timber.w("Aborting v3 send: pending-distribution set did not persist")
+                return null
+            }
         }
         return qubeeManager.encryptGroupMessageV3(groupIdHex, text)
     }

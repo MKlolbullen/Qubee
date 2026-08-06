@@ -153,9 +153,16 @@ class PreferenceRepository @Inject constructor(
      * hadn't received their distribution yet. Rides the encrypted store
      * like everything else here.
      */
-    fun savePendingDistribution(json: String) {
-        prefs.edit().putString(KEY_PENDING_DIST, json).apply()
-    }
+    /**
+     * Uses `commit()` (synchronous) and returns whether the write was
+     * durably acknowledged. The caller must know the pending set is on
+     * disk *before* advancing the sender chain: a chain that advanced
+     * while a not-yet-persisted member is still owed the key would, on
+     * a crash, leave that member unable to decrypt (the restart sees
+     * iteration > 0 and skips the re-seed). Call off the main thread.
+     */
+    fun savePendingDistribution(json: String): Boolean =
+        prefs.edit().putString(KEY_PENDING_DIST, json).commit()
 
     fun loadPendingDistribution(): String? = prefs.getString(KEY_PENDING_DIST, null)
 

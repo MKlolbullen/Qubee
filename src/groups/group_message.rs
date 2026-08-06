@@ -31,26 +31,48 @@ use chacha20poly1305::{
 
 /// Magic prefix for a group-message frame.
 ///
-/// `\x02` is the sealed-outer-envelope wire format: the only plaintext
-/// metadata on the wire is the group id (which is already revealed by
-/// the gossipsub topic name) and the outer AEAD nonce. Everything else
-/// — sender id, generation, timestamp, hybrid signature, the inner
-/// AEAD ciphertext — is encrypted under a key derived from the group
-/// key, so a passive observer subscribed to the topic learns nothing
-/// beyond "a member sent N bytes at some time".
+/// `\x04` removes the last plaintext identifier: the wire is now
+/// `MAGIC || nonce(12) || selector(8) || ciphertext`, with no group id
+/// anywhere in the clear. `\x02` carried the 32-byte group id so a
+/// receiver could pick the right key, justified at the time because
+/// the gossipsub topic name revealed it anyway. Blinding the topic
+/// removed that justification and left the envelope as the one place
+/// group identity was still readable on the wire.
 ///
-/// `\x01` was the pre-sealing format that left the signed body
-/// bincoded in plaintext. We don't accept `\x01` on the receive path
-/// any more — pre-this-change builds have to upgrade. The pre-alpha
-/// posture in `SECURITY.md` already documents that minor-version
-/// upgrades may break in-flight messages.
-pub const MAGIC_GROUP_MESSAGE: &[u8] = b"QUBEE_GMS\x02";
+/// The selector replaces it: a keyed, per-message value only a
+/// key-holder can compute (see [`group_selector`]). Everything else —
+/// sender id, generation, timestamp, hybrid signature, inner AEAD
+/// ciphertext — stays sealed under a key derived from the group key,
+/// so a passive observer learns only "someone sent N bytes at some
+/// time" and cannot tell two frames of the same group apart.
+///
+/// `\x01` and `\x02` are not accepted on the receive path. The
+/// pre-alpha posture in `SECURITY.md` already documents that upgrades
+/// may break in-flight messages.
+///
+/// `\x03` is deliberately skipped: it is already
+/// [`crate::ratchet::sender_keys::MAGIC_GROUP_MESSAGE_V3`], the
+/// ratchet sender-key frame. Reusing it would make
+/// [`is_group_message_frame`] and the sender-key frame check match the
+/// same bytes and route frames to the wrong decoder.
+pub const MAGIC_GROUP_MESSAGE: &[u8] = b"QUBEE_GMS\x04";
 
 /// Domain-separation tag for the BLAKE3 KDF that turns the group key
 /// into the outer-envelope ChaCha20-Poly1305 key. Distinct from any
 /// other derivation in the protocol so a compromise of either layer's
 /// key reveals nothing about the other.
 const OUTER_ENVELOPE_KDF_CONTEXT: &str = "qubee outer envelope v1";
+
+/// Domain-separation tag for the selector KDF. Separate from the
+/// outer-envelope key so the value published in the clear can never be
+/// used to attack the key that actually seals the frame.
+const GROUP_SELECTOR_KDF_CONTEXT: &str = "qubee group selector v1";
+
+/// Bytes of selector on the wire. 8 gives a ~2^-64 chance that a frame
+/// picks the wrong candidate key, and a wrong pick just fails the AEAD
+/// — so this trades collision odds against frame overhead, not
+/// security.
+pub const GROUP_SELECTOR_LEN: usize = 8;
 
 /// Maximum age of a group message frame. Bounds the replay window
 /// for a captured frame. 5 minutes matches the rest of the protocol.
@@ -117,38 +139,51 @@ fn derive_outer_envelope_key(group_key: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(OUTER_ENVELOPE_KDF_CONTEXT, group_key)
 }
 
+/// Per-message key-selection value written in the clear.
+///
+/// Keyed by the group key and salted by the frame's own nonce, so it
+/// is unpredictable without the key and *different on every frame* —
+/// an observer can't use it to group a stream of messages by group the
+/// way the old plaintext group id allowed. A receiver recomputes it
+/// for each group it holds a key for and matches.
+pub fn group_selector(group_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; GROUP_SELECTOR_LEN] {
+    let selector_key = blake3::derive_key(GROUP_SELECTOR_KDF_CONTEXT, group_key);
+    let full = blake3::keyed_hash(&selector_key, nonce);
+    let mut out = [0u8; GROUP_SELECTOR_LEN];
+    out.copy_from_slice(&full.as_bytes()[..GROUP_SELECTOR_LEN]);
+    out
+}
+
 /// Wrap a bincoded signed envelope in the outer AEAD layer and return
 /// the wire-ready bytes ready for gossipsub publication. Only the
-/// `group_id` and the AEAD nonce are plaintext; everything else
-/// (sender id, generation, timestamp, signature, inner ciphertext) is
-/// sealed.
-pub fn seal_outer_envelope(
-    group_id: &GroupId,
-    group_key: &[u8; 32],
-    inner_bincoded: &[u8],
-) -> Result<Vec<u8>> {
+/// nonce and the keyed selector are plaintext; sender id, generation,
+/// timestamp, signature and inner ciphertext are all sealed, and
+/// nothing on the wire names the group.
+pub fn seal_outer_envelope(group_key: &[u8; 32], inner_bincoded: &[u8]) -> Result<Vec<u8>> {
     let outer_key = derive_outer_envelope_key(group_key);
     let cipher = ChaCha20Poly1305::new_from_slice(&outer_key)
         .map_err(|_| anyhow!("invalid outer key length"))?;
     let nonce_bytes = secure_rng::random::array::<12>()?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    // Bind the outer AEAD to the group_id by including it as
-    // associated data — prevents a captured ciphertext from being
-    // replayed onto a different group's topic.
+    let selector = group_selector(group_key, &nonce_bytes);
+    // The selector is the associated data, so a captured ciphertext
+    // can't be re-published under a different selector — the same job
+    // the plaintext group id used to do, without naming the group.
     let ciphertext = cipher
         .encrypt(
             nonce,
             chacha20poly1305::aead::Payload {
                 msg: inner_bincoded,
-                aad: group_id.as_ref(),
+                aad: &selector,
             },
         )
         .map_err(|e| anyhow!("outer envelope seal: {e:?}"))?;
 
-    let mut out = Vec::with_capacity(MAGIC_GROUP_MESSAGE.len() + 32 + 12 + ciphertext.len());
+    let mut out =
+        Vec::with_capacity(MAGIC_GROUP_MESSAGE.len() + 12 + GROUP_SELECTOR_LEN + ciphertext.len());
     out.extend_from_slice(MAGIC_GROUP_MESSAGE);
-    out.extend_from_slice(group_id.as_ref());
     out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&selector);
     out.extend_from_slice(&ciphertext);
     Ok(out)
 }
@@ -156,19 +191,17 @@ pub fn seal_outer_envelope(
 /// Strip the outer-envelope layer. Returns `(group_id, inner_bincoded)`
 /// on success.
 ///
-/// `group_key_lookup` is a closure that takes the parsed `group_id`
-/// and returns the current 32-byte group key for it, or `None` if the
-/// receiver isn't a member. Two-stage because the wire carries
-/// `group_id` in the clear — since the gossip topic became a blinded
-/// rotating hash this is the one place group identity is still
-/// readable on the wire — but the inner ciphertext can only be opened
-/// with the right group key — so the parser first reads `group_id`,
-/// asks the caller which key to use, then attempts AEAD.
+/// `candidates` yields every `(group_id, group_key)` the receiver
+/// holds. Since `\x03` no longer names the group, selection is by
+/// recomputing [`group_selector`] over the frame's nonce for each
+/// candidate — cheap BLAKE3 per group, so a junk frame costs a few
+/// hashes rather than a full AEAD attempt each.
 pub fn open_outer_envelope(
     wire: &[u8],
-    group_key_lookup: impl FnOnce(&GroupId) -> Option<[u8; 32]>,
+    candidates: impl IntoIterator<Item = (GroupId, [u8; 32])>,
 ) -> Result<(GroupId, Vec<u8>)> {
-    if wire.len() < MAGIC_GROUP_MESSAGE.len() + 32 + 12 {
+    let header = MAGIC_GROUP_MESSAGE.len() + 12 + GROUP_SELECTOR_LEN;
+    if wire.len() < header {
         return Err(anyhow!("outer envelope too short"));
     }
     if &wire[..MAGIC_GROUP_MESSAGE.len()] != MAGIC_GROUP_MESSAGE {
@@ -176,30 +209,34 @@ pub fn open_outer_envelope(
     }
     let mut offset = MAGIC_GROUP_MESSAGE.len();
 
-    let mut group_id_bytes = [0u8; 32];
-    group_id_bytes.copy_from_slice(&wire[offset..offset + 32]);
-    let group_id = GroupId::from_bytes(group_id_bytes);
-    offset += 32;
-
-    let nonce = Nonce::from_slice(&wire[offset..offset + 12]);
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&wire[offset..offset + 12]);
     offset += 12;
-    let ciphertext = &wire[offset..];
 
-    let group_key = group_key_lookup(&group_id)
-        .ok_or_else(|| anyhow!("outer envelope: unknown group / not a member"))?;
-    let outer_key = derive_outer_envelope_key(&group_key);
-    let cipher = ChaCha20Poly1305::new_from_slice(&outer_key)
-        .map_err(|_| anyhow!("invalid outer key length"))?;
-    let inner = cipher
-        .decrypt(
-            nonce,
-            chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad: group_id.as_ref(),
-            },
-        )
-        .map_err(|e| anyhow!("outer envelope open: {e:?}"))?;
-    Ok((group_id, inner))
+    let wire_selector = &wire[offset..offset + GROUP_SELECTOR_LEN];
+    offset += GROUP_SELECTOR_LEN;
+    let ciphertext = &wire[offset..];
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    for (group_id, group_key) in candidates {
+        if group_selector(&group_key, &nonce_bytes) != wire_selector {
+            continue;
+        }
+        let outer_key = derive_outer_envelope_key(&group_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(&outer_key)
+            .map_err(|_| anyhow!("invalid outer key length"))?;
+        let inner = cipher
+            .decrypt(
+                nonce,
+                chacha20poly1305::aead::Payload {
+                    msg: ciphertext,
+                    aad: wire_selector,
+                },
+            )
+            .map_err(|e| anyhow!("outer envelope open: {e:?}"))?;
+        return Ok((group_id, inner));
+    }
+    Err(anyhow!("outer envelope: unknown group / not a member"))
 }
 
 /// Canonical bytes the sender's [`HybridSignature`] covers. Built by
@@ -255,7 +292,7 @@ pub fn group_message_id(body: &GroupMessageBody) -> [u8; 16] {
 /// aren't a valid sealed frame for a group the receiver is a member
 /// of.
 pub fn extract_message_id(gm: &GroupManager, wire: &[u8]) -> Option<[u8; 16]> {
-    let (_, inner) = open_outer_envelope(wire, |gid| gm.export_group_key(gid)).ok()?;
+    let (_, inner) = open_outer_envelope(wire, gm.group_key_candidates()).ok()?;
     let envelope = GroupMessageEnvelope::from_inner_bincode(&inner).ok()?;
     Some(group_message_id(&envelope.body))
 }
@@ -309,7 +346,7 @@ pub fn encrypt_group_message(
     let group_key = gm
         .export_group_key(&group_id)
         .ok_or_else(|| anyhow!("encrypt: no group key installed"))?;
-    seal_outer_envelope(&group_id, &group_key, &inner_bincoded)
+    seal_outer_envelope(&group_key, &inner_bincoded)
 }
 
 /// Validate + decrypt a wire-format group-message frame.
@@ -331,7 +368,7 @@ pub fn decrypt_group_message(gm: &GroupManager, wire: &[u8]) -> Result<Decrypted
     // Strip the outer-envelope layer first. Failure here (wrong magic,
     // wrong group, outer AEAD reject) means the frame either isn't ours
     // or has been tampered with — bounce it before any signature work.
-    let (_outer_group_id, inner) = open_outer_envelope(wire, |gid| gm.export_group_key(gid))?;
+    let (_outer_group_id, inner) = open_outer_envelope(wire, gm.group_key_candidates())?;
     let envelope = GroupMessageEnvelope::from_inner_bincode(&inner)?;
     let body = &envelope.body;
 

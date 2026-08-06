@@ -102,7 +102,7 @@ fn group_message_magic_is_pinned() {
     // pre-sealing format that left signed bodies plaintext on the
     // wire; pinned here so a "let's bump the magic" change has to
     // also bump this assertion (and the doc on `MAGIC_GROUP_MESSAGE`).
-    assert_eq!(MAGIC_GROUP_MESSAGE, b"QUBEE_GMS\x02");
+    assert_eq!(MAGIC_GROUP_MESSAGE, b"QUBEE_GMS\x04");
 }
 
 #[test]
@@ -465,13 +465,11 @@ proptest! {
         // that breaks bincode round-trips of the inner envelope.
         let group_key = [0x5Au8; 32];
         let inner = envelope.to_inner_bincode().expect("inner bincode");
-        let wire = qubee_crypto::groups::group_message::seal_outer_envelope(
-            &body.group_id, &group_key, &inner,
-        )
-        .expect("seal");
+        let wire = qubee_crypto::groups::group_message::seal_outer_envelope(&group_key, &inner)
+            .expect("seal");
         let (gid_out, inner_out) = qubee_crypto::groups::group_message::open_outer_envelope(
             &wire,
-            |gid| if *gid == body.group_id { Some(group_key) } else { None },
+            vec![(body.group_id, group_key)],
         )
         .expect("open");
         prop_assert_eq!(gid_out, body.group_id);

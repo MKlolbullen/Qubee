@@ -3412,10 +3412,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
             let gm = gm_guard
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-            let (_group_id, inner) =
-                crate::groups::group_message::open_outer_envelope(&wire_bytes, |gid| {
-                    gm.export_group_key(gid)
-                })?;
+            let (_group_id, inner) = crate::groups::group_message::open_outer_envelope(
+                &wire_bytes,
+                gm.group_key_candidates(),
+            )?;
             let envelope =
                 crate::groups::group_message::GroupMessageEnvelope::from_inner_bincode(&inner)?;
             let hex_id = hex::encode(envelope.body.sender_id.as_ref() as &[u8]);

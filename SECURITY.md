@@ -136,10 +136,11 @@ the pre-alpha:
   padded to fixed size classes, though the live v2 path is still
   padded only at the envelope; mDNS is off by default; and the gossip
   topic is a blinded rotating hash instead of the group id in the
-  clear. **Group identity is reduced, not hidden** — the outer
-  group-message envelope still carries `group_id` in plaintext, so an
-  observer who captures a payload, rather than only watching topic
-  strings, can still tell which group it belongs to.
+  clear, and the group-message envelope (`QUBEE_GMS\x04`) replaced its
+  plaintext `group_id` with a per-message keyed selector. Neither the
+  topic nor the payload now names a group, and neither is stable
+  across messages — but note this hides *which* group, not *that*
+  group traffic exists.
 - The Android Keystore master key that wraps both the SQLCipher
   passphrase *and* the Rust core keystore passphrase is configured
   with `setUserAuthenticationRequired(false)`, meaning local data

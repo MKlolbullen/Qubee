@@ -194,7 +194,27 @@ The only tier that targets a **global passive adversary** and
 traffic-analysis. [Nym](https://docs.rs/nym-sdk)'s mixnet uses
 fixed-size Sphinx packets, continuous-time mixing (random per-hop
 delays), and tunable cover traffic to provide sender–receiver
-unlinkability that *improves* as the network grows.
+unlinkability that *improves* as the network grows. Because it hides
+your IP **and** defeats traffic-analysis, Tier 3 strictly *subsumes*
+Tier 2 — so it's a legitimate (if far heavier) target to jump to.
+
+**Status: foundation landed; mixnet transport not wired.** Same shape as
+Tier 2: a `nym` Cargo feature (off by default, pulls no dependencies),
+the `TransportPrivacy::NymMixnet` config variant, and the fail-closed
+`with_config` seam + leaky-by-default discovery guards shared with Tor.
+Selecting `NymMixnet` today refuses to start rather than expose the IP.
+
+**Dependency probe (done).** `nym-sdk 1.21.4` (current on crates.io — the
+"publication paused" note applies to an older line) **resolves against
+our pinned tree without a hard conflict**: `rand_core 0.6.4`,
+`chacha20poly1305 0.10.1`, `ed25519-dalek 2.2`, `x25519-dalek 2.0.1`,
+`curve25519-dalek 4.1.3` all survive, and Nym coexists by pulling
+*parallel* versions (`rand_core 0.9`/`0.10`, `curve25519-dalek-ng`,
+`libcrux-*`, `zstd`, …). So the pinned-crypto conflict is **not** a hard
+blocker — but it drags in a large transitive tree (supply-chain +
+build-time cost), and compilation-together is unverified. It also
+exposes a `libp2p-vanilla` feature worth investigating: Nym may offer a
+libp2p adapter that's cleaner than a full transport-model replacement.
 
 Costs (from Nym's own measurements):
 
@@ -225,14 +245,17 @@ Costs (from Nym's own measurements):
    one parked item is padding on the *legacy v2* group path, which
    adopts the same primitive at the ratchet cutover when its format
    changes anyway.)
-2. **Tier 2 (Tor/Arti)** as the first *IP*-anonymisation step: an
-   opt-in onion-service transport, defaulted **off**, gated behind the
-   same "experimental, device-validation-pending" discipline as the
-   ratchet cutover and the DB-key binding. This is the biggest
-   single win for "peers can see my IP" and is independently useful
-   even before Tier 3.
-3. **Tier 3 (Nym mixnet)** only if/when defeating a global passive
-   adversary becomes a goal — it's the strongest and by far the
+2. **Tier 2 (Tor/Arti)** — foundation landed (fail-closed seam +
+   guards). The `arti-client` transport wiring is deferred: the project
+   chose to jump to Tier 3 instead, since a mixnet subsumes Tor's
+   IP-hiding. Tier 2 remains a valid lighter-weight option if the Nym
+   integration proves too heavy in practice.
+3. **Tier 3 (Nym mixnet)** — foundation landed (fail-closed seam +
+   guards + dependency probe). The remaining work is the heavy part:
+   pull `nym-sdk` (gated on the `nym` feature), decide unicast-fan-out
+   vs. the `libp2p-vanilla` adapter, and route the privacy-sensitive
+   path through the mixnet — accepting the latency + cover-traffic cost
+   and the Nym gateway dependency. Strongest protection, by far the
    heaviest, and it changes the transport model.
 
 None of these should be advertised as done until validated, and the

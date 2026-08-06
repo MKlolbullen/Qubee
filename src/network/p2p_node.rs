@@ -221,14 +221,26 @@ pub enum TransportPrivacy {
     /// Plain TCP/QUIC. Peers learn your IP. (Current shipped behaviour.)
     #[default]
     Direct,
-    /// Tor onion-service transport. Foundation only today — not yet
-    /// functional; `with_config` refuses to start in this mode.
+    /// Tor onion-service transport (Tier 2). Hides your IP/location.
+    /// Foundation only today — not yet functional; `with_config` refuses
+    /// to start in this mode.
     TorOnion,
+    /// Nym mixnet transport (Tier 3). Hides your IP **and** resists
+    /// traffic-analysis by a global passive adversary — fixed-size Sphinx
+    /// packets, per-hop mixing delays, and cover traffic. A mixnet
+    /// *replaces* the libp2p transport for the privacy-sensitive path
+    /// (unicast to a Nym `Recipient`, not gossip), so it's the heaviest
+    /// option. Foundation only today — not yet functional; `with_config`
+    /// refuses to start in this mode.
+    NymMixnet,
 }
 
 impl TransportPrivacy {
-    fn is_tor(self) -> bool {
-        matches!(self, TransportPrivacy::TorOnion)
+    /// True only for the shipped `Direct` transport. The anonymising
+    /// modes are foundation-only and fail closed until their transports
+    /// are wired.
+    fn is_direct(self) -> bool {
+        matches!(self, TransportPrivacy::Direct)
     }
 }
 
@@ -248,9 +260,11 @@ struct ResolvedDiscovery {
 /// transport-privacy posture. Pure + unit-tested so the leaky-by-default
 /// guards are pinned independently of the (not-yet-built) Tor transport.
 fn resolve_discovery(privacy: TransportPrivacy, enable_mdns: bool) -> ResolvedDiscovery {
-    if privacy.is_tor() {
-        // Force the address-leaking behaviours off regardless of the
-        // caller's mDNS request — under Tor they would defeat the point.
+    if !privacy.is_direct() {
+        // Any anonymising posture (Tor / Nym) forces the address-leaking
+        // behaviours off regardless of the caller's mDNS request — mDNS
+        // and DHT address advertisement would publish the real address
+        // the overlay exists to hide.
         ResolvedDiscovery {
             mdns_enabled: false,
             kademlia_client_mode: true,
@@ -336,26 +350,27 @@ impl P2PNodeConfig {
     }
 }
 
-/// Error for a [`TransportPrivacy::TorOnion`] request that can't be
-/// honoured yet. Feature-aware so the message states the real reason,
-/// but the outcome is the same either way: fail closed, never downgrade
-/// to a direct transport that would expose the IP the caller asked to
-/// hide.
-fn tor_transport_unavailable() -> anyhow::Error {
-    #[cfg(feature = "tor")]
-    {
+/// Error for an anonymising-transport request that can't be honoured
+/// yet. Feature-aware so the message states the real reason, but the
+/// outcome is the same either way: fail closed, never downgrade to a
+/// direct transport that would expose the IP the caller asked to hide.
+fn transport_unavailable(mode: TransportPrivacy) -> anyhow::Error {
+    let (label, feature, enabled) = match mode {
+        TransportPrivacy::Direct => return anyhow!("internal: Direct is always available"),
+        TransportPrivacy::TorOnion => ("Tor onion-service", "tor", cfg!(feature = "tor")),
+        TransportPrivacy::NymMixnet => ("Nym mixnet", "nym", cfg!(feature = "nym")),
+    };
+    if enabled {
         anyhow!(
-            "TransportPrivacy::TorOnion selected, but the onion-service transport is not \
-             implemented yet (Tier-2 foundation). Refusing to start rather than fall back to a \
-             direct transport that would expose your IP."
+            "TransportPrivacy::{mode:?} selected, but the {label} transport is not implemented yet \
+             (foundation only). Refusing to start rather than fall back to a direct transport that \
+             would expose your IP."
         )
-    }
-    #[cfg(not(feature = "tor"))]
-    {
+    } else {
         anyhow!(
-            "TransportPrivacy::TorOnion requires the `tor` Cargo feature — and the onion transport \
-             itself is not implemented yet. Refusing to fall back to a direct transport that would \
-             expose your IP."
+            "TransportPrivacy::{mode:?} requires the `{feature}` Cargo feature — and the {label} \
+             transport itself is not implemented yet. Refusing to fall back to a direct transport \
+             that would expose your IP."
         )
     }
 }
@@ -397,15 +412,16 @@ impl P2PNode {
         command_receiver: mpsc::Receiver<P2PCommand>,
         config: P2PNodeConfig,
     ) -> Result<Self> {
-        // Tier-2 foundation: the Tor onion-service transport isn't wired
-        // yet. Fail CLOSED rather than fall back to a direct TCP/QUIC
-        // node — a caller who asked for Tor did so to hide their IP, and
+        // The anonymising transports (Tor onion service / Nym mixnet)
+        // aren't wired yet — only their config surface + guards are.
+        // Fail CLOSED rather than fall back to a direct TCP/QUIC node: a
+        // caller who asked for Tor or Nym did so to hide their IP, and
         // silently giving them a direct transport would expose the very
         // address they meant to protect. The `resolve_discovery` guards
         // (mDNS off, Kademlia client mode) are already in place for when
-        // the transport lands; see docs/architecture/network-privacy.md.
-        if config.transport_privacy.is_tor() {
-            return Err(tor_transport_unavailable());
+        // a transport lands; see docs/architecture/network-privacy.md.
+        if !config.transport_privacy.is_direct() {
+            return Err(transport_unavailable(config.transport_privacy));
         }
 
         let cfg_for_behaviour = config.clone();
@@ -758,6 +774,35 @@ mod tests {
             },
             "Tor mode must silence mDNS and DHT address advertisement",
         );
+    }
+
+    #[test]
+    fn nym_mode_also_forces_address_leaking_behaviours_off() {
+        // Every anonymising posture, not just Tor, silences mDNS + DHT
+        // address advertisement.
+        let resolved = resolve_discovery(TransportPrivacy::NymMixnet, true);
+        assert_eq!(
+            resolved,
+            ResolvedDiscovery {
+                mdns_enabled: false,
+                kademlia_client_mode: true,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn nym_transport_fails_closed_until_implemented() {
+        // Nym mixnet, like Tor, must refuse to start rather than fall
+        // back to a direct transport that would expose the IP.
+        let id_keys = libp2p::identity::Keypair::generate_ed25519();
+        let (_tx, rx) = mpsc::channel(1);
+        let config = P2PNodeConfig {
+            transport_privacy: TransportPrivacy::NymMixnet,
+            ..P2PNodeConfig::for_testing()
+        };
+        let result = P2PNode::with_config(id_keys, rx, config).await;
+        assert!(result.is_err(), "NymMixnet must fail closed");
+        assert!(format!("{:#}", result.err().unwrap()).contains("expose your IP"));
     }
 
     #[tokio::test]

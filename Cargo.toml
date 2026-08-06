@@ -149,6 +149,16 @@ _typecheck_jni = []
 # when explicitly enabled; it pulls no extra dependencies today. See
 # docs/architecture/network-privacy.md (Tier 2).
 tor = []
+# Tier-3 network privacy: Nym mixnet transport. FOUNDATION only today —
+# same fail-closed config seam + discovery guards as `tor`. A mixnet
+# replaces the libp2p transport for the private path (unicast to a Nym
+# `Recipient`), resists traffic-analysis by a global passive adversary,
+# and costs latency + steady cover traffic. The flag gates the eventual
+# `nym-sdk` dependency (which resolves against our pinned tree but pulls
+# a large transitive tree) so it compiles only when explicitly enabled;
+# it pulls no extra dependencies today. See
+# docs/architecture/network-privacy.md (Tier 3).
+nym = []
 
 [dev-dependencies]
 tempfile = "3.27"

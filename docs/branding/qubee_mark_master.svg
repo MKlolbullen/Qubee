@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1000" viewBox="0 0 1500 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Qubee master mark</title>
+  <desc id="desc">A neon green quantum Q and bee emblem with wireframe wings, matrix digits, and an integrated rounded key.</desc>
+
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="44%" r="62%">
+      <stop offset="0" stop-color="#0b1f18"/>
+      <stop offset="0.5" stop-color="#06100d"/>
+      <stop offset="1" stop-color="#020504"/>
+    </radialGradient>
+
+    <linearGradient id="neon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#caff6a"/>
+      <stop offset="0.45" stop-color="#48ff92"/>
+      <stop offset="1" stop-color="#00d879"/>
+    </linearGradient>
+
+    <linearGradient id="neonDim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#72ff9e" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#0aa964" stop-opacity="0.75"/>
+    </linearGradient>
+
+    <filter id="glow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="12" result="blur1"/>
+      <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <clipPath id="bodyClip">
+      <path d="M760 388 C824 388 872 434 872 507 C872 578 826 643 760 643 C694 643 648 578 648 507 C648 434 696 388 760 388 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1500" height="1000" rx="56" fill="url(#bgGlow)"/>
+
+  <!-- Ambient halo -->
+  <ellipse cx="750" cy="502" rx="380" ry="330" fill="#26ff8a" opacity="0.035"/>
+  <ellipse cx="750" cy="502" rx="300" ry="270" fill="none" stroke="#2aff91" stroke-opacity="0.08" stroke-width="2"/>
+
+  <!-- Wireframe wings -->
+  <g fill="none" stroke="url(#neonDim)" stroke-linecap="round" stroke-linejoin="round" filter="url(#softGlow)">
+    <path d="M658 430 C560 305 394 280 316 348 C260 397 278 487 374 514 C464 540 574 490 658 430 Z" stroke-width="8" opacity="0.9"/>
+    <path d="M862 430 C960 305 1126 280 1204 348 C1260 397 1242 487 1146 514 C1056 540 946 490 862 430 Z" stroke-width="8" opacity="0.9"/>
+
+    <path d="M654 441 C533 397 425 388 324 367" stroke-width="3" opacity="0.55"/>
+    <path d="M648 457 C526 442 421 452 326 478" stroke-width="3" opacity="0.45"/>
+    <path d="M632 474 C538 493 464 514 382 514" stroke-width="3" opacity="0.5"/>
+    <path d="M620 419 C563 371 511 339 451 320" stroke-width="3" opacity="0.55"/>
+    <path d="M604 447 C541 415 479 392 411 375" stroke-width="2.5" opacity="0.45"/>
+    <path d="M585 482 C515 466 452 459 382 462" stroke-width="2.5" opacity="0.42"/>
+
+    <path d="M866 441 C987 397 1095 388 1196 367" stroke-width="3" opacity="0.55"/>
+    <path d="M872 457 C994 442 1099 452 1194 478" stroke-width="3" opacity="0.45"/>
+    <path d="M888 474 C982 493 1056 514 1138 514" stroke-width="3" opacity="0.5"/>
+    <path d="M900 419 C957 371 1009 339 1069 320" stroke-width="3" opacity="0.55"/>
+    <path d="M916 447 C979 415 1041 392 1109 375" stroke-width="2.5" opacity="0.45"/>
+    <path d="M935 482 C1005 466 1068 459 1138 462" stroke-width="2.5" opacity="0.42"/>
+  </g>
+
+  <!-- Wing glitch fragments -->
+  <g stroke="#5cff9a" stroke-width="4" stroke-linecap="round" opacity="0.55">
+    <path d="M300 420 h58"/><path d="M340 332 h34"/><path d="M460 502 h48"/>
+    <path d="M1220 420 h-58"/><path d="M1180 332 h-34"/><path d="M1060 502 h-48"/>
+  </g>
+
+  <!-- Q ring -->
+  <g filter="url(#glow)">
+    <circle cx="760" cy="484" r="214" fill="none" stroke="url(#neon)" stroke-width="38"/>
+    <circle cx="760" cy="484" r="166" fill="none" stroke="#83ffad" stroke-opacity="0.14" stroke-width="2"/>
+  </g>
+
+  <!-- Bee head -->
+  <g filter="url(#softGlow)">
+    <circle cx="760" cy="336" r="66" fill="#06100d" stroke="url(#neon)" stroke-width="13"/>
+    <path d="M720 286 C690 248 672 237 651 236" fill="none" stroke="#4dff93" stroke-width="10" stroke-linecap="round"/>
+    <path d="M800 286 C830 248 848 237 869 236" fill="none" stroke="#4dff93" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="648" cy="235" r="10" fill="#6dff9c"/>
+    <circle cx="872" cy="235" r="10" fill="#6dff9c"/>
+    <path d="M733 334 q27 24 54 0" fill="none" stroke="#76ffa8" stroke-width="7" stroke-linecap="round" opacity="0.8"/>
+  </g>
+
+  <!-- Body / Q stem body -->
+  <g>
+    <path d="M760 388 C824 388 872 434 872 507 C872 578 826 643 760 643 C694 643 648 578 648 507 C648 434 696 388 760 388 Z" fill="#04100b" stroke="url(#neon)" stroke-width="14" filter="url(#softGlow)"/>
+
+    <!-- Matrix rain clipped inside body -->
+    <g clip-path="url(#bodyClip)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-weight="700" fill="#72ff9e">
+      <g opacity="0.95" font-size="25">
+        <text x="670" y="425">10100101</text>
+        <text x="674" y="454">01011010</text>
+        <text x="669" y="483">11001001</text>
+        <text x="674" y="512">00110110</text>
+        <text x="669" y="541">10101100</text>
+        <text x="674" y="570">01010011</text>
+        <text x="669" y="599">11100010</text>
+        <text x="674" y="628">00101101</text>
+      </g>
+      <g opacity="0.25" font-size="18">
+        <text x="651" y="440">011010010101</text>
+        <text x="651" y="498">101101001011</text>
+        <text x="651" y="556">001011101100</text>
+        <text x="651" y="614">110100010110</text>
+      </g>
+    </g>
+
+    <!-- Body segmentation -->
+    <path d="M660 466 C713 488 807 488 860 466" fill="none" stroke="#56ff96" stroke-width="9" opacity="0.72"/>
+    <path d="M653 526 C714 548 806 548 867 526" fill="none" stroke="#56ff96" stroke-width="9" opacity="0.72"/>
+    <path d="M668 585 C722 600 798 600 852 585" fill="none" stroke="#56ff96" stroke-width="9" opacity="0.72"/>
+  </g>
+
+  <!-- Integrated Q tail into rounded key -->
+  <g filter="url(#glow)" fill="none" stroke="url(#neon)" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M868 620 C928 670 970 714 1003 764" stroke-width="42"/>
+    <path d="M1003 764 L1003 844" stroke-width="42"/>
+    <path d="M1003 844 L1060 844 L1060 808 L1101 808 L1101 770 L1142 770" stroke-width="42"/>
+  </g>
+
+  <!-- Rounded key head -->
+  <g filter="url(#softGlow)">
+    <circle cx="875" cy="624" r="47" fill="#06100d" stroke="url(#neon)" stroke-width="18"/>
+    <circle cx="875" cy="624" r="14" fill="#56ff96" opacity="0.9"/>
+  </g>
+
+  <!-- Key teeth detail accents -->
+  <g stroke="#b9ffcf" stroke-width="5" stroke-linecap="round" opacity="0.75">
+    <path d="M1003 820 h26"/>
+    <path d="M1060 790 h24"/>
+    <path d="M1101 752 h22"/>
+  </g>
+
+  <!-- Tiny quantum orbit accents -->
+  <g fill="none" stroke="#62ff9b" stroke-width="3" opacity="0.45">
+    <ellipse cx="760" cy="484" rx="276" ry="86" transform="rotate(-18 760 484)"/>
+    <ellipse cx="760" cy="484" rx="286" ry="96" transform="rotate(22 760 484)"/>
+  </g>
+  <g fill="#9dffb8" opacity="0.8">
+    <circle cx="502" cy="394" r="7"/><circle cx="1009" cy="579" r="7"/>
+    <circle cx="544" cy="638" r="6"/><circle cx="969" cy="337" r="6"/>
+  </g>
+</svg>

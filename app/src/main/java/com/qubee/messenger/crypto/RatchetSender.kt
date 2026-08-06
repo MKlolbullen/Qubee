@@ -1,11 +1,15 @@
 package com.qubee.messenger.crypto
 
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import com.qubee.messenger.data.repository.GroupRepository
 import com.qubee.messenger.data.repository.PreferenceRepository
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import timber.log.Timber
 
 /**
@@ -36,18 +40,72 @@ class RatchetSender @Inject constructor(
      * as soon as we hear from them — without this, one deferred
      * distribution would lock that member out of the whole chain
      * (iteration > 0 skips the fan-out forever).
-     * TODO(two-device checklist): persist across process restarts; an
-     * app kill with entries pending currently drops them until the
-     * next rekey mints a fresh chain.
+     *
+     * Persisted (JSON, via [PreferenceRepository]) so a process kill
+     * with entries still pending doesn't strand those members until the
+     * next rekey. Loaded lazily on first access.
      */
-    private val pendingDistribution = mutableMapOf<String, MutableSet<String>>()
+    private var pendingDistribution: MutableMap<String, MutableSet<String>>? = null
     private val pendingLock = Mutex()
+    private val gson = Gson()
+    private val pendingType =
+        object : TypeToken<MutableMap<String, MutableSet<String>>>() {}.type
 
     fun enabled(): Boolean = preferenceRepository.ratchetSendEnabled()
+
+    private fun pending(): MutableMap<String, MutableSet<String>> {
+        pendingDistribution?.let { return it }
+        val loaded: MutableMap<String, MutableSet<String>> = runCatching {
+            preferenceRepository.loadPendingDistribution()?.let { json ->
+                gson.fromJson<MutableMap<String, MutableSet<String>>>(json, pendingType)
+            }
+        }.getOrNull() ?: mutableMapOf()
+        pendingDistribution = loaded
+        return loaded
+    }
+
+    /**
+     * Durably persist the pending map (synchronous `commit()`, off the
+     * main thread). Returns whether the write was acknowledged so the
+     * send path can refuse to advance the sender chain when the set of
+     * members still owed the key couldn't be recorded. Always writes a
+     * concrete map, never a JSON `null`.
+     */
+    private suspend fun persistPending(): Boolean = withContext(Dispatchers.IO) {
+        runCatching { preferenceRepository.savePendingDistribution(gson.toJson(pending())) }
+            .getOrElse {
+                Timber.w(it, "Failed to persist pending-distribution set")
+                false
+            }
+    }
 
     /** Encrypt a 1:1 text as a QUBEE_DMS frame, or null (fail-closed). */
     suspend fun encryptDirectText(peerIdHex: String, text: String): ByteArray? =
         qubeeManager.encryptDirectMessage(peerIdHex, text)
+
+    /**
+     * Retry every group's still-pending sender-key distributions.
+     * Called when a peer's prekey bundle is newly installed (a member
+     * we couldn't reach before may now be reachable), so a late joiner
+     * gets the current chain without waiting for the next group send.
+     * No-op when the flag is off or nothing is pending.
+     */
+    suspend fun redeliverPending() {
+        if (!enabled()) return
+        pendingLock.withLock {
+            val map = pending()
+            if (map.isEmpty()) return
+            var changed = false
+            for ((groupIdHex, members) in map) {
+                if (members.isEmpty()) continue
+                val before = members.size
+                deliverDistributions(groupIdHex, members)
+                if (members.size != before) changed = true
+            }
+            map.entries.removeAll { it.value.isEmpty() }
+            if (changed) persistPending()
+        }
+    }
 
     /**
      * Encrypt a group text as a QUBEE_GMS v3 frame. A fresh chain
@@ -60,13 +118,24 @@ class RatchetSender @Inject constructor(
      */
     suspend fun encryptGroupText(groupIdHex: String, selfIdHex: String?, text: String): ByteArray? {
         pendingLock.withLock {
-            val pending = pendingDistribution.getOrPut(groupIdHex) { mutableSetOf() }
+            val map = pending()
+            val group = map.getOrPut(groupIdHex) { mutableSetOf() }
             if (qubeeManager.ownSenderChainIteration(groupIdHex) <= 0L) {
-                pending.clear()
-                pending += activeMemberIds(groupIdHex, selfIdHex)
+                group.clear()
+                group += activeMemberIds(groupIdHex, selfIdHex)
             }
-            if (pending.isNotEmpty()) {
-                deliverDistributions(groupIdHex, pending)
+            if (group.isNotEmpty()) {
+                deliverDistributions(groupIdHex, group)
+            }
+            if (group.isEmpty()) map.remove(groupIdHex)
+            // Fail closed: the encrypt below advances the sender chain
+            // (persisted synchronously in the Rust keystore). If we
+            // couldn't durably record who's still owed the key, a crash
+            // here would leave those members unable to decrypt — so
+            // don't produce the frame until the pending set is on disk.
+            if (!persistPending()) {
+                Timber.w("Aborting v3 send: pending-distribution set did not persist")
+                return null
             }
         }
         return qubeeManager.encryptGroupMessageV3(groupIdHex, text)

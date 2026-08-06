@@ -382,6 +382,45 @@ class QubeeManager @Inject constructor(
     }
 
     /**
+     * Deterministic 16-byte id (32-char hex) of a v3 sender-key group
+     * frame — the v3 analogue of [extractMessageId]. The sender stamps
+     * it on the outbound row; the receiver's [publishGroupMessageAck]
+     * carries the same id so the row flips to DELIVERED. Null for
+     * non-v3 frames or groups whose key we don't hold.
+     */
+    suspend fun extractV3MessageId(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeExtractV3MessageId(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust v3-message-id JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Rust v3 message-id extraction failed")
+            null
+        }
+    }
+
+    /**
+     * Publish a signed delivery ack for a decrypted v3 group message
+     * on the group topic (the v2 path auto-acks in Rust; v3 decrypts
+     * in Kotlin, so the receiver triggers the ack here). Best-effort.
+     */
+    suspend fun publishGroupMessageAck(groupIdHex: String, messageIdHex: String): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext false
+            try {
+                nativePublishGroupMessageAck(groupIdHex, messageIdHex)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust v3-ack JNI is not linked")
+                false
+            } catch (e: Exception) {
+                Timber.e(e, "Rust v3 message ack failed")
+                false
+            }
+        }
+
+    /**
      * Build this device's signed prekey bundle and broadcast it on the
      * global topic so peers can initiate ratchet sessions with us.
      * Receivers verify + cache it Rust-side from any topic. Call after
@@ -862,6 +901,8 @@ class QubeeManager @Inject constructor(
     private external fun nativeCreateDirectDistributionMessage(peerIdHex: String, groupIdHex: String): ByteArray?
     private external fun nativeOwnSenderChainIteration(groupIdHex: String): Long
     private external fun nativePublishGroupFrame(groupIdHex: String, wire: ByteArray): Boolean
+    private external fun nativeExtractV3MessageId(wire: ByteArray): String?
+    private external fun nativePublishGroupMessageAck(groupIdHex: String, messageIdHex: String): Boolean
     private external fun nativeResetGroupSenderState(groupIdHex: String): Int
     private external fun nativeResetDirectSession(peerIdHex: String): Int
     private external fun nativeDecryptMessage(sessionId: String, encryptedEnvelope: ByteArray): String?

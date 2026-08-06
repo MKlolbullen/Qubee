@@ -57,6 +57,7 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var messageRepository: MessageRepository
     @Inject lateinit var conversationRepository: ConversationRepository
     @Inject lateinit var contactRepository: ContactRepository
+    @Inject lateinit var ratchetSender: com.qubee.messenger.crypto.RatchetSender
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var isRunning = false
@@ -245,6 +246,13 @@ class MessageService : Service(), NetworkCallback {
     }
 
     private suspend fun runOfflineRetryTick() {
+        // Retry any sender-key distributions still owed to members we
+        // couldn't reach before (their prekey bundle may have since
+        // arrived). Cheap no-op when the ratchet flag is off or nothing
+        // is pending; a full bundle-install callback is a later refinement.
+        runCatching { ratchetSender.redeliverPending() }
+            .onFailure { Timber.w(it, "pending-distribution redelivery failed") }
+
         val now = System.currentTimeMillis()
         val due = messageRepository.dueForRetry(now, OFFLINE_RETRY_MAX_ATTEMPTS, RETRY_BATCH_LIMIT)
         if (due.isEmpty()) return
@@ -548,12 +556,22 @@ class MessageService : Service(), NetworkCallback {
                 return true
             }
             val result = JSONObject(resultJson)
+            val groupIdHex = result.optString("groupId")
             persistInboundGroupMessage(
-                groupIdHex = result.optString("groupId"),
+                groupIdHex = groupIdHex,
                 senderIdHex = result.optString("senderId"),
                 content = result.optString("plaintext"),
                 timestampMillis = System.currentTimeMillis(),
             )
+            // Delivery ack: v2 auto-acks in Rust, but v3 decrypts here,
+            // so publish the signed MessageAck for this frame's id. The
+            // sender stamped the same id as the row's wireId, so its
+            // onMessageAcked → applyAck flips the row to DELIVERED.
+            // Best-effort: a dropped ack just leaves the sender at SENT.
+            val v3MessageId = qubeeManager.extractV3MessageId(data)
+            if (v3MessageId != null) {
+                qubeeManager.publishGroupMessageAck(groupIdHex, v3MessageId)
+            }
             return true
         }
 

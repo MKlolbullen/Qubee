@@ -477,6 +477,42 @@ pub fn is_group_message_v3_frame(wire: &[u8]) -> bool {
         && &wire[..MAGIC_GROUP_MESSAGE_V3.len()] == MAGIC_GROUP_MESSAGE_V3
 }
 
+/// Deterministic 16-byte id for a v3 sender-key message, derived from
+/// group + sender + iteration + inner ciphertext. Sender and receiver
+/// compute the same id from the same frame, so it correlates a
+/// delivery `MessageAck` back to the sent row — the v3 analogue of
+/// `group_message_id` for the v2 path.
+pub fn v3_message_id(
+    group: &GroupId,
+    sender: &IdentityId,
+    iteration: u32,
+    payload: &[u8],
+) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"qubee_group_message_v3_id_v1");
+    h.update(group.as_bytes());
+    h.update(sender.as_ref());
+    h.update(&iteration.to_le_bytes());
+    h.update(payload);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    out
+}
+
+/// Open a sealed v3 frame with `group_key` and compute its
+/// [`v3_message_id`]. `None` if the bytes aren't a valid v3 envelope
+/// under this key.
+pub fn extract_v3_message_id(group_key: &[u8; 32], wire: &[u8]) -> Option<[u8; 16]> {
+    let (group, inner) = open_outer_v3(group_key, wire).ok()?;
+    let msg: SenderKeyMessage = bounded_bincode_deserialize(&inner).ok()?;
+    Some(v3_message_id(
+        &group,
+        &msg.sender_id,
+        msg.iteration,
+        &msg.payload,
+    ))
+}
+
 /// Read the (plaintext, but AD-bound) group id off a v3 frame without
 /// any keys — the dispatcher needs it to look up the group key that
 /// [`decrypt_sender_key_message`] requires. `None` if the frame is not
@@ -610,6 +646,33 @@ mod tests {
     #[test]
     fn v3_magic_is_pinned() {
         assert_eq!(MAGIC_GROUP_MESSAGE_V3, b"QUBEE_GMS\x03");
+    }
+
+    #[test]
+    fn v3_message_id_is_stable_and_frame_derivable() {
+        let (mut a, mut b, _c) = trio();
+        let g = group();
+
+        let w1 = encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, b"one").unwrap();
+        let w2 = encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, b"two").unwrap();
+
+        // Sender and receiver derive the same id from the same frame.
+        let id1_send = extract_v3_message_id(&GROUP_KEY, &w1).unwrap();
+        let id1_recv = extract_v3_message_id(&GROUP_KEY, &w1).unwrap();
+        assert_eq!(id1_send, id1_recv);
+
+        // Distinct messages (and iterations) get distinct ids.
+        let id2 = extract_v3_message_id(&GROUP_KEY, &w2).unwrap();
+        assert_ne!(id1_send, id2);
+
+        // Bob, decrypting, derives the same id the sender would ack against.
+        let _ = decrypt_sender_key_message(&mut b.ks, &GROUP_KEY, &w1).unwrap();
+        assert_eq!(extract_v3_message_id(&GROUP_KEY, &w1).unwrap(), id1_send);
+
+        // Wrong group key can't open the envelope → no id.
+        assert!(extract_v3_message_id(&[0u8; 32], &w1).is_none());
+        // A non-v3 frame yields nothing.
+        assert!(extract_v3_message_id(&GROUP_KEY, b"not a frame").is_none());
     }
 
     #[test]

@@ -58,18 +58,26 @@ Cheap, self-contained, ships without a new network dependency. Does
   identity instead. Also loses gossipsub's own signature-based spam
   gate (app-layer signatures still hold). Medium effort, security-
   sensitive — the single highest-value metadata win in our control.
-- **Fixed-size padding buckets.** Pad ciphertext to a small set of
-  size classes (e.g. 256 B / 1 KiB / 4 KiB) so length stops
-  fingerprinting message type. Cheap, safe, purely additive.
+- **Fixed-size padding buckets.** ✅ *Landed (v3 path).*
+  `security::padding` (length-prefix + zero-pad to a geometric size
+  class: 256 / 1 K / 4 K / 16 K / 64 K, then 64 K steps) is applied to
+  the v3 sender-key message plaintext before sealing, so distinct small
+  messages share one on-wire length. Scoped to the dark-launched v3
+  path (no live-wire/compat impact); the v2 and 1:1 paths adopt the
+  same primitive at the ratchet cutover, when their formats change once
+  anyway.
 - **Blinded topic ids.** Derive the gossip topic from a rotating hash
   of the group id + an epoch (all members derive the same value)
   instead of the raw hex, so a passive observer can't read group ids
   or trivially correlate a topic across time. Medium; needs a shared
   epoch clock among members.
-- **Tighter discovery defaults.** Default mDNS **off** outside explicit
-  local-discovery use, and consider Kademlia `Mode::Client` (query the
-  DHT without advertising) for privacy-sensitive profiles. Small, and
-  directly cuts address propagation.
+- **Tighter discovery defaults.** ✅ *mDNS default off (landed).*
+  `P2PNodeConfig::default` now sets `enable_mdns: false`, so a device no
+  longer broadcasts its presence + LAN IP by default (Kademlia /
+  bootstrap remain the discovery path; a caller can re-enable mDNS
+  explicitly for local use). Still open: a Kademlia `Mode::Client`
+  option (query the DHT without advertising) for privacy-sensitive
+  profiles.
 
 ### Tier 2 — IP anonymisation via Tor (Arti)
 

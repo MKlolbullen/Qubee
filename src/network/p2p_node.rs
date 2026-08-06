@@ -178,7 +178,12 @@ pub struct P2PNodeConfig {
 impl Default for P2PNodeConfig {
     fn default() -> Self {
         Self {
-            enable_mdns: true,
+            // Privacy default: mDNS broadcasts the device's presence and
+            // LAN IP to every host on the local network. Production peers
+            // find each other via Kademlia / bootstrap, so mDNS is an
+            // opt-in local-discovery convenience, not a requirement —
+            // default it OFF and let a caller re-enable it explicitly.
+            enable_mdns: false,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/0.0.0.0/udp/0/quic-v1"

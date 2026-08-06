@@ -334,11 +334,14 @@ pub fn encrypt_sender_key_message(
     let (key, nonce) = derive_msg_aead(&mk)?;
     mk.zeroize();
     let cipher = ChaCha20Poly1305::new(&key.into());
+    // Length-hiding: pad the plaintext to a size class before sealing so
+    // the on-wire ciphertext length no longer fingerprints the message.
+    let padded = crate::security::padding::pad(plaintext);
     let payload = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: plaintext,
+                msg: &padded,
                 aad: &inner_aad(group, &local_id, iteration),
             },
         )
@@ -392,7 +395,7 @@ pub fn decrypt_sender_key_message(
     let (key, nonce) = derive_msg_aead(&mk)?;
     mk.zeroize();
     let cipher = ChaCha20Poly1305::new(&key.into());
-    let plaintext = cipher
+    let padded = cipher
         .decrypt(
             Nonce::from_slice(&nonce),
             Payload {
@@ -401,6 +404,7 @@ pub fn decrypt_sender_key_message(
             },
         )
         .map_err(|_| anyhow!("sender message decrypt failed (tamper)"))?;
+    let plaintext = crate::security::padding::unpad(&padded)?;
 
     store_recv_state(ks, &group, &msg.sender_id, &state)?;
     Ok((group, msg.sender_id, plaintext))
@@ -673,6 +677,21 @@ mod tests {
         assert!(extract_v3_message_id(&[0u8; 32], &w1).is_none());
         // A non-v3 frame yields nothing.
         assert!(extract_v3_message_id(&GROUP_KEY, b"not a frame").is_none());
+    }
+
+    #[test]
+    fn padding_collapses_small_messages_to_one_wire_size() {
+        let (mut a, _b, _c) = trio();
+        let g = group();
+        // Two very different plaintext lengths, both under the 256 bucket.
+        let short = encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, b"hi").unwrap();
+        let long =
+            encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, &[0x5a; 200]).unwrap();
+        assert_eq!(
+            short.len(),
+            long.len(),
+            "distinct small message lengths must share one on-wire size",
+        );
     }
 
     #[test]

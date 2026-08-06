@@ -1,10 +1,13 @@
 # Network privacy: IP anonymisation & metadata leakage
 
-Status: **assessment + staged plan.** Nothing here is shipped yet; the
-current position is the "IP-address privacy: No / traffic-analysis
-resistance: No" row in the README security table. This document
-enumerates exactly what leaks today, then lays out what can be done —
-with honest costs — in the order it's worth doing.
+Status: **Tier 1 landed; Tiers 2–3 not started.** The metadata
+reductions that need no new overlay are in (§2, Tier 1). IP address is
+*still* exposed to every peer you connect to — the README's
+"IP-address privacy: No / traffic-analysis resistance: No" row stays
+accurate until Tier 2 (Tor) and Tier 3 (mixnet) respectively, and
+neither has begun. This document enumerates exactly what leaks today,
+then lays out what can be done — with honest costs — in the order it's
+worth doing.
 
 The guiding rule matches the rest of the project: **name the threat
 precisely, don't overclaim.** Content confidentiality is already strong
@@ -23,7 +26,7 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
 | **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
 | ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
-| **Group identity** | Topic name = `group_topic(group_id_hex)` — the group id in the clear | Anyone who observes the topic string |
+| ~~**Group identity**~~ | ✅ *Closed.* Topic is now a blinded rotating hash (`blake3(domain ‖ group_id ‖ epoch)`), not the group id in the clear | ~~Anyone who observes the topic string~~ — an observer sees an opaque, rotating label |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
 What is **not** leaked: message content (sealed), and — usefully —
@@ -109,18 +112,34 @@ Cheap, self-contained, ships without a new network dependency. Does
   length. Scoped to the dark-launched ratchet paths (no live-wire /
   compat impact); the legacy v2 group path adopts the same primitive at
   the ratchet cutover, when its format changes once anyway.
-- **Blinded topic ids.** Derive the gossip topic from a rotating hash
-  of the group id + an epoch (all members derive the same value)
-  instead of the raw hex, so a passive observer can't read group ids
-  or trivially correlate a topic across time. Medium; needs a shared
-  epoch clock among members.
-- **Tighter discovery defaults.** ✅ *mDNS default off (landed).*
-  `P2PNodeConfig::default` now sets `enable_mdns: false`, so a device no
-  longer broadcasts its presence + LAN IP by default (Kademlia /
-  bootstrap remain the discovery path; a caller can re-enable mDNS
-  explicitly for local use). Still open: a Kademlia `Mode::Client`
-  option (query the DHT without advertising) for privacy-sensitive
-  profiles.
+- **Blinded topic ids.** ✅ *Landed.* The topic is now
+  `qubee-g-<blake3(domain ‖ group_id_hex ‖ epoch)[..16]>` instead of
+  `qubee-group-<group_id_hex>`, so the group id no longer rides on the
+  wire and an observer gets no stable handle to follow a group across
+  time. The shared epoch clock is wall-clock time floored to
+  `TOPIC_EPOCH_SECS` (24 h). Skew is absorbed by *subscribing to a
+  window* rather than a point: a member follows `{e-1, e, e+1}` and
+  publishes on `e`, so a peer whose clock is up to a full epoch off
+  still shares a topic, and frames in flight across a rotation boundary
+  still land. Because the window has to be re-derived as epochs roll,
+  the node follows **group ids, not topic strings** — the new
+  `P2PCommand::SubscribeGroup` / `UnsubscribeGroup`, with the node
+  re-syncing its subscriptions on a 5-minute ticker. The receive path
+  was already topic-agnostic (group id comes from the signed frame), so
+  nothing downstream had to change.
+  *Compatibility:* this changes the topic string, so blinded and
+  pre-blinded builds do not meet on the same group. Pre-alpha, no
+  migration.
+- **Tighter discovery defaults.** ✅ *Landed.* `P2PNodeConfig::default`
+  sets `enable_mdns: false`, so a device no longer broadcasts its
+  presence + LAN IP by default (Kademlia / bootstrap remain the
+  discovery path; a caller can re-enable mDNS explicitly for local use).
+  `kademlia_client_mode` now offers `kad::Mode::Client` — query the DHT
+  without advertising our own addresses into it. It is **opt-in, default
+  off** on purpose: a client-mode node cannot be found through the DHT
+  and serves no routing for anyone else, so if every node ran as a
+  client there would be no DHT left to query. It is a knob for
+  privacy-sensitive profiles, not a new default.
 
 ### Tier 2 — IP anonymisation via Tor (Arti)
 
@@ -183,13 +202,13 @@ Costs (from Nym's own measurements):
 
 ## 3. Recommended order
 
-1. **Tier 1 first**, because it's in our control, needs no new overlay,
-   and closes the *social-graph* leak that a plain VPN/Tor would not
-   even address. Start with the two lowest-risk pieces — **fixed-size
-   padding buckets** and **tighter discovery defaults** — then take on
-   **anonymous gossipsub authorship** as a focused, separately-reviewed
-   change (it touches the trust-linkage invariant). Blinded topic ids
-   last within the tier.
+1. **Tier 1 — ✅ complete.** All four pieces have landed: fixed-size
+   padding buckets, tighter discovery defaults (mDNS off by default plus
+   an opt-in Kademlia client mode), anonymous gossipsub authorship
+   (steps 1–3), and blinded topic ids. The remaining Tier 1 debt is
+   deliberate and recorded above: the legacy v2 group path still sends
+   unpadded, adopting `security::padding` at the ratchet cutover when
+   its format changes once anyway.
 2. **Tier 2 (Tor/Arti)** as the first *IP*-anonymisation step: an
    opt-in onion-service transport, defaulted **off**, gated behind the
    same "experimental, device-validation-pending" discipline as the

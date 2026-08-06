@@ -816,7 +816,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             // `resubscribe_known_groups()` picks it up on the next
             // bootstrap because `gm.create_group` already persisted
             // the group through `store_group_securely`.
-            let _ = subscribe_topic(group_topic(&hex::encode(group_id.as_ref())));
+            let _ = subscribe_group(hex::encode(group_id.as_ref()));
 
             // Stamp our own PeerId onto the owner membership so it rides
             // out in JoinAccepted/MemberAdded snapshots. No-op if the node
@@ -1465,9 +1465,9 @@ fn publish_request_join(payload: &InvitePayload) -> anyhow::Result<bool> {
     // JoinAccepted reply. Then publish the RequestJoin on the same
     // topic — every other peer not in the group is unsubscribed and
     // never sees the handshake.
-    let topic = group_topic(&hex::encode(payload.group_id.as_ref()));
-    let _ = subscribe_topic(topic.clone());
-    Ok(publish_to_topic(topic, wire))
+    let group_hex = hex::encode(payload.group_id.as_ref());
+    let _ = subscribe_group(group_hex.clone());
+    Ok(publish_to_topic(group_topic(&group_hex), wire))
 }
 
 /// Pop the cached Kyber secret for an invitation, returning ownership
@@ -1503,19 +1503,22 @@ fn resubscribe_known_groups() {
         .collect();
     drop(gm_guard);
     for hex_id in groups {
-        let _ = subscribe_topic(group_topic(&hex_id));
+        let _ = subscribe_group(hex_id);
     }
 }
 
 /// Subscribe to a named gossipsub topic. No-op (returns false) if the
 /// network thread hasn't started yet.
-fn subscribe_topic(topic: String) -> bool {
+fn subscribe_group(group_id_hex: String) -> bool {
     let commander_lock = P2P_COMMANDER.lock().unwrap();
     let commander = match commander_lock.as_ref() {
         Some(c) => c,
         None => return false,
     };
-    matches!(commander.try_send(P2PCommand::Subscribe { topic }), Ok(()))
+    matches!(
+        commander.try_send(P2PCommand::SubscribeGroup { group_id_hex }),
+        Ok(())
+    )
 }
 
 /// Publish bytes on a named gossipsub topic. The local node must be

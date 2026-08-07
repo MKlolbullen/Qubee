@@ -213,6 +213,28 @@ class MessageService : Service(), NetworkCallback {
      */
     private fun startOfflineRetryLoop() {
         serviceScope.launch {
+            // Crash-consistency recovery, run once before the retry loop.
+            // A row still in PREPARED at process start was orphaned by a
+            // previous death between the PREPARED write and encrypt/queue;
+            // surface it as FAILED (text preserved, resendable) so it's
+            // never silently lost. Rows that already reached SENDING/SENT
+            // carry their ciphertext and are re-driven by the tick below.
+            try {
+                val failed = messageRepository.recoverStalePreparedOutbound()
+                if (failed > 0) {
+                    Timber.i("crash recovery: %d stale PREPARED row(s) marked FAILED", failed)
+                }
+                // Transmit-window recovery: a row orphaned in SENDING has
+                // durable ciphertext but an unconfirmed publish; promote it
+                // to SENT so the retry loop below reclaims it instead of
+                // leaving it queued forever.
+                val requeued = messageRepository.recoverOrphanedSendingOutbound()
+                if (requeued > 0) {
+                    Timber.i("crash recovery: %d orphaned SENDING row(s) requeued for retry", requeued)
+                }
+            } catch (e: Exception) {
+                Timber.w(e, "outbound crash recovery failed")
+            }
             while (isActive) {
                 kotlinx.coroutines.delay(RETRY_LOOP_INTERVAL_MS)
                 try {

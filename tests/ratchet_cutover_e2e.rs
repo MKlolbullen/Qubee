@@ -384,3 +384,88 @@ fn direct_frame_for_one_peer_is_rejected_by_another() {
         (aid, DirectPayload::Text("meant for B".into()))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Crash consistency: no ratchet key reuse across process death.
+//
+// The catastrophic outbound failure class is "the ratchet advanced but the
+// ciphertext's durable state didn't" — if a restart reverted the ratchet,
+// the next send would reuse a message key/nonce. The Rust send path
+// persists the advance *before* returning the ciphertext (encrypt →
+// store → return), so a relaunch always resumes past the last emitted
+// position. These lock that invariant end to end; the Kotlin
+// PREPARED→…→ACKNOWLEDGED outbox recovery is built on top of it. See
+// docs/architecture/crash-consistency.md and issue #47.
+// ---------------------------------------------------------------------------
+
+/// A 1:1 send whose ciphertext is lost to a crash (before it reached the
+/// durable outbox) must not desync the channel or get its position reused
+/// by the next send: the ratchet advance was already durable, so the
+/// relaunched sender continues *past* it and the receiver just skips the
+/// gap.
+#[test]
+fn crash_after_advance_never_reuses_a_1to1_position() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    pair(&mut a, &mut b, 1);
+    let (aid, bid) = (a.id(), b.id());
+
+    // Send #1 advances + persists A's ratchet; then the wire is dropped,
+    // modelling a process kill before the ciphertext was durably queued.
+    let _lost = encrypt_direct_text(&mut a.ks, aid, bid, "lost to a crash", 1).unwrap();
+
+    // Relaunch: A's ratchet comes back from disk alone.
+    a.restart();
+
+    // The recovered send lands on a fresh position. B never saw the lost
+    // frame, so it decrypts this one by skipping the gap (within the skip
+    // window) — proving no desync and no reuse.
+    let wire = encrypt_direct_text(&mut a.ks, aid, bid, "after restart", 2).unwrap();
+    let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &wire, 2).unwrap();
+    assert_eq!(
+        (sender, payload),
+        (aid, DirectPayload::Text("after restart".into())),
+    );
+}
+
+/// Stronger form of the same invariant: two sends straddling a restart
+/// must occupy DISTINCT ratchet positions. If the crash reverted the
+/// ratchet, the second frame would reuse the first's position and the
+/// receiver would reject it as a replay once the first is consumed.
+#[test]
+fn sends_straddling_a_restart_occupy_distinct_positions() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    pair(&mut a, &mut b, 1);
+    let (aid, bid) = (a.id(), b.id());
+
+    let wire1 = encrypt_direct_text(&mut a.ks, aid, bid, "one", 1).unwrap();
+    a.restart();
+    let wire2 = encrypt_direct_text(&mut a.ks, aid, bid, "two", 2).unwrap();
+
+    // Both decrypt to their own plaintext. Reuse would make the second
+    // decrypt fail as consumed once the first position is in.
+    let (_, p1) = decrypt_direct_payload(&mut b.ks, bid, &wire1, 1).unwrap();
+    let (_, p2) = decrypt_direct_payload(&mut b.ks, bid, &wire2, 2).unwrap();
+    assert_eq!(p1, DirectPayload::Text("one".into()));
+    assert_eq!(p2, DirectPayload::Text("two".into()));
+}
+
+/// Group (sender-key) equivalent: a crash after the sender chain advanced
+/// must not reuse an iteration — the relaunched sender continues past the
+/// lost frame and the receiver skips the gap.
+#[test]
+fn crash_after_advance_never_reuses_a_group_iteration() {
+    let mut devs = [Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0x77; 32]);
+    let key = [0x33u8; 32];
+    mesh(&mut devs, &group, 1);
+
+    let _lost = send(&mut devs[0], &group, &key, b"lost to a crash");
+    devs[0].restart();
+    let wire = send(&mut devs[0], &group, &key, b"after restart");
+
+    let sender_id = devs[0].id();
+    let (from, pt) = recv(&mut devs[1], &key, &wire);
+    assert_eq!((from, pt), (sender_id, b"after restart".to_vec()));
+}

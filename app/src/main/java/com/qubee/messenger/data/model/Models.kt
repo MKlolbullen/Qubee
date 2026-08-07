@@ -108,6 +108,16 @@ data class ContactWithLastMessage(
 enum class MessageType { TEXT, IMAGE, VIDEO, FILE, AUDIO, VOICE }
 
 enum class MessageStatus {
+    /**
+     * Durably recorded (plaintext + intent) but not yet encrypted. The
+     * first state of the outbound crash-consistency FSM: written *before*
+     * the ratchet advance so a process death in the encrypt window leaves
+     * a recoverable row instead of a silently-lost message. Persisted by
+     * name (see `Converters`), so adding it is schema-safe. Recovery
+     * surfaces any lingering PREPARED row as FAILED on next start.
+     * See docs/architecture/crash-consistency.md.
+     */
+    PREPARED,
     SENDING,
     SENT,
     DELIVERED,

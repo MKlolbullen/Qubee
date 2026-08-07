@@ -108,6 +108,39 @@ abstract class MessageDao {
     abstract suspend fun clearRetryState(messageId: String)
 
     /**
+     * Crash-consistency recovery. A row still in `PREPARED` at process
+     * start is orphaned: a previous process died between writing the
+     * PREPARED row and completing encrypt/queue. It was never encrypted
+     * or transmitted (the ratchet may or may not have advanced, but no
+     * ciphertext escaped), so flip it to FAILED — the user's text is
+     * preserved and the UI offers a resend, instead of the message being
+     * silently lost. Returns the number of rows recovered.
+     *
+     * Scoped to `isFromMe = 1`: PREPARED is an outbound-only state today,
+     * and pinning the directional predicate at the DB layer keeps this
+     * recovery from ever touching a hypothetical future inbound use.
+     */
+    @Query("UPDATE messages SET status = 'FAILED' WHERE status = 'PREPARED' AND isFromMe = 1")
+    abstract suspend fun failStalePreparedOutbound(): Int
+
+    /**
+     * Crash-consistency recovery for the transmit window. A row left in
+     * `SENDING` at process start had its ciphertext durably queued
+     * (`wireBytes`) but its publish was never confirmed — the process
+     * died between the ciphertext save and the SENT/FAILED update. Since
+     * the retry loop only reclaims `SENT` rows, such a row would otherwise
+     * sit queued forever. Promote it to `SENT` so the retry loop
+     * re-publishes the same durable wire idempotently (same wireId → late
+     * acks still correlate, never a re-encrypt). Only rows that actually
+     * captured a ciphertext are eligible. Returns the number recovered.
+     */
+    @Query(
+        "UPDATE messages SET status = 'SENT' " +
+            "WHERE status = 'SENDING' AND isFromMe = 1 AND wireBytes IS NOT NULL"
+    )
+    abstract suspend fun recoverOrphanedSendingOutbound(): Int
+
+    /**
      * Atomically read + update the row matched by `wireId` to record
      * `ackerIdHex` as a recipient that ack'd this message. Runs the
      * read and the write inside a single SQLite transaction so two

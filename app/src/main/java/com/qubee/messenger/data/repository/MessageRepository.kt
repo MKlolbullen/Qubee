@@ -57,6 +57,27 @@ class MessageRepository @Inject constructor(
         messageDao.getRetryableOutbound(now = now, maxAttempts = maxAttempts, limit = limit)
 
     /**
+     * Crash-consistency recovery: surface any outbound row orphaned in
+     * `PREPARED` by a previous process death as `FAILED` (text preserved,
+     * resendable) rather than losing it silently. Returns how many were
+     * recovered. Safe to call once at process start — a genuinely
+     * in-flight PREPARED row only exists within a single send coroutine,
+     * which transitions it before this runs.
+     */
+    suspend fun recoverStalePreparedOutbound(): Int =
+        messageDao.failStalePreparedOutbound()
+
+    /**
+     * Crash-consistency recovery for the transmit window: promote any
+     * outbound row orphaned in `SENDING` (ciphertext durable, publish
+     * unconfirmed) to `SENT` so the offline-retry loop reclaims and
+     * re-publishes it, rather than leaving it queued forever. Returns how
+     * many were recovered.
+     */
+    suspend fun recoverOrphanedSendingOutbound(): Int =
+        messageDao.recoverOrphanedSendingOutbound()
+
+    /**
      * Re-stamp a row after a retry tick. Pass `nextRetryAt = null`
      * to retire the row (budget exhausted).
      */

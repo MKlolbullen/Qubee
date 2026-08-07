@@ -293,3 +293,94 @@ fn one_to_one_text_leg_survives_restart() {
         (bid, DirectPayload::Text("still here".into()))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Category-A cutover matrix rows (host-automatable). The primitives are
+// unit-tested in `src/ratchet/*`; these prove the same properties end to
+// end over the public JNI-facing API, which is what the flag flip depends
+// on. See issue #47 (v0.2.0 — Ratchet Cutover).
+// ---------------------------------------------------------------------------
+
+/// "100 alternating messages → no desync." Each direction flip forces a
+/// fresh DH ratchet step, so sustained ping-pong exercises far more
+/// ratchet advancement than any single-direction burst. Every frame must
+/// decrypt to the exact text with the right authenticated sender.
+#[test]
+fn alternating_conversation_never_desyncs() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    pair(&mut a, &mut b, 1);
+    let (aid, bid) = (a.id(), b.id());
+
+    for i in 0..100u64 {
+        let text = format!("msg {i}");
+        // Alternate who speaks each turn → a DH ratchet step every flip.
+        let (from, from_id, to, to_id) = if i % 2 == 0 {
+            (&mut a, aid, &mut b, bid)
+        } else {
+            (&mut b, bid, &mut a, aid)
+        };
+        let now = 10 + i;
+        let wire = encrypt_direct_text(&mut from.ks, from_id, to_id, &text, now).unwrap();
+        let (sender, payload) = decrypt_direct_payload(&mut to.ks, to_id, &wire, now).unwrap();
+        assert_eq!(
+            (sender, payload),
+            (from_id, DirectPayload::Text(text.clone())),
+            "desync at message {i}",
+        );
+    }
+}
+
+/// Cross-group ciphertext substitution: a sender-key frame is sealed under
+/// its group's symmetric key, so a frame captured from group 1 must not
+/// open under group 2's key — and a failed attempt must not corrupt the
+/// receiver's chain state (the correct key still works afterward).
+#[test]
+fn frame_sealed_for_one_group_key_is_rejected_under_another() {
+    let mut devs = [Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0x5c; 32]);
+    let key_1 = [0x11u8; 32];
+    let key_2 = [0x22u8; 32];
+    mesh(&mut devs, &group, 1);
+
+    let wire = send(&mut devs[0], &group, &key_1, b"group one only");
+
+    // Wrong group key → rejected at the outer seal, before any chain state
+    // is touched.
+    assert!(
+        decrypt_sender_key_message(&mut devs[1].ks, &key_2, &wire).is_err(),
+        "a frame sealed under one group key must not open under another",
+    );
+    // The failed attempt left the receiver's state intact: the correct key
+    // still opens the same frame.
+    let sender_id = devs[0].id();
+    let (from, pt) = recv(&mut devs[1], &key_1, &wire);
+    assert_eq!((from, pt), (sender_id, b"group one only".to_vec()));
+}
+
+/// Cross-session (cross-user) substitution: a 1:1 frame addressed to B
+/// must not decrypt in C's session, even though C also has a session with
+/// the same sender A. Sessions derive independent keys.
+#[test]
+fn direct_frame_for_one_peer_is_rejected_by_another() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    let mut c = Device::new();
+    pair(&mut a, &mut b, 1);
+    pair(&mut a, &mut c, 1);
+    let (aid, bid, cid) = (a.id(), b.id(), c.id());
+
+    let wire_for_b = encrypt_direct_text(&mut a.ks, aid, bid, "meant for B", 5).unwrap();
+
+    // C shares a session with A but not this frame's keys.
+    assert!(
+        decrypt_direct_payload(&mut c.ks, cid, &wire_for_b, 5).is_err(),
+        "a frame for B must not open in C's session",
+    );
+    // B, the intended recipient, still reads it.
+    let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &wire_for_b, 5).unwrap();
+    assert_eq!(
+        (sender, payload),
+        (aid, DirectPayload::Text("meant for B".into()))
+    );
+}

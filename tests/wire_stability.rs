@@ -533,6 +533,80 @@ use proptest::prelude::*;
 use qubee_crypto::groups::group_handshake::{sign_request_join, sign_role_change, GroupHandshake};
 use qubee_crypto::groups::group_message::GroupMessageEnvelope;
 
+// ---------------------------------------------------------------------
+// Wire-freeze guard.
+//
+// Every signed `GroupHandshake` frame is part of the frozen wire surface
+// and MUST carry a pinned byte layout (a `canonical_*` golden vector
+// above), keyed by a stable `qubee_handshake_<name>_vN` domain-separation
+// tag. This match has NO wildcard arm on purpose: adding a variant breaks
+// compilation here, forcing whoever adds a frame to register its frozen
+// tag below AND pin its bytes above. A frame that changes layout without a
+// `_vN` bump silently breaks old peers — that is exactly what the pins,
+// and this guard, exist to prevent.
+// ---------------------------------------------------------------------
+fn frozen_handshake_tag(frame: &GroupHandshake) -> &'static str {
+    match frame {
+        GroupHandshake::RequestJoin { .. } => "qubee_handshake_request_join_v2",
+        GroupHandshake::JoinAccepted { .. } => "qubee_handshake_join_accepted_v3",
+        GroupHandshake::JoinRejected { .. } => "qubee_handshake_join_rejected_v1",
+        GroupHandshake::KeyRotation { .. } => "qubee_handshake_key_rotation_v1",
+        GroupHandshake::MemberAdded { .. } => "qubee_handshake_member_added_v2",
+        GroupHandshake::RoleChange { .. } => "qubee_handshake_role_change_v1",
+        GroupHandshake::RequestStateSync { .. } => "qubee_handshake_request_state_sync_v1",
+        GroupHandshake::StateSyncResponse { .. } => "qubee_handshake_state_sync_response_v3",
+        GroupHandshake::OwnershipTransfer { .. } => "qubee_handshake_ownership_transfer_v1",
+        GroupHandshake::MessageAck { .. } => "qubee_handshake_message_ack_v1",
+        GroupHandshake::PrekeyBundle { .. } => "qubee_handshake_prekey_bundle_v1",
+        GroupHandshake::KeyRotationAnnounce { .. } => "qubee_handshake_key_rotation_announce_v1",
+        GroupHandshake::KeyDelivery { .. } => "qubee_handshake_key_delivery_v1",
+    }
+}
+
+#[test]
+fn frozen_handshake_tags_match_canonical_encoders() {
+    // Anchor the guard's tag literals to what the canonical encoders
+    // actually emit, for the two variants whose signers are cheap to
+    // build here. The other eleven are compile-forced by the exhaustive
+    // match above and byte-pinned by their own `canonical_*` tests.
+    let kp = IdentityKeyPair::generate().unwrap();
+
+    let (kyber_pub, _) = generate_ephemeral_kyber();
+    let rj_body = RequestJoinBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        invitation_code: "code".to_string(),
+        joiner_public_key: kp.public_key(),
+        joiner_display_name: "Bob".to_string(),
+        joiner_kyber_pub: kyber_pub,
+        joiner_peer_id: "12D3KooWBob".to_string(),
+    };
+    let rj_canonical = canonical_request_join(&rj_body).unwrap();
+    let rj = sign_request_join(&kp, rj_body).unwrap();
+    let rj_tag = frozen_handshake_tag(&rj);
+    assert_eq!(rj_tag, "qubee_handshake_request_join_v2");
+    assert!(
+        rj_canonical.starts_with(rj_tag.as_bytes()),
+        "RequestJoin canonical bytes no longer start with the frozen tag",
+    );
+
+    let rc_body = RoleChangeBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        promoter_id: IdentityId::from([0u8; 32]),
+        member_id: IdentityId::from([0u8; 32]),
+        new_role: Role::Admin,
+        new_version: 1,
+        timestamp: 0,
+    };
+    let rc_canonical = canonical_role_change(&rc_body).unwrap();
+    let rc = sign_role_change(&kp, rc_body).unwrap();
+    let rc_tag = frozen_handshake_tag(&rc);
+    assert_eq!(rc_tag, "qubee_handshake_role_change_v1");
+    assert!(
+        rc_canonical.starts_with(rc_tag.as_bytes()),
+        "RoleChange canonical bytes no longer start with the frozen tag",
+    );
+}
+
 fn config_64() -> ProptestConfig {
     ProptestConfig {
         cases: 64,

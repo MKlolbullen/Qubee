@@ -3,7 +3,8 @@
 //! must fail gracefully (`None` / `Err`) on arbitrary, malformed, or
 //! truncated input — never panic, never over-read, never allocate on an
 //! attacker-controlled length. This is the in-CI form of "fuzz the
-//! protocol parsers"; a `cargo-fuzz` target set is future infra.
+//! protocol parsers"; the coverage-guided `cargo-fuzz` counterpart lives
+//! in `fuzz/` (see `fuzz/README.md`) and mirrors these exact entry points.
 //!
 //! The pinned vectors in `wire_stability.rs` prove one valid input round-
 //! trips; these prove *invalid* inputs are handled safely.

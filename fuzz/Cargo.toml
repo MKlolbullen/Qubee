@@ -1,0 +1,56 @@
+# cargo-fuzz harness for the untrusted wire parsers. This is a SEPARATE
+# crate, deliberately NOT part of the root build: the repo root is not a
+# Cargo workspace, and the empty `[workspace]` below makes this crate its
+# own root, so `cargo build` / `cargo test` at the repo root never touch
+# it. Running it needs a nightly toolchain + `cargo install cargo-fuzz`;
+# see README.md. The targets mirror the in-CI proptest suite in
+# `tests/wire_parser_robustness.rs` — this is the deeper, coverage-guided
+# form of the same "attack the parsers" property.
+[package]
+name = "qubee-crypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.qubee_crypto]
+path = ".."
+
+# Own workspace root — isolate from the parent crate entirely.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_group_handshake"
+path = "fuzz_targets/parse_group_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_direct_message"
+path = "fuzz_targets/parse_direct_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_invite_link"
+path = "fuzz_targets/parse_invite_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_identity_key"
+path = "fuzz_targets/parse_identity_key.rs"
+test = false
+doc = false
+bench = false

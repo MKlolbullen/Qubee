@@ -155,6 +155,19 @@ fn canonical_join_rejected_starts_with_versioned_tag() {
     };
     let canonical = canonical_join_rejected(&body).unwrap();
     assert!(canonical.starts_with(b"qubee_handshake_join_rejected_v1"));
+
+    // Golden vector — pin the full byte layout, not just the tag.
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_join_rejected_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(b"code"); // invitation_code
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // joiner_id
+    expected.push(0);
+    expected.extend_from_slice(b"test"); // reason
+    assert_eq!(canonical, expected, "canonical JoinRejected bytes changed");
 }
 
 #[test]
@@ -169,6 +182,24 @@ fn canonical_key_rotation_starts_with_versioned_tag() {
     };
     let canonical = canonical_key_rotation(&body).unwrap();
     assert!(canonical.starts_with(b"qubee_handshake_key_rotation_v1"));
+
+    // Golden vector — full byte layout for the no-removal, no-deliveries
+    // shape (the empty-deliveries length prefix is part of the contract).
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_key_rotation_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(&1u64.to_le_bytes()); // generation
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // rotator_id
+    expected.push(0);
+    expected.push(0); // removed_member_id == None
+    expected.push(0);
+    expected.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    expected.push(0);
+    expected.extend_from_slice(&0u32.to_le_bytes()); // deliveries.len() == 0
+    assert_eq!(canonical, expected, "canonical KeyRotation bytes changed");
 }
 
 #[test]
@@ -328,6 +359,83 @@ fn canonical_request_state_sync_starts_with_versioned_tag() {
     };
     let canonical = canonical_request_state_sync(&body).unwrap();
     assert!(canonical.starts_with(b"qubee_handshake_request_state_sync_v1"));
+
+    // Golden vector — full byte layout.
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_request_state_sync_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // requester_id
+    expected.push(0);
+    expected.extend_from_slice(&1u64.to_le_bytes()); // since_version
+    expected.push(0);
+    expected.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    assert_eq!(
+        canonical, expected,
+        "canonical RequestStateSync bytes changed"
+    );
+}
+
+#[test]
+fn canonical_message_ack_is_pinned() {
+    use qubee_crypto::groups::group_handshake::{canonical_message_ack, MessageAckBody};
+    // Previously untested on the wire — a signed payload with no stability
+    // vector could drift silently. Pin tag + full byte layout.
+    let body = MessageAckBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        message_id: [3u8; 16],
+        acker_id: IdentityId::from([1u8; 32]),
+        timestamp: 42,
+    };
+    let canonical = canonical_message_ack(&body);
+    assert!(canonical.starts_with(b"qubee_handshake_message_ack_v1"));
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_message_ack_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(&[3u8; 16]); // message_id
+    expected.push(0);
+    expected.extend_from_slice(&[1u8; 32]); // acker_id
+    expected.push(0);
+    expected.extend_from_slice(&42u64.to_le_bytes()); // timestamp
+    assert_eq!(canonical, expected, "canonical MessageAck bytes changed");
+}
+
+#[test]
+fn canonical_ownership_transfer_is_pinned() {
+    use qubee_crypto::groups::group_handshake::{
+        canonical_ownership_transfer, OwnershipTransferBody,
+    };
+    // Previously untested on the wire. Pin tag + full byte layout.
+    let body = OwnershipTransferBody {
+        group_id: GroupId::from_bytes([0u8; 32]),
+        donor_id: IdentityId::from([1u8; 32]),
+        new_owner_id: IdentityId::from([2u8; 32]),
+        new_version: 7,
+        timestamp: 42,
+    };
+    let canonical = canonical_ownership_transfer(&body).unwrap();
+    assert!(canonical.starts_with(b"qubee_handshake_ownership_transfer_v1"));
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(b"qubee_handshake_ownership_transfer_v1");
+    expected.push(0);
+    expected.extend_from_slice(&[0u8; 32]); // group_id
+    expected.push(0);
+    expected.extend_from_slice(&[1u8; 32]); // donor_id
+    expected.push(0);
+    expected.extend_from_slice(&[2u8; 32]); // new_owner_id
+    expected.push(0);
+    expected.extend_from_slice(&7u64.to_le_bytes()); // new_version
+    expected.push(0);
+    expected.extend_from_slice(&42u64.to_le_bytes()); // timestamp
+    assert_eq!(
+        canonical, expected,
+        "canonical OwnershipTransfer bytes changed"
+    );
 }
 
 #[test]

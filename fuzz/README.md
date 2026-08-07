@@ -29,8 +29,10 @@ cargo install cargo-fuzz
 
 ## Run
 
+`cargo-fuzz` is driven from the repo root (the directory that *contains*
+`fuzz/`) — it locates `fuzz/Cargo.toml` itself; don't `cd` into `fuzz/`.
+
 ```sh
-cd fuzz
 cargo +nightly fuzz run parse_group_handshake      # or any target above
 cargo +nightly fuzz run parse_identity_key -- -max_total_time=300
 ```
@@ -48,7 +50,7 @@ valid frame captured from `tests/wire_stability.rs`.
 
 ## Note
 
-A scheduled CI job (nightly + `cargo fuzz run -- -max_total_time=…`) is the
-natural next step but is intentionally not added here — it needs its own
-runner budget decision. Until then, run these before a beta cut and after
-any change to a wire parser or its bincode config.
+A scheduled CI job (nightly + `cargo fuzz run <target> -- -max_total_time=…`,
+one invocation per target) is the natural next step but is intentionally not
+added here — it needs its own runner budget decision. Until then, run these
+before a beta cut and after any change to a wire parser or its bincode config.

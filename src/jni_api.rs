@@ -443,8 +443,16 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                     "Starting P2P Node",
                 );
 
-                let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
-                let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32);
+                // Command channel is sized to absorb startup + refresh
+                // bursts without dropping. Blinded topics subscribe to a
+                // 3-topic window per group, and the periodic refresh emits
+                // up to 5 commands per group; at the 16-group membership
+                // cap that's ~80 commands that can queue before `node.run`
+                // drains them. 256 leaves comfortable headroom; a full
+                // channel now also logs rather than silently dropping (see
+                // `subscribe_topic` / `unsubscribe_topic`).
+                let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(256);
+                let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(64);
 
                 match P2PNode::new(id_keys, rx_cmd).await {
                     Ok(node) => {
@@ -1566,7 +1574,19 @@ fn subscribe_topic(topic: String) -> bool {
         Some(c) => c,
         None => return false,
     };
-    matches!(commander.try_send(P2PCommand::Subscribe { topic }), Ok(()))
+    match commander.try_send(P2PCommand::Subscribe {
+        topic: topic.clone(),
+    }) {
+        Ok(()) => true,
+        Err(e) => {
+            // A dropped Subscribe means we silently miss traffic on that
+            // topic — surface it rather than swallowing it. The command
+            // channel is sized (256) to make this a genuine
+            // overload/shutdown signal, not routine backpressure.
+            tracing::warn!(%topic, error = %e, "failed to enqueue Subscribe");
+            false
+        }
+    }
 }
 
 /// Unsubscribe from a named gossipsub topic. No-op (returns false) if the
@@ -1577,10 +1597,18 @@ fn unsubscribe_topic(topic: String) -> bool {
         Some(c) => c,
         None => return false,
     };
-    matches!(
-        commander.try_send(P2PCommand::Unsubscribe { topic }),
-        Ok(())
-    )
+    match commander.try_send(P2PCommand::Unsubscribe {
+        topic: topic.clone(),
+    }) {
+        Ok(()) => true,
+        Err(e) => {
+            // A dropped Unsubscribe just means we linger on a stale epoch
+            // topic until the next refresh retries — less severe than a
+            // dropped Subscribe, but still worth a breadcrumb.
+            tracing::debug!(%topic, error = %e, "failed to enqueue Unsubscribe");
+            false
+        }
+    }
 }
 
 /// Publish bytes on a named gossipsub topic. The local node must be

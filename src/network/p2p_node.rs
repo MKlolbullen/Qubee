@@ -160,6 +160,14 @@ pub fn topic_epoch(now_unix_secs: u64) -> u64 {
 /// separated BLAKE3 over the group id + epoch. All members derive the
 /// same value from the shared wall clock, so no group id or stable
 /// per-group identifier appears on the wire.
+///
+/// Threat scope: this defeats a *passive off-path* observer reading topic
+/// strings and correlating a group across epochs. It does **not** hide
+/// the topic from a *connected gossipsub mesh peer*, which sees the
+/// window's topic hashes in GRAFT/PRUNE/SUBSCRIBE control messages and
+/// can link consecutive epochs — that's a Tier-3 (transport-masking)
+/// property. `BLINDED_TOPIC_DOMAIN` pins the derivation; `tests/`
+/// `wire_stability.rs` pins a canonical vector so it can't drift silently.
 pub fn blinded_group_topic(group_id_hex: &str, epoch: u64) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(BLINDED_TOPIC_DOMAIN);
@@ -184,10 +192,17 @@ pub fn group_topic(group_id_hex: &str) -> String {
 /// epoch's mesh is pre-warmed before it becomes current. Returned oldest
 /// to newest.
 pub fn group_topic_window(group_id_hex: &str) -> Vec<String> {
-    let e = topic_epoch(now_unix());
-    [e.saturating_sub(1), e, e + 1]
+    group_topic_window_at(group_id_hex, topic_epoch(now_unix()))
+}
+
+/// The `{epoch-1, epoch, epoch+1}` window centred on a specific epoch.
+/// Split out from [`group_topic_window`] so callers (and tests) can pin
+/// the epoch instead of racing two separate `now_unix()` reads across a
+/// rollover boundary.
+fn group_topic_window_at(group_id_hex: &str, epoch: u64) -> Vec<String> {
+    [epoch.saturating_sub(1), epoch, epoch + 1]
         .into_iter()
-        .map(|epoch| blinded_group_topic(group_id_hex, epoch))
+        .map(|e| blinded_group_topic(group_id_hex, e))
         .collect()
 }
 
@@ -723,16 +738,18 @@ mod tests {
 
     #[test]
     fn topic_window_is_prev_current_next() {
+        // Pin the epoch so the two `now_unix()` reads can't straddle a
+        // rollover boundary and make this flaky.
         let gid = "deadbeef";
-        let e = topic_epoch(now_unix());
-        let window = group_topic_window(gid);
+        let e = 20_000u64;
+        let window = group_topic_window_at(gid, e);
         assert_eq!(window.len(), 3);
         assert_eq!(window[0], blinded_group_topic(gid, e - 1));
         assert_eq!(window[1], blinded_group_topic(gid, e));
         assert_eq!(window[2], blinded_group_topic(gid, e + 1));
-        // The publish topic (current epoch) is the middle of the window a
+        // The publish topic at epoch `e` is the middle of the window a
         // subscriber joins, so a publisher and subscriber rendezvous.
-        assert_eq!(group_topic(gid), window[1]);
+        assert_eq!(blinded_group_topic(gid, e), window[1]);
         // Three distinct strings.
         assert_ne!(window[0], window[1]);
         assert_ne!(window[1], window[2]);
@@ -802,7 +819,15 @@ mod tests {
         };
         let result = P2PNode::with_config(id_keys, rx, config).await;
         assert!(result.is_err(), "NymMixnet must fail closed");
-        assert!(format!("{:#}", result.err().unwrap()).contains("expose your IP"));
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(msg.contains("expose your IP"));
+        // The selected mode must render in the message (inline format-arg
+        // capture), not appear as a literal `{mode:?}`.
+        assert!(msg.contains("NymMixnet"), "mode should render: {msg}");
+        assert!(
+            !msg.contains("{mode"),
+            "format placeholder must not leak: {msg}"
+        );
     }
 
     #[tokio::test]

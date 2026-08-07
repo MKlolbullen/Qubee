@@ -35,6 +35,27 @@ fn handshake_magic_is_pinned() {
 }
 
 #[test]
+fn blinded_group_topic_is_pinned() {
+    use qubee_crypto::network::p2p_node::blinded_group_topic;
+    // The blinded-topic derivation is a rendezvous format: every member
+    // must compute the identical string for a given (group, epoch), so an
+    // accidental change to the domain tag, field order, or truncation
+    // would silently split a group across two topics. Pin canonical
+    // values so any drift fails here. `qubee_blinded_group_topic_v1` is
+    // the FIRST versioned form of this topic (the pre-blinding format was
+    // the plaintext `qubee-group-<hex>`, which carried no version tag), so
+    // `_v1` is correct — a future derivation change bumps to `_v2` here.
+    assert_eq!(
+        blinded_group_topic("00000000000000000000000000000000", 0),
+        "qubee-g-8393de9a647e35fa992015d1de5e21f7",
+    );
+    assert_eq!(
+        blinded_group_topic("deadbeef", 20_000),
+        "qubee-g-b3270bca49768324b45fd3e5ee29f902",
+    );
+}
+
+#[test]
 fn direct_message_magic_is_pinned() {
     use qubee_crypto::ratchet::direct_message::MAGIC_DIRECT_MESSAGE;
     // `\x01` is the first PQXDH + Double Ratchet 1:1 wire version. A bump

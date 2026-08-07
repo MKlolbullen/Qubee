@@ -20,10 +20,10 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | Leak | Mechanism | Who sees it |
 |---|---|---|
 | **Your IP address** | Direct TCP/QUIC dials; no relay or onion layer | Every peer you connect to or gossip with; any on-path network observer |
-| **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
-| **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
+| **LAN IP / presence** | mDNS. ✅ *Now default **off*** (`P2PNodeConfig::default` sets `enable_mdns: false`); a caller can opt back in for local use | Only anyone on the same local network *if* mDNS is explicitly enabled |
+| **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries (forced to `Mode::Client` under any anonymising transport) | The whole DHT, transitively |
 | ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
-| ~~**Group identity**~~ | ✅ *Closed.* Topic is now a daily-rotating `BLAKE3(domain ‖ group_id ‖ epoch)` (blinded topic ids, landed) — the group id is no longer on the wire and the topic string decorrelates across epochs | ~~Anyone who observes the topic string~~ — only sees an opaque, rotating id |
+| **Group identity** (reduced) | Topic is now a daily-rotating `BLAKE3(domain ‖ group_id ‖ epoch)` (blinded topic ids, landed) — the group id is no longer on the wire, and to a *passive off-path observer* the topic string decorrelates across epochs. **Caveat:** a connected gossipsub *mesh* peer sees the window's topic hashes in GRAFT/PRUNE/SUBSCRIBE control messages, so it can still link a group's consecutive-epoch topics; true cross-epoch unlinkability needs Tier-3 transport masking | A passive observer sees only an opaque, rotating id; a connected mesh peer can still correlate consecutive epochs |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
 What is **not** leaked: message content (sealed), and — usefully —
@@ -113,12 +113,20 @@ Cheap, self-contained, ships without a new network dependency. Does
   is now `BLAKE3(domain ‖ group_id_hex ‖ epoch)` (`blinded_group_topic`,
   `TOPIC_EPOCH_SECS = 1 day`) instead of the raw `qubee-group-<hex>`, so
   the group id never appears on the wire and the topic string changes
-  every epoch — a passive observer can't read group ids or correlate a
-  group's traffic across days. Members **publish** to the current-epoch
+  every epoch — a *passive off-path* observer can't read group ids or
+  correlate a group's traffic across days. **Scope caveat:** a *connected
+  gossipsub mesh peer* sees the subscription window's topic hashes in
+  GRAFT / PRUNE / SUBSCRIBE control messages, so it can still link a
+  group's consecutive-epoch topics (and, being in the mesh, already
+  knows the group). Blinding removes the id from the wire and defeats
+  *passive topic-stream* correlation; unlinkability against an in-mesh
+  peer is a Tier-3 (transport-masking) property, not something topic
+  blinding can provide. Members **publish** to the current-epoch
   topic and **subscribe** to a `{epoch-1, epoch, epoch+1}` window
   (`group_topic_window`), which absorbs up to ~one epoch of clock skew
-  and makes rollover seamless; a periodic refresh (`refresh_group_-`
-  `subscriptions`, hourly) advances the window and drops stale epochs.
+  and makes rollover seamless; a periodic refresh
+  (`refresh_group_subscriptions`, hourly) advances the window and drops
+  stale epochs.
   Live-topic change (all members must run the same derivation — treat
   `BLINDED_TOPIC_DOMAIN` like a wire version); pre-alpha, so no
   compatibility shim. Still visible to an observer: *that* some blinded
@@ -204,7 +212,7 @@ the `TransportPrivacy::NymMixnet` config variant, and the fail-closed
 `with_config` seam + leaky-by-default discovery guards shared with Tor.
 Selecting `NymMixnet` today refuses to start rather than expose the IP.
 
-**Dependency probe (done).** `nym-sdk 1.21.4` (current on crates.io — the
+**Dependency probe (2026-08).** `nym-sdk 1.21.4` (current on crates.io — the
 "publication paused" note applies to an older line) **resolves against
 our pinned tree without a hard conflict**: `rand_core 0.6.4`,
 `chacha20poly1305 0.10.1`, `ed25519-dalek 2.2`, `x25519-dalek 2.0.1`,

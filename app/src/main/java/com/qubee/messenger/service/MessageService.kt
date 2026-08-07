@@ -220,12 +220,20 @@ class MessageService : Service(), NetworkCallback {
             // never silently lost. Rows that already reached SENDING/SENT
             // carry their ciphertext and are re-driven by the tick below.
             try {
-                val recovered = messageRepository.recoverStalePreparedOutbound()
-                if (recovered > 0) {
-                    Timber.i("crash recovery: %d stale PREPARED row(s) marked FAILED", recovered)
+                val failed = messageRepository.recoverStalePreparedOutbound()
+                if (failed > 0) {
+                    Timber.i("crash recovery: %d stale PREPARED row(s) marked FAILED", failed)
+                }
+                // Transmit-window recovery: a row orphaned in SENDING has
+                // durable ciphertext but an unconfirmed publish; promote it
+                // to SENT so the retry loop below reclaims it instead of
+                // leaving it queued forever.
+                val requeued = messageRepository.recoverOrphanedSendingOutbound()
+                if (requeued > 0) {
+                    Timber.i("crash recovery: %d orphaned SENDING row(s) requeued for retry", requeued)
                 }
             } catch (e: Exception) {
-                Timber.w(e, "stale-PREPARED recovery failed")
+                Timber.w(e, "outbound crash recovery failed")
             }
             while (isActive) {
                 kotlinx.coroutines.delay(RETRY_LOOP_INTERVAL_MS)

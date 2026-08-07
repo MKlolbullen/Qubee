@@ -3,7 +3,7 @@
 The system that sends one message crosses four trust/durability domains
 that are **not** one transaction:
 
-```
+```text
 Room  ↔  Kotlin repo/VM  ↔  JNI  ↔  Rust ratchet keystore  ↔  network
 ```
 
@@ -48,7 +48,7 @@ semantics.
 
 `MessageStatus`, in send order:
 
-```
+```text
 PREPARED → SENDING → SENT → DELIVERED
    │          │        │
    └──────────┴────────┴──► FAILED   (fail-closed / budget exhausted)
@@ -72,7 +72,8 @@ publish → `SENT`/`FAILED`. Acks flip `SENDING`/`SENT` → `DELIVERED`.
 |---|---|
 | before `PREPARED` write | nothing sent, nothing lost — user simply didn't send |
 | `PREPARED` write and `SENDING` | row lingers in `PREPARED`; startup recovery flips it to `FAILED` (`MessageDao.failStalePreparedOutbound`), text preserved, one-tap resend. The ratchet may have advanced (a skipped counter the receiver tolerates) — never reused |
-| `SENDING`/`SENT` and ack | ciphertext is durable; the retry loop re-publishes the same wire idempotently until ack or budget |
+| `SENDING` write and the publish→`SENT`/`FAILED` update | row lingers in `SENDING` with durable ciphertext; the retry loop only reclaims `SENT`, so startup recovery promotes it to `SENT` (`MessageDao.recoverOrphanedSendingOutbound`). The retry loop then re-publishes the same wire idempotently |
+| `SENT` and ack | ciphertext is durable; the retry loop re-publishes the same wire idempotently until ack or budget |
 | after `DELIVERED` | terminal, pruned |
 
 Recovery runs once at `MessageService` start, before the retry loop. A

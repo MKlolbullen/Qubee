@@ -124,6 +124,23 @@ abstract class MessageDao {
     abstract suspend fun failStalePreparedOutbound(): Int
 
     /**
+     * Crash-consistency recovery for the transmit window. A row left in
+     * `SENDING` at process start had its ciphertext durably queued
+     * (`wireBytes`) but its publish was never confirmed — the process
+     * died between the ciphertext save and the SENT/FAILED update. Since
+     * the retry loop only reclaims `SENT` rows, such a row would otherwise
+     * sit queued forever. Promote it to `SENT` so the retry loop
+     * re-publishes the same durable wire idempotently (same wireId → late
+     * acks still correlate, never a re-encrypt). Only rows that actually
+     * captured a ciphertext are eligible. Returns the number recovered.
+     */
+    @Query(
+        "UPDATE messages SET status = 'SENT' " +
+            "WHERE status = 'SENDING' AND isFromMe = 1 AND wireBytes IS NOT NULL"
+    )
+    abstract suspend fun recoverOrphanedSendingOutbound(): Int
+
+    /**
      * Atomically read + update the row matched by `wireId` to record
      * `ackerIdHex` as a recipient that ack'd this message. Runs the
      * read and the write inside a single SQLite transaction so two

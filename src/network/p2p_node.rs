@@ -373,11 +373,11 @@ impl Default for P2PNodeConfig {
 
 impl P2PNodeConfig {
     /// Test profile: loopback, no mDNS, 100 ms gossipsub heartbeat.
-    /// Used by `tests/p2p_two_node_e2e.rs`.
+    /// Used by `tests/p2p_two_node_e2e.rs`. Starts from `Default` and
+    /// overrides only the test-specific fields, so a new config field
+    /// doesn't need to be kept in sync in two places.
     pub fn for_testing() -> Self {
         Self {
-            enable_mdns: false,
-            transport_privacy: TransportPrivacy::Direct,
             listen_addr: "/ip4/127.0.0.1/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/127.0.0.1/udp/0/quic-v1"
@@ -385,10 +385,7 @@ impl P2PNodeConfig {
                     .expect("hardcoded multiaddr"),
             ),
             gossipsub_heartbeat: Duration::from_millis(100),
-            // Match production: anonymous authorship needs None.
-            gossipsub_validation_mode: gossipsub::ValidationMode::None,
-            idle_connection_timeout: Duration::from_secs(60),
-            kademlia_client_mode: false,
+            ..Default::default()
         }
     }
 }

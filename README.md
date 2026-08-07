@@ -1,12 +1,14 @@
 <p align="center">
-  <img src="docs/branding/qubee_mark_master.svg" alt="Qubee logo — a quantum Q, bee wings, and key-shaped stinger" width="180" />
+  <a href="docs/branding/qubee_mark_master.svg">
+    <img src="docs/branding/logo.png" alt="Qubee — post-quantum secure messaging" width="300" />
+  </a>
 </p>
 
 <h1 align="center">Qubee</h1>
 
 <p align="center">
-  <strong>Post-quantum, peer-to-peer secure messaging for Android.</strong><br />
-  A Kotlin/Compose client backed by a Rust cryptographic and networking core.
+  <strong>Post-quantum · end-to-end encrypted · peer-to-peer messaging for Android</strong><br />
+  Kotlin/Jetpack Compose on the outside. Rust cryptographic + networking core on the inside.
 </p>
 
 <p align="center">
@@ -22,11 +24,12 @@
   <img alt="Rust 1.88 or newer" src="https://img.shields.io/badge/Rust-1.88%2B-f46623?logo=rust" />
   <img alt="Android API 24 to 34" src="https://img.shields.io/badge/Android-API%2024%E2%80%9334-3ddc84?logo=android&logoColor=white" />
   <img alt="Post-quantum ML-KEM and ML-DSA" src="https://img.shields.io/badge/PQC-ML--KEM--768%20%2B%20ML--DSA--44-12ead8" />
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8cff72" /></a>
+  <a href="LICENSE.md"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8cff72" /></a>
 </p>
 
 <p align="center">
-  <a href="#overview">Overview</a> ·
+  <a href="#what-qubee-is">Overview</a> ·
+  <a href="#current-development-focus">Current focus</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#security-model">Security</a> ·
   <a href="#build-from-source">Build</a> ·
@@ -37,41 +40,56 @@
 ---
 
 > [!WARNING]
-> **Qubee is pre-alpha research software.** It has not received an independent security audit. Do not use it for safety-of-life communications, high-risk operational traffic, or anything where compromise would be catastrophic. The Rust core is heavily tested, but the Android application and end-to-end product flow are still under active development. Treat the live CI badges—not optimistic prose—as the source of truth for build health.
+> **Qubee is pre-alpha research software.** It has not received an independent security audit. Do not use it for safety-of-life communications, high-risk operational traffic, or anything where compromise would be catastrophic. The Rust core is heavily tested, but the Android application and complete device-to-device lifecycle are still under active validation.
 
-## Overview
+## What Qubee is
 
-Qubee is an experimental secure messenger built around three ideas:
+Qubee is an experimental Android messenger built around four principles:
 
-1. **Cryptographic authority belongs in a memory-safe core.** Identity, key management, protocol state, encryption, signatures, and peer-to-peer networking live in Rust. Kotlin owns Android lifecycle, presentation, persistence orchestration, and user interaction.
-2. **Post-quantum protection should be hybrid, not theatrical.** Qubee combines classical primitives with NIST-standardized post-quantum primitives rather than pretending a single new algorithm magically fixes every layer.
-3. **No central message server.** Peers communicate over libp2p using direct transports and gossip-based group distribution. That removes a central message custodian, but it does **not** remove network metadata or IP exposure.
+1. **Cryptographic authority belongs in a memory-safe core.** Long-term identity, key management, protocol state, encryption, signatures, sender-key state and peer-to-peer networking live in Rust. Kotlin owns Android lifecycle, persistence orchestration and UI.
+2. **Post-quantum security should be hybrid and explicit.** Qubee combines classical primitives with NIST-standardized post-quantum primitives rather than treating a single PQ algorithm as magic dust.
+3. **No central message custodian.** Message transport is peer-to-peer over libp2p. Infrastructure may eventually assist discovery, rendezvous or relaying, but it must never become a plaintext message server or key authority.
+4. **Implemented is not the same as validated.** Security-sensitive features stay gated until their real-device, persistence and failure-mode behavior is proven.
 
-The project currently focuses on Android, small trusted groups, QR/deep-link onboarding, out-of-band contact verification, encrypted local storage, and a staged migration toward forward-secret and deniable messaging.
-
-### A look at the app
-
-<p align="center">
-  <img src="docs/mockups/png/01-inbox.png" width="185" alt="Inbox"/>
-  <img src="docs/mockups/png/02-group-chat.png" width="185" alt="Group chat"/>
-  <img src="docs/mockups/png/03-group-details.png" width="185" alt="Group details"/>
-  <img src="docs/mockups/png/06-screen-lock.png" width="185" alt="Screen lock"/>
-</p>
-<p align="center">
-  <em>Inbox · Group chat · Group details · Screen lock —
-  design mockups; the committed Paparazzi baselines are the source of truth for shipped UI.</em>
-</p>
-
-### What Qubee is—and is not
+### Qubee is — and is not
 
 | Qubee is | Qubee is not |
 |---|---|
-| A research-grade Android messenger with a Rust security core | A finished Signal replacement |
+| A research-grade Android secure messenger with a Rust security core | A finished Signal replacement |
 | Hybrid classical + post-quantum cryptography | “Quantum encryption” marketing fog |
-| Direct peer-to-peer communication over libp2p | Anonymous routing or a mixnet |
-| Explicit identity verification using fingerprints, SAS, and QR | Automatic proof that a human is trustworthy |
-| Encrypted local persistence with hardware-backed key wrapping | Protection from a fully compromised, unlocked device |
-| A security engineering project with tests and pinned wire formats | Independently audited production software |
+| Direct P2P communication over libp2p | Anonymous networking by default |
+| Explicit fingerprint / SAS / QR verification | Automatic proof that a human identity is trustworthy |
+| Encrypted local persistence with Android Keystore integration | Protection from a fully compromised, unlocked device |
+| A security-engineering project with adversarial tests and pinned wire formats | Independently audited production software |
+
+## Current development focus
+
+### `v0.2.0 — Ratchet Cutover`
+
+The current priority is not adding another crypto primitive. It is validating the forward-secret path already in the tree and making it safe to become the default.
+
+**Automated / host-verifiable work now includes:**
+
+- PQXDH + Double Ratchet integration tests across the public JNI-facing API.
+- 100-message alternating conversations to force repeated DH ratchet transitions.
+- replay, tamper, cross-session and cross-group substitution rejection.
+- sender-key removal rekey, late-join behavior and restart persistence.
+- crash-consistency tests proving ratchet positions are not reused after restart.
+- `PREPARED → SENDING → SENT/DELIVERED|FAILED` outbound persistence semantics.
+- property-based parser robustness against arbitrary bytes, truncation, corruption and hostile length prefixes.
+- full-byte golden vectors for deterministic signed protocol payloads.
+
+**Still required before the ratchet send path should become the default:**
+
+- physical-device validation across multiple Android/OEM combinations;
+- Doze/background-kill and network-transition testing;
+- release/R8 JNI callback validation;
+- auth-bound datastore validation on real hardware;
+- complete 1:1 delivery acknowledgement semantics;
+- correct durable direct-message retry routing;
+- metadata-parity hardening for the sender-key group wire format before it replaces the current group envelope.
+
+See [`docs/manual-testing/ratchet-cutover-device-matrix.md`](docs/manual-testing/ratchet-cutover-device-matrix.md) and [`tests/ratchet_cutover_e2e.rs`](tests/ratchet_cutover_e2e.rs).
 
 ## At a glance
 
@@ -80,44 +98,46 @@ The project currently focuses on Android, small trusted groups, QR/deep-link onb
 | **Android client** | Kotlin, Jetpack Compose, Material 3, MVVM, Hilt, Coroutines/Flow |
 | **Native core** | Rust crate `qubee_crypto`, exposed through JNI as Android `.so` libraries |
 | **Identity signatures** | Hybrid Ed25519 + ML-DSA-44; both components must verify |
-| **Post-quantum key establishment** | ML-KEM-768 |
-| **Classical key agreement** | X25519 where used by the ratchet/prekey design |
+| **Post-quantum KEM** | ML-KEM-768 |
+| **Classical agreement** | X25519 in the ratchet/prekey design |
 | **Payload encryption** | ChaCha20-Poly1305 |
-| **Hashing and derivation** | BLAKE3, HKDF, SHA-2, Argon2id for keystore wrapping |
-| **P2P networking** | libp2p over TCP, WebSocket, and QUIC; Noise XX/TLS, Yamux, anonymous gossipsub, Kademlia, DNS (mDNS present but off by default so a device doesn't broadcast its LAN presence) |
-| **Android database** | Room over SQLCipher; per-install database key wrapped by Android Keystore |
-| **Rust key storage** | Encrypted keystore with authenticated entries, atomic writes, crash-safe master-key rotation, zeroization |
-| **Group model** | Maximum 16 members; Owner, Admin, Moderator, Member, Observer roles |
+| **Hashing / derivation** | BLAKE3, HKDF, SHA-2, Argon2id |
+| **P2P networking** | libp2p over TCP, WebSocket and QUIC; Noise/TLS, Yamux, anonymous gossipsub, Kademlia, DNS |
+| **Android storage** | Room over SQLCipher; random DB key wrapped by Android Keystore |
+| **Rust key storage** | Authenticated encrypted keystore, atomic writes, zeroization and secure-memory helpers |
+| **Group model** | Maximum 16 members; Owner, Admin, Moderator, Member, Observer |
 | **Supported Android** | `minSdk 24`, `targetSdk 34`, four ABIs |
 | **License** | MIT |
 
 ## Feature status
 
-The distinction between **implemented**, **enabled**, and **planned** matters. Security projects get dangerous when those words are blurred.
+The distinction between **active**, **dark-launched**, **foundation-only** and **planned** is deliberate.
 
 | Capability | Status | Notes |
 |---|---:|---|
-| Hybrid identity generation and signed onboarding bundles | ✅ Active | Ed25519 + ML-DSA-44 identity material is created and persisted by the Rust core. |
-| Identity sharing through QR/deep links | ✅ Active | `qubee://identity/...` onboarding flow. |
-| Fingerprint, SAS, and QR contact verification | ✅ Active | Verification state is persisted; key changes can be surfaced separately from verified trust. |
-| Direct libp2p networking | ✅ Active | TCP/WebSocket + Noise and QUIC are configured; the persistent libp2p key keeps `PeerId` stable across restarts. |
-| Encrypted 1:1 and group message envelopes | ✅ Active | Current default send path uses the established signed-envelope format. |
-| Group creation, invites, membership, roles, and state sync | ✅ Active | CSPRNG invitation codes, atomic use accounting, signed membership broadcasts, and offline snapshot resync. |
-| SQLCipher-backed Android storage | ✅ Active | Messages, contacts, and conversations are stored in encrypted Room tables under a hardware-Keystore-wrapped random key. |
-| App screen lock (biometric / device credential) | ✅ Active | Opt-in (Settings → Screen lock, default off). Biometric or PIN/pattern/password gate on cold start and foreground return, with `FLAG_SECURE`. |
-| Unlock-bound database key | 🟡 Wired, device-validation pending | When Screen Lock is on, the SQLCipher key + Rust-core passphrase are re-wrapped under an auth-bound Keystore key (per-use `CryptoObject`); a cold process can't open the datastore until unlocked. Builds green; needs real-hardware validation across API levels before relying on it. |
-| Delivery acknowledgements | 🟡 Partial | The protocol includes signed acknowledgements; UI semantics and end-to-end device validation remain pre-alpha. |
-| PQXDH + Double Ratchet for 1:1 messaging | 🟡 Dark-launched | Send and receive paths are both fully wired (prekey publication, fail-closed send, session persistence); emission is gated behind a rollout preference that is off by default pending two-device validation. |
-| Sender keys for groups | 🟡 Dark-launched | Wire format, receive path, and the flag-gated send path (sender-key distribution fan-out, post-rekey redistribution) are wired; default send traffic has not cut over pending two-device validation. |
-| Reproducible signed releases | 🟡 Infrastructure present | Release workflow and reproducibility guidance exist; verify the actual tag, checksum, and CI result before installing. |
-| Voice/video calling | ❌ Not shipped | WebRTC code is feature-gated behind `calling` and not part of the default build. |
-| File-transfer protocol | ❌ Not shipped | Legacy code is feature-gated and not production-ready. |
-| Tor, onion routing, relay privacy, or mixnet transport | ❌ Not shipped | Direct peers can learn each other’s IP addresses. |
-| Multi-device identity synchronization | ❌ Not shipped | Current identity model is device-local. |
+| Hybrid identity + signed onboarding | ✅ Active | Ed25519 + ML-DSA-44 identity material is generated and persisted by Rust. |
+| QR/deep-link identity sharing | ✅ Active | `qubee://identity/...` onboarding flow. |
+| Fingerprint / SAS / QR verification | ✅ Active | Trust state persists and key changes can invalidate prior verification. |
+| Direct libp2p networking | ✅ Active | TCP/WebSocket + Noise and QUIC; persistent `PeerId`. |
+| Anonymous gossip authorship | ✅ Active | Group gossip no longer broadcasts the author `PeerId`; app-layer crypto remains the authenticity gate. |
+| Blinded rotating group topics | ✅ Active | Topic names no longer contain a stable plaintext group identifier. |
+| `QUBEE_GMS\x04` group envelope | ✅ Active | Current signed-envelope group path removes the plaintext group id using a per-message keyed selector. |
+| SQLCipher-backed Android storage | ✅ Active | Messages, contacts and conversations are encrypted at rest. |
+| App screen lock | ✅ Active | Optional biometric/device-credential gate with `FLAG_SECURE`. |
+| Auth-bound datastore key | 🟡 Device-validation pending | Cold-process datastore access is intended to require user authentication when Screen Lock is enabled. |
+| PQXDH + Double Ratchet | 🟡 Dark-launched | Send + receive paths are wired, fail closed and persist sessions; emission is still gated. |
+| Group sender keys | 🟡 Dark-launched | Distribution, rekey and receive paths are wired; default emission remains gated. |
+| Crash-consistent outbound FSM | 🟡 Cutover validation | `PREPARED` rows prevent silent loss around ratchet advancement; durable ciphertext is retried verbatim. |
+| Delivery acknowledgements | 🟡 Partial | Group sender-key ACKs exist; 1:1 ratchet delivery semantics still need completion. |
+| Tor / Nym transport posture | 🟡 Foundation only | `Direct`, `TorOnion`, `NymMixnet` config + fail-closed guards exist, but no anonymising transport is wired yet. |
+| Reproducible signed releases | 🟡 Infrastructure present | Release workflow and verification guidance exist; verify actual tags/checksums/CI. |
+| Multi-device identity sync | ❌ Not shipped | Identity remains device-local. |
+| Voice/video calling | ❌ Not shipped | Feature-gated research code only. |
+| File transfer | ❌ Not shipped | Legacy code is not production-ready. |
 
 ## Architecture
 
-Qubee deliberately keeps Kotlin away from raw private-key operations. The Android layer requests operations; the Rust core performs them and returns bounded results or callbacks.
+Qubee keeps raw long-term secret operations out of Kotlin. Android requests operations; the Rust core owns cryptographic state and bounded wire processing.
 
 ```mermaid
 flowchart LR
@@ -141,20 +161,20 @@ flowchart LR
         GROUPS[Groups + invitations]
         MSG[Message envelopes]
         RATCHET[PQXDH + Double Ratchet + sender keys]
-        STORE[Secure keystore]
+        STORE[Encrypted keystore]
         NET[libp2p node]
 
         ID <--> STORE
         GROUPS <--> STORE
-        MSG <--> GROUPS
         RATCHET <--> STORE
+        MSG <--> GROUPS
         MSG <--> NET
         RATCHET <--> NET
     end
 
     VM <--> JNI
     SVC <--> JNI
-    KS -->|Keystore-derived secret bytes| JNI
+    KS -->|wrapped secret material| JNI
     JNI <--> ID
     JNI <--> GROUPS
     JNI <--> MSG
@@ -170,266 +190,126 @@ flowchart LR
 |---|---|
 | Screens, navigation, permissions, lifecycle | Identity key generation and verification |
 | ViewModels, repositories, UI state | Hybrid signatures and canonical signed bytes |
-| Room entities and SQLCipher database integration | ML-KEM encapsulation/decapsulation |
-| Foreground service and notification plumbing | Group key rotation and membership state |
+| Room entities + SQLCipher integration | ML-KEM encapsulation/decapsulation |
+| Foreground service and notifications | Group key rotation and membership state |
 | QR scanner and share intents | Ratchet/session state and replay handling |
-| Android Keystore key wrapping | Encrypted Rust keystore and secure memory handling |
+| Android Keystore key wrapping | Encrypted Rust keystore and secret handling |
 | User-facing trust ceremonies | libp2p transport and authenticated peer events |
-
-## Protocol flows
-
-### Identity onboarding and verification
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as Alice / Android UI
-    participant AR as Alice / Rust core
-    participant B as Bob / Android UI
-    participant BR as Bob / Rust core
-
-    A->>AR: Create local identity
-    AR->>AR: Generate Ed25519 + ML-DSA-44 keys
-    AR-->>A: Signed onboarding bundle + fingerprint
-    A-->>B: Share QR or qubee://identity link
-    B->>BR: Parse and verify bundle
-    BR->>BR: Require both signature components
-    BR-->>B: Contact identity + fingerprint
-    A<<->>B: Compare fingerprint, SAS, or QR out of band
-    B->>BR: Mark contact VERIFIED
-    BR-->>B: Persist trust state
-```
-
-The QR code is a transport mechanism, not a trust oracle. Verification only becomes meaningful when the users compare the fingerprint or SAS over a channel an attacker cannot silently replace.
-
-### Group join and key rotation
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant O as Owner/Admin
-    participant C as Candidate
-    participant G as Existing group members
-
-    O->>O: Generate 128-bit CSPRNG invitation code
-    O-->>C: Share signed invitation
-    C->>O: RequestJoin + per-group ML-KEM public key
-    O->>O: Atomically reserve invitation use
-    O->>O: Validate expiry, role, capacity, and signature
-    O-->>C: JoinAccepted with wrapped group key
-    O-->>G: Signed MemberAdded broadcast
-    G->>G: Update roster and generation
-
-    Note over O,G: If a member is removed
-    O->>O: Generate fresh group key
-    O-->>G: Per-member ML-KEM wrapped KeyRotation
-    G->>G: Accept only authorized, signed, forward generation
-```
-
-### Message path
-
-```mermaid
-flowchart LR
-    A[Compose send action] --> B[ChatViewModel]
-    B --> C[QubeeManager JNI]
-    C --> D{Send mode}
-    D -->|Default| E[Signed encrypted envelope]
-    D -->|Rollout flag| F[PQXDH / Double Ratchet or sender keys]
-    E --> G[libp2p gossipsub or peer transport]
-    F --> G
-    G --> H[Remote Rust core]
-    H --> I[Bounded decode + replay checks]
-    I --> J[Verify / decrypt]
-    J --> K[JNI callback]
-    K --> L[MessageService]
-    L --> M[(SQLCipher Room DB)]
-    M --> N[Compose UI]
-```
 
 ## Security model
 
-Qubee uses layered protection. No single primitive is treated as holy water.
+### Identity
 
-### 1. Identity authenticity
+Qubee uses hybrid long-term identity signatures:
 
-Long-term identity operations use a hybrid signature:
+- **Ed25519** for mature classical authentication.
+- **ML-DSA-44** for post-quantum signature resistance.
+- Verification requires **both** components.
+- Canonical signed bytes are domain-separated and versioned.
 
-- **Ed25519** provides mature classical authentication.
-- **ML-DSA-44** provides post-quantum signature resistance.
-- Verification requires **both** components to pass.
-- Canonical signed payloads use explicit domain-separation tags and length-bounded encodings.
+### Key establishment
 
-Hybrid signatures protect against a failure in either the classical or post-quantum assumption, provided the other remains secure and the composition is correct.
+- **ML-KEM-768** supplies post-quantum KEM protection.
+- **X25519** participates in the ratchet/prekey design.
+- The dark-launched direct-message path uses PQXDH-style establishment followed by a persistent Double Ratchet.
 
-### 2. Post-quantum key encapsulation
+### Message encryption
 
-ML-KEM-768 is used to wrap sensitive key material for intended recipients, including group key distribution and rotation. Each group member carries a per-group KEM public key so membership changes can trigger recipient-specific rekeying.
+- ChaCha20-Poly1305 protects message payloads and protocol envelopes.
+- Forward-secret 1:1 sessions evolve message keys per ratchet state.
+- Group sender keys evolve per sender and are redistributed after relevant membership changes.
+- Failed ratchet operations do **not** silently downgrade to the legacy path.
 
-### 3. Transport protection
+### Network metadata
 
-libp2p establishes authenticated encrypted transport using:
+Tier-1 metadata reductions already landed:
 
-- Noise XX over TCP/WebSocket transports.
-- QUIC with TLS 1.3 as an additional direct transport.
-- Yamux stream multiplexing.
-- **Anonymous** gossipsub authorship: group frames are authenticated at the application layer (hybrid identity / sender-key signatures), so the transport no longer broadcasts an author `PeerId` to every topic subscriber. The `PeerId`↔identity linkage is learned only from authenticated in-band membership frames or the direct request/response channel, never from the gossip author.
+- anonymous gossipsub authorship;
+- mDNS disabled by default;
+- rotating blinded topic identifiers;
+- length-padding buckets on the forward-secret paths;
+- active `QUBEE_GMS\x04` envelope removes the plaintext group identifier.
 
-Transport encryption prevents passive observers from reading payloads in flight. Application-layer encryption remains necessary because group gossip and stored envelopes have a different trust boundary.
+What this does **not** solve:
 
-### 4. Message-layer protection
+- direct peers still learn network addresses;
+- timing/volume correlation remains possible;
+- Tor and Nym modes are currently fail-closed foundations, not working transports.
 
-The default message path uses ChaCha20-Poly1305 under group/session key material plus hybrid identity signatures and strict generation checks.
+See [`docs/architecture/network-privacy.md`](docs/architecture/network-privacy.md).
 
-The newer ratchet path adds:
-
-- PQXDH-style prekey establishment.
-- Persistent Double Ratchet state for 1:1 sessions.
-- Replay rejection and bounded skipped-key handling.
-- Group sender chains with per-sender forward evolution.
-- Deniable message authentication inside the ratcheted formats.
-
-That path is intentionally staged. Receiving new formats before emitting them avoids a flag-day protocol break. The send rollout remains gated until multi-device validation is complete.
-
-### 5. Local storage protection
+### Local storage
 
 ```mermaid
 flowchart TB
-    AK[Android Keystore<br/>hardware-backed where available]
+    AK[Android Keystore]
     DBK[Random SQLCipher key]
-    RP[Random Rust-keystore passphrase]
-    DB[(Room / SQLCipher database)]
-    A2[Argon2id<br/>per-install salt]
-    MK[Rust keystore master key]
-    ENTRIES[Authenticated encrypted entries]
+    RP[Rust-keystore passphrase]
+    DB[(Room + SQLCipher)]
+    KDF[Argon2id]
+    STORE[Authenticated Rust keystore]
 
-    AK -->|AES-256-GCM wrap| DBK
+    AK -->|wrap| DBK
     DBK --> DB
-    AK -->|AES-256-GCM wrap| RP
-    RP --> A2
-    A2 -->|derive wrapping key| MK
-    MK --> ENTRIES
-    ENTRIES --> IK[Identity private keys]
-    ENTRIES --> GK[Group keys + KEM secrets]
-    ENTRIES --> RS[Ratchet/session state]
-    ENTRIES --> INV[Pending invitations]
+    AK -->|wrap| RP
+    RP --> KDF
+    KDF --> STORE
 ```
 
-The Rust keystore additionally uses:
+The Rust keystore uses authenticated encryption, slot-specific associated data, atomic file writes and explicit secret zeroization. Android Keystore protects the material needed to open the SQLCipher and Rust stores.
 
-- ChaCha20-Poly1305 authenticated encryption.
-- Entry-specific associated data to prevent ciphertext swapping between key slots.
-- Atomic temp-file, `fsync`, rename, and directory-sync writes.
-- Crash-recoverable master-key rotation.
-- `SecretBox`, `Zeroize`, and explicit buffer scrubbing.
-- `mlock`/`munlock` on supported Unix systems.
+### Current security posture
 
-### Security properties and limitations
-
-| Property | Current position |
+| Property | Position |
 |---|---|
-| Payload confidentiality on the network | Yes, using transport and application encryption |
-| Sender and control-frame authentication | Yes, with hybrid signatures on the active signed formats |
-| Post-quantum KEM/signature primitives | Yes, ML-KEM-768 and ML-DSA-44 |
-| Local database encryption | Yes, SQLCipher with a Keystore-wrapped random key; optionally re-wrapped under an unlock-bound key when Screen Lock is on |
-| Rust key-store encryption | Yes, authenticated encryption and Keystore-derived wrapping secret |
-| At-rest protection on a locked/stolen device | Partial; with Screen Lock on, a cold process can’t open the datastore without a biometric/PIN unlock (device-validation pending) |
-| Group rekey after member removal | Implemented |
-| Offline group state recovery | Implemented through signed snapshot resync |
-| Forward secrecy on the default send path | Not fully; ratchet rollout is still gated |
-| Post-compromise security | Not guaranteed on the default path |
-| Deniability | Ratcheted formats are designed for it; the active signed legacy envelope is non-repudiable |
-| Group authorship metadata on the network | Not broadcast; gossip authorship is anonymous, so a topic subscriber can see that a group has traffic but not which `PeerId` authored a given message |
-| IP-address privacy | No; direct peers can observe each other’s network addresses (Tor/onion transport is a planned opt-in, not shipped) |
-| Traffic-analysis resistance | Partial and narrow; fixed-size length-padding buckets are applied on the forward-secret ratchet paths, but there is no onion routing, mixnet, or cover-traffic system |
-| Protection after full device compromise | No |
-| Independent audit | No |
+| Network payload confidentiality | Yes |
+| Hybrid long-term authentication | Yes |
+| NIST PQ KEM/signature primitives | Yes — ML-KEM-768 + ML-DSA-44 |
+| Local database encryption | Yes |
+| Ratchet forward secrecy | Implemented, dark-launched pending device validation |
+| Post-compromise security | Implemented in the ratchet design; not yet the default message path |
+| Deniability | Ratcheted formats are designed for it; legacy signed envelopes are non-repudiable |
+| Group-author `PeerId` exposure in gossip | Reduced — gossip authorship is anonymous |
+| Stable plaintext group identifier on active `\x04` envelope | No |
+| IP-address privacy | No on the shipped direct transport |
+| Traffic-analysis resistance | Partial only |
+| Protection after complete unlocked-device compromise | No |
+| Independent security audit | No |
 
-For reporting vulnerabilities, supported scope, acknowledged limitations, and safe-harbour terms, read [`SECURITY.md`](SECURITY.md).
+For vulnerability reporting and safe-harbour terms, read [`SECURITY.md`](SECURITY.md).
 
-## Trust states
+## Architectural invariants
 
-Qubee separates cryptographic validity from human trust.
+Changes touching crypto, wire formats, membership or JNI should preserve these rules:
 
-| State | Meaning |
-|---|---|
-| **Unknown / unverified** | The identity bundle is cryptographically valid, but the user has not compared it out of band. |
-| **Verified** | The user completed a fingerprint, SAS, or QR comparison and persisted that decision. |
-| **Key changed** | Previously observed identity material changed and must not silently inherit prior trust. |
-| **Compromised / blocked** | The local policy refuses normal trust progression and prevents casual re-verification from clearing the warning. |
+1. **Rust remains the cryptographic authority.**
+2. **Both hybrid signature components must verify.**
+3. **Canonical signed bytes are versioned and domain-separated.**
+4. **Untrusted lengths are bounded before allocation.**
+5. **State mutates only after authentication succeeds.**
+6. **Removed members never receive rotated group material.**
+7. **Trust is never silently inherited across an identity-key change.**
+8. **JNI failures fail closed without aborting the Android process.**
+9. **Secrets do not cross JNI as immutable Java strings.**
+10. **Wire-format changes require pinned vectors and migration reasoning.**
+11. **A failed privacy mode must never silently fall back to a less-private transport.**
+12. **Retries reuse durable ciphertext; they do not re-encrypt and burn another ratchet position.**
 
-The 8-byte BLAKE3 fingerprint is derived from the combined classical and post-quantum public identity material. It is a human comparison aid, not a replacement for the full public keys.
+## A look at the app
 
-## Groups and permissions
+<p align="center">
+  <img src="docs/mockups/png/01-inbox.png" width="185" alt="Qubee inbox" />
+  <img src="docs/mockups/png/02-group-chat.png" width="185" alt="Qubee group chat" />
+  <img src="docs/mockups/png/03-group-details.png" width="185" alt="Qubee group details" />
+  <img src="docs/mockups/png/06-screen-lock.png" width="185" alt="Qubee screen lock" />
+</p>
+<p align="center"><em>Design mockups. Committed Paparazzi baselines are the source of truth for rendered UI.</em></p>
 
-Qubee groups are intentionally small: **16 members maximum**.
+### Branding
 
-| Role | Typical authority |
-|---|---|
-| **Owner** | Full group authority, ownership transfer, role and membership control |
-| **Admin** | Administrative membership and rotation operations within policy |
-| **Moderator** | Moderation-oriented permissions without ownership authority |
-| **Member** | Normal encrypted messaging participation |
-| **Observer** | Restricted participation/read-oriented role where configured |
+The canonical Qubee mark is the **Q + bee + key** symbol in [`docs/branding/qubee_mark_master.svg`](docs/branding/qubee_mark_master.svg). The high-fidelity README/marketing raster is [`docs/branding/logo.png`](docs/branding/logo.png). Android uses a simplified vector/adaptive-icon version for runtime assets.
 
-Membership mutations are signed and versioned. Receivers reject stale or unexpected generations rather than trying to guess their way back into sync. Devices that were offline can request a signed state snapshot; only authorized responders may provide ownership-sensitive state.
-
-## Visual system
-
-Qubee’s visual language mirrors the security model: local ownership, post-quantum engineering, and direct peer trust—without turning every screen into a glowing hacker-movie aquarium.
-
-| Token | Value | Use |
-|---|---|---|
-| **Void** | `#040C16` | Primary background |
-| **Panel** | `#0A1726` | Cards and secure surfaces |
-| **Cyan** | `#12EAD8` | Primary actions and live security state |
-| **Blue** | `#00A7FF` | Gradient support and network state |
-| **Green** | `#8CFF72` | Verified/post-quantum accent |
-| **Text** | `#EAFBFF` | Primary text |
-| **Muted** | `#A3BDCA` | Secondary explanation |
-| **Danger** | `#FF5C7A` | Identity reset and destructive key actions |
-
-The reusable Compose foundation lives in:
-
-```text
-app/src/main/java/com/qubee/messenger/ui/theme/QubeeDesign.kt
-```
-
-Design documentation and asset sources:
-
-- [`docs/design-system.md`](docs/design-system.md)
-- [`docs/branding/qubee_mark_master.svg`](docs/branding/qubee_mark_master.svg)
-- [`docs/screenshot-tests.md`](docs/screenshot-tests.md)
-
-Paparazzi snapshots are preferred over hand-drawn mockups for shipped UI because they render the real Composables and fail on visual drift. The mockups below illustrate intended layout and flow; the committed Paparazzi baselines under `app/src/test/snapshots/` are the source of truth for what actually renders.
-
-### Mockups
-
-Rendered PNGs are shown for reliable display; the editable sources live alongside them as `.svg`.
-
-| | | |
-|---|---|---|
-| [<img src="docs/mockups/png/01-inbox.png" width="210"/>](docs/mockups/01-inbox.svg)<br/>**Inbox** | [<img src="docs/mockups/png/02-group-chat.png" width="210"/>](docs/mockups/02-group-chat.svg)<br/>**Group chat** | [<img src="docs/mockups/png/03-group-details.png" width="210"/>](docs/mockups/03-group-details.svg)<br/>**Group details** |
-| [<img src="docs/mockups/png/04-role-picker.png" width="210"/>](docs/mockups/04-role-picker.svg)<br/>**Role picker** | [<img src="docs/mockups/png/05-settings-identity.png" width="210"/>](docs/mockups/05-settings-identity.svg)<br/>**Settings — identity** | [<img src="docs/mockups/png/06-screen-lock.png" width="210"/>](docs/mockups/06-screen-lock.svg)<br/>**Screen lock** |
-
-## Install
-
-### Prebuilt APKs
-
-Tagged builds may publish APKs and checksums through GitHub Releases:
-
-1. Open the [Releases](https://github.com/MKlolbullen/Qubee/releases) page.
-2. Select the intended pre-release tag.
-3. Check that the release workflow completed successfully for that tag.
-4. Download the APK and matching SHA-256 file.
-5. Verify the checksum before installing.
-6. Verify the signing identity described by the release/security documentation.
-
-```bash
-sha256sum -c qubee-<version>.apk.sha256
-adb install qubee-<version>.apk
-```
-
-Do not install an APK whose checksum, signing identity, tag, or workflow provenance does not match.
+See [`docs/branding/README.md`](docs/branding/README.md) for sizing and export guidance.
 
 ## Build from source
 
@@ -437,20 +317,19 @@ Do not install an APK whose checksum, signing identity, tag, or workflow provena
 
 - Git
 - JDK 17
-- Android Studio with Android SDK 34
+- Android Studio / Android SDK 34
 - Android NDK **r26b** (`26.1.10909125`)
 - Rust **1.88** as pinned by `rust-toolchain.toml`
 - `cargo-ndk` 3.x
-- Linux, macOS, Windows/PowerShell, or WSL for development
 
-### 1. Clone
+### Clone
 
 ```bash
 git clone https://github.com/MKlolbullen/Qubee.git
 cd Qubee
 ```
 
-### 2. Install the pinned Rust toolchain and Android targets
+### Rust + Android targets
 
 ```bash
 rustup show
@@ -463,7 +342,7 @@ rustup target add \
 cargo install cargo-ndk --locked --version '^3'
 ```
 
-### 3. Point the build at the Android SDK/NDK
+### Android SDK / NDK
 
 ```bash
 export ANDROID_HOME="$HOME/Android/Sdk"
@@ -472,7 +351,7 @@ export NDK_HOME="$ANDROID_NDK_HOME"
 printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
 ```
 
-### 4. Build the Rust shared libraries
+### Build Rust shared libraries
 
 Linux/macOS/WSL:
 
@@ -487,58 +366,25 @@ Windows PowerShell:
 ./build_rust.ps1
 ```
 
-The scripts build and copy libraries for:
-
-```text
-arm64-v8a
-armeabi-v7a
-x86
-x86_64
-```
-
-Output lands under `app/src/main/jniLibs/`.
-
-### 5. Build the Android application
+### Build Android
 
 ```bash
 chmod +x gradlew
 ./gradlew :app:assembleDebug --no-daemon --stacktrace
-```
-
-The debug APK is normally written to:
-
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-Install it with:
-
-```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### Release build
-
-A local unsigned release build can exercise R8/ProGuard without release secrets:
+Release/R8 dry run:
 
 ```bash
 ./gradlew :app:assembleRelease --no-daemon --stacktrace
 ```
 
-Signed releases require the environment variables documented by [`RELEASE.md`](RELEASE.md):
-
-```text
-RELEASE_KEYSTORE_FILE
-RELEASE_KEYSTORE_PASSWORD
-RELEASE_KEY_ALIAS
-RELEASE_KEY_PASSWORD
-```
+Signing variables and release verification are documented in [`RELEASE.md`](RELEASE.md).
 
 ## Testing
 
 ### Rust core
-
-Run the same layers CI is expected to exercise:
 
 ```bash
 cargo fmt --all -- --check
@@ -548,204 +394,140 @@ cargo build --features _typecheck_jni
 cargo bench --no-run
 ```
 
-Security audit:
+### Security audit
 
 ```bash
 cargo install --locked cargo-audit --version 0.22.2
 cargo audit --deny unsound --deny yanked
 ```
 
-### JNI contract checks
-
-The JNI boundary has two directions: Kotlin calling Rust and Rust calling Kotlin callbacks. Both can compile independently and still explode at runtime if a method name or descriptor drifts.
+### JNI contracts
 
 ```bash
 bash scripts/check_jni_contracts.sh
 bash scripts/audit_message_file_bridge.sh
 ```
 
-### Android JVM tests
+### Android JVM + screenshot tests
 
 ```bash
 ./gradlew :app:testDebugUnitTest
-```
-
-### Paparazzi screenshot tests
-
-Record baselines:
-
-```bash
-./gradlew :app:recordPaparazziDebug
-```
-
-Verify against committed baselines:
-
-```bash
 ./gradlew :app:verifyPaparazziDebug
 ```
 
 ### Instrumented Android tests
 
-Requires an emulator or physical device:
-
 ```bash
 ./gradlew :app:connectedDebugAndroidTest --no-daemon --stacktrace
 ```
 
-### Test coverage map
+### Security-focused test map
 
 | Area | Representative coverage |
 |---|---|
-| Hybrid signatures | Both signature components required, malformed and future-dated input rejection |
-| AEAD | Encrypt/decrypt round trips and tamper rejection |
-| Group handshake | Join, role changes, ownership transfer, invitation limits, state sync |
-| Group messaging | Generation gate, key rotation, late joiners, replay rejection |
-| Ratchet | Ping-pong, out-of-order delivery, skipped-key bounds, replay rejection, persistence |
-| Keystore | Migration, AAD slot binding, atomic writes, crash-safe master-key rotation |
-| Networking | Two in-process libp2p nodes over loopback |
-| Wire format | Pinned canonical vectors plus property-based round trips and bounded decoding |
-| Android storage | Room DAO behavior and SQLCipher/Keystore round trips |
-| UI | Paparazzi JVM snapshots and selected instrumented flows |
+| Hybrid signatures | both components required; malformed/future-dated input rejection |
+| Ratchet | ping-pong, skipped keys, replay, tamper, persistence, crash no-reuse |
+| Groups | joins, roles, ownership transfer, removal rekey, late joiners |
+| Wire parsers | arbitrary input, truncation, corruption, hostile length claims |
+| Wire stability | full-byte golden vectors + versioned canonical encodings |
+| Keystore | AAD slot binding, atomic writes, migration, zeroization paths |
+| Networking | in-process libp2p tests + anonymous gossip behavior |
+| Android storage | Room / SQLCipher / Keystore integration |
+| UI | Paparazzi snapshots + selected instrumented flows |
 
 ## CI/CD
 
 | Workflow | Purpose |
 |---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | Rust format, clippy, tests, JNI typecheck, benchmark compile, RustSec audit, OSV.dev sweep |
-| [`jni-contracts.yml`](.github/workflows/jni-contracts.yml) | Kotlin ↔ Rust JNI symbol and descriptor parity |
-| [`android-smoke.yml`](.github/workflows/android-smoke.yml) | Four-ABI Rust build, debug APK, release/R8 dry run, Android lint |
-| [`instrumented-tests.yml`](.github/workflows/instrumented-tests.yml) | API 34 emulator and connected Android tests |
-| [`release.yml`](.github/workflows/release.yml) | Tagged signed APK build, verification, checksums, and release assets |
+| [`ci.yml`](.github/workflows/ci.yml) | Rust format, clippy, tests, JNI typecheck, benchmark compile, RustSec audit |
+| [`jni-contracts.yml`](.github/workflows/jni-contracts.yml) | Kotlin ↔ Rust JNI symbol/descriptor parity |
+| [`android-smoke.yml`](.github/workflows/android-smoke.yml) | Four-ABI Rust build, debug APK, release/R8 dry run, lint |
+| [`instrumented-tests.yml`](.github/workflows/instrumented-tests.yml) | Emulator/device integration tests |
+| [`release.yml`](.github/workflows/release.yml) | Signed tagged APK, verification and checksums |
 
 ## Project structure
 
 ```text
 Qubee/
 ├── app/
-│   ├── src/main/java/com/qubee/messenger/
-│   │   ├── crypto/                  # Kotlin JNI facade and payload models
-│   │   ├── data/                    # Room entities, DAOs, repositories
-│   │   ├── di/                      # Hilt modules
-│   │   ├── security/                # Android Keystore / SQLCipher key provider
-│   │   ├── service/                 # Background P2P message handling
-│   │   └── ui/                      # Compose + Fragment application surfaces
-│   ├── src/main/jniLibs/            # Built Rust .so files
-│   ├── src/test/                    # JVM and Paparazzi tests
-│   ├── src/androidTest/             # Device/emulator tests
-│   └── build.gradle
+│   └── src/main/java/com/qubee/messenger/
+│       ├── crypto/          # Kotlin JNI facade
+│       ├── data/            # Room entities, DAOs, repositories
+│       ├── security/        # Android Keystore / SQLCipher integration
+│       ├── service/         # P2P lifecycle + message handling
+│       └── ui/              # Compose application surfaces
 ├── src/
-│   ├── identity/                    # Hybrid identity keys and contacts
-│   ├── onboarding/                  # Signed onboarding bundles and deep links
-│   ├── groups/                      # Group state, roles, invites, handshakes, crypto
-│   ├── ratchet/                     # PQXDH, Double Ratchet, sender keys, sessions
-│   ├── network/                     # libp2p node and resolution
-│   ├── storage/                     # Encrypted Rust keystore
-│   ├── security/                    # RNG and secure-memory helpers
-│   ├── calling/                     # Feature-gated WebRTC work in progress
-│   ├── jni_api.rs                   # Android JNI entry points and callbacks
-│   └── lib.rs
-├── tests/                           # Rust integration and wire-stability tests
-├── benches/                         # Criterion crypto benchmarks
-├── scripts/                         # JNI and bridge audits
-├── docs/
-│   ├── branding/                    # Master SVG and brand guidance
-│   ├── perf/                        # Benchmark baselines
-│   └── *.md                         # Design, protocol, build, and test docs
-├── .github/workflows/               # CI, Android, release automation
-├── Cargo.toml
-├── Cargo.lock
-├── rust-toolchain.toml
-├── build_rust.sh
-└── build_rust.ps1
+│   ├── identity/            # hybrid identity keys
+│   ├── onboarding/          # signed onboarding bundles
+│   ├── groups/              # groups, roles, invites, handshakes
+│   ├── ratchet/             # PQXDH, Double Ratchet, sender keys
+│   ├── network/             # libp2p node
+│   ├── storage/             # encrypted Rust keystore
+│   ├── security/            # RNG / secure-memory helpers
+│   └── jni_api.rs           # Android JNI boundary
+├── tests/                   # integration, adversarial and wire tests
+├── scripts/                 # JNI / bridge audits
+├── docs/                    # architecture, branding, testing, threat-model docs
+└── .github/workflows/       # CI + release automation
 ```
-
-## Architectural invariants
-
-Changes touching crypto, wire formats, membership, or JNI should preserve these rules:
-
-1. **Rust remains the cryptographic authority.** Kotlin does not reimplement signing, KEM, ratchet, or group-key logic.
-2. **Both hybrid signature components must verify.** “Either classical or PQ” silently degrades the security claim.
-3. **Canonical signed bytes are versioned and domain-separated.** Avoid signing ad-hoc serializer output.
-4. **Untrusted lengths are bounded before allocation.** Gossip input is attacker-controlled.
-5. **State mutates only after authentication succeeds.** Especially ratchet state, invitation counters, and membership generations.
-6. **Key rotation is recipient-aware.** Removed members must not receive fresh group material.
-7. **Trust is not silently inherited across key changes.** A new key is a new security event.
-8. **JNI failures must fail closed without aborting the Android process.** Panic handling and descriptor parity are security-relevant.
-9. **Secrets do not cross JNI as immutable Java strings.** Use byte arrays and scrub both sides.
-10. **Wire-format changes require pinned vectors and migration reasoning.** “Serde compiled” is not a protocol compatibility strategy.
-
-## Performance
-
-Criterion benchmarks cover the cryptographic hot paths:
-
-- ML-KEM-768 encapsulation and decapsulation
-- ML-DSA-44 signing and verification
-- Group message encryption and decryption
-
-Run locally:
-
-```bash
-cargo bench
-```
-
-See [`docs/perf/baseline.md`](docs/perf/baseline.md) for the recorded baseline and test environment. Numbers are hardware-dependent; compare on the same machine before claiming a regression or improvement.
 
 ## Roadmap
 
-### Pre-alpha stabilization
+### `v0.2.0 — Ratchet Cutover`
 
-- [ ] Keep Rust tests, RustSec audit, JNI contracts, and Android smoke builds green on `main`.
-- [ ] Finish real-device validation for onboarding, direct messaging, groups, verification, and identity reset.
-- [ ] Complete the ratchet send-path rollout after two-device and three-device interoperability checks.
-- [ ] Move logically peer-directed control frames away from broad group-topic delivery where practical.
-- [ ] Add a maintained threat model and parser/network fuzzing plan.
-- [ ] Expand committed Paparazzi baselines for onboarding, contacts, conversations, groups, verification, and settings.
+- [x] Host-level ratchet integration/adversarial matrix.
+- [x] Outbound crash-consistency FSM + no-reuse tests.
+- [x] Parser robustness sweep in normal CI.
+- [x] Expanded full-byte wire golden vectors.
+- [x] Physical-device validation runbook.
+- [ ] Fix direct-message retry routing and pin it with regression tests.
+- [ ] Complete 1:1 ratchet delivery acknowledgements.
+- [ ] Give the sender-key group format the same metadata privacy as `QUBEE_GMS\x04`.
+- [ ] Run the complete physical-device matrix on release builds across multiple OEMs.
+- [ ] Enable the ratchet send path by default only after the matrix is green.
 
-### Alpha
+### `v0.3.x — Reliable P2P`
 
-- [ ] Stabilize database and wire migrations across releases.
-- [ ] Harden network diagnostics, reconnect behavior, and offline recovery UX.
-- [ ] Complete delivery-state semantics and user-facing failure recovery.
-- [ ] Produce reproducible, signed pre-release APKs with documented verification steps.
-- [ ] Commission external review of the protocol composition and implementation glue.
+- [ ] Harden reconnect behavior across mobile network changes.
+- [ ] Evaluate AutoNAT / DCUtR / Circuit Relay v2 / rendezvous or equivalent untrusted infrastructure.
+- [ ] Improve offline recovery UX and delivery-state diagnostics.
 
-### Later research
+### `v0.4.x — Transport privacy`
 
-- [ ] Privacy-preserving transport options such as Tor, without pretending relays are metadata-free.
-- [ ] Multi-device identity and session synchronization.
+- [x] Fail-closed `Direct` / `TorOnion` / `NymMixnet` posture foundation.
+- [ ] Implement and validate an anonymising transport.
+- [ ] Keep mDNS/address-advertising behavior privacy-aware under non-direct profiles.
+- [ ] Measure latency, battery and traffic-analysis tradeoffs on real devices.
+
+### Later
+
+- [ ] Multi-device identity/session synchronization.
 - [ ] Secure backup/export with explicit recovery-key design.
-- [ ] Rebuilt file transfer and media calling on current dependencies.
-- [ ] Stronger traffic-analysis resistance beyond the length-padding buckets already applied on the ratchet paths (blinded topic ids, cover traffic).
-
-The in-tree metadata reductions — anonymous gossip authorship, mDNS off by default, and length-padding buckets on the forward-secret paths — have landed; see [`docs/architecture/network-privacy.md`](docs/architecture/network-privacy.md) for the full assessment and the tiered plan toward IP anonymisation.
+- [ ] Rebuilt file transfer on current protocol foundations.
+- [ ] Voice/video calling only after the messaging path is mature.
+- [ ] Independent review of protocol composition, JNI/state transitions and Android lifecycle behavior.
 
 ## Contributing
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first.
 
-For changes in security-sensitive areas:
+Security-sensitive changes should:
 
-- Explain the threat or invariant being addressed.
-- Add adversarial tests, not only happy-path tests.
-- State whether the wire format or persistent state changes.
-- Run Rust, JNI, and relevant Android checks.
-- Avoid drive-by cryptographic substitutions without a protocol-level argument.
+- state the threat or invariant being addressed;
+- add adversarial tests, not only happy-path tests;
+- explain wire-format or persistent-state changes;
+- run Rust, JNI and relevant Android checks;
+- avoid silent fallbacks or optimistic security claims.
 
 ## Reporting security issues
 
-Do **not** open a public issue for a vulnerability. Use GitHub’s private vulnerability reporting flow described in [`SECURITY.md`](SECURITY.md).
+**Do not open a public issue for a vulnerability.** Use the private vulnerability reporting flow described in [`SECURITY.md`](SECURITY.md).
 
-Useful reports include:
-
-- The tested commit SHA.
-- A minimal reproducer or failing test.
-- The affected layer: Rust, wire format, JNI, Android storage, or CI/release.
-- Impact and realistic attacker prerequisites.
-- Whether the issue has been disclosed elsewhere.
+Useful reports include the tested commit SHA, a minimal reproducer/failing test, affected layer, impact and realistic attacker prerequisites.
 
 ## License
 
-Qubee is distributed under the [MIT License](LICENSE).
+Qubee is distributed under the [MIT License](LICENSE.md).
 
 ---
 

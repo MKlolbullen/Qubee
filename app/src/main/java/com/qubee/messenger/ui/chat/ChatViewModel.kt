@@ -140,21 +140,34 @@ class ChatViewModel @Inject constructor(
         viewModelScope.launch {
             val messageId = UUID.randomUUID().toString()
             val now = System.currentTimeMillis()
+            val fromId = selfSenderId ?: SELF_SENDER_ID_FALLBACK
 
-            // Encrypt first so the locally-saved row can carry the
-            // canonical wire id from the start. Otherwise a fast
-            // loopback peer could ack before we stamped the row
-            // and `applyAck` would miss it.
-            //
-            // Encryption is cheap (sub-millisecond on modern
-            // devices); the slight UI delay vs. saving a placeholder
-            // SENDING row first is well under perceptual.
-            //
-            // Flag-gated Stage 5 cutover: with `ratchetSendEnabled`
-            // on, outbound traffic uses the forward-secret wire
-            // formats and NEVER falls back to the legacy envelope —
-            // a failed v3 encrypt is a failed send (see
-            // RatchetSender for the downgrade-resistance rationale).
+            // Crash-consistency FSM, step 1 — PREPARED. Durably record the
+            // user's text BEFORE the encrypt that advances the ratchet, so
+            // a process death in the tiny encrypt→persist window leaves a
+            // recoverable row instead of a silently-lost message. The
+            // ratchet advance is itself durable before the ciphertext is
+            // returned (Rust side), so the worst case here is a message
+            // surfaced as FAILED on next start — never key reuse, never a
+            // silent loss. See docs/architecture/crash-consistency.md.
+            messageRepository.saveMessage(
+                Message(
+                    id = messageId,
+                    conversationId = conversationId,
+                    senderId = fromId,
+                    content = payload,
+                    contentType = MessageType.TEXT,
+                    timestamp = now,
+                    status = MessageStatus.PREPARED,
+                    isFromMe = true,
+                ),
+            )
+
+            // Flag-gated Stage 5 cutover: with `ratchetSendEnabled` on,
+            // outbound traffic uses the forward-secret wire formats and
+            // NEVER falls back to the legacy envelope — a failed v3
+            // encrypt is a failed send (see RatchetSender for the
+            // downgrade-resistance rationale).
             val isGroup = _uiState.value.isGroup
             val wire = runCatching {
                 if (ratchetSender.enabled()) {
@@ -168,20 +181,10 @@ class ChatViewModel @Inject constructor(
                 }
             }.getOrNull()
             if (wire == null) {
-                // Persist a FAILED row so the UI still shows what
-                // the user typed and surfaces the error.
-                messageRepository.saveMessage(
-                    Message(
-                        id = messageId,
-                        conversationId = conversationId,
-                        senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
-                        content = payload,
-                        contentType = MessageType.TEXT,
-                        timestamp = now,
-                        status = MessageStatus.FAILED,
-                        isFromMe = true,
-                    ),
-                )
+                // Encrypt failed (fail-closed). The PREPARED row already
+                // holds the user's text — flip it to FAILED so the UI
+                // surfaces the error and offers a resend.
+                messageRepository.updateMessageStatus(messageId, MessageStatus.FAILED)
                 _events.emit(
                     ChatUiEvent.Notice(
                         "Encrypt failed — peer may not have accepted the invite or shared keys yet",
@@ -202,17 +205,19 @@ class ChatViewModel @Inject constructor(
                 qubeeManager.extractMessageId(wire)
             }
 
-            // Save the row with the wireId + retry payload already
-            // present. `wireBytes` lets `MessageService`'s background
-            // loop re-publish the *same* wire if the peer is offline
-            // — same wire = same wireId = late acks still correlate.
-            // First retry attempt scheduled `INITIAL_RETRY_DELAY_MS`
-            // out so the eager publish below isn't immediately
-            // shadowed.
+            // FSM step 2 — ENCRYPTED + DURABLY_QUEUED. Replace the
+            // PREPARED row (same id) with the ciphertext + wireId + retry
+            // payload, all durable BEFORE the transmit below. `wireBytes`
+            // lets `MessageService`'s retry loop re-publish the *same*
+            // wire if the peer is offline — same wire = same wireId = late
+            // acks still correlate, and re-publish is idempotent (never a
+            // re-encrypt, so the ratchet never advances twice for one
+            // message). First retry is `INITIAL_RETRY_DELAY_MS` out so the
+            // eager publish below isn't immediately shadowed.
             val message = Message(
                 id = messageId,
                 conversationId = conversationId,
-                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
+                senderId = fromId,
                 content = payload,
                 contentType = MessageType.TEXT,
                 timestamp = now,
@@ -907,6 +912,7 @@ private fun MessageType.toUiType(): UiMessageType = when (this) {
 }
 
 private fun MessageStatus.toUiStatus(isFromMe: Boolean): MessageDeliveryState = when (this) {
+    MessageStatus.PREPARED -> MessageDeliveryState.Queued
     MessageStatus.SENDING -> MessageDeliveryState.Queued
     MessageStatus.SENT -> MessageDeliveryState.Sent
     MessageStatus.DELIVERED -> MessageDeliveryState.Delivered

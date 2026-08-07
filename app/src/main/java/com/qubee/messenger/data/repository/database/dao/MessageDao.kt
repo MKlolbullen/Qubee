@@ -108,6 +108,18 @@ abstract class MessageDao {
     abstract suspend fun clearRetryState(messageId: String)
 
     /**
+     * Crash-consistency recovery. A row still in `PREPARED` at process
+     * start is orphaned: a previous process died between writing the
+     * PREPARED row and completing encrypt/queue. It was never encrypted
+     * or transmitted (the ratchet may or may not have advanced, but no
+     * ciphertext escaped), so flip it to FAILED — the user's text is
+     * preserved and the UI offers a resend, instead of the message being
+     * silently lost. Returns the number of rows recovered.
+     */
+    @Query("UPDATE messages SET status = 'FAILED' WHERE status = 'PREPARED'")
+    abstract suspend fun failStalePreparedOutbound(): Int
+
+    /**
      * Atomically read + update the row matched by `wireId` to record
      * `ackerIdHex` as a recipient that ack'd this message. Runs the
      * read and the write inside a single SQLite transaction so two

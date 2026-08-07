@@ -83,22 +83,39 @@ proptest! {
     }
 }
 
-/// Truncation at every byte offset of a valid frame must never panic;
-/// only the full frame parses. Catches over-reads a single fixed vector
-/// wouldn't.
+/// Truncation at every byte offset of a valid frame must be *rejected*
+/// by that frame's own parser (not merely not-panic), and must not panic
+/// any other parser. Only the full frame parses — a regression that
+/// accepted a short frame would fail here. Catches over-reads and
+/// lenient decoders a single fixed vector wouldn't.
 #[test]
-fn truncated_valid_frames_never_panic() {
-    let builders: [fn() -> Vec<u8>; 2] = [valid_request_join_wire, valid_direct_message_wire];
-    for build in builders {
-        let wire = build();
-        for n in 0..wire.len() {
-            let prefix = &wire[..n];
-            let _ = GroupHandshake::from_wire(prefix);
-            let _ = DirectMessage::from_wire(prefix);
-            let _ = inspect_direct_sender(prefix);
-            let _ = IdentityKey::from_bytes(prefix);
-        }
+fn truncated_valid_frames_are_rejected_and_never_panic() {
+    // RequestJoin handshake frame: every proper prefix must fail to parse
+    // as a handshake, and must not panic the other parsers.
+    let hs = valid_request_join_wire();
+    for n in 0..hs.len() {
+        let prefix = &hs[..n];
+        assert!(
+            GroupHandshake::from_wire(prefix).is_none(),
+            "truncated handshake prefix (len {n}) was accepted",
+        );
+        let _ = DirectMessage::from_wire(prefix);
+        let _ = inspect_direct_sender(prefix);
+        let _ = IdentityKey::from_bytes(prefix);
     }
+
+    // DirectMessage frame: same, against its own parser.
+    let dm = valid_direct_message_wire();
+    for n in 0..dm.len() {
+        let prefix = &dm[..n];
+        assert!(
+            DirectMessage::from_wire(prefix).is_none(),
+            "truncated direct-message prefix (len {n}) was accepted",
+        );
+        let _ = GroupHandshake::from_wire(prefix);
+        let _ = IdentityKey::from_bytes(prefix);
+    }
+
     // The full frames still parse as their own type.
     assert!(GroupHandshake::from_wire(&valid_request_join_wire()).is_some());
     assert!(DirectMessage::from_wire(&valid_direct_message_wire()).is_some());

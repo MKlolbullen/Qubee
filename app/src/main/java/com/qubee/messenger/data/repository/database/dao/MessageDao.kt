@@ -115,8 +115,12 @@ abstract class MessageDao {
      * ciphertext escaped), so flip it to FAILED — the user's text is
      * preserved and the UI offers a resend, instead of the message being
      * silently lost. Returns the number of rows recovered.
+     *
+     * Scoped to `isFromMe = 1`: PREPARED is an outbound-only state today,
+     * and pinning the directional predicate at the DB layer keeps this
+     * recovery from ever touching a hypothetical future inbound use.
      */
-    @Query("UPDATE messages SET status = 'FAILED' WHERE status = 'PREPARED'")
+    @Query("UPDATE messages SET status = 'FAILED' WHERE status = 'PREPARED' AND isFromMe = 1")
     abstract suspend fun failStalePreparedOutbound(): Int
 
     /**

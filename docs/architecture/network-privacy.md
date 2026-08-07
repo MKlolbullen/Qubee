@@ -1,13 +1,15 @@
 # Network privacy: IP anonymisation & metadata leakage
 
-Status: **Tier 1 landed; Tiers 2–3 not started.** The metadata
-reductions that need no new overlay are in (§2, Tier 1). IP address is
-*still* exposed to every peer you connect to — the README's
-"IP-address privacy: No / traffic-analysis resistance: No" row stays
-accurate until Tier 2 (Tor) and Tier 3 (mixnet) respectively, and
-neither has begun. This document enumerates exactly what leaks today,
-then lays out what can be done — with honest costs — in the order it's
-worth doing.
+Status: **Tier 1 landed; Tiers 2–3 at fail-closed foundation.** The
+metadata reductions that need no new overlay are in (§2, Tier 1). The
+transport tiers now have their config surface + leaky-by-default guards
+(a `TransportPrivacy` posture that fails closed), but neither transport
+is wired — IP address is *still* exposed to every peer you connect to,
+so the README's "IP-address privacy: No / traffic-analysis resistance:
+No" row stays accurate until the Tor (Tier 2) / mixnet (Tier 3)
+transports actually land. This document enumerates exactly what leaks
+today, then lays out what can be done — with honest costs — in the order
+it's worth doing.
 
 The guiding rule matches the rest of the project: **name the threat
 precisely, don't overclaim.** Content confidentiality is already strong
@@ -158,6 +160,15 @@ Hides your IP/location. The mature-enough Rust path is
 which since its #21 supports **listening as an onion service** — both
 endpoints anonymous, and no router port-forwarding needed.
 
+**Status: foundation landed; onion transport not wired.** Behind a `tor`
+Cargo feature (off by default, pulls no dependencies):
+`P2PNodeConfig::transport_privacy: TransportPrivacy` gains a `TorOnion`
+variant; selecting it **fails closed** (`P2PNode::with_config` returns an
+error rather than building a direct transport that would expose the IP),
+and `resolve_discovery` forces mDNS off + Kademlia `Mode::Client`
+under any anonymising posture regardless of the caller's bools. That's
+the seam the `arti-client` transport slots into.
+
 Honest costs and caveats (from the crate's own warnings + Arti's
 status, 2025–26):
 
@@ -171,12 +182,15 @@ status, 2025–26):
 - **Latency.** Bootstrapping a Tor client takes ~20–60 s; per-message
   latency rises. gossipsub over circuit-switched Tor is workable for
   small groups but is not what Tor is optimised for.
-- **Version gap.** The crate currently pins `libp2p ^0.53` / `arti
-  ^0.24`; we're on libp2p 0.56. Adoption means either waiting for /
-  contributing a 0.56 bump, or embedding `arti-client` directly and
-  wiring a custom `Transport` (the arti-client API is stable enough —
-  `TorClient::create_bootstrapped`, `launch_onion_service`,
-  `connect`).
+- **Version gap (confirmed 2026-08).** `libp2p-community-tor` 0.4.1
+  (latest, Nov 2024) pins `libp2p ^0.53` / `arti-client 0.24`; we're on
+  libp2p 0.56 and downgrading is a non-starter (it would regress the
+  merged anonymous-authorship work + the gossipsub 0.49.4 security
+  floor). Adoption means either carrying a patched fork bumped to 0.56 +
+  current Arti, or embedding `arti-client` directly and wiring a custom
+  `Transport` (`TorClient::create_bootstrapped`, `launch_onion_service`,
+  `connect`). The foundation above is transport-agnostic so either drops
+  into the same `with_config` seam.
 - **What it does *not* do:** Tor is low-latency with no mixing or cover
   traffic, so it does **not** defeat traffic-analysis (timing/volume
   correlation) by a global passive adversary. It hides *where* you are,
@@ -188,7 +202,34 @@ The only tier that targets a **global passive adversary** and
 traffic-analysis. [Nym](https://docs.rs/nym-sdk)'s mixnet uses
 fixed-size Sphinx packets, continuous-time mixing (random per-hop
 delays), and tunable cover traffic to provide sender–receiver
-unlinkability that *improves* as the network grows.
+unlinkability that *improves* as the network grows. Because it hides
+your IP **and** defeats traffic-analysis, Tier 3 strictly *subsumes*
+Tier 2 — a legitimate (if far heavier) target to jump straight to.
+
+**Status: foundation landed; mixnet transport not wired.** Same shape as
+Tier 2: a `nym` Cargo feature (off, no dependencies), a
+`TransportPrivacy::NymMixnet` variant, and the shared fail-closed
+`with_config` seam + discovery guards. Selecting `NymMixnet` refuses to
+start rather than expose the IP.
+
+**Dependency probe (2026-08).** `nym-sdk 1.21.4` (current on crates.io)
+**resolves against our pinned tree without a hard conflict** —
+`rand_core 0.6.4`, `chacha20poly1305 0.10.1`, `ed25519-dalek 2.2`,
+`x25519-dalek 2.0.1`, `curve25519-dalek 4.1.3` all survive; Nym coexists
+via *parallel* versions (`rand_core 0.9`/`0.10`, `curve25519-dalek-ng`,
+`libcrux-*`, `zstd`, …). Not a hard blocker, but it pulls a large
+transitive tree (supply-chain + build-time cost); compilation-together
+is unverified.
+
+**Integration shape (investigated).** The only existing libp2p
+`Transport` over Nym — [`ChainSafe/rust-libp2p-nym`](https://github.com/ChainSafe/rust-libp2p-nym)
+— targets **libp2p 0.51** (git-patched) with 2023-era Nym git revisions
+and is an unmaintained prototype; `nym-sdk`'s `libp2p-vanilla` feature is
+an SDK build flag, **not** a pluggable transport. The maintained path is
+`nym-sdk`'s **`Stream` module** (multiplexed `AsyncRead + AsyncWrite`
+byte-streams over the mixnet), wrapped in a **custom libp2p `Transport`**
+so our gossipsub / request-response stack runs *over* Nym rather than
+being replaced — the less-disruptive of the two shapes.
 
 Costs (from Nym's own measurements):
 
@@ -218,15 +259,18 @@ Costs (from Nym's own measurements):
    deliberate and recorded above: the legacy v2 group path still sends
    unpadded, adopting `security::padding` at the ratchet cutover when
    its format changes once anyway.
-2. **Tier 2 (Tor/Arti)** as the first *IP*-anonymisation step: an
-   opt-in onion-service transport, defaulted **off**, gated behind the
-   same "experimental, device-validation-pending" discipline as the
-   ratchet cutover and the DB-key binding. This is the biggest
-   single win for "peers can see my IP" and is independently useful
-   even before Tier 3.
-3. **Tier 3 (Nym mixnet)** only if/when defeating a global passive
-   adversary becomes a goal — it's the strongest and by far the
-   heaviest, and it changes the transport model.
+2. **Tier 2 (Tor/Arti)** — foundation landed (fail-closed seam +
+   guards). The `arti-client` transport wiring is deferred: the project
+   chose to head for Tier 3 instead, since a mixnet subsumes Tor's
+   IP-hiding. Tier 2 stays a valid lighter-weight fallback if the Nym
+   integration proves too heavy.
+3. **Tier 3 (Nym mixnet)** — foundation landed (fail-closed seam +
+   guards + dependency probe + integration-shape investigation). The
+   remaining work is the heavy part: pull `nym-sdk` (gated on `nym`),
+   wrap its `Stream` module in a custom libp2p `Transport`, and route the
+   privacy-sensitive path through the mixnet — accepting the latency +
+   cover-traffic cost and the Nym gateway dependency. Strongest
+   protection, by far the heaviest.
 
 None of these should be advertised as done until validated, and the
 README/SECURITY tables should move from "No" to a precise

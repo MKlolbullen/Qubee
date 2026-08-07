@@ -225,9 +225,106 @@ pub enum NodeEvent {
 /// (b) binds to `127.0.0.1` so test runs don't leak onto the LAN,
 /// and (c) shortens the gossipsub heartbeat so mesh formation
 /// completes inside a normal test timeout.
+/// Transport privacy posture for the node.
+///
+/// `Direct` is the shipped behaviour: plain TCP/QUIC dials, so peers you
+/// connect to (and on-path observers) learn your IP. The anonymising
+/// modes are Tier-2/Tier-3 **foundations** — the config surface and the
+/// leaky-by-default guards exist, but their transports are not wired, so
+/// selecting one fails closed (see [`P2PNode::with_config`]) rather than
+/// silently falling back to `Direct` and leaking the IP it exists to hide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TransportPrivacy {
+    /// Plain TCP/QUIC. Peers learn your IP. (Current shipped behaviour.)
+    #[default]
+    Direct,
+    /// Tor onion-service transport (Tier 2). Hides your IP/location.
+    /// Foundation only — not yet functional.
+    TorOnion,
+    /// Nym mixnet transport (Tier 3). Hides your IP **and** resists
+    /// traffic-analysis by a global passive adversary (Sphinx packets,
+    /// per-hop mixing, cover traffic). A mixnet *replaces* the libp2p
+    /// transport for the private path, so it's the heaviest option.
+    /// Foundation only — not yet functional.
+    NymMixnet,
+}
+
+impl TransportPrivacy {
+    /// True only for the shipped `Direct` transport. The anonymising
+    /// modes are foundation-only and fail closed until wired.
+    fn is_direct(self) -> bool {
+        matches!(self, TransportPrivacy::Direct)
+    }
+}
+
+/// Effective discovery settings once the transport-privacy posture is
+/// applied. An anonymising transport is *leaky-by-default* unless the
+/// address-advertising behaviours are silenced: mDNS broadcasts your LAN
+/// IP, and a Kademlia server advertises its addresses to the DHT — both
+/// would publish the real address the overlay is meant to hide. So any
+/// non-`Direct` posture forces mDNS off and Kademlia into client mode,
+/// regardless of the caller's `enable_mdns` / `kademlia_client_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedDiscovery {
+    mdns_enabled: bool,
+    kademlia_client_mode: bool,
+}
+
+/// Resolve discovery behaviour from the caller's requested settings and
+/// the transport-privacy posture. Pure + unit-tested so the leaky-by-
+/// default guards are pinned independently of the (not-yet-built)
+/// anonymising transports. For `Direct`, the caller's settings pass
+/// through unchanged.
+fn resolve_discovery(
+    privacy: TransportPrivacy,
+    enable_mdns: bool,
+    kademlia_client_mode: bool,
+) -> ResolvedDiscovery {
+    if privacy.is_direct() {
+        ResolvedDiscovery {
+            mdns_enabled: enable_mdns,
+            kademlia_client_mode,
+        }
+    } else {
+        ResolvedDiscovery {
+            mdns_enabled: false,
+            kademlia_client_mode: true,
+        }
+    }
+}
+
+/// Error for an anonymising-transport request that can't be honoured yet.
+/// Feature-aware so the message states the real reason, but the outcome
+/// is the same either way: fail closed, never downgrade to a direct
+/// transport that would expose the IP the caller asked to hide.
+fn transport_unavailable(mode: TransportPrivacy) -> anyhow::Error {
+    let (label, feature, enabled) = match mode {
+        TransportPrivacy::Direct => return anyhow!("internal: Direct is always available"),
+        TransportPrivacy::TorOnion => ("Tor onion-service", "tor", cfg!(feature = "tor")),
+        TransportPrivacy::NymMixnet => ("Nym mixnet", "nym", cfg!(feature = "nym")),
+    };
+    if enabled {
+        anyhow!(
+            "TransportPrivacy::{mode:?} selected, but the {label} transport is not implemented yet \
+             (foundation only). Refusing to start rather than fall back to a direct transport that \
+             would expose your IP."
+        )
+    } else {
+        anyhow!(
+            "TransportPrivacy::{mode:?} requires the `{feature}` Cargo feature — and the {label} \
+             transport itself is not implemented yet. Refusing to fall back to a direct transport \
+             that would expose your IP."
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct P2PNodeConfig {
     pub enable_mdns: bool,
+    /// Transport privacy posture. Defaults to [`TransportPrivacy::Direct`];
+    /// the anonymising modes are foundation-only and currently refuse to
+    /// start (fail closed).
+    pub transport_privacy: TransportPrivacy,
     pub listen_addr: Multiaddr,
     /// Optional QUIC (UDP) listen address, bound *in addition to*
     /// `listen_addr` (TCP). `None` disables QUIC listening. QUIC dials
@@ -255,6 +352,7 @@ impl Default for P2PNodeConfig {
             // opt-in local-discovery convenience, not a requirement —
             // default it OFF and let a caller re-enable it explicitly.
             enable_mdns: false,
+            transport_privacy: TransportPrivacy::Direct,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/0.0.0.0/udp/0/quic-v1"
@@ -279,6 +377,7 @@ impl P2PNodeConfig {
     pub fn for_testing() -> Self {
         Self {
             enable_mdns: false,
+            transport_privacy: TransportPrivacy::Direct,
             listen_addr: "/ip4/127.0.0.1/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
                 "/ip4/127.0.0.1/udp/0/quic-v1"
@@ -333,6 +432,16 @@ impl P2PNode {
         command_receiver: mpsc::Receiver<P2PCommand>,
         config: P2PNodeConfig,
     ) -> Result<Self> {
+        // The anonymising transports (Tor onion service / Nym mixnet)
+        // aren't wired yet — only their config surface + guards are. Fail
+        // CLOSED rather than fall back to a direct TCP/QUIC node: a caller
+        // who asked for Tor or Nym did so to hide their IP, and silently
+        // giving them a direct transport would expose the very address
+        // they meant to protect. See docs/architecture/network-privacy.md.
+        if !config.transport_privacy.is_direct() {
+            return Err(transport_unavailable(config.transport_privacy));
+        }
+
         let cfg_for_behaviour = config.clone();
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys)
             .with_tokio()
@@ -379,15 +488,26 @@ impl P2PNode {
                 )
                 .map_err(std::io::Error::other)?;
 
+                // Fold the transport-privacy posture into the discovery
+                // settings: any anonymising mode forces mDNS off + Kademlia
+                // client, independently of the caller's bools. (For Direct
+                // this is an identity over `enable_mdns` /
+                // `kademlia_client_mode`.)
+                let discovery = resolve_discovery(
+                    cfg_for_behaviour.transport_privacy,
+                    cfg_for_behaviour.enable_mdns,
+                    cfg_for_behaviour.kademlia_client_mode,
+                );
+
                 let kad_store = kad::store::MemoryStore::new(peer_id);
                 let mut kademlia = kad::Behaviour::new(peer_id, kad_store);
-                kademlia.set_mode(Some(if cfg_for_behaviour.kademlia_client_mode {
+                kademlia.set_mode(Some(if discovery.kademlia_client_mode {
                     kad::Mode::Client
                 } else {
                     kad::Mode::Server
                 }));
 
-                let mdns: Toggle<mdns::tokio::Behaviour> = if cfg_for_behaviour.enable_mdns {
+                let mdns: Toggle<mdns::tokio::Behaviour> = if discovery.mdns_enabled {
                     Some(mdns::tokio::Behaviour::new(
                         mdns::Config::default(),
                         peer_id,
@@ -648,6 +768,74 @@ mod tests {
 
     const GROUP_A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
     const GROUP_B: &str = "ffeeddccbbaa99887766554433221100";
+
+    #[test]
+    fn direct_mode_passes_discovery_settings_through() {
+        // Direct honours the caller's mDNS + Kademlia-client choices.
+        assert_eq!(
+            resolve_discovery(TransportPrivacy::Direct, true, false),
+            ResolvedDiscovery {
+                mdns_enabled: true,
+                kademlia_client_mode: false,
+            },
+        );
+        assert_eq!(
+            resolve_discovery(TransportPrivacy::Direct, false, true),
+            ResolvedDiscovery {
+                mdns_enabled: false,
+                kademlia_client_mode: true,
+            },
+        );
+    }
+
+    #[test]
+    fn anonymising_modes_force_address_leaking_behaviours_off() {
+        // Tor and Nym both silence mDNS + DHT advertisement even when the
+        // caller explicitly asked for mDNS and a Kademlia server.
+        for mode in [TransportPrivacy::TorOnion, TransportPrivacy::NymMixnet] {
+            assert_eq!(
+                resolve_discovery(mode, true, false),
+                ResolvedDiscovery {
+                    mdns_enabled: false,
+                    kademlia_client_mode: true,
+                },
+                "{mode:?} must force mDNS off + Kademlia client",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymising_transports_fail_closed_until_implemented() {
+        // Selecting Tor or Nym must refuse to start — never silently fall
+        // back to a direct transport that would expose the IP the caller
+        // asked to hide.
+        for mode in [TransportPrivacy::TorOnion, TransportPrivacy::NymMixnet] {
+            let id_keys = libp2p::identity::Keypair::generate_ed25519();
+            let (_tx, rx) = mpsc::channel(1);
+            let config = P2PNodeConfig {
+                transport_privacy: mode,
+                ..P2PNodeConfig::for_testing()
+            };
+            let result = P2PNode::with_config(id_keys, rx, config).await;
+            assert!(result.is_err(), "{mode:?} must fail closed");
+            let msg = format!("{:#}", result.err().unwrap());
+            assert!(msg.contains("expose your IP"), "{mode:?}: {msg}");
+            // The mode name must render (inline format-arg capture), not
+            // appear as a literal `{mode:?}`.
+            assert!(
+                msg.contains(&format!("{mode:?}")),
+                "mode should render: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_transport_still_builds() {
+        let id_keys = libp2p::identity::Keypair::generate_ed25519();
+        let (_tx, rx) = mpsc::channel(1);
+        let result = P2PNode::with_config(id_keys, rx, P2PNodeConfig::for_testing()).await;
+        assert!(result.is_ok(), "Direct transport must still build");
+    }
 
     /// The whole point of blinding: the group id must not be readable
     /// off the topic string by a passive observer.

@@ -20,6 +20,22 @@ jobs:
           ref: agent/direct-retry-routing
           fetch-depth: 0
 
+      - name: Correct peer-bundle test anchor
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/agent_direct_selectors.py')
+          text = p.read_text()
+          start = text.index("replace_once(\n    path,\n    '''        let loaded = get_peer_bundle")
+          end = text.index("\n\n# ---------------------------------------------------------------------------\n# Direct wire", start)
+          call = '''replace_once(
+              path,
+              """        assert_eq!(got.identity_x25519, body.identity_x25519);\n        assert_eq!(got.kem_public, body.kem_public);\n""",
+              """        assert_eq!(got.identity_x25519, body.identity_x25519);\n        assert_eq!(got.kem_public, body.kem_public);\n        let ids = list_peer_bundle_ids(&ks).unwrap();\n        assert!(ids.contains(&kp.identity_id()));\n""",
+          )'''
+          p.write_text(text[:start] + call + text[end:])
+          PY
+
       - name: Apply opaque selector patch
         run: python3 scripts/agent_direct_selectors.py
 

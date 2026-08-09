@@ -1,0 +1,154 @@
+name: Agent signed prekey route bootstrap
+
+on:
+  push:
+    branches:
+      - agent/direct-retry-routing
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/direct-retry-routing
+          fetch-depth: 0
+
+      - name: Apply signed-route bootstrap patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def rep(path, old, new, count=1):
+              p = Path(path)
+              t = p.read_text()
+              got = t.count(old)
+              if got != count:
+                  raise SystemExit(f'{path}: expected {count} matches, got {got}: {old[:90]!r}')
+              p.write_text(t.replace(old, new, count))
+
+          # Signed prekey bundle: advertise the publisher's current libp2p PeerId.
+          p = 'src/groups/group_handshake.rs'
+          rep(p,
+              'const PREKEY_BUNDLE_TAG: &[u8] = b"qubee_handshake_prekey_bundle_v1";',
+              '// _v2: bind the publisher current libp2p PeerId into the hybrid-signed bundle so\\n'
+              '// anonymous-gossip recipients can resolve IdentityId -> PeerId without trusting\\n'
+              '// a gossip propagation source.\\n'
+              'const PREKEY_BUNDLE_TAG: &[u8] = b"qubee_handshake_prekey_bundle_v2";')
+          rep(p,
+              'pub struct PrekeyBundleBody {\\n    pub publisher: IdentityKey,\\n',
+              'pub struct PrekeyBundleBody {\\n'
+              '    pub publisher: IdentityKey,\\n'
+              '    /// Current libp2p PeerId, hybrid-signed by `publisher`. This is a\\n'
+              '    /// routing assertion, not a message-authentication key. A receiver\\n'
+              '    /// validates the PeerId syntax only after the bundle signature passes.\\n'
+              '    pub publisher_peer_id: String,\\n')
+          rep(p,
+              '    out.extend_from_slice(body.publisher.identity_id.as_ref());\\n    out.push(0u8);\\n    out.extend_from_slice(&body.identity_x25519);',
+              '    out.extend_from_slice(body.publisher.identity_id.as_ref());\\n'
+              '    out.push(0u8);\\n'
+              '    out.extend_from_slice(&(body.publisher_peer_id.len() as u32).to_le_bytes());\\n'
+              '    out.extend_from_slice(body.publisher_peer_id.as_bytes());\\n'
+              '    out.push(0u8);\\n'
+              '    out.extend_from_slice(&body.identity_x25519);')
+
+          # Preserve existing build_body callers with an empty route; JNI publishing uses the
+          # explicit route-aware builder once LOCAL_PEER_ID exists.
+          p = 'src/ratchet/prekey_store.rs'
+          rep(p,
+              'pub fn build_body(\\n    secret: &PrekeyBundleSecret,\\n    kem_public: &KemPublicKey,\\n    publisher: IdentityKey,\\n    timestamp: u64,\\n) -> PrekeyBundleBody {\\n    PrekeyBundleBody {\\n        publisher,\\n',
+              'pub fn build_body(\\n'
+              '    secret: &PrekeyBundleSecret,\\n'
+              '    kem_public: &KemPublicKey,\\n'
+              '    publisher: IdentityKey,\\n'
+              '    timestamp: u64,\\n'
+              ') -> PrekeyBundleBody {\\n'
+              '    build_body_with_peer_id(secret, kem_public, publisher, String::new(), timestamp)\\n'
+              '}\\n\\n'
+              '/// Route-aware form used by the live publisher after the libp2p node has\\n'
+              '/// established its stable local PeerId. The route is part of the signed body.\\n'
+              'pub fn build_body_with_peer_id(\\n'
+              '    secret: &PrekeyBundleSecret,\\n'
+              '    kem_public: &KemPublicKey,\\n'
+              '    publisher: IdentityKey,\\n'
+              '    publisher_peer_id: String,\\n'
+              '    timestamp: u64,\\n'
+              ') -> PrekeyBundleBody {\\n'
+              '    PrekeyBundleBody {\\n'
+              '        publisher,\\n'
+              '        publisher_peer_id,\\n')
+          # Add a signature-binding regression test without perturbing the legacy builder tests.
+          marker = '''    #[test]\n    fn peer_bundle_cache_round_trips() {'''
+          insert = '''    #[test]\n    fn signed_bundle_binds_publisher_peer_id() {\n        let (mut ks, _d) = fresh_ks();\n        let kp = IdentityKeyPair::generate().unwrap();\n        let (secret, kem_pub) = get_or_create_local_bundle(&mut ks, 9).unwrap();\n        let body = build_body_with_peer_id(\n            &secret,\n            &kem_pub,\n            kp.public_key(),\n            "12D3KooWRoute".to_string(),\n            9,\n        );\n        let signed = sign_prekey_bundle(&kp, body).unwrap();\n        let (mut body, sig) = match signed {\n            GroupHandshake::PrekeyBundle { body, signature } => (body, signature),\n            _ => unreachable!(),\n        };\n        assert!(verify_prekey_bundle(&body, &sig).unwrap());\n        body.publisher_peer_id.push('X');\n        assert!(!verify_prekey_bundle(&body, &sig).unwrap());\n    }\n\n    #[test]\n    fn peer_bundle_cache_round_trips() {'''
+          rep(p, marker, insert)
+
+          # JNI: publish the signed route and install it only after hybrid verification.
+          p = 'src/jni_api.rs'
+          rep(p,
+              'use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};',
+              'use crate::ratchet::prekey_store::{\\n'
+              '    build_body_with_peer_id, get_or_create_local_bundle, store_peer_bundle,\\n'
+              '};')
+          rep(p,
+              '            let body = build_body(&secret, &kem_public, identity.public_key(), now);',
+              '            let publisher_peer_id = LOCAL_PEER_ID.lock().unwrap().clone().unwrap_or_default();\\n'
+              '            let body = build_body_with_peer_id(\\n'
+              '                &secret,\\n'
+              '                &kem_public,\\n'
+              '                identity.public_key(),\\n'
+              '                publisher_peer_id,\\n'
+              '                now,\\n'
+              '            );')
+          # Add helper immediately after resolve_peer_id.
+          needle = '''fn resolve_peer_id(identity_hex: &str) -> Option<String> {\n    PEER_DIRECTORY.lock().unwrap().get(identity_hex).cloned()\n}\n'''
+          helper = '''fn resolve_peer_id(identity_hex: &str) -> Option<String> {\n    PEER_DIRECTORY.lock().unwrap().get(identity_hex).cloned()\n}\n\n/// Install the route assertion carried by a prekey bundle *after* its hybrid\n/// identity signature has verified. Anonymous gossipsub gives us no trustworthy\n/// transport author, so the signed in-band PeerId is the bootstrap link for\n/// first-contact direct delivery.\nfn install_prekey_peer_route(body: &crate::groups::group_handshake::PrekeyBundleBody) -> anyhow::Result<()> {\n    if body.publisher_peer_id.is_empty() {\n        return Ok(());\n    }\n    let peer: libp2p::PeerId = body\n        .publisher_peer_id\n        .parse()\n        .map_err(|e| anyhow::anyhow!("invalid signed prekey PeerId: {e}"))?;\n    let peer_id = peer.to_string();\n    let identity_hex = hex::encode(body.publisher.identity_id.as_ref() as &[u8]);\n    PEER_DIRECTORY\n        .lock()\n        .unwrap()\n        .insert(identity_hex.clone(), peer_id.clone());\n    dispatch_peer_linked(peer_id, identity_hex);\n    Ok(())\n}\n'''
+          rep(p, needle, helper)
+          rep(p,
+              '            store_peer_bundle(ks, &body)?;\\n        }\\n    }\\n    Ok(())',
+              '            store_peer_bundle(ks, &body)?;\\n'
+              '            install_prekey_peer_route(&body)?;\\n'
+              '        }\\n'
+              '    }\\n'
+              '    Ok(())')
+
+          # Wire stability: the signed route is an intentional prekey canonical-v2 bump.
+          p = 'tests/wire_stability.rs'
+          rep(p,
+              '        publisher: kp.public_key(),\\n        identity_x25519: [1u8; 32],',
+              '        publisher: kp.public_key(),\\n'
+              '        publisher_peer_id: "12D3KooWRoute".to_string(),\\n'
+              '        identity_x25519: [1u8; 32],')
+          rep(p,
+              'assert!(canonical.starts_with(b"qubee_handshake_prekey_bundle_v1"));',
+              'assert!(canonical.starts_with(b"qubee_handshake_prekey_bundle_v2"));')
+          rep(p,
+              'GroupHandshake::PrekeyBundle { .. } => "qubee_handshake_prekey_bundle_v1",',
+              'GroupHandshake::PrekeyBundle { .. } => "qubee_handshake_prekey_bundle_v2",')
+
+          print('signed prekey route bootstrap patch applied')
+          PY
+
+      - name: Format Rust
+        run: cargo fmt --all
+
+      - name: Test Rust
+        run: cargo test --all-targets
+
+      - name: Remove one-shot workflow
+        if: success()
+        run: rm -f .github/workflows/agent-prekey-route-bootstrap.yml
+
+      - name: Commit validated patch
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(routing): bootstrap PeerIds from signed prekeys"
+          git push origin HEAD:agent/direct-retry-routing

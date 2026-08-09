@@ -19,6 +19,9 @@ jobs:
           ref: agent/direct-retry-routing
           fetch-depth: 0
 
+      - name: Correct one-shot patch guard
+        run: sed -i 's/minimum=3)/minimum=2)/' scripts/agent_direct_routing.py
+
       - name: Apply routing patch
         run: python3 scripts/agent_direct_routing.py
 

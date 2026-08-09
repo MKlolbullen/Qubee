@@ -46,6 +46,33 @@ jobs:
       - name: Apply opaque selector patch
         run: python3 scripts/agent_direct_selectors.py
 
+      - name: Translate direct adversarial tests to selectors
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/ratchet/direct.rs')
+          text = p.read_text()
+
+          replacements = {
+              'assert_eq!(inspect_direct_sender(&w1).unwrap(), aid);':
+                  'assert_eq!(inspect_direct_sender(&b.ks, &w1).unwrap(), aid);',
+              '            dm.sender_id = aid;':
+                  '            dm.sender_selector = direct_identity_selector(&aid, &dm.route_nonce);',
+              '        dm.sender_id = bid;\n        let err = decrypt_direct(&mut b.ks, bid, &dm.to_wire().unwrap(), 1).unwrap_err();\n        assert!(err.to_string().contains("from ourselves"));':
+                  '        dm.sender_selector = direct_identity_selector(&bid, &dm.route_nonce);\n        let err = decrypt_direct(&mut b.ks, bid, &dm.to_wire().unwrap(), 1).unwrap_err();\n        assert!(err.to_string().contains("verified peer"));',
+              '        assert!(inspect_direct_sender(b"QUBEE_GMS\\x01whatever").is_none());\n        assert!(inspect_direct_sender(&[]).is_none());':
+                  '        let device = Device::new();\n        assert!(inspect_direct_sender(&device.ks, b"QUBEE_GMS\\x01whatever").is_none());\n        assert!(inspect_direct_sender(&device.ks, &[]).is_none());',
+              '        assert!(err.to_string().contains("no verified prekey bundle"));':
+                  '        assert!(err.to_string().contains("verified peer"));',
+          }
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'direct test rewrite expected one match, got {count}: {old[:90]!r}')
+              text = text.replace(old, new, 1)
+          p.write_text(text)
+          PY
+
       - name: Format Rust
         run: cargo fmt --all
 

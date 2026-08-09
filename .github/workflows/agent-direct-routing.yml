@@ -25,6 +25,19 @@ jobs:
       - name: Apply routing patch
         run: python3 scripts/agent_direct_routing.py
 
+      - name: Update direct-v2 parser fixture
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/wire_parser_robustness.rs')
+          text = p.read_text()
+          old = "        sender_id: IdentityId::from([3u8; 32]),\n        initial: None,\n"
+          new = "        sender_id: IdentityId::from([3u8; 32]),\n        recipient_id: IdentityId::from([4u8; 32]),\n        initial: None,\n"
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one direct parser fixture, got {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Format Rust
         run: cargo fmt --all
 

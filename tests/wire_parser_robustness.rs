@@ -38,6 +38,7 @@ fn valid_request_join_wire() -> Vec<u8> {
 fn valid_direct_message_wire() -> Vec<u8> {
     DirectMessage {
         sender_id: IdentityId::from([3u8; 32]),
+        recipient_id: IdentityId::from([4u8; 32]),
         initial: None,
         header: MessageHeader {
             dh: [8u8; 32],

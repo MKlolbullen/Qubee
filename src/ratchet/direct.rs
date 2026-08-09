@@ -102,7 +102,7 @@ pub fn install_peer_bundle(ks: &mut SecureKeyStore, wire: &[u8]) -> Result<Ident
 
 /// Encrypt `plaintext` for `peer_id`, establishing a session on first
 /// use from the peer's cached prekey bundle. Returns the
-/// `QUBEE_DMS\x01` wire frame. Fails if no session exists and no bundle
+/// `QUBEE_DMS\x02` wire frame. Fails if no session exists and no bundle
 /// for the peer has been installed.
 pub fn encrypt_direct(
     ks: &mut SecureKeyStore,
@@ -151,6 +151,7 @@ pub fn encrypt_direct(
     store_session(ks, &session)?;
     DirectMessage {
         sender_id: local_id,
+        recipient_id: peer_id,
         initial,
         header,
         ciphertext,
@@ -158,7 +159,7 @@ pub fn encrypt_direct(
     .to_wire()
 }
 
-/// Decrypt an inbound `QUBEE_DMS\x01` frame, establishing the responder
+/// Decrypt an inbound `QUBEE_DMS\x02` frame, establishing the responder
 /// side of the session on the conversation's first message. Returns the
 /// sender's identity id and the plaintext.
 pub fn decrypt_direct(
@@ -169,6 +170,9 @@ pub fn decrypt_direct(
 ) -> Result<(IdentityId, Vec<u8>)> {
     let dm = DirectMessage::from_wire(wire).ok_or_else(|| anyhow!("not a direct message frame"))?;
     let peer_id = dm.sender_id;
+    if dm.recipient_id != local_id {
+        bail!("direct message addressed to a different recipient");
+    }
     if peer_id == local_id {
         bail!("direct message claims to be from ourselves");
     }

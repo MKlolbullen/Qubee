@@ -37,10 +37,10 @@ fn handshake_magic_is_pinned() {
 #[test]
 fn direct_message_magic_is_pinned() {
     use qubee_crypto::ratchet::direct_message::MAGIC_DIRECT_MESSAGE;
-    // `\x01` is the first PQXDH + Double Ratchet 1:1 wire version. A bump
-    // here means old devices silently drop new-format direct messages, so
-    // it must be a deliberate version change with a migration path.
-    assert_eq!(MAGIC_DIRECT_MESSAGE, b"QUBEE_DMS\x01");
+    // `\x02` adds the intended recipient IdentityId to the durable frame,
+    // allowing Rust to route initial sends and exact-wire retries through
+    // `/qubee/direct/1` without trusting Kotlin sender/contact fields.
+    assert_eq!(MAGIC_DIRECT_MESSAGE, b"QUBEE_DMS\x02");
 }
 
 #[test]
@@ -49,6 +49,7 @@ fn direct_message_round_trips_through_wire() {
     use qubee_crypto::ratchet::double_ratchet::MessageHeader;
     let dm = DirectMessage {
         sender_id: IdentityId::from([3u8; 32]),
+        recipient_id: IdentityId::from([4u8; 32]),
         initial: None,
         header: MessageHeader {
             dh: [8u8; 32],
@@ -58,7 +59,7 @@ fn direct_message_round_trips_through_wire() {
         ciphertext: vec![0x11, 0x22, 0x33],
     };
     let wire = dm.to_wire().unwrap();
-    assert!(wire.starts_with(b"QUBEE_DMS\x01"));
+    assert!(wire.starts_with(b"QUBEE_DMS\x02"));
     assert_eq!(DirectMessage::from_wire(&wire).unwrap(), dm);
 }
 

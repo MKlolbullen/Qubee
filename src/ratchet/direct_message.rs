@@ -27,7 +27,7 @@ use crate::ratchet::pqxdh::WireInitialMessage;
 /// Magic prefix for a direct-message frame. `\x01` is the first
 /// (PQXDH + Double Ratchet) direct-message wire version, matching the
 /// `QUBEE_GHS`/`QUBEE_GMS` family used by the group frames.
-pub const MAGIC_DIRECT_MESSAGE: &[u8] = b"QUBEE_DMS\x01";
+pub const MAGIC_DIRECT_MESSAGE: &[u8] = b"QUBEE_DMS\x02";
 
 /// A single 1:1 ratchet message on the wire.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -35,6 +35,11 @@ pub struct DirectMessage {
     /// The sender's identity id, so the receiver can find (or, on the
     /// first message, establish) the matching session.
     pub sender_id: IdentityId,
+    /// The intended recipient identity. This is routing metadata, not a
+    /// new authentication primitive: the same sender/recipient pair is
+    /// already committed into the ratchet's conversation associated data.
+    /// Receivers reject frames addressed to any other local identity.
+    pub recipient_id: IdentityId,
     /// Present only on the conversation's first message: the PQXDH
     /// initial handshake material. `None` on every subsequent message.
     pub initial: Option<WireInitialMessage>,
@@ -77,6 +82,13 @@ pub fn is_direct_message_frame(bytes: &[u8]) -> bool {
         && &bytes[..MAGIC_DIRECT_MESSAGE.len()] == MAGIC_DIRECT_MESSAGE
 }
 
+/// Read the intended recipient from a well-formed direct frame without
+/// touching ratchet state. Used only for transport routing; authenticity
+/// still comes from the pair-bound ratchet AEAD on receive.
+pub fn inspect_direct_recipient(bytes: &[u8]) -> Option<IdentityId> {
+    DirectMessage::from_wire(bytes).map(|dm| dm.recipient_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,13 +105,14 @@ mod tests {
 
     #[test]
     fn magic_is_pinned() {
-        assert_eq!(MAGIC_DIRECT_MESSAGE, b"QUBEE_DMS\x01");
+        assert_eq!(MAGIC_DIRECT_MESSAGE, b"QUBEE_DMS\x02");
     }
 
     #[test]
     fn round_trips_first_message_with_initial() {
         let dm = DirectMessage {
             sender_id: IdentityId::from([4u8; 32]),
+            recipient_id: IdentityId::from([6u8; 32]),
             initial: Some(sample_initial()),
             header: MessageHeader {
                 dh: [9u8; 32],
@@ -117,6 +130,7 @@ mod tests {
     fn round_trips_subsequent_message_without_initial() {
         let dm = DirectMessage {
             sender_id: IdentityId::from([5u8; 32]),
+            recipient_id: IdentityId::from([7u8; 32]),
             initial: None,
             header: MessageHeader {
                 dh: [0u8; 32],
@@ -127,6 +141,10 @@ mod tests {
         };
         let wire = dm.to_wire().unwrap();
         assert_eq!(DirectMessage::from_wire(&wire).unwrap(), dm);
+        assert_eq!(
+            inspect_direct_recipient(&wire),
+            Some(IdentityId::from([7u8; 32]))
+        );
     }
 
     #[test]

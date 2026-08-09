@@ -36,6 +36,7 @@ use crate::ratchet::direct::{
     decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text,
     inspect_direct_sender, install_peer_bundle, reset_direct_session, DirectPayload,
 };
+use crate::ratchet::direct_message::{inspect_direct_recipient, is_direct_message_frame};
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
@@ -490,7 +491,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
     })
 }
 
-/// Send a P2P message (Publish/Direct)
+/// Send an outbound frame.
+///
+/// Forward-secret QUBEE_DMS frames are never gossip-published: their v2
+/// envelope carries the intended Qubee IdentityId, which is resolved through
+/// the authenticated IdentityId -> libp2p PeerId directory and delivered over
+/// `/qubee/direct/1`. Missing/invalid routes fail closed. The caller-provided
+/// `peer_id` remains a compatibility hint for non-DMS legacy traffic only.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2PMessage(
     mut env: JNIEnv,
@@ -499,25 +506,49 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
     data: JByteArray,
 ) -> jboolean {
     catch_unwind_result(|| {
-        // Untrusted JNI input: never `.expect()` here. A malformed
-        // peer_id or byte array must fail closed (return 0), not panic.
-        let peer_id_str: String = match env.get_string(&peer_id) {
-            Ok(s) => s.into(),
-            Err(_) => return 0,
-        };
         let data_vec = match env.convert_byte_array(&data) {
             Ok(d) => d,
             Err(_) => return 0,
         };
 
-        let commander_lock = P2P_COMMANDER.lock().unwrap();
+        // A direct-magic frame must *never* fall through to gossipsub. If it
+        // does not parse cleanly, or its authenticated identity has no known
+        // transport route, leave it queued for retry instead of broadcasting.
+        if is_direct_message_frame(&data_vec) {
+            let recipient = match inspect_direct_recipient(&data_vec) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!("malformed QUBEE_DMS frame; refusing gossip fallback");
+                    return 0;
+                }
+            };
+            let recipient_hex = hex::encode(recipient.as_ref());
+            let route = match resolve_peer_id(&recipient_hex) {
+                Some(peer) => peer,
+                None => {
+                    tracing::debug!(recipient = %recipient_hex, "direct recipient has no authenticated PeerId route yet");
+                    return 0;
+                }
+            };
+            if send_direct(route, data_vec) {
+                return 1;
+            }
+            tracing::debug!(recipient = %recipient_hex, "direct frame could not be enqueued; caller will retry same wire");
+            return 0;
+        }
 
+        // Legacy/non-direct compatibility path. This remains unchanged until
+        // the v0.2.0 cutover removes legacy emission.
+        let peer_id_str: String = match env.get_string(&peer_id) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let commander_lock = P2P_COMMANDER.lock().unwrap();
         if let Some(commander) = commander_lock.as_ref() {
             let cmd = P2PCommand::SendMessage {
                 peer_id: peer_id_str,
                 data: data_vec,
             };
-
             match commander.try_send(cmd) {
                 Ok(_) => 1,
                 Err(e) => {

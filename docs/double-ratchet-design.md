@@ -61,7 +61,7 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     per-conversation AD (blake3 over the sorted id pair) binds every
     frame to its pair.
   * *3c* — `src/ratchet/direct_message.rs`: the `DirectMessage`
-    (`QUBEE_DMS\x01`) wire frame carrying the optional PQXDH
+    (`QUBEE_DMS\x02`) wire frame carrying the optional PQXDH
     `InitialMessage`, the ratchet header, and the ciphertext. Unsigned
     (deniable); bounded decode on the unauth path.
   * *3d* — `src/ratchet/direct.rs` + four JNI symbols

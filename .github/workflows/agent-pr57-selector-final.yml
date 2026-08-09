@@ -1,0 +1,66 @@
+name: Agent PR57 selector final validation
+
+on:
+  push:
+    branches:
+      - agent/direct-retry-routing
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/direct-retry-routing
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Check JNI symbol contract
+        run: bash scripts/check_jni_contracts.sh
+
+      - name: Audit message/file bridge contract
+        run: bash scripts/audit_message_file_bridge.sh
+
+      - name: Typecheck JNI surface
+        run: cargo build --features _typecheck_jni
+
+      - name: Clippy all targets
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Compile Android debug Kotlin
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace
+
+      - name: Remove one-shot workflow
+        if: success()
+        run: rm -f .github/workflows/agent-pr57-selector-final.yml
+
+      - name: Commit cleanup
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "chore: remove final PR57 validation workflow"
+          git push origin HEAD:agent/direct-retry-routing

@@ -68,9 +68,9 @@ abstract class MessageDao {
     /// Outbound rows the offline-retry loop should re-publish: `SENT` or
     /// a network-send `FAILED` row that still carries durable wire bytes.
     /// Encrypt failures never have `wireBytes`, so they remain excluded.
-    /// Once an ack lands `applyAckTransactional` moves the row to DELIVERED and
-    /// the row to `DELIVERED` on first ack and `nextRetryAt` is
-    /// cleared then), carrying preserved `wireBytes`, with a retry
+    /// Once an ack lands `applyAckTransactional` moves the row to `DELIVERED`
+    /// and clears `nextRetryAt`; until then the preserved `wireBytes` remain
+    /// eligible for bounded retry.
     /// scheduled at-or-before `now`, and under the attempt budget.
     @Query(
         "SELECT * FROM messages " +

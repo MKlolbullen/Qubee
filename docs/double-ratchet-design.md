@@ -334,7 +334,9 @@ or three carefully-reviewed PRs.
 knows the recipient's authenticated libp2p `PeerId`, delivery uses
 `/qubee/direct/1`. If that route is not known yet, the exact same ratchet frame is
 published only to the recipient's rotating blinded direct-inbox topic — never to
-`qubee-global`. The sender's current `PeerId` is carried inside the ratchet-encrypted
-payload; after a successful decrypt the receiver binds that route to the
-channel-authenticated Qubee identity and subsequent replies can upgrade to the
-direct request/response transport.
+`qubee-global`. The recipient follows that inbox persistently; publishers subscribe
+only transiently for mesh formation + send, then drop it so prior senders cannot
+passively observe later inbox traffic. The sender's current `PeerId` is carried inside
+the ratchet-encrypted payload; after a successful decrypt the receiver binds that
+route to the channel-authenticated Qubee identity and subsequent replies can upgrade
+to the direct request/response transport.

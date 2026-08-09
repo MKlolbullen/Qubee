@@ -499,8 +499,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
 
 /// Send an outbound frame.
 ///
-/// Forward-secret QUBEE_DMS frames are never gossip-published: their v2
-/// envelope carries the intended Qubee IdentityId, which is resolved through
+/// Forward-secret QUBEE_DMS frames are never published on the global gossip
+/// topic: their v2 envelope carries the intended Qubee IdentityId, resolved through
 /// the authenticated IdentityId -> libp2p PeerId directory and delivered over
 /// `/qubee/direct/1`. Missing/invalid routes fail closed. The caller-provided
 /// `peer_id` remains a compatibility hint for non-DMS legacy traffic only.

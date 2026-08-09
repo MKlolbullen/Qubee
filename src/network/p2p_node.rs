@@ -134,8 +134,9 @@ pub enum P2PCommand {
     /// The identity id never appears in the topic string itself.
     FollowDirectInbox { identity_id_hex: String },
     /// Publish a route-less direct frame to one recipient's blinded inbox.
-    /// The node also follows the inbox so mesh formation can complete before
-    /// later exact-wire retries.
+    /// The publisher subscribes only transiently: enough for gossipsub mesh
+    /// formation + publish, then the topic is dropped unless it is this node's
+    /// own persistently-followed inbox.
     PublishDirectInbox {
         recipient_id_hex: String,
         data: Vec<u8>,
@@ -169,6 +170,13 @@ const DIRECT_INBOX_BLIND_DOMAIN: &[u8] = b"qubee-direct-inbox-blind-v1";
 /// epoch length: it only has to be fine-grained enough that a rotation
 /// is picked up promptly, and cheap enough to run forever.
 const TOPIC_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
+/// Gossipsub needs a local subscription + a few heartbeats before a newly
+/// joined topic has peers to publish to. Keep bootstrap subscriptions short-
+/// lived and retry locally a few times before handing recovery back to the
+/// durable message retry loop.
+const DIRECT_INBOX_PUBLISH_TICK: Duration = Duration::from_millis(100);
+const DIRECT_INBOX_MESH_WAIT: Duration = Duration::from_millis(350);
+const DIRECT_INBOX_MAX_LOCAL_ATTEMPTS: u8 = 3;
 
 /// Current topic epoch. Saturates rather than panicking if the system
 /// clock is before the Unix epoch.
@@ -442,6 +450,13 @@ struct QubeeBehaviour {
 
 // --- The P2P Node ---
 
+struct PendingDirectInboxPublish {
+    topic: String,
+    data: Vec<u8>,
+    ready_at: tokio::time::Instant,
+    attempts: u8,
+}
+
 pub struct P2PNode {
     swarm: Swarm<QubeeBehaviour>,
     command_receiver: mpsc::Receiver<P2PCommand>,
@@ -449,6 +464,7 @@ pub struct P2PNode {
     live_group_topics: HashSet<String>,
     followed_direct_inboxes: HashSet<String>,
     live_direct_inbox_topics: HashSet<String>,
+    pending_direct_inbox_publishes: Vec<PendingDirectInboxPublish>,
 }
 
 const GLOBAL_TOPIC: &str = "qubee-global";
@@ -582,6 +598,7 @@ impl P2PNode {
             live_group_topics: HashSet::new(),
             followed_direct_inboxes: HashSet::new(),
             live_direct_inbox_topics: HashSet::new(),
+            pending_direct_inbox_publishes: Vec::new(),
         })
     }
 
@@ -628,6 +645,55 @@ impl P2PNode {
         self.live_direct_inbox_topics = desired;
     }
 
+    /// Flush bootstrap publications after their short mesh-formation delay.
+    /// A publisher must never become a long-lived subscriber to someone
+    /// else's inbox: on success (or local retry exhaustion) remove the
+    /// temporary subscription unless the topic is also one of our own live
+    /// inbox-window topics.
+    fn flush_pending_direct_inbox_publishes(&mut self) {
+        let now = tokio::time::Instant::now();
+        let pending = std::mem::take(&mut self.pending_direct_inbox_publishes);
+        let mut keep = Vec::with_capacity(pending.len());
+
+        for mut item in pending {
+            if item.ready_at > now {
+                keep.push(item);
+                continue;
+            }
+
+            let topic = gossipsub::IdentTopic::new(item.topic.clone());
+            match self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic.clone(), item.data.clone())
+            {
+                Ok(_) => {
+                    if !self.live_direct_inbox_topics.contains(&item.topic) {
+                        self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+                    }
+                }
+                Err(e) => {
+                    item.attempts = item.attempts.saturating_add(1);
+                    if item.attempts < DIRECT_INBOX_MAX_LOCAL_ATTEMPTS {
+                        item.ready_at = now + DIRECT_INBOX_MESH_WAIT;
+                        keep.push(item);
+                    } else {
+                        eprintln!(
+                            "PublishDirectInbox {} exhausted local attempts: {e:?}",
+                            item.topic
+                        );
+                        if !self.live_direct_inbox_topics.contains(&item.topic) {
+                            self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.pending_direct_inbox_publishes = keep;
+    }
+
     /// Main event loop. Drives the swarm forward and translates
     /// behaviour events into [`NodeEvent`] messages for Kotlin.
     pub async fn run(mut self, event_sender: mpsc::Sender<NodeEvent>) {
@@ -638,12 +704,17 @@ impl P2PNode {
 
         let mut topic_resync = tokio::time::interval(TOPIC_RESYNC_INTERVAL);
         topic_resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut direct_inbox_publish_tick = tokio::time::interval(DIRECT_INBOX_PUBLISH_TICK);
+        direct_inbox_publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 _ = topic_resync.tick() => {
                     self.resync_group_topics();
                     self.resync_direct_inbox_topics();
+                }
+                _ = direct_inbox_publish_tick.tick() => {
+                    self.flush_pending_direct_inbox_publishes();
                 }
                 command = self.command_receiver.recv() => match command {
                     Some(P2PCommand::SendMessage { peer_id: _, data }) => {
@@ -714,17 +785,20 @@ impl P2PNode {
                         }
                     }
                     Some(P2PCommand::PublishDirectInbox { recipient_id_hex, data }) => {
-                        if self.followed_direct_inboxes.insert(recipient_id_hex.clone()) {
-                            self.resync_direct_inbox_topics();
-                        }
-                        let topic = gossipsub::IdentTopic::new(direct_inbox_topic(&recipient_id_hex));
-                        if let Err(e) = self
-                            .swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .publish(topic.clone(), data)
-                        {
-                            eprintln!("PublishDirectInbox {topic} error: {e:?}");
+                        let topic_name = direct_inbox_topic(&recipient_id_hex);
+                        let topic = gossipsub::IdentTopic::new(topic_name.clone());
+                        match self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                            Ok(_) => {
+                                self.pending_direct_inbox_publishes.push(PendingDirectInboxPublish {
+                                    topic: topic_name,
+                                    data,
+                                    ready_at: tokio::time::Instant::now() + DIRECT_INBOX_MESH_WAIT,
+                                    attempts: 0,
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("PublishDirectInbox temporary subscribe {topic} failed: {e:?}");
+                            }
                         }
                     }
                     Some(P2PCommand::PublishToTopic { topic, data }) => {

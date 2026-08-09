@@ -99,26 +99,25 @@ async fn assert_payload_not_received(node: &mut TestNode, payload: &[u8], total:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blinded_direct_inbox_reaches_only_the_subscribed_recipient() {
+async fn blinded_direct_inbox_reaches_only_the_recipient_and_publishers_leave() {
     let mut alice = spawn_test_node("alice").await;
     let mut bob = spawn_test_node("bob").await;
     let mut carol = spawn_test_node("carol").await;
 
-    // Bob and Carol are both connected to Alice. Carol is deliberately not
-    // subscribed to Bob's inbox, so simple network adjacency must not be enough
-    // to expose Bob's route-less direct frame.
+    // Both potential senders connect directly to Bob. Only Bob follows Bob's
+    // inbox persistently; publishers must not remain subscribed after use.
     send_cmd(
-        &bob,
+        &alice,
         P2PCommand::Dial {
-            multiaddr: alice.listen_addr.clone(),
+            multiaddr: bob.listen_addr.clone(),
         },
-        "bob",
+        "alice",
     )
     .await;
     send_cmd(
         &carol,
         P2PCommand::Dial {
-            multiaddr: alice.listen_addr.clone(),
+            multiaddr: bob.listen_addr.clone(),
         },
         "carol",
     )
@@ -127,19 +126,6 @@ async fn blinded_direct_inbox_reaches_only_the_subscribed_recipient() {
     let bob_identity =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
     let expected_topic = direct_inbox_topic(&bob_identity);
-
-    // Pre-follow on sender + recipient so the gossipsub mesh exists before the
-    // first publish. Production PublishDirectInbox also follows automatically;
-    // if that first enqueue beats mesh formation, the durable retry sends the
-    // exact same wire again after the mesh has converged.
-    send_cmd(
-        &alice,
-        P2PCommand::FollowDirectInbox {
-            identity_id_hex: bob_identity.clone(),
-        },
-        "alice",
-    )
-    .await;
     send_cmd(
         &bob,
         P2PCommand::FollowDirectInbox {
@@ -149,16 +135,15 @@ async fn blinded_direct_inbox_reaches_only_the_subscribed_recipient() {
     )
     .await;
 
-    // Test config uses a 100 ms gossipsub heartbeat. Several cycles makes the
-    // test deterministic without depending on implementation timing.
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
 
-    let payload = b"opaque-qdm-bootstrap-frame".to_vec();
+    // Alice bootstraps a route-less frame without persistently following Bob.
+    let first = b"opaque-qdm-bootstrap-from-alice".to_vec();
     send_cmd(
         &alice,
         P2PCommand::PublishDirectInbox {
-            recipient_id_hex: bob_identity,
-            data: payload.clone(),
+            recipient_id_hex: bob_identity.clone(),
+            data: first.clone(),
         },
         "alice",
     )
@@ -168,25 +153,48 @@ async fn blinded_direct_inbox_reaches_only_the_subscribed_recipient() {
         matches!(
             event,
             NodeEvent::MessageReceived { topic, data, .. }
-                if topic == &expected_topic && data == &payload
+                if topic == &expected_topic && data == &first
         )
     })
     .await;
-
-    let NodeEvent::MessageReceived {
-        sender,
-        topic,
-        data,
-    } = event
-    else {
+    let NodeEvent::MessageReceived { sender, .. } = event else {
         unreachable!("predicate guarantees MessageReceived")
     };
     assert!(
         sender.is_empty(),
         "direct inbox must preserve anonymous gossip authorship"
     );
-    assert_eq!(topic, expected_topic);
-    assert_eq!(data, payload);
 
-    assert_payload_not_received(&mut carol, &payload, Duration::from_millis(800)).await;
+    // Carol was connected to Bob but not subscribed, so Alice's inbox frame
+    // must not be application-delivered to Carol.
+    assert_payload_not_received(&mut carol, &first, Duration::from_millis(700)).await;
+
+    // Alice's temporary publish subscription should now be gone. Let Carol
+    // publish a second frame to Bob; Bob gets it, but Alice must not become a
+    // passive observer merely because she used Bob's inbox earlier.
+    let second = b"opaque-qdm-bootstrap-from-carol".to_vec();
+    send_cmd(
+        &carol,
+        P2PCommand::PublishDirectInbox {
+            recipient_id_hex: bob_identity,
+            data: second.clone(),
+        },
+        "carol",
+    )
+    .await;
+
+    let second_event = next_matching(&mut bob, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            NodeEvent::MessageReceived { topic, data, .. }
+                if topic == &expected_topic && data == &second
+        )
+    })
+    .await;
+    let NodeEvent::MessageReceived { sender, .. } = second_event else {
+        unreachable!("predicate guarantees MessageReceived")
+    };
+    assert!(sender.is_empty());
+
+    assert_payload_not_received(&mut alice, &second, Duration::from_millis(900)).await;
 }

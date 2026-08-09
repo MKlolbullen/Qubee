@@ -65,14 +65,16 @@ abstract class MessageDao {
     @Query("SELECT * FROM messages WHERE wireId = :wireId LIMIT 1")
     abstract suspend fun getMessageByWireId(wireId: String): Message?
 
-    /// Outbound rows the offline-retry loop should re-publish: still
-    /// `SENT` (no ack yet — the `applyAckTransactional` path moves
+    /// Outbound rows the offline-retry loop should re-publish: `SENT` or
+    /// a network-send `FAILED` row that still carries durable wire bytes.
+    /// Encrypt failures never have `wireBytes`, so they remain excluded.
+    /// Once an ack lands `applyAckTransactional` moves the row to DELIVERED and
     /// the row to `DELIVERED` on first ack and `nextRetryAt` is
     /// cleared then), carrying preserved `wireBytes`, with a retry
     /// scheduled at-or-before `now`, and under the attempt budget.
     @Query(
         "SELECT * FROM messages " +
-            "WHERE isFromMe = 1 AND status = 'SENT' " +
+            "WHERE isFromMe = 1 AND status IN ('SENT', 'FAILED') " +
             "AND wireBytes IS NOT NULL " +
             "AND nextRetryAt IS NOT NULL AND nextRetryAt <= :now " +
             "AND retryAttempt < :maxAttempts " +

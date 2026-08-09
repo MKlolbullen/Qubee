@@ -130,6 +130,16 @@ pub enum P2PCommand {
     SubscribeGroup { group_id_hex: String },
     /// Stop following a group and drop its whole topic window.
     UnsubscribeGroup { group_id_hex: String },
+    /// Follow this identity's rotating blinded direct-inbox window.
+    /// The identity id never appears in the topic string itself.
+    FollowDirectInbox { identity_id_hex: String },
+    /// Publish a route-less direct frame to one recipient's blinded inbox.
+    /// The node also follows the inbox so mesh formation can complete before
+    /// later exact-wire retries.
+    PublishDirectInbox {
+        recipient_id_hex: String,
+        data: Vec<u8>,
+    },
     /// Publish bytes on a named gossipsub topic. The local node must be
     /// subscribed for the publish to actually go out — gossipsub
     /// silently drops publishes on topics with no local subscription.
@@ -153,6 +163,7 @@ pub const TOPIC_EPOCH_SECS: u64 = 86_400;
 pub const TOPIC_EPOCH_SKEW: u64 = 1;
 
 const TOPIC_BLIND_DOMAIN: &[u8] = b"qubee-group-topic-blind-v1";
+const DIRECT_INBOX_BLIND_DOMAIN: &[u8] = b"qubee-direct-inbox-blind-v1";
 
 /// How often the node re-derives its topic window. Independent of the
 /// epoch length: it only has to be fine-grained enough that a rotation
@@ -199,6 +210,33 @@ pub fn group_topic_window(group_id_hex: &str) -> Vec<String> {
     let now = topic_epoch_now();
     (now.saturating_sub(TOPIC_EPOCH_SKEW)..=now.saturating_add(TOPIC_EPOCH_SKEW))
         .map(|epoch| group_topic_for_epoch(group_id_hex, epoch))
+        .collect()
+}
+
+/// Rotating inbox for a Qubee identity. The 32-byte identity is already a
+/// high-entropy public identifier; hashing it with a domain + epoch prevents
+/// the raw id becoming a stable topic label. Parties that know the identity
+/// can derive the inbox, while unrelated subscribers cannot enumerate it from
+/// the topic string alone.
+pub fn direct_inbox_topic_for_epoch(identity_id_hex: &str, epoch: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DIRECT_INBOX_BLIND_DOMAIN);
+    hasher.update(identity_id_hex.as_bytes());
+    hasher.update(&epoch.to_be_bytes());
+    format!(
+        "qubee-d-{}",
+        hex::encode(&hasher.finalize().as_bytes()[..16])
+    )
+}
+
+pub fn direct_inbox_topic(identity_id_hex: &str) -> String {
+    direct_inbox_topic_for_epoch(identity_id_hex, topic_epoch_now())
+}
+
+pub fn direct_inbox_topic_window(identity_id_hex: &str) -> Vec<String> {
+    let now = topic_epoch_now();
+    (now.saturating_sub(TOPIC_EPOCH_SKEW)..=now.saturating_add(TOPIC_EPOCH_SKEW))
+        .map(|epoch| direct_inbox_topic_for_epoch(identity_id_hex, epoch))
         .collect()
 }
 
@@ -409,6 +447,8 @@ pub struct P2PNode {
     command_receiver: mpsc::Receiver<P2PCommand>,
     followed_groups: HashSet<String>,
     live_group_topics: HashSet<String>,
+    followed_direct_inboxes: HashSet<String>,
+    live_direct_inbox_topics: HashSet<String>,
 }
 
 const GLOBAL_TOPIC: &str = "qubee-global";
@@ -540,6 +580,8 @@ impl P2PNode {
             command_receiver,
             followed_groups: HashSet::new(),
             live_group_topics: HashSet::new(),
+            followed_direct_inboxes: HashSet::new(),
+            live_direct_inbox_topics: HashSet::new(),
         })
     }
 
@@ -566,6 +608,26 @@ impl P2PNode {
         self.live_group_topics = desired;
     }
 
+    fn resync_direct_inbox_topics(&mut self) {
+        let desired: HashSet<String> = self
+            .followed_direct_inboxes
+            .iter()
+            .flat_map(|id| direct_inbox_topic_window(id))
+            .collect();
+
+        for topic in desired.difference(&self.live_direct_inbox_topics) {
+            let ident = gossipsub::IdentTopic::new(topic.clone());
+            if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&ident) {
+                eprintln!("Direct-inbox subscribe error for {topic}: {e:?}");
+            }
+        }
+        for topic in self.live_direct_inbox_topics.difference(&desired) {
+            let ident = gossipsub::IdentTopic::new(topic.clone());
+            self.swarm.behaviour_mut().gossipsub.unsubscribe(&ident);
+        }
+        self.live_direct_inbox_topics = desired;
+    }
+
     /// Main event loop. Drives the swarm forward and translates
     /// behaviour events into [`NodeEvent`] messages for Kotlin.
     pub async fn run(mut self, event_sender: mpsc::Sender<NodeEvent>) {
@@ -581,6 +643,7 @@ impl P2PNode {
             tokio::select! {
                 _ = topic_resync.tick() => {
                     self.resync_group_topics();
+                    self.resync_direct_inbox_topics();
                 }
                 command = self.command_receiver.recv() => match command {
                     Some(P2PCommand::SendMessage { peer_id: _, data }) => {
@@ -643,6 +706,25 @@ impl P2PNode {
                     Some(P2PCommand::UnsubscribeGroup { group_id_hex }) => {
                         if self.followed_groups.remove(&group_id_hex) {
                             self.resync_group_topics();
+                        }
+                    }
+                    Some(P2PCommand::FollowDirectInbox { identity_id_hex }) => {
+                        if self.followed_direct_inboxes.insert(identity_id_hex) {
+                            self.resync_direct_inbox_topics();
+                        }
+                    }
+                    Some(P2PCommand::PublishDirectInbox { recipient_id_hex, data }) => {
+                        if self.followed_direct_inboxes.insert(recipient_id_hex.clone()) {
+                            self.resync_direct_inbox_topics();
+                        }
+                        let topic = gossipsub::IdentTopic::new(direct_inbox_topic(&recipient_id_hex));
+                        if let Err(e) = self
+                            .swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(topic.clone(), data)
+                        {
+                            eprintln!("PublishDirectInbox {topic} error: {e:?}");
                         }
                     }
                     Some(P2PCommand::PublishToTopic { topic, data }) => {
@@ -847,6 +929,22 @@ mod tests {
                 assert!(!topic.contains(frag), "leaked {frag} in {topic}");
             }
         }
+    }
+
+    #[test]
+    fn direct_inbox_topic_hides_identity_and_rotates() {
+        let identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let t1 = direct_inbox_topic_for_epoch(identity, 42);
+        let t2 = direct_inbox_topic_for_epoch(identity, 42);
+        let t3 = direct_inbox_topic_for_epoch(identity, 43);
+        assert_eq!(t1, t2);
+        assert_ne!(t1, t3);
+        assert!(!t1.contains(identity));
+        for window in identity.as_bytes().windows(8) {
+            let frag = std::str::from_utf8(window).unwrap();
+            assert!(!t1.contains(frag), "leaked {frag} in {t1}");
+        }
+        assert!(direct_inbox_topic_window(identity).contains(&direct_inbox_topic(identity)));
     }
 
     #[test]

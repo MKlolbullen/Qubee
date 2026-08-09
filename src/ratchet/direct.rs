@@ -293,6 +293,10 @@ pub fn reset_direct_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Resul
 
 pub const PAYLOAD_TAG_TEXT: u8 = 0x01;
 pub const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
+/// Version of the tagged payload envelope *inside* the ratchet ciphertext.
+/// v1 adds an optional sender libp2p PeerId hint before the payload tag.
+pub const DIRECT_PAYLOAD_ENVELOPE_VERSION: u8 = 0x01;
+const DIRECT_ROUTE_HINT_MAX_LEN: usize = 256;
 
 /// A decoded 1:1 plaintext.
 #[derive(Debug, PartialEq, Eq)]
@@ -306,7 +310,7 @@ pub enum DirectPayload {
     SenderKeyDistribution(SenderKeyDistribution),
 }
 
-fn encode_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
+fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
     match payload {
         DirectPayload::Text(text) => {
             let mut out = Vec::with_capacity(1 + text.len());
@@ -324,7 +328,7 @@ fn encode_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
     }
 }
 
-fn decode_payload(bytes: &[u8]) -> Result<DirectPayload> {
+fn decode_tagged_payload(bytes: &[u8]) -> Result<DirectPayload> {
     let (tag, body) = bytes
         .split_first()
         .ok_or_else(|| anyhow!("empty direct payload"))?;
@@ -339,6 +343,56 @@ fn decode_payload(bytes: &[u8]) -> Result<DirectPayload> {
     }
 }
 
+/// Encode the direct plaintext envelope. The PeerId is encrypted by the
+/// Double Ratchet and therefore visible only to the intended recipient; it is
+/// not an unauthenticated transport hint. Once the ratchet AEAD opens, the
+/// receiver can bind this route to the channel-authenticated IdentityId.
+fn encode_payload_with_route(
+    payload: &DirectPayload,
+    sender_peer_id: Option<&str>,
+) -> Result<Vec<u8>> {
+    let route = sender_peer_id.unwrap_or("").as_bytes();
+    if route.len() > DIRECT_ROUTE_HINT_MAX_LEN || route.len() > u16::MAX as usize {
+        bail!("direct route hint too long");
+    }
+    let tagged = encode_tagged_payload(payload)?;
+    let mut out = Vec::with_capacity(3 + route.len() + tagged.len());
+    out.push(DIRECT_PAYLOAD_ENVELOPE_VERSION);
+    out.extend_from_slice(&(route.len() as u16).to_le_bytes());
+    out.extend_from_slice(route);
+    out.extend_from_slice(&tagged);
+    Ok(out)
+}
+
+fn decode_payload_with_route(bytes: &[u8]) -> Result<(Option<String>, DirectPayload)> {
+    if bytes.len() < 4 {
+        bail!("direct payload envelope too short");
+    }
+    if bytes[0] != DIRECT_PAYLOAD_ENVELOPE_VERSION {
+        bail!("unsupported direct payload envelope version {}", bytes[0]);
+    }
+    let route_len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+    if route_len > DIRECT_ROUTE_HINT_MAX_LEN {
+        bail!("direct route hint exceeds maximum");
+    }
+    let route_end = 3usize
+        .checked_add(route_len)
+        .ok_or_else(|| anyhow!("direct route length overflow"))?;
+    if route_end >= bytes.len() {
+        bail!("truncated direct route hint or missing payload tag");
+    }
+    let route = if route_len == 0 {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(&bytes[3..route_end])
+                .map_err(|e| anyhow!("direct route hint not UTF-8: {e}"))?
+                .to_string(),
+        )
+    };
+    Ok((route, decode_tagged_payload(&bytes[route_end..])?))
+}
+
 /// Encrypt a chat text for `peer_id` (tagged-payload flavour of
 /// [`encrypt_direct`] — what the JNI send path uses).
 pub fn encrypt_direct_text(
@@ -348,7 +402,23 @@ pub fn encrypt_direct_text(
     text: &str,
     now: u64,
 ) -> Result<Vec<u8>> {
-    let payload = encode_payload(&DirectPayload::Text(text.to_string()))?;
+    encrypt_direct_text_with_route(ks, local_id, peer_id, text, None, now)
+}
+
+/// Live-send flavour that carries this node's current libp2p PeerId *inside*
+/// the ratchet ciphertext. A route-less first message can arrive through the
+/// blinded direct inbox; after decrypt the recipient can upgrade replies to
+/// `/qubee/direct/1` without a globally visible IdentityId↔PeerId binding.
+pub fn encrypt_direct_text_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    text: &str,
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload =
+        encode_payload_with_route(&DirectPayload::Text(text.to_string()), sender_peer_id)?;
     encrypt_direct(ks, local_id, peer_id, &payload, now)
 }
 
@@ -361,7 +431,21 @@ pub fn encrypt_direct_distribution(
     dist: &SenderKeyDistribution,
     now: u64,
 ) -> Result<Vec<u8>> {
-    let payload = encode_payload(&DirectPayload::SenderKeyDistribution(dist.clone()))?;
+    encrypt_direct_distribution_with_route(ks, local_id, peer_id, dist, None, now)
+}
+
+pub fn encrypt_direct_distribution_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    dist: &SenderKeyDistribution,
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload = encode_payload_with_route(
+        &DirectPayload::SenderKeyDistribution(dist.clone()),
+        sender_peer_id,
+    )?;
     encrypt_direct(ks, local_id, peer_id, &payload, now)
 }
 
@@ -373,8 +457,19 @@ pub fn decrypt_direct_payload(
     wire: &[u8],
     now: u64,
 ) -> Result<(IdentityId, DirectPayload)> {
+    let (sender, _route, payload) = decrypt_direct_payload_with_route(ks, local_id, wire, now)?;
+    Ok((sender, payload))
+}
+
+pub fn decrypt_direct_payload_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    wire: &[u8],
+    now: u64,
+) -> Result<(IdentityId, Option<String>, DirectPayload)> {
     let (sender, plaintext) = decrypt_direct(ks, local_id, wire, now)?;
-    Ok((sender, decode_payload(&plaintext)?))
+    let (route, payload) = decode_payload_with_route(&plaintext)?;
+    Ok((sender, route, payload))
 }
 
 #[cfg(test)]
@@ -446,6 +541,30 @@ mod tests {
             let w = encrypt_direct(&mut a.ks, aid, bid, &[i], 12).unwrap();
             assert_eq!(decrypt_direct(&mut b.ks, bid, &w, 12).unwrap().1, [i]);
         }
+    }
+
+    #[test]
+    fn encrypted_payload_binds_private_route_hint_to_authenticated_sender() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let wire = encrypt_direct_text_with_route(
+            &mut a.ks,
+            aid,
+            bid,
+            "hello via inbox",
+            Some("12D3KooWPrivateRoute"),
+            1,
+        )
+        .unwrap();
+        // The transport route must not be visible in the durable outer wire.
+        assert!(!wire
+            .windows(b"12D3KooWPrivateRoute".len())
+            .any(|w| w == b"12D3KooWPrivateRoute"));
+        let (sender, route, payload) =
+            decrypt_direct_payload_with_route(&mut b.ks, bid, &wire, 1).unwrap();
+        assert_eq!(sender, aid);
+        assert_eq!(route.as_deref(), Some("12D3KooWPrivateRoute"));
+        assert_eq!(payload, DirectPayload::Text("hello via inbox".to_string()));
     }
 
     #[test]
@@ -670,8 +789,8 @@ mod tests {
 
     #[test]
     fn unknown_and_empty_payload_tags_are_rejected() {
-        assert!(decode_payload(&[]).is_err());
-        assert!(decode_payload(&[0x7F, 1, 2, 3]).is_err());
+        assert!(decode_payload_with_route(&[]).is_err());
+        assert!(decode_payload_with_route(&[0x7F, 1, 2, 3]).is_err());
     }
 
     #[test]

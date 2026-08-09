@@ -326,3 +326,15 @@ These are the standard ways that DR implementations have shipped
 CVEs over the past decade. The safe move is to write the protocol
 down, prove out the prekey infrastructure, then implement in two
 or three carefully-reviewed PRs.
+
+
+### Route bootstrap
+
+`QUBEE_DMS\x02` is recipient-bound in the durable outer frame. When Rust already
+knows the recipient's authenticated libp2p `PeerId`, delivery uses
+`/qubee/direct/1`. If that route is not known yet, the exact same ratchet frame is
+published only to the recipient's rotating blinded direct-inbox topic — never to
+`qubee-global`. The sender's current `PeerId` is carried inside the ratchet-encrypted
+payload; after a successful decrypt the receiver binds that route to the
+channel-authenticated Qubee identity and subsequent replies can upgrade to the
+direct request/response transport.

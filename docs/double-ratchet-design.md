@@ -330,11 +330,14 @@ or three carefully-reviewed PRs.
 
 ### Route bootstrap
 
-`QUBEE_DMS\x02` is recipient-bound in the durable outer frame. When Rust already
-knows the recipient's authenticated libp2p `PeerId`, delivery uses
-`/qubee/direct/1`. If that route is not known yet, the exact same ratchet frame is
-published only to the recipient's rotating blinded direct-inbox topic — never to
-`qubee-global`. The recipient follows that inbox persistently; publishers subscribe
+`QUBEE_DMS\x02` is endpoint-bound without placing either raw Qubee IdentityId in
+the outer frame. A fresh 16-byte route nonce derives independent 16-byte sender and
+recipient selectors; Rust resolves selectors only against its signature-verified peer
+prekey cache, and the local recipient validates its own selector before ratchet state
+is touched. When Rust already knows the recipient's authenticated libp2p `PeerId`,
+delivery uses `/qubee/direct/1`. If that route is not known yet, the exact same ratchet
+frame is published only to the recipient's rotating blinded direct-inbox topic — never
+to `qubee-global`. The recipient follows that inbox persistently; publishers subscribe
 only transiently for mesh formation + send, then drop it so prior senders cannot
 passively observe later inbox traffic. The sender's current `PeerId` is carried inside
 the ratchet-encrypted payload; after a successful decrypt the receiver binds that

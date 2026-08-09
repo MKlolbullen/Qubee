@@ -64,6 +64,9 @@ class MessageService : Service(), NetworkCallback {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
+        /// "QUBEE_DMS\x02" — current PQXDH + Double Ratchet frame magic.
+        private val DIRECT_V2_MAGIC: ByteArray =
+            "QUBEE_DMS".toByteArray(Charsets.US_ASCII) + byteArrayOf(0x02)
         /// "QUBEE_GMS\x03" — the Stage 4 sender-keys group frame magic.
         /// Kept in sync with MAGIC_GROUP_MESSAGE_V3 in
         /// src/ratchet/sender_keys.rs (pinned in wire_stability).
@@ -543,8 +546,10 @@ class MessageService : Service(), NetworkCallback {
      * misleading failure would surface.
      */
     private suspend fun handleRatchetFrame(peerId: String, data: ByteArray): Boolean {
-        // 1:1 PQXDH + Double Ratchet frame (QUBEE_DMS).
-        if (qubeeManager.inspectDirectMessageSender(data) != null) {
+        // 1:1 PQXDH + Double Ratchet frame (QUBEE_DMS). Detect by magic,
+        // not by sender resolution: an unknown/tampered selector is still a
+        // direct frame and must fail closed here rather than reach legacy decrypt.
+        if (isDirectV2Frame(data)) {
             val resultJson = qubeeManager.decryptDirectMessage(data)
             if (resultJson == null) {
                 Timber.w("Ratchet 1:1 decrypt failed from %s", peerId)
@@ -638,6 +643,14 @@ class MessageService : Service(), NetworkCallback {
         }
 
         return false
+    }
+
+    private fun isDirectV2Frame(data: ByteArray): Boolean {
+        if (data.size < DIRECT_V2_MAGIC.size) return false
+        for (i in DIRECT_V2_MAGIC.indices) {
+            if (data[i] != DIRECT_V2_MAGIC[i]) return false
+        }
+        return true
     }
 
     private fun isGroupV3Frame(data: ByteArray): Boolean {

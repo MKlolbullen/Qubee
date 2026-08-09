@@ -138,16 +138,19 @@ async fn blinded_direct_inbox_reaches_only_the_recipient_and_publishers_leave() 
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     // Alice bootstraps a route-less frame without persistently following Bob.
-    let first = b"opaque-qdm-bootstrap-from-alice".to_vec();
-    send_cmd(
-        &alice,
-        P2PCommand::PublishDirectInbox {
-            recipient_id_hex: bob_identity.clone(),
-            data: first.clone(),
-        },
-        "alice",
-    )
-    .await;
+    let first = b"opaque-qdm-bootstrap-from-alice-1".to_vec();
+    let first_b = b"opaque-qdm-bootstrap-from-alice-2".to_vec();
+    for payload in [&first, &first_b] {
+        send_cmd(
+            &alice,
+            P2PCommand::PublishDirectInbox {
+                recipient_id_hex: bob_identity.clone(),
+                data: payload.clone(),
+            },
+            "alice",
+        )
+        .await;
+    }
 
     let event = next_matching(&mut bob, Duration::from_secs(5), |event| {
         matches!(
@@ -167,7 +170,21 @@ async fn blinded_direct_inbox_reaches_only_the_recipient_and_publishers_leave() 
 
     // Carol was connected to Bob but not subscribed, so Alice's inbox frame
     // must not be application-delivered to Carol.
+    let second_alice = next_matching(&mut bob, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            NodeEvent::MessageReceived { topic, data, .. }
+                if topic == &expected_topic && data == &first_b
+        )
+    })
+    .await;
+    let NodeEvent::MessageReceived { sender, .. } = second_alice else {
+        unreachable!("predicate guarantees MessageReceived")
+    };
+    assert!(sender.is_empty());
+
     assert_payload_not_received(&mut carol, &first, Duration::from_millis(700)).await;
+    assert_payload_not_received(&mut carol, &first_b, Duration::from_millis(250)).await;
 
     // Alice's temporary publish subscription should now be gone. Let Carol
     // publish a second frame to Bob; Bob gets it, but Alice must not become a

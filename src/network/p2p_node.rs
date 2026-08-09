@@ -654,6 +654,7 @@ impl P2PNode {
         let now = tokio::time::Instant::now();
         let pending = std::mem::take(&mut self.pending_direct_inbox_publishes);
         let mut keep = Vec::with_capacity(pending.len());
+        let mut cleanup_topics: HashSet<String> = HashSet::new();
 
         for mut item in pending {
             if item.ready_at > now {
@@ -669,9 +670,7 @@ impl P2PNode {
                 .publish(topic.clone(), item.data.clone())
             {
                 Ok(_) => {
-                    if !self.live_direct_inbox_topics.contains(&item.topic) {
-                        self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
-                    }
+                    cleanup_topics.insert(item.topic);
                 }
                 Err(e) => {
                     item.attempts = item.attempts.saturating_add(1);
@@ -683,12 +682,22 @@ impl P2PNode {
                             "PublishDirectInbox {} exhausted local attempts: {e:?}",
                             item.topic
                         );
-                        if !self.live_direct_inbox_topics.contains(&item.topic) {
-                            self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
-                        }
+                        cleanup_topics.insert(item.topic);
                     }
                 }
             }
+        }
+
+        let still_pending_topics: HashSet<&str> =
+            keep.iter().map(|item| item.topic.as_str()).collect();
+        for topic_name in cleanup_topics {
+            if self.live_direct_inbox_topics.contains(&topic_name)
+                || still_pending_topics.contains(topic_name.as_str())
+            {
+                continue;
+            }
+            let topic = gossipsub::IdentTopic::new(topic_name);
+            self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
         }
 
         self.pending_direct_inbox_publishes = keep;

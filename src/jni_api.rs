@@ -34,10 +34,10 @@ use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload_with_route, encrypt_direct_distribution_with_route,
-    encrypt_direct_text_with_route, inspect_direct_sender, install_peer_bundle,
-    reset_direct_session, DirectPayload,
+    encrypt_direct_text_with_route, inspect_direct_recipient, inspect_direct_sender,
+    install_peer_bundle, reset_direct_session, DirectPayload,
 };
-use crate::ratchet::direct_message::{inspect_direct_recipient, is_direct_message_frame};
+use crate::ratchet::direct_message::is_direct_message_frame;
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
@@ -500,8 +500,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
 /// Send an outbound frame.
 ///
 /// Forward-secret QUBEE_DMS frames are never published on the global gossip
-/// topic: their v2 envelope carries the intended Qubee IdentityId, resolved through
-/// the authenticated IdentityId -> libp2p PeerId directory and delivered over
+/// topic: their v2 envelope carries only per-message opaque endpoint selectors.
+/// Rust resolves the recipient selector against its signature-verified peer cache,
+/// then uses the authenticated IdentityId -> libp2p PeerId directory and delivers over
 /// `/qubee/direct/1`. Missing/invalid routes fail closed. The caller-provided
 /// `peer_id` remains a compatibility hint for non-DMS legacy traffic only.
 #[no_mangle]
@@ -521,11 +522,23 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
         // does not parse cleanly, or its authenticated identity has no known
         // transport route, leave it queued for retry instead of broadcasting.
         if is_direct_message_frame(&data_vec) {
-            let recipient = match inspect_direct_recipient(&data_vec) {
-                Some(id) => id,
-                None => {
-                    tracing::warn!("malformed QUBEE_DMS frame; refusing gossip fallback");
-                    return 0;
+            let recipient = {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = match ks_guard.as_mut() {
+                    Some(ks) => ks,
+                    None => {
+                        tracing::warn!("QUBEE_DMS routing attempted before keystore init");
+                        return 0;
+                    }
+                };
+                match inspect_direct_recipient(ks, &data_vec) {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(
+                            "malformed/unresolvable QUBEE_DMS route; refusing global gossip fallback"
+                        );
+                        return 0;
+                    }
                 }
             };
             let recipient_hex = hex::encode(recipient.as_ref());
@@ -3021,10 +3034,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
     })
 }
 
-/// Cheap dispatcher probe: if `wire` is a `QUBEE_DMS\x01` frame, return
-/// the claimed sender's identity id as a 64-char hex string without
-/// touching session state; `null` otherwise. The claim is only
-/// authenticated once `nativeDecryptDirectMessage` succeeds.
+/// Diagnostic sender probe for a syntactically valid `QUBEE_DMS\x02` frame.
+/// The outer wire contains only an opaque selector, so resolution is limited
+/// to identities with signature-verified prekey bundles in the Rust keystore.
+/// The resolved identity is still only authenticated once decrypt succeeds.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspectDirectMessageSender(
     env: JNIEnv,
@@ -3036,8 +3049,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
             let wire_bytes = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
-            let sender = inspect_direct_sender(&wire_bytes)
-                .ok_or_else(|| anyhow::anyhow!("not a direct message frame"))?;
+            let sender = {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                inspect_direct_sender(ks, &wire_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("unresolvable direct sender selector"))?
+            };
             let java_str = env
                 .new_string(hex::encode(sender.as_ref() as &[u8]))
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;

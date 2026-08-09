@@ -16,8 +16,9 @@ use qubee_crypto::groups::group_handshake::{
 use qubee_crypto::groups::group_invite::InvitePayload;
 use qubee_crypto::groups::group_manager::GroupId;
 use qubee_crypto::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
-use qubee_crypto::ratchet::direct::inspect_direct_sender;
-use qubee_crypto::ratchet::direct_message::DirectMessage;
+use qubee_crypto::ratchet::direct_message::{
+    direct_identity_selector, inspect_direct_selectors, DirectMessage,
+};
 use qubee_crypto::ratchet::double_ratchet::MessageHeader;
 use qubee_crypto::ratchet::sender_keys::extract_v3_message_id;
 
@@ -36,9 +37,13 @@ fn valid_request_join_wire() -> Vec<u8> {
 }
 
 fn valid_direct_message_wire() -> Vec<u8> {
+    let sender = IdentityId::from([3u8; 32]);
+    let recipient = IdentityId::from([4u8; 32]);
+    let route_nonce = [5u8; 16];
     DirectMessage {
-        sender_id: IdentityId::from([3u8; 32]),
-        recipient_id: IdentityId::from([4u8; 32]),
+        route_nonce,
+        sender_selector: direct_identity_selector(&sender, &route_nonce),
+        recipient_selector: direct_identity_selector(&recipient, &route_nonce),
         initial: None,
         header: MessageHeader {
             dh: [8u8; 32],
@@ -62,7 +67,7 @@ proptest! {
     ) {
         let _ = GroupHandshake::from_wire(&bytes);
         let _ = DirectMessage::from_wire(&bytes);
-        let _ = inspect_direct_sender(&bytes);
+        let _ = inspect_direct_selectors(&bytes);
         let _ = IdentityKey::from_bytes(&bytes);
         let _ = extract_v3_message_id(&[0u8; 32], &bytes);
     }
@@ -102,7 +107,7 @@ fn truncated_valid_frames_are_rejected_and_never_panic() {
             "truncated handshake prefix (len {n}) was accepted",
         );
         let _ = DirectMessage::from_wire(prefix);
-        let _ = inspect_direct_sender(prefix);
+        let _ = inspect_direct_selectors(prefix);
         let _ = IdentityKey::from_bytes(prefix);
     }
 

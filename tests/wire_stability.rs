@@ -37,19 +37,23 @@ fn handshake_magic_is_pinned() {
 #[test]
 fn direct_message_magic_is_pinned() {
     use qubee_crypto::ratchet::direct_message::MAGIC_DIRECT_MESSAGE;
-    // `\x02` adds the intended recipient IdentityId to the durable frame,
-    // allowing Rust to route initial sends and exact-wire retries through
-    // `/qubee/direct/1` without trusting Kotlin sender/contact fields.
+    // `\x02` adds the opaque endpoint-selector routing envelope. Rust can
+    // recover initial-send/retry destinations from verified peer state without
+    // exposing either raw Qubee IdentityId on bootstrap gossip.
     assert_eq!(MAGIC_DIRECT_MESSAGE, b"QUBEE_DMS\x02");
 }
 
 #[test]
 fn direct_message_round_trips_through_wire() {
-    use qubee_crypto::ratchet::direct_message::DirectMessage;
+    use qubee_crypto::ratchet::direct_message::{direct_identity_selector, DirectMessage};
     use qubee_crypto::ratchet::double_ratchet::MessageHeader;
+    let sender = IdentityId::from([3u8; 32]);
+    let recipient = IdentityId::from([4u8; 32]);
+    let route_nonce = [5u8; 16];
     let dm = DirectMessage {
-        sender_id: IdentityId::from([3u8; 32]),
-        recipient_id: IdentityId::from([4u8; 32]),
+        route_nonce,
+        sender_selector: direct_identity_selector(&sender, &route_nonce),
+        recipient_selector: direct_identity_selector(&recipient, &route_nonce),
         initial: None,
         header: MessageHeader {
             dh: [8u8; 32],
@@ -61,6 +65,8 @@ fn direct_message_round_trips_through_wire() {
     let wire = dm.to_wire().unwrap();
     assert!(wire.starts_with(b"QUBEE_DMS\x02"));
     assert_eq!(DirectMessage::from_wire(&wire).unwrap(), dm);
+    assert!(!wire.windows(32).any(|w| w == sender.as_ref()));
+    assert!(!wire.windows(32).any(|w| w == recipient.as_ref()));
 }
 
 #[test]

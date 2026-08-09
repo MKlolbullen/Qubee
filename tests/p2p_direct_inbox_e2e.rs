@@ -181,7 +181,10 @@ async fn blinded_direct_inbox_reaches_only_the_subscribed_recipient() {
     else {
         unreachable!("predicate guarantees MessageReceived")
     };
-    assert!(sender.is_empty(), "direct inbox must preserve anonymous gossip authorship");
+    assert!(
+        sender.is_empty(),
+        "direct inbox must preserve anonymous gossip authorship"
+    );
     assert_eq!(topic, expected_topic);
     assert_eq!(data, payload);
 

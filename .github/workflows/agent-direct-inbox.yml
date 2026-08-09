@@ -22,6 +22,9 @@ jobs:
       - name: Apply direct-inbox patch
         run: python3 scripts/agent_direct_inbox.py
 
+      - name: Update payload-envelope negative tests
+        run: sed -i 's/decode_payload(/decode_payload_with_route(/g' src/ratchet/direct.rs
+
       - name: Format Rust
         run: cargo fmt --all
 

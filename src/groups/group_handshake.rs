@@ -198,7 +198,7 @@ pub struct JoinAcceptedBody {
     pub wrapped_group_key: WrappedGroupKey,
     /// Inviter's view of `group.version` at the moment the join lands.
     /// The joiner adopts this verbatim so subsequent generation-counter
-    /// gates (`decrypt_group_message`, `process_key_rotation`) line up
+    /// gates (`decrypt_group_message`, `process_key_delivery`) line up
     /// across the two devices. Without this the joiner starts at
     /// `version = 1` while the inviter is at N>1, and every
     /// post-join group message bounces on "generation mismatch".

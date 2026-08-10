@@ -33,9 +33,11 @@ use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
-    decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text,
-    inspect_direct_sender, install_peer_bundle, reset_direct_session, DirectPayload,
+    decrypt_direct_payload_with_route, encrypt_direct_distribution_with_route,
+    encrypt_direct_text_with_route, inspect_direct_recipient, inspect_direct_sender,
+    install_peer_bundle, reset_direct_session, DirectPayload,
 };
+use crate::ratchet::direct_message::is_direct_message_frame;
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
@@ -452,6 +454,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                         // restart doesn't drop us off the topic mesh.
                         resubscribe_known_groups();
 
+                        // Also follow this identity's rotating direct inbox.
+                        // This is the fail-closed bootstrap path for a contact
+                        // that knows our Qubee identity but not our PeerId yet.
+                        subscribe_local_direct_inbox();
+
                         // Now that the node's PeerId is known, stamp it
                         // onto our own membership in each group so it
                         // rides out in the roster snapshots we build.
@@ -490,7 +497,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
     })
 }
 
-/// Send a P2P message (Publish/Direct)
+/// Send an outbound frame.
+///
+/// Forward-secret QUBEE_DMS frames are never published on the global gossip
+/// topic: their v2 envelope carries only per-message opaque endpoint selectors.
+/// Rust resolves the recipient selector against its signature-verified peer cache,
+/// then uses the authenticated IdentityId -> libp2p PeerId directory and delivers over
+/// `/qubee/direct/1`. Missing/invalid routes fail closed. The caller-provided
+/// `peer_id` remains a compatibility hint for non-DMS legacy traffic only.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2PMessage(
     mut env: JNIEnv,
@@ -499,25 +513,66 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
     data: JByteArray,
 ) -> jboolean {
     catch_unwind_result(|| {
-        // Untrusted JNI input: never `.expect()` here. A malformed
-        // peer_id or byte array must fail closed (return 0), not panic.
-        let peer_id_str: String = match env.get_string(&peer_id) {
-            Ok(s) => s.into(),
-            Err(_) => return 0,
-        };
         let data_vec = match env.convert_byte_array(&data) {
             Ok(d) => d,
             Err(_) => return 0,
         };
 
-        let commander_lock = P2P_COMMANDER.lock().unwrap();
+        // A direct-magic frame must *never* fall through to gossipsub. If it
+        // does not parse cleanly, or its authenticated identity has no known
+        // transport route, leave it queued for retry instead of broadcasting.
+        if is_direct_message_frame(&data_vec) {
+            let recipient = {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = match ks_guard.as_mut() {
+                    Some(ks) => ks,
+                    None => {
+                        tracing::warn!("QUBEE_DMS routing attempted before keystore init");
+                        return 0;
+                    }
+                };
+                match inspect_direct_recipient(ks, &data_vec) {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(
+                            "malformed/unresolvable QUBEE_DMS route; refusing global gossip fallback"
+                        );
+                        return 0;
+                    }
+                }
+            };
+            let recipient_hex = hex::encode(recipient.as_ref());
+            if let Some(route) = resolve_peer_id(&recipient_hex) {
+                if send_direct(route, data_vec) {
+                    return 1;
+                }
+                tracing::debug!(recipient = %recipient_hex, "direct frame could not be enqueued; caller will retry same wire");
+                return 0;
+            }
 
+            // First-contact / route-lost bootstrap: publish only on the
+            // recipient's rotating blinded inbox, never on qubee-global. The
+            // frame is still end-to-end ratchet encrypted and recipient-bound.
+            if publish_direct_inbox(recipient_hex.clone(), data_vec) {
+                tracing::debug!(recipient = %recipient_hex, "queued direct frame on blinded recipient inbox");
+                return 1;
+            }
+            tracing::debug!(recipient = %recipient_hex, "direct recipient route/inbox unavailable; caller will retry same wire");
+            return 0;
+        }
+
+        // Legacy/non-direct compatibility path. This remains unchanged until
+        // the v0.2.0 cutover removes legacy emission.
+        let peer_id_str: String = match env.get_string(&peer_id) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let commander_lock = P2P_COMMANDER.lock().unwrap();
         if let Some(commander) = commander_lock.as_ref() {
             let cmd = P2PCommand::SendMessage {
                 peer_id: peer_id_str,
                 data: data_vec,
             };
-
             match commander.try_send(cmd) {
                 Ok(_) => 1,
                 Err(e) => {
@@ -1521,6 +1576,38 @@ fn subscribe_group(group_id_hex: String) -> bool {
     )
 }
 
+fn subscribe_local_direct_inbox() -> bool {
+    let identity = match active_identity() {
+        Ok(Some(id)) => id,
+        _ => return false,
+    };
+    let identity_id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return false,
+    };
+    matches!(
+        commander.try_send(P2PCommand::FollowDirectInbox { identity_id_hex }),
+        Ok(())
+    )
+}
+
+fn publish_direct_inbox(recipient_id_hex: String, data: Vec<u8>) -> bool {
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return false,
+    };
+    matches!(
+        commander.try_send(P2PCommand::PublishDirectInbox {
+            recipient_id_hex,
+            data,
+        }),
+        Ok(())
+    )
+}
+
 /// Publish bytes on a named gossipsub topic. The local node must be
 /// subscribed to the topic for the publish to actually go out — see
 /// `p2p_node.rs::P2PCommand::PublishToTopic`.
@@ -1617,6 +1704,27 @@ fn handle_inbound_handshake(frame: GroupHandshake, sender_peer_id: String) {
 /// StateSyncResponse) rather than broadcast a directed frame.
 fn resolve_peer_id(identity_hex: &str) -> Option<String> {
     PEER_DIRECTORY.lock().unwrap().get(identity_hex).cloned()
+}
+
+/// Install a PeerId that arrived *inside* a successfully decrypted direct
+/// ratchet payload. The AEAD/session already authenticated `sender`, so this
+/// binding is stronger than a gossip propagation source and does not expose
+/// the route to mailbox subscribers.
+fn install_authenticated_direct_route(sender: IdentityId, peer_id: &str) -> anyhow::Result<()> {
+    if peer_id.is_empty() {
+        return Ok(());
+    }
+    let parsed: libp2p::PeerId = peer_id
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid encrypted direct PeerId: {e}"))?;
+    let normalized = parsed.to_string();
+    let identity_hex = hex::encode(sender.as_ref() as &[u8]);
+    PEER_DIRECTORY
+        .lock()
+        .unwrap()
+        .insert(identity_hex.clone(), normalized.clone());
+    dispatch_peer_linked(normalized, identity_hex);
+    Ok(())
 }
 
 /// Ingest the in-band PeerIds carried by a roster snapshot into
@@ -2778,7 +2886,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
             let ks = ks_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-            let wire = encrypt_direct_text(ks, local_id, peer_id, &plaintext_str, now_secs())?;
+            let local_peer_id = LOCAL_PEER_ID.lock().unwrap().clone();
+            let wire = encrypt_direct_text_with_route(
+                ks,
+                local_id,
+                peer_id,
+                &plaintext_str,
+                local_peer_id.as_deref(),
+                now_secs(),
+            )?;
             let arr = env
                 .byte_array_from_slice(&wire)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
@@ -2825,7 +2941,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let dist = create_or_get_own_sender_key(ks, &group_id, local_id)?;
-            let wire = encrypt_direct_distribution(ks, local_id, peer_id, &dist, now_secs())?;
+            let local_peer_id = LOCAL_PEER_ID.lock().unwrap().clone();
+            let wire = encrypt_direct_distribution_with_route(
+                ks,
+                local_id,
+                peer_id,
+                &dist,
+                local_peer_id.as_deref(),
+                now_secs(),
+            )?;
             let arr = env
                 .byte_array_from_slice(&wire)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
@@ -2863,13 +2987,16 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
             let identity =
                 active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let local_id = identity.identity_id();
-            let (sender, payload) = {
+            let (sender, encrypted_route, payload) = {
                 let mut ks_guard = KEYSTORE.lock().unwrap();
                 let ks = ks_guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-                decrypt_direct_payload(ks, local_id, &wire_bytes, now_secs())?
+                decrypt_direct_payload_with_route(ks, local_id, &wire_bytes, now_secs())?
             };
+            if let Some(ref peer_id) = encrypted_route {
+                install_authenticated_direct_route(sender, peer_id)?;
+            }
             let sender_hex = hex::encode(sender.as_ref() as &[u8]);
             match payload {
                 DirectPayload::Text(text) => Ok(json!({
@@ -2907,10 +3034,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
     })
 }
 
-/// Cheap dispatcher probe: if `wire` is a `QUBEE_DMS\x01` frame, return
-/// the claimed sender's identity id as a 64-char hex string without
-/// touching session state; `null` otherwise. The claim is only
-/// authenticated once `nativeDecryptDirectMessage` succeeds.
+/// Diagnostic sender probe for a syntactically valid `QUBEE_DMS\x02` frame.
+/// The outer wire contains only an opaque selector, so resolution is limited
+/// to identities with signature-verified prekey bundles in the Rust keystore.
+/// The resolved identity is still only authenticated once decrypt succeeds.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspectDirectMessageSender(
     env: JNIEnv,
@@ -2922,8 +3049,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInspec
             let wire_bytes = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
-            let sender = inspect_direct_sender(&wire_bytes)
-                .ok_or_else(|| anyhow::anyhow!("not a direct message frame"))?;
+            let sender = {
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                inspect_direct_sender(ks, &wire_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("unresolvable direct sender selector"))?
+            };
             let java_str = env
                 .new_string(hex::encode(sender.as_ref() as &[u8]))
                 .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;

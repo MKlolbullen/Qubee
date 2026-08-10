@@ -29,8 +29,34 @@ use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyS
 /// Keystore id under which the local device's secret bundle is stored.
 const LOCAL_BUNDLE_KEY_ID: &str = "ratchet_local_prekey_bundle_v1";
 
+const PEER_BUNDLE_KEY_PREFIX: &str = "ratchet_peer_prekey_";
+
 fn peer_key_id(id: &IdentityId) -> String {
-    format!("ratchet_peer_prekey_{}", hex::encode(id.as_ref() as &[u8]))
+    format!(
+        "{PEER_BUNDLE_KEY_PREFIX}{}",
+        hex::encode(id.as_ref() as &[u8])
+    )
+}
+
+/// Enumerate identities for which Rust has a signature-verified peer prekey
+/// bundle. These ids form the candidate set for opaque direct-message route
+/// selectors. Prefix-matching entries are keystore-owned state; malformed
+/// entries fail closed rather than being silently ignored.
+pub fn list_peer_bundle_ids(ks: &SecureKeyStore) -> Result<Vec<IdentityId>> {
+    let mut out = Vec::new();
+    for key in ks.list_keys() {
+        let Some(hex_id) = key.strip_prefix(PEER_BUNDLE_KEY_PREFIX) else {
+            continue;
+        };
+        let raw = hex::decode(hex_id)
+            .map_err(|e| anyhow!("malformed peer prekey id in keystore: {e}"))?;
+        let bytes: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("malformed peer prekey id length in keystore"))?;
+        out.push(IdentityId::from(bytes));
+    }
+    Ok(out)
 }
 
 /// On-disk serialisation of a secret prekey bundle. The KEM secret
@@ -312,6 +338,8 @@ mod tests {
             .unwrap();
         assert_eq!(got.identity_x25519, body.identity_x25519);
         assert_eq!(got.kem_public, body.kem_public);
+        let ids = list_peer_bundle_ids(&ks).unwrap();
+        assert!(ids.contains(&kp.identity_id()));
     }
 
     #[test]

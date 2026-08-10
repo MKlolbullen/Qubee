@@ -45,11 +45,13 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::groups::group_handshake::{verify_prekey_bundle, GroupHandshake};
 use crate::identity::identity_key::IdentityId;
-use crate::ratchet::direct_message::DirectMessage;
+use crate::ratchet::direct_message::{
+    direct_identity_selector, DirectMessage, DIRECT_ID_SELECTOR_LEN, DIRECT_ROUTE_NONCE_LEN,
+};
 use crate::ratchet::pqxdh::WireInitialMessage;
 use crate::ratchet::prekey_store::{
     body_to_public, consume_one_time_prekey, get_or_create_local_bundle, get_peer_bundle,
-    store_peer_bundle,
+    list_peer_bundle_ids, store_peer_bundle,
 };
 use crate::ratchet::sender_keys::SenderKeyDistribution;
 use crate::ratchet::session::{load_session, store_session, Session};
@@ -102,7 +104,7 @@ pub fn install_peer_bundle(ks: &mut SecureKeyStore, wire: &[u8]) -> Result<Ident
 
 /// Encrypt `plaintext` for `peer_id`, establishing a session on first
 /// use from the peer's cached prekey bundle. Returns the
-/// `QUBEE_DMS\x01` wire frame. Fails if no session exists and no bundle
+/// `QUBEE_DMS\x02` wire frame. Fails if no session exists and no bundle
 /// for the peer has been installed.
 pub fn encrypt_direct(
     ks: &mut SecureKeyStore,
@@ -111,6 +113,12 @@ pub fn encrypt_direct(
     plaintext: &[u8],
     now: u64,
 ) -> Result<Vec<u8>> {
+    // Generate routing metadata before advancing the ratchet. If secure RNG
+    // fails, the send fails without consuming a message-key position.
+    let route_nonce = crate::security::secure_rng::random::array::<DIRECT_ROUTE_NONCE_LEN>()?;
+    let sender_selector = direct_identity_selector(&local_id, &route_nonce);
+    let recipient_selector = direct_identity_selector(&peer_id, &route_nonce);
+
     let mut session = match load_session(ks, &peer_id)? {
         Some(s) => s,
         None => {
@@ -150,7 +158,9 @@ pub fn encrypt_direct(
     let (header, ciphertext) = session.encrypt(&padded)?;
     store_session(ks, &session)?;
     DirectMessage {
-        sender_id: local_id,
+        route_nonce,
+        sender_selector,
+        recipient_selector,
         initial,
         header,
         ciphertext,
@@ -158,7 +168,7 @@ pub fn encrypt_direct(
     .to_wire()
 }
 
-/// Decrypt an inbound `QUBEE_DMS\x01` frame, establishing the responder
+/// Decrypt an inbound `QUBEE_DMS\x02` frame, establishing the responder
 /// side of the session on the conversation's first message. Returns the
 /// sender's identity id and the plaintext.
 pub fn decrypt_direct(
@@ -168,7 +178,10 @@ pub fn decrypt_direct(
     now: u64,
 ) -> Result<(IdentityId, Vec<u8>)> {
     let dm = DirectMessage::from_wire(wire).ok_or_else(|| anyhow!("not a direct message frame"))?;
-    let peer_id = dm.sender_id;
+    if direct_identity_selector(&local_id, &dm.route_nonce) != dm.recipient_selector {
+        bail!("direct message addressed to a different recipient");
+    }
+    let peer_id = resolve_direct_selector(ks, &dm.route_nonce, &dm.sender_selector)?;
     if peer_id == local_id {
         bail!("direct message claims to be from ourselves");
     }
@@ -240,11 +253,35 @@ pub fn decrypt_direct(
     Ok((peer_id, crate::security::padding::unpad(&padded)?))
 }
 
-/// Cheap sender extraction for dispatcher routing — parses the frame
-/// without touching any session state. `None` if `wire` is not a direct
-/// message frame.
-pub fn inspect_direct_sender(wire: &[u8]) -> Option<IdentityId> {
-    DirectMessage::from_wire(wire).map(|dm| dm.sender_id)
+fn resolve_direct_selector(
+    ks: &SecureKeyStore,
+    route_nonce: &[u8; DIRECT_ROUTE_NONCE_LEN],
+    selector: &[u8; DIRECT_ID_SELECTOR_LEN],
+) -> Result<IdentityId> {
+    let mut matched: Option<IdentityId> = None;
+    for candidate in list_peer_bundle_ids(ks)? {
+        if direct_identity_selector(&candidate, route_nonce) == *selector {
+            if matched.replace(candidate).is_some() {
+                bail!("ambiguous direct identity selector collision");
+            }
+        }
+    }
+    matched.ok_or_else(|| anyhow!("direct identity selector does not match a verified peer"))
+}
+
+/// Resolve the opaque sender selector against Rust's signature-verified peer
+/// bundle cache. Used by JNI only as a diagnostic/dispatcher helper; actual
+/// authentication still requires the ratchet decrypt to succeed.
+pub fn inspect_direct_sender(ks: &SecureKeyStore, wire: &[u8]) -> Option<IdentityId> {
+    let dm = DirectMessage::from_wire(wire)?;
+    resolve_direct_selector(ks, &dm.route_nonce, &dm.sender_selector).ok()
+}
+
+/// Resolve the durable destination for initial send / exact-wire retry. This
+/// is the routing authority: Kotlin fields are never consulted for QUBEE_DMS.
+pub fn inspect_direct_recipient(ks: &SecureKeyStore, wire: &[u8]) -> Option<IdentityId> {
+    let dm = DirectMessage::from_wire(wire)?;
+    resolve_direct_selector(ks, &dm.route_nonce, &dm.recipient_selector).ok()
 }
 
 /// Tear down the 1:1 session with a peer: the session itself, our
@@ -289,6 +326,10 @@ pub fn reset_direct_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Resul
 
 pub const PAYLOAD_TAG_TEXT: u8 = 0x01;
 pub const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
+/// Version of the tagged payload envelope *inside* the ratchet ciphertext.
+/// v1 adds an optional sender libp2p PeerId hint before the payload tag.
+pub const DIRECT_PAYLOAD_ENVELOPE_VERSION: u8 = 0x01;
+const DIRECT_ROUTE_HINT_MAX_LEN: usize = 256;
 
 /// A decoded 1:1 plaintext.
 #[derive(Debug, PartialEq, Eq)]
@@ -302,7 +343,7 @@ pub enum DirectPayload {
     SenderKeyDistribution(SenderKeyDistribution),
 }
 
-fn encode_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
+fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
     match payload {
         DirectPayload::Text(text) => {
             let mut out = Vec::with_capacity(1 + text.len());
@@ -320,7 +361,7 @@ fn encode_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
     }
 }
 
-fn decode_payload(bytes: &[u8]) -> Result<DirectPayload> {
+fn decode_tagged_payload(bytes: &[u8]) -> Result<DirectPayload> {
     let (tag, body) = bytes
         .split_first()
         .ok_or_else(|| anyhow!("empty direct payload"))?;
@@ -335,6 +376,56 @@ fn decode_payload(bytes: &[u8]) -> Result<DirectPayload> {
     }
 }
 
+/// Encode the direct plaintext envelope. The PeerId is encrypted by the
+/// Double Ratchet and therefore visible only to the intended recipient; it is
+/// not an unauthenticated transport hint. Once the ratchet AEAD opens, the
+/// receiver can bind this route to the channel-authenticated IdentityId.
+fn encode_payload_with_route(
+    payload: &DirectPayload,
+    sender_peer_id: Option<&str>,
+) -> Result<Vec<u8>> {
+    let route = sender_peer_id.unwrap_or("").as_bytes();
+    if route.len() > DIRECT_ROUTE_HINT_MAX_LEN || route.len() > u16::MAX as usize {
+        bail!("direct route hint too long");
+    }
+    let tagged = encode_tagged_payload(payload)?;
+    let mut out = Vec::with_capacity(3 + route.len() + tagged.len());
+    out.push(DIRECT_PAYLOAD_ENVELOPE_VERSION);
+    out.extend_from_slice(&(route.len() as u16).to_le_bytes());
+    out.extend_from_slice(route);
+    out.extend_from_slice(&tagged);
+    Ok(out)
+}
+
+fn decode_payload_with_route(bytes: &[u8]) -> Result<(Option<String>, DirectPayload)> {
+    if bytes.len() < 4 {
+        bail!("direct payload envelope too short");
+    }
+    if bytes[0] != DIRECT_PAYLOAD_ENVELOPE_VERSION {
+        bail!("unsupported direct payload envelope version {}", bytes[0]);
+    }
+    let route_len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+    if route_len > DIRECT_ROUTE_HINT_MAX_LEN {
+        bail!("direct route hint exceeds maximum");
+    }
+    let route_end = 3usize
+        .checked_add(route_len)
+        .ok_or_else(|| anyhow!("direct route length overflow"))?;
+    if route_end >= bytes.len() {
+        bail!("truncated direct route hint or missing payload tag");
+    }
+    let route = if route_len == 0 {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(&bytes[3..route_end])
+                .map_err(|e| anyhow!("direct route hint not UTF-8: {e}"))?
+                .to_string(),
+        )
+    };
+    Ok((route, decode_tagged_payload(&bytes[route_end..])?))
+}
+
 /// Encrypt a chat text for `peer_id` (tagged-payload flavour of
 /// [`encrypt_direct`] — what the JNI send path uses).
 pub fn encrypt_direct_text(
@@ -344,7 +435,23 @@ pub fn encrypt_direct_text(
     text: &str,
     now: u64,
 ) -> Result<Vec<u8>> {
-    let payload = encode_payload(&DirectPayload::Text(text.to_string()))?;
+    encrypt_direct_text_with_route(ks, local_id, peer_id, text, None, now)
+}
+
+/// Live-send flavour that carries this node's current libp2p PeerId *inside*
+/// the ratchet ciphertext. A route-less first message can arrive through the
+/// blinded direct inbox; after decrypt the recipient can upgrade replies to
+/// `/qubee/direct/1` without a globally visible IdentityId↔PeerId binding.
+pub fn encrypt_direct_text_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    text: &str,
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload =
+        encode_payload_with_route(&DirectPayload::Text(text.to_string()), sender_peer_id)?;
     encrypt_direct(ks, local_id, peer_id, &payload, now)
 }
 
@@ -357,7 +464,21 @@ pub fn encrypt_direct_distribution(
     dist: &SenderKeyDistribution,
     now: u64,
 ) -> Result<Vec<u8>> {
-    let payload = encode_payload(&DirectPayload::SenderKeyDistribution(dist.clone()))?;
+    encrypt_direct_distribution_with_route(ks, local_id, peer_id, dist, None, now)
+}
+
+pub fn encrypt_direct_distribution_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    dist: &SenderKeyDistribution,
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload = encode_payload_with_route(
+        &DirectPayload::SenderKeyDistribution(dist.clone()),
+        sender_peer_id,
+    )?;
     encrypt_direct(ks, local_id, peer_id, &payload, now)
 }
 
@@ -369,8 +490,19 @@ pub fn decrypt_direct_payload(
     wire: &[u8],
     now: u64,
 ) -> Result<(IdentityId, DirectPayload)> {
+    let (sender, _route, payload) = decrypt_direct_payload_with_route(ks, local_id, wire, now)?;
+    Ok((sender, payload))
+}
+
+pub fn decrypt_direct_payload_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    wire: &[u8],
+    now: u64,
+) -> Result<(IdentityId, Option<String>, DirectPayload)> {
     let (sender, plaintext) = decrypt_direct(ks, local_id, wire, now)?;
-    Ok((sender, decode_payload(&plaintext)?))
+    let (route, payload) = decode_payload_with_route(&plaintext)?;
+    Ok((sender, route, payload))
 }
 
 #[cfg(test)]
@@ -430,7 +562,7 @@ mod tests {
         let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
 
         let w1 = encrypt_direct(&mut a.ks, aid, bid, b"hello bob", 10).unwrap();
-        assert_eq!(inspect_direct_sender(&w1).unwrap(), aid);
+        assert_eq!(inspect_direct_sender(&b.ks, &w1).unwrap(), aid);
         let (from, pt) = decrypt_direct(&mut b.ks, bid, &w1, 10).unwrap();
         assert_eq!((from, pt.as_slice()), (aid, b"hello bob".as_slice()));
 
@@ -442,6 +574,45 @@ mod tests {
             let w = encrypt_direct(&mut a.ks, aid, bid, &[i], 12).unwrap();
             assert_eq!(decrypt_direct(&mut b.ks, bid, &w, 12).unwrap().1, [i]);
         }
+    }
+
+    #[test]
+    fn encrypted_payload_binds_private_route_hint_to_authenticated_sender() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let wire = encrypt_direct_text_with_route(
+            &mut a.ks,
+            aid,
+            bid,
+            "hello via inbox",
+            Some("12D3KooWPrivateRoute"),
+            1,
+        )
+        .unwrap();
+        // The transport route must not be visible in the durable outer wire.
+        assert!(!wire
+            .windows(b"12D3KooWPrivateRoute".len())
+            .any(|w| w == b"12D3KooWPrivateRoute"));
+        let (sender, route, payload) =
+            decrypt_direct_payload_with_route(&mut b.ks, bid, &wire, 1).unwrap();
+        assert_eq!(sender, aid);
+        assert_eq!(route.as_deref(), Some("12D3KooWPrivateRoute"));
+        assert_eq!(payload, DirectPayload::Text("hello via inbox".to_string()));
+    }
+
+    #[test]
+    fn opaque_direct_selectors_resolve_only_verified_peers() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let wire = encrypt_direct_text(&mut a.ks, aid, bid, "selector", 1).unwrap();
+        assert_eq!(inspect_direct_recipient(&a.ks, &wire), Some(bid));
+        assert_eq!(inspect_direct_sender(&b.ks, &wire), Some(aid));
+
+        let mut dm = DirectMessage::from_wire(&wire).unwrap();
+        dm.sender_selector[0] ^= 0x80;
+        let tampered = dm.to_wire().unwrap();
+        assert_eq!(inspect_direct_sender(&b.ks, &tampered), None);
+        assert!(decrypt_direct_payload(&mut b.ks, bid, &tampered, 1).is_err());
     }
 
     #[test]
@@ -506,7 +677,7 @@ mod tests {
 
         let w = encrypt_direct(&mut a.ks, aid, bid, b"hi", 1).unwrap();
         let err = decrypt_direct(&mut b.ks, bid, &w, 1).unwrap_err();
-        assert!(err.to_string().contains("no verified prekey bundle"));
+        assert!(err.to_string().contains("verified peer"));
     }
 
     #[test]
@@ -525,7 +696,7 @@ mod tests {
         let forged = {
             let wire = encrypt_direct(&mut mallory.ks, mid, bid, b"evil", 1).unwrap();
             let mut dm = DirectMessage::from_wire(&wire).unwrap();
-            dm.sender_id = aid;
+            dm.sender_selector = direct_identity_selector(&aid, &dm.route_nonce);
             dm.to_wire().unwrap()
         };
         let err = decrypt_direct(&mut b.ks, bid, &forged, 1).unwrap_err();
@@ -583,9 +754,9 @@ mod tests {
         let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
         let w = encrypt_direct(&mut a.ks, aid, bid, b"x", 1).unwrap();
         let mut dm = DirectMessage::from_wire(&w).unwrap();
-        dm.sender_id = bid;
+        dm.sender_selector = direct_identity_selector(&bid, &dm.route_nonce);
         let err = decrypt_direct(&mut b.ks, bid, &dm.to_wire().unwrap(), 1).unwrap_err();
-        assert!(err.to_string().contains("from ourselves"));
+        assert!(err.to_string().contains("verified peer"));
     }
 
     #[test]
@@ -618,8 +789,9 @@ mod tests {
 
     #[test]
     fn non_direct_frames_are_not_dispatched() {
-        assert!(inspect_direct_sender(b"QUBEE_GMS\x01whatever").is_none());
-        assert!(inspect_direct_sender(&[]).is_none());
+        let device = Device::new();
+        assert!(inspect_direct_sender(&device.ks, b"QUBEE_GMS\x01whatever").is_none());
+        assert!(inspect_direct_sender(&device.ks, &[]).is_none());
     }
 
     #[test]
@@ -666,8 +838,8 @@ mod tests {
 
     #[test]
     fn unknown_and_empty_payload_tags_are_rejected() {
-        assert!(decode_payload(&[]).is_err());
-        assert!(decode_payload(&[0x7F, 1, 2, 3]).is_err());
+        assert!(decode_payload_with_route(&[]).is_err());
+        assert!(decode_payload_with_route(&[0x7F, 1, 2, 3]).is_err());
     }
 
     #[test]

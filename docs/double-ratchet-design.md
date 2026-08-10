@@ -61,7 +61,7 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     per-conversation AD (blake3 over the sorted id pair) binds every
     frame to its pair.
   * *3c* — `src/ratchet/direct_message.rs`: the `DirectMessage`
-    (`QUBEE_DMS\x01`) wire frame carrying the optional PQXDH
+    (`QUBEE_DMS\x02`) wire frame carrying the optional PQXDH
     `InitialMessage`, the ratchet header, and the ciphertext. Unsigned
     (deniable); bounded decode on the unauth path.
   * *3d* — `src/ratchet/direct.rs` + four JNI symbols
@@ -326,3 +326,20 @@ These are the standard ways that DR implementations have shipped
 CVEs over the past decade. The safe move is to write the protocol
 down, prove out the prekey infrastructure, then implement in two
 or three carefully-reviewed PRs.
+
+
+### Route bootstrap
+
+`QUBEE_DMS\x02` is endpoint-bound without placing either raw Qubee IdentityId in
+the outer frame. A fresh 16-byte route nonce derives independent 16-byte sender and
+recipient selectors; Rust resolves selectors only against its signature-verified peer
+prekey cache, and the local recipient validates its own selector before ratchet state
+is touched. When Rust already knows the recipient's authenticated libp2p `PeerId`,
+delivery uses `/qubee/direct/1`. If that route is not known yet, the exact same ratchet
+frame is published only to the recipient's rotating blinded direct-inbox topic — never
+to `qubee-global`. The recipient follows that inbox persistently; publishers subscribe
+only transiently for mesh formation + send, then drop it so prior senders cannot
+passively observe later inbox traffic. The sender's current `PeerId` is carried inside
+the ratchet-encrypted payload; after a successful decrypt the receiver binds that
+route to the channel-authenticated Qubee identity and subsequent replies can upgrade
+to the direct request/response transport.

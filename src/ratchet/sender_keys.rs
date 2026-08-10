@@ -723,6 +723,12 @@ fn open_outer_v5(
     let wire_selector = &wire[magic_len + 12..magic_len + 12 + V5_SELECTOR_LEN];
     let ciphertext = &wire[magic_len + 12 + V5_SELECTOR_LEN..];
 
+    // Fail-closed on selector collision, mirroring the v4 envelope's
+    // `open_outer_envelope`: if a candidate's selector matches but its
+    // AEAD fails, the `?` below returns immediately — later candidates
+    // are NOT tried. An 8-byte cross-key collision is ~2^-64 per
+    // candidate; continuing past a failed AEAD would let a genuinely
+    // tampered frame masquerade as "unknown group" instead of erroring.
     for (group, group_key) in candidates {
         if v5_group_selector(&group_key, &nonce_bytes) != wire_selector {
             continue;
@@ -1196,11 +1202,12 @@ mod tests {
     }
 
     #[test]
-    fn v5_and_v3_ids_agree_for_the_same_sender_state() {
-        // The migration window has mixed senders. The ack id must be
-        // format-independent so a v3 sender's row correlates with an
-        // ack computed off a v5 re-encryption of the same position and
-        // vice versa. (Same chain position => same id inputs.)
+    fn v5_and_v3_ids_are_derived_by_the_same_rule_per_chain_position() {
+        // The migration window has mixed senders, so both formats feed
+        // the same id derivation (`v3_message_id` over group + sender +
+        // iteration + inner ciphertext — the outer envelope never
+        // contributes). Consecutive sends occupy distinct chain
+        // positions and therefore must yield distinct ids.
         let (mut a, mut b, _c) = trio();
         let g = group();
         let w3 = encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, b"same").unwrap();

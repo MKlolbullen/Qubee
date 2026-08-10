@@ -777,13 +777,7 @@ class MessageService : Service(), NetworkCallback {
         }
     }
 
-    private fun isDirectV2Frame(data: ByteArray): Boolean {
-        if (data.size < DIRECT_V2_MAGIC.size) return false
-        for (i in DIRECT_V2_MAGIC.indices) {
-            if (data[i] != DIRECT_V2_MAGIC[i]) return false
-        }
-        return true
-    }
+    private fun isDirectV2Frame(data: ByteArray): Boolean = hasMagic(data, DIRECT_V2_MAGIC)
 
     private fun isGroupV3Frame(data: ByteArray): Boolean = hasMagic(data, GROUP_V3_MAGIC)
 

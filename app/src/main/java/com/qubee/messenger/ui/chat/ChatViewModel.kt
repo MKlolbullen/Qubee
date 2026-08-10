@@ -193,16 +193,13 @@ class ChatViewModel @Inject constructor(
                 return@launch
             }
 
-            // Best-effort id extraction, so a delivery ack flips the
-            // row to DELIVERED. Group v3 (QUBEE_GMS\x03) frames now
-            // carry their own deterministic id; the v2 envelope path
-            // uses the legacy id. 1:1 QUBEE_DMS frames still have no
-            // ack channel and persist without a wireId (retry re-sends
-            // the same frame; replay-guarded receiver-side).
-            val wireId = if (ratchetSender.enabled() && isGroup) {
-                qubeeManager.extractV3MessageId(wire)
-            } else {
-                qubeeManager.extractMessageId(wire)
+            // Stable wire id lets a cryptographic receipt retire the durable
+            // retry row. Each ratchet format owns its own id derivation; legacy
+            // group envelopes keep the pre-ratchet extractor.
+            val wireId = when {
+                ratchetSender.enabled() && isGroup -> qubeeManager.extractV3MessageId(wire)
+                ratchetSender.enabled() -> qubeeManager.extractDirectMessageId(wire)
+                else -> qubeeManager.extractMessageId(wire)
             }
 
             // FSM step 2 — ENCRYPTED + DURABLY_QUEUED. Replace the

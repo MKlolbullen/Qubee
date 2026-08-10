@@ -32,6 +32,8 @@ pub const MAGIC_DIRECT_MESSAGE: &[u8] = b"QUBEE_DMS\x02";
 const DIRECT_ID_SELECTOR_TAG: &[u8] = b"qubee_direct_identity_selector_v1";
 pub const DIRECT_ROUTE_NONCE_LEN: usize = 16;
 pub const DIRECT_ID_SELECTOR_LEN: usize = 16;
+pub const DIRECT_MESSAGE_ID_LEN: usize = 16;
+const DIRECT_MESSAGE_ID_TAG: &[u8] = b"qubee_direct_message_id_v1";
 
 /// Domain-separated, per-message opaque handle for one Qubee identity.
 /// IdentityIds are 256-bit public-key-derived values; the fresh route nonce
@@ -96,6 +98,20 @@ impl DirectMessage {
         }
         bounded_bincode_deserialize(&bytes[MAGIC_DIRECT_MESSAGE.len()..]).ok()
     }
+}
+
+/// Deterministic id for an exact direct wire frame. The id is derived only
+/// after the frame parses as the current QUBEE_DMS format, so arbitrary bytes
+/// cannot manufacture delivery-receipt ids. Retries reuse the exact durable
+/// wire bytes and therefore keep the same id without re-encrypting.
+pub fn extract_direct_message_id(bytes: &[u8]) -> Option<[u8; DIRECT_MESSAGE_ID_LEN]> {
+    DirectMessage::from_wire(bytes)?;
+    let mut h = blake3::Hasher::new();
+    h.update(DIRECT_MESSAGE_ID_TAG);
+    h.update(bytes);
+    let mut out = [0u8; DIRECT_MESSAGE_ID_LEN];
+    out.copy_from_slice(&h.finalize().as_bytes()[..DIRECT_MESSAGE_ID_LEN]);
+    Some(out)
 }
 
 /// True if `bytes` carries the direct-message magic — a cheap prefix
@@ -191,6 +207,34 @@ mod tests {
             direct_identity_selector(&recipient, &other_nonce),
             "selector must rotate with the per-message nonce",
         );
+    }
+
+    #[test]
+    fn direct_message_id_is_stable_and_wire_bound() {
+        let sender = IdentityId::from([0x31u8; 32]);
+        let recipient = IdentityId::from([0x42u8; 32]);
+        let route_nonce = [0x53u8; DIRECT_ROUTE_NONCE_LEN];
+        let dm = DirectMessage {
+            route_nonce,
+            sender_selector: direct_identity_selector(&sender, &route_nonce),
+            recipient_selector: direct_identity_selector(&recipient, &route_nonce),
+            initial: None,
+            header: MessageHeader {
+                dh: [0x64u8; 32],
+                pn: 2,
+                n: 9,
+            },
+            ciphertext: vec![0x75; 48],
+        };
+        let wire = dm.to_wire().unwrap();
+        let id = extract_direct_message_id(&wire).unwrap();
+        assert_eq!(id, extract_direct_message_id(&wire).unwrap());
+
+        let mut changed = dm;
+        changed.ciphertext[0] ^= 0x80;
+        let changed_wire = changed.to_wire().unwrap();
+        assert_ne!(id, extract_direct_message_id(&changed_wire).unwrap());
+        assert!(extract_direct_message_id(b"not-a-direct-frame").is_none());
     }
 
     #[test]

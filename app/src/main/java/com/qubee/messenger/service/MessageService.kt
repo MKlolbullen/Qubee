@@ -550,6 +550,29 @@ class MessageService : Service(), NetworkCallback {
         // not by sender resolution: an unknown/tampered selector is still a
         // direct frame and must fail closed here rather than reach legacy decrypt.
         if (isDirectV2Frame(data)) {
+            val directMessageId = qubeeManager.extractDirectMessageId(data)
+            if (directMessageId == null) {
+                Timber.w("Malformed QUBEE_DMS frame from %s", peerId)
+                return true
+            }
+
+            // Lost-receipt recovery: retries deliberately reuse the exact wire
+            // bytes, while the Double Ratchet correctly rejects decrypting the
+            // same frame twice. Persisting the inbound wireId lets us recognise
+            // an already-accepted frame and issue a fresh encrypted receipt
+            // without weakening ratchet replay protection. This survives a
+            // process death because the evidence is in Room, not a RAM cache.
+            val prior = messageRepository.getMessageByWireId(directMessageId)
+            if (prior != null && !prior.isFromMe) {
+                val senderIdentityHex = qubeeManager.inspectDirectMessageSender(data)
+                if (!senderIdentityHex.isNullOrBlank()) {
+                    sendDirectDeliveryAck(senderIdentityHex, directMessageId)
+                } else {
+                    Timber.w("Cannot re-ack direct replay: sender selector is unresolved")
+                }
+                return true
+            }
+
             val resultJson = qubeeManager.decryptDirectMessage(data)
             if (resultJson == null) {
                 Timber.w("Ratchet 1:1 decrypt failed from %s", peerId)
@@ -592,6 +615,7 @@ class MessageService : Service(), NetworkCallback {
                             timestamp = System.currentTimeMillis(),
                             status = MessageStatus.DELIVERED,
                             isFromMe = false,
+                            wireId = directMessageId,
                         ),
                     )
                     if (contact != null) {
@@ -601,6 +625,22 @@ class MessageService : Service(), NetworkCallback {
                             System.currentTimeMillis(),
                         )
                     }
+                    // Receipt only after the plaintext is durably persisted. If
+                    // this send is lost, the sender retries the same ciphertext
+                    // and the prior-wireId branch above emits a fresh receipt.
+                    sendDirectDeliveryAck(senderIdentityHex, directMessageId)
+                }
+                "ack" -> {
+                    val ackedWireId = result.optString("messageId")
+                    if (ackedWireId.isBlank()) {
+                        Timber.w("Ratchet direct ack from %s has no message id", senderIdentityHex)
+                    } else {
+                        val applied = messageRepository.applyAck(ackedWireId, senderIdentityHex)
+                        if (!applied) {
+                            Timber.d("Ignored direct ack for unknown wireId=%s", ackedWireId)
+                        }
+                    }
+                    // Never ack an ack: that would create an infinite receipt loop.
                 }
                 "senderKeyDistribution" -> {
                     // Rust has already membership-checked + installed it.
@@ -643,6 +683,19 @@ class MessageService : Service(), NetworkCallback {
         }
 
         return false
+    }
+
+    private suspend fun sendDirectDeliveryAck(recipientIdentityHex: String, messageIdHex: String) {
+        val ackWire = qubeeManager.createDirectMessageAck(recipientIdentityHex, messageIdHex)
+        if (ackWire == null) {
+            Timber.w("Could not create direct delivery ack for %s", messageIdHex)
+            return
+        }
+        // Rust owns QUBEE_DMS routing from the frame's opaque recipient
+        // selector. Empty compatibility hint makes that authority explicit.
+        if (!qubeeManager.sendP2PMessage("", ackWire)) {
+            Timber.d("Direct delivery ack enqueue failed for %s; sender retry will solicit another", messageIdHex)
+        }
     }
 
     private fun isDirectV2Frame(data: ByteArray): Boolean {

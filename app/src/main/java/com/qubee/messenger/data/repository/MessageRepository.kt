@@ -51,9 +51,11 @@ class MessageRepository @Inject constructor(
     suspend fun getMessageByWireId(wireId: String): Message? =
         messageDao.getMessageByWireId(wireId)
 
-    suspend fun cacheInboundDirectReceipt(messageId: String, receiptWire: ByteArray) {
-        messageDao.cacheInboundDirectReceipt(messageId, receiptWire)
-    }
+    suspend fun getActiveInboundMessageByWireId(wireId: String): Message? =
+        messageDao.getActiveInboundMessageByWireId(wireId)
+
+    suspend fun cacheInboundDirectReceipt(messageId: String, receiptWire: ByteArray): Boolean =
+        messageDao.cacheInboundDirectReceipt(messageId, receiptWire) == 1
 
     /**
      * Return outbound rows whose retry timer has fired and whose

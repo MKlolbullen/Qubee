@@ -172,8 +172,8 @@ data class Message(
     /// delivery re-sends that exact receipt rather than advancing our send
     /// ratchet again. `getRetryableOutbound` is scoped to `isFromMe = 1`, so
     /// inbound receipt caches never enter the normal retry queue. Outbound bytes
-    /// are cleared when the first receipt lands; inbound caches live with the
-    /// message row and disappear when that message is deleted/expired.
+    /// are cleared when the first receipt lands; inbound caches are cleared on
+    /// soft deletion and disappear entirely when that row expires/is purged.
     val wireBytes: ByteArray? = null,
     /// Number of times the offline-retry loop has re-published
     /// `wireBytes`. Bounded by `OFFLINE_RETRY_MAX_ATTEMPTS` (see

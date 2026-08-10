@@ -32,6 +32,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import timber.log.Timber
 import java.util.UUID
@@ -60,6 +62,10 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var ratchetSender: com.qubee.messenger.crypto.RatchetSender
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Network callbacks launch concurrently. Stripe by exact direct wire id so
+    // duplicates of one ciphertext cannot race the read -> ratchet-encrypt ->
+    // receipt-cache sequence, while keeping memory bounded under hostile input.
+    private val directFrameLocks = Array(DIRECT_FRAME_LOCK_STRIPES) { Mutex() }
     private var isRunning = false
 
     companion object {
@@ -83,6 +89,7 @@ class MessageService : Service(), NetworkCallback {
         /// 30m, 2h) = ~3 hours of attempts before the row is left
         /// alone.
         private const val OFFLINE_RETRY_MAX_ATTEMPTS: Int = 5
+        private const val DIRECT_FRAME_LOCK_STRIPES: Int = 64
 
         /// Prekey bundles ride gossipsub, so peers offline at publish
         /// time miss them and can never initiate v3 toward us. A
@@ -556,127 +563,130 @@ class MessageService : Service(), NetworkCallback {
                 return true
             }
 
-            // Lost-receipt recovery: retries deliberately reuse the exact wire
-            // bytes, while the Double Ratchet correctly rejects decrypting the
-            // same frame twice. Persisting the inbound wireId lets us recognise
-            // an already-accepted frame and issue a fresh encrypted receipt
-            // without weakening ratchet replay protection. This survives a
-            // process death because the evidence is in Room, not a RAM cache.
-            val prior = messageRepository.getMessageByWireId(directMessageId)
-            if (prior != null && !prior.isFromMe) {
-                sendOrReplayDirectDeliveryAck(
-                    inboundMessage = prior,
-                    originalWire = data,
-                    messageIdHex = directMessageId,
-                    authenticatedSenderIdentityHex = null,
-                )
-                return true
-            }
-
-            val resultJson = qubeeManager.decryptDirectMessage(data)
-            if (resultJson == null) {
-                Timber.w("Ratchet 1:1 decrypt failed from %s", peerId)
-                return true
-            }
-            val result = JSONObject(resultJson)
-            val senderIdentityHex = result.optString("senderId")
-            when (result.optString("kind")) {
-                "text" -> {
-                    // Same peer↔identity linkage as the legacy path,
-                    // but from the channel-authenticated sender rather
-                    // than an envelope field — the trust policy still
-                    // sees every (peerId, identityId) observation.
-                    // Only observe the PeerId<->IdentityId linkage when the
-                    // peer is authenticated (direct channel). Anonymous
-                    // gossip delivers an empty peerId; feeding that to the
-                    // trust policy would stamp an empty PeerId and could
-                    // spuriously trip KeyChanged. Fall back to identity-only
-                    // resolution in that case.
-                    val contact =
-                        if (peerId.isNotEmpty()) {
-                            contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
-                        } else {
-                            contactRepository.getContactByIdentityId(senderIdentityHex)
-                        }
-                    val routedSenderId = contact?.id ?: senderIdentityHex
-                    val conversationId =
-                        conversationRepository.getOrCreateConversationId(routedSenderId)
-                    if (conversationId.isEmpty()) {
-                        Timber.w("Cannot route ratchet 1:1 from %s", senderIdentityHex)
-                        return true
-                    }
-                    val inboundMessage = Message(
-                        id = UUID.randomUUID().toString(),
-                        conversationId = conversationId,
-                        senderId = routedSenderId,
-                        content = result.optString("text"),
-                        contentType = MessageType.TEXT,
-                        timestamp = System.currentTimeMillis(),
-                        status = MessageStatus.DELIVERED,
-                        isFromMe = false,
-                        wireId = directMessageId,
-                    )
-                    messageRepository.saveMessage(inboundMessage)
-                    if (contact != null) {
-                        contactRepository.updateOnlineStatus(
-                            contact.id,
-                            true,
-                            System.currentTimeMillis(),
-                        )
-                    }
-                    // Receipt only after the plaintext is durably persisted. Cache
-                    // the exact encrypted receipt before transmit; if it is lost, an
-                    // exact text retry re-sends the same receipt bytes without advancing
-                    // our send ratchet a second time.
+            val lockIndex = Math.floorMod(directMessageId.hashCode(), directFrameLocks.size)
+            return directFrameLocks[lockIndex].withLock {
+                // Lost-receipt recovery: retries deliberately reuse the exact wire
+                // bytes, while the Double Ratchet correctly rejects decrypting the
+                // same frame twice. Persisting the inbound wireId lets us recognise
+                // an already-accepted frame and issue a fresh encrypted receipt
+                // without weakening ratchet replay protection. This survives a
+                // process death because the evidence is in Room, not a RAM cache.
+                val prior = messageRepository.getActiveInboundMessageByWireId(directMessageId)
+                if (prior != null) {
                     sendOrReplayDirectDeliveryAck(
-                        inboundMessage = inboundMessage,
+                        inboundMessage = prior,
                         originalWire = data,
                         messageIdHex = directMessageId,
-                        authenticatedSenderIdentityHex = senderIdentityHex,
+                        authenticatedSenderIdentityHex = null,
                     )
+                    return@withLock true
                 }
-                "ack" -> {
-                    val ackedWireId = result.optString("messageId")
-                    if (ackedWireId.isBlank()) {
-                        Timber.w("Ratchet direct ack from %s has no message id", senderIdentityHex)
-                    } else {
-                        val contact = contactRepository.getContactByIdentityId(senderIdentityHex)
-                        val participantId = contact?.id ?: senderIdentityHex
-                        val directConversationId =
-                            conversationRepository.findDirectConversationId(participantId)
-                        if (directConversationId == null) {
-                            Timber.w(
-                                "Ignored direct ack from %s: no matching direct conversation",
-                                senderIdentityHex,
+
+                val resultJson = qubeeManager.decryptDirectMessage(data)
+                if (resultJson == null) {
+                    Timber.w("Ratchet 1:1 decrypt failed from %s", peerId)
+                    return@withLock true
+                }
+                val result = JSONObject(resultJson)
+                val senderIdentityHex = result.optString("senderId")
+                when (result.optString("kind")) {
+                    "text" -> {
+                        // Same peer↔identity linkage as the legacy path,
+                        // but from the channel-authenticated sender rather
+                        // than an envelope field — the trust policy still
+                        // sees every (peerId, identityId) observation.
+                        // Only observe the PeerId<->IdentityId linkage when the
+                        // peer is authenticated (direct channel). Anonymous
+                        // gossip delivers an empty peerId; feeding that to the
+                        // trust policy would stamp an empty PeerId and could
+                        // spuriously trip KeyChanged. Fall back to identity-only
+                        // resolution in that case.
+                        val contact =
+                            if (peerId.isNotEmpty()) {
+                                contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
+                            } else {
+                                contactRepository.getContactByIdentityId(senderIdentityHex)
+                            }
+                        val routedSenderId = contact?.id ?: senderIdentityHex
+                        val conversationId =
+                            conversationRepository.getOrCreateConversationId(routedSenderId)
+                        if (conversationId.isEmpty()) {
+                            Timber.w("Cannot route ratchet 1:1 from %s", senderIdentityHex)
+                            return@withLock true
+                        }
+                        val inboundMessage = Message(
+                            id = UUID.randomUUID().toString(),
+                            conversationId = conversationId,
+                            senderId = routedSenderId,
+                            content = result.optString("text"),
+                            contentType = MessageType.TEXT,
+                            timestamp = System.currentTimeMillis(),
+                            status = MessageStatus.DELIVERED,
+                            isFromMe = false,
+                            wireId = directMessageId,
+                        )
+                        messageRepository.saveMessage(inboundMessage)
+                        if (contact != null) {
+                            contactRepository.updateOnlineStatus(
+                                contact.id,
+                                true,
+                                System.currentTimeMillis(),
                             )
+                        }
+                        // Receipt only after the plaintext is durably persisted. Cache
+                        // the exact encrypted receipt before transmit; if it is lost, an
+                        // exact text retry re-sends the same receipt bytes without advancing
+                        // our send ratchet a second time.
+                        sendOrReplayDirectDeliveryAck(
+                            inboundMessage = inboundMessage,
+                            originalWire = data,
+                            messageIdHex = directMessageId,
+                            authenticatedSenderIdentityHex = senderIdentityHex,
+                        )
+                    }
+                    "ack" -> {
+                        val ackedWireId = result.optString("messageId")
+                        if (ackedWireId.isBlank()) {
+                            Timber.w("Ratchet direct ack from %s has no message id", senderIdentityHex)
                         } else {
-                            val applied = messageRepository.applyAck(
-                                ackedWireId,
-                                senderIdentityHex,
-                                directConversationId,
-                            )
-                            if (!applied) {
-                                Timber.d(
-                                    "Ignored direct ack for wireId=%s outside conversation=%s",
+                            val contact = contactRepository.getContactByIdentityId(senderIdentityHex)
+                            val participantId = contact?.id ?: senderIdentityHex
+                            val directConversationId =
+                                conversationRepository.findDirectConversationId(participantId)
+                            if (directConversationId == null) {
+                                Timber.w(
+                                    "Ignored direct ack from %s: no matching direct conversation",
+                                    senderIdentityHex,
+                                )
+                            } else {
+                                val applied = messageRepository.applyAck(
                                     ackedWireId,
+                                    senderIdentityHex,
                                     directConversationId,
                                 )
+                                if (!applied) {
+                                    Timber.d(
+                                        "Ignored direct ack for wireId=%s outside conversation=%s",
+                                        ackedWireId,
+                                        directConversationId,
+                                    )
+                                }
                             }
                         }
+                        // Never ack an ack: that would create an infinite receipt loop.
                     }
-                    // Never ack an ack: that would create an infinite receipt loop.
+                    "senderKeyDistribution" -> {
+                        // Rust has already membership-checked + installed it.
+                        Timber.i(
+                            "Installed sender key for group %s from %s",
+                            result.optString("groupId"),
+                            senderIdentityHex,
+                        )
+                    }
+                    else -> Timber.w("Unknown ratchet payload kind from %s", senderIdentityHex)
                 }
-                "senderKeyDistribution" -> {
-                    // Rust has already membership-checked + installed it.
-                    Timber.i(
-                        "Installed sender key for group %s from %s",
-                        result.optString("groupId"),
-                        senderIdentityHex,
-                    )
-                }
-                else -> Timber.w("Unknown ratchet payload kind from %s", senderIdentityHex)
+                return@withLock true
             }
-            return true
         }
 
         // v3 sender-keys group frame (QUBEE_GMS\x03).
@@ -736,7 +746,19 @@ class MessageService : Service(), NetworkCallback {
             // Persist before transmit. A crash or an active replay after this point
             // can only cause this exact receipt ciphertext to be re-published; it
             // cannot repeatedly advance our Double Ratchet send chain.
-            messageRepository.cacheInboundDirectReceipt(inboundMessage.id, ackWire)
+            if (!messageRepository.cacheInboundDirectReceipt(inboundMessage.id, ackWire)) {
+                val persisted = messageRepository
+                    .getActiveInboundMessageByWireId(messageIdHex)
+                    ?.wireBytes
+                if (persisted == null) {
+                    Timber.w(
+                        "Direct receipt cache lost CAS for %s without a live cached row; dropping send",
+                        messageIdHex,
+                    )
+                    return
+                }
+                ackWire = persisted
+            }
         }
 
         // Rust owns QUBEE_DMS routing from the frame's opaque recipient selector.

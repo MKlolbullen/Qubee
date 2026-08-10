@@ -226,10 +226,16 @@ class MessageDaoInstrumentedTest {
         )
         dao.insertMessage(inbound)
         val receiptWire = byteArrayOf(0x51, 0x55, 0x42, 0x45, 0x45)
-        dao.cacheInboundDirectReceipt(inbound.id, receiptWire)
+        assertEquals(1, dao.cacheInboundDirectReceipt(inbound.id, receiptWire))
+        assertEquals(
+            "receipt cache is compare-and-set; a duplicate creator cannot overwrite it",
+            0,
+            dao.cacheInboundDirectReceipt(inbound.id, byteArrayOf(9, 9, 9)),
+        )
 
         val stored = dao.getMessageById(inbound.id)!!
         assertArrayEquals(receiptWire, stored.wireBytes)
+        assertNotNull(dao.getActiveInboundMessageByWireId(inbound.wireId!!))
         assertTrue(
             "inbound receipt cache must never be selected by the outbound retry query",
             dao.getRetryableOutbound(
@@ -237,6 +243,15 @@ class MessageDaoInstrumentedTest {
                 maxAttempts = 99,
                 limit = 100,
             ).none { it.id == inbound.id },
+        )
+
+        dao.markMessageAsDeleted(inbound.id, deletedAt = 5_000L)
+        val deleted = dao.getMessageById(inbound.id)!!
+        assertTrue(deleted.isDeleted)
+        assertNull("soft delete must destroy cached direct receipt bytes", deleted.wireBytes)
+        assertNull(
+            "soft-deleted inbound row must not answer an exact ciphertext replay",
+            dao.getActiveInboundMessageByWireId(inbound.wireId!!),
         )
     }
 

@@ -1048,7 +1048,7 @@ impl GroupManager {
     /// Bump the group generation counter for a **proactive** key
     /// rotation (one not tied to a member removal). The removal path
     /// already advances `version` inside `remove_member`, so this is
-    /// used only when `plan_key_rotation` is called with no target —
+    /// used only when `plan_key_rotation_split` is called with no target —
     /// without it the rotation carries an unchanged generation and
     /// every receiver's strict `generation > version` gate rejects it,
     /// stranding the initiator on a key nobody adopts. Returns the new
@@ -1232,7 +1232,7 @@ impl GroupManager {
         group_key: &[u8; 32],
         // The inviter's view of `group.version` at handshake time.
         // Generation gates in `decrypt_group_message` and
-        // `process_key_rotation` only work if both sides start from
+        // `process_key_delivery` only work if both sides start from
         // the same version number — otherwise the joiner's first
         // received message panics on a bogus mismatch.
         snapshot_version: u64,

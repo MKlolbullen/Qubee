@@ -1,7 +1,7 @@
 //! Encrypted group-message envelope.
 //!
 //! Once a group has a shared symmetric key (negotiated via the join
-//! handshake or rotated via [`crate::groups::handshake_handlers::plan_key_rotation`]),
+//! handshake or rotated via [`crate::groups::handshake_handlers::plan_key_rotation_split`]),
 //! members exchange messages over the per-group gossipsub topic as
 //! [`GroupMessageEnvelope`] frames:
 //!
@@ -314,7 +314,7 @@ pub struct DecryptedGroupMessage {
 ///
 /// The group must already have a key installed in `gm`'s GroupCrypto;
 /// callers can assume that's the case after a successful join or
-/// `plan_key_rotation`.
+/// `plan_key_rotation_split`.
 pub fn encrypt_group_message(
     gm: &GroupManager,
     sender_identity: &IdentityKeyPair,
@@ -361,7 +361,7 @@ pub fn encrypt_group_message(
 ///   5. Return the plaintext + sender id + timestamp.
 ///
 /// Step 2 is the linchpin of "removed members can't keep talking" —
-/// `process_key_rotation` flips the kicked member's status, so any
+/// `process_key_delivery` flips the kicked member's status, so any
 /// later GroupMessage from them is rejected here on purely local
 /// state.
 pub fn decrypt_group_message(gm: &GroupManager, wire: &[u8]) -> Result<DecryptedGroupMessage> {

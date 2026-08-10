@@ -429,7 +429,7 @@ fn proactive_rotation_propagates_and_is_accepted() {
     // receiver's strict `generation > version` gate rejected it, and
     // the initiator self-partitioned onto a key nobody else adopted.
     use qubee_crypto::groups::group_handshake::GroupHandshake;
-    use qubee_crypto::groups::handshake_handlers::{plan_key_rotation, process_key_rotation};
+    use qubee_crypto::groups::handshake_handlers::{plan_key_rotation_split, process_key_delivery};
 
     let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
     let alice_id = alice_kp.identity_id();
@@ -457,12 +457,22 @@ fn proactive_rotation_propagates_and_is_accepted() {
 
     let version_before = alice_gm.get_group(&group_id).unwrap().version;
 
-    // Alice proactively rotates (no removed member).
-    let signed = plan_key_rotation(&mut alice_gm, &alice_kp, group_id, None, "compromise drill")
-        .expect("proactive rotation should plan");
-    let (body, sig) = match signed {
-        GroupHandshake::KeyRotation { body, signature } => (body, signature),
-        _ => unreachable!("plan_key_rotation returns KeyRotation"),
+    // Alice proactively rotates (no removed member). The split planner
+    // must produce no broadcast announce (nothing to tell the topic)
+    // and exactly one directed delivery, addressed to Bob.
+    let (announce, mut deliveries) =
+        plan_key_rotation_split(&mut alice_gm, &alice_kp, group_id, None, "compromise drill")
+            .expect("proactive rotation should plan");
+    assert!(
+        announce.is_none(),
+        "proactive rotation must not put an announce on the broadcast channel",
+    );
+    assert_eq!(deliveries.len(), 1, "one delivery for the one other member");
+    let (recipient, frame) = deliveries.pop().unwrap();
+    assert_eq!(recipient, bob_kp.identity_id());
+    let (body, sig) = match frame {
+        GroupHandshake::KeyDelivery { body, signature } => (body, signature),
+        _ => unreachable!("plan_key_rotation_split returns KeyDelivery frames"),
     };
 
     // The generation must have advanced past Alice's pre-rotation
@@ -475,7 +485,7 @@ fn proactive_rotation_propagates_and_is_accepted() {
     );
 
     // Bob applies it and converges — no generation-gate rejection.
-    process_key_rotation(&mut bob_gm, bob_kp.identity_id(), &body, &sig)
+    process_key_delivery(&mut bob_gm, bob_kp.identity_id(), &body, &sig)
         .expect("Bob must accept the proactive rotation");
 
     assert_eq!(

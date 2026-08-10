@@ -41,7 +41,7 @@ interface NetworkCallback {
 
     /**
      * Fired by the Rust core after a successful handshake event
-     * (RequestJoin, KeyRotation, MemberAdded, RoleChange,
+     * (RequestJoin, KeyRotationAnnounce, KeyDelivery, MemberAdded, RoleChange,
      * RequestStateSync, StateSyncResponse) when the (libp2p PeerId,
      * Qubee IdentityId) pair becomes known. Lets the Android side
      * stamp `Contact.peerId` *before* any encrypted message round-

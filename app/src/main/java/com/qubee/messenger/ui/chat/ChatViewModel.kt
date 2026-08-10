@@ -633,9 +633,11 @@ class ChatViewModel @Inject constructor(
      * Rust-side; callers without permission see "Failed to remove
      * member" via the null-mapped JNI return.
      *
-     * The Rust core publishes a `KeyRotation` after a successful
-     * removal so the remaining members converge on a fresh group
-     * key the kicked member can no longer decrypt with — the
+     * The Rust core emits a split rotation after a successful
+     * removal (`KeyRotationAnnounce` broadcast + one directed
+     * `KeyDelivery` per remaining member) so the remaining members
+     * converge on a fresh group key the kicked member can no
+     * longer decrypt with — the
      * removed member stays subscribed to the gossipsub topic but
      * sees only the encrypted bytes from this point.
      */
@@ -724,8 +726,9 @@ class ChatViewModel @Inject constructor(
      * "remove yourself" the same way it accepts an owner removing
      * someone else, just with `member_id = self_id`. Triggers a
      * local key rotation so the user no longer holds the
-     * post-rotation key; remaining members get a `KeyRotation`
-     * broadcast and converge on the fresh key.
+     * post-rotation key; remaining members get the split
+     * `KeyRotationAnnounce`/`KeyDelivery` frames and converge on
+     * the fresh key.
      *
      * The local Conversation row stays in place after a leave —
      * the user can still scroll back through the message history

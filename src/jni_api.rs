@@ -14,8 +14,8 @@ use tokio::runtime::Runtime;
 // Core modules
 use crate::groups::group_handshake::{
     generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_prekey_bundle,
-    sign_request_join, sign_role_change, verify_prekey_bundle, GroupHandshake, KeyRotationBody,
-    MessageAckBody, RequestJoinBody,
+    sign_request_join, sign_role_change, verify_prekey_bundle, GroupHandshake, MessageAckBody,
+    RequestJoinBody,
 };
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_manager::{
@@ -26,7 +26,7 @@ use crate::groups::group_message::{
 };
 use crate::groups::group_permissions::Role;
 use crate::groups::handshake_handlers::{
-    plan_key_rotation_split, process_join_accepted, process_key_delivery, process_key_rotation,
+    plan_key_rotation_split, process_join_accepted, process_key_delivery,
     process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
@@ -1786,7 +1786,6 @@ fn stamp_local_peer_id_in_groups() {
 fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
     let id: IdentityId = match frame {
         GroupHandshake::RequestJoin { body, .. } => body.joiner_public_key.identity_id,
-        GroupHandshake::KeyRotation { body, .. } => body.rotator_id,
         GroupHandshake::KeyRotationAnnounce { body, .. } => body.rotator_id,
         GroupHandshake::KeyDelivery { body, .. } => body.rotator_id,
         GroupHandshake::MemberAdded { body, .. } => body.adder_id,
@@ -1797,6 +1796,10 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
         GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
         GroupHandshake::PrekeyBundle { body, .. } => body.publisher.identity_id,
         GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
+        // Retired legacy frame (phase 2D): inbound KeyRotation is
+        // dropped unprocessed, so it must not feed peer↔identity
+        // linkage either.
+        GroupHandshake::KeyRotation { .. } => return None,
     };
     Some(hex::encode(id.as_ref() as &[u8]))
 }
@@ -1890,8 +1893,19 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
                 "invite to group rejected",
             );
         }
-        GroupHandshake::KeyRotation { body, signature } => {
-            on_key_rotation(body, signature)?;
+        GroupHandshake::KeyRotation { body, .. } => {
+            // Retired legacy frame (phase 2D). Emission moved to the
+            // split KeyRotationAnnounce + KeyDelivery pair in phase 2B/
+            // 2C; every current build rotates via that path, so an
+            // inbound monolithic KeyRotation can only come from a
+            // pre-split build (or a replay) and is dropped without
+            // touching group state. The enum variant itself must stay:
+            // bincode tags variants by position, so removing it would
+            // shift every later frame's wire tag.
+            tracing::warn!(
+                group_id = %body.group_id,
+                "ignoring retired legacy KeyRotation frame",
+            );
         }
         GroupHandshake::KeyRotationAnnounce { body, signature } => {
             on_key_rotation_announce(body, signature)?;
@@ -2024,37 +2038,6 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
     Ok(())
 }
 
-fn on_key_rotation(
-    body: KeyRotationBody,
-    signature: crate::identity::identity_key::HybridSignature,
-) -> anyhow::Result<()> {
-    let identity =
-        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
-    // Don't process our own rotations as if we received them — we
-    // already installed the new key in plan_key_rotation.
-    if body.rotator_id == identity.identity_id() {
-        return Ok(());
-    }
-    {
-        let mut gm_guard = GROUP_MANAGER.lock().unwrap();
-        let gm = gm_guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-        process_key_rotation(gm, identity.identity_id(), &body, &signature)?;
-    }
-    // An authenticated rotation means membership changed: wipe our
-    // Stage 4 sender chains for the group so everyone re-distributes
-    // on fresh ones (a removed member holds the old chain keys). Only
-    // after a *successful* process — a forged rotation frame must not
-    // be able to trigger rekey churn.
-    let mut ks_guard = KEYSTORE.lock().unwrap();
-    let ks = ks_guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-    reset_group_sender_state(ks, &body.group_id)?;
-    Ok(())
-}
-
 /// Receive-side handler for a broadcast `KeyRotationAnnounce`. Applies
 /// the removal / self-removal (never a key install — that's the
 /// KeyDelivery's job). We skip our own broadcast.
@@ -2075,9 +2058,9 @@ fn on_key_rotation_announce(
 }
 
 /// Receive-side handler for a directed `KeyDelivery`. Installs the new
-/// key + adopts the generation (via the handler), then — as with
-/// `on_key_rotation` — resets our Stage 4 sender chains, since an
-/// authenticated rotation means the membership changed.
+/// key + adopts the generation (via the handler), then resets our
+/// Stage 4 sender chains, since an authenticated rotation means the
+/// membership changed.
 fn on_key_delivery(
     body: crate::groups::group_handshake::KeyDeliveryBody,
     signature: crate::identity::identity_key::HybridSignature,

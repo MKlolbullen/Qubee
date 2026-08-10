@@ -81,7 +81,7 @@ Failing screenshots write side-by-side diffs to `app/build/paparazzi/failures/`.
 
 ### Group messaging strict generation gate
 
-`decrypt_group_message` rejects any frame whose generation counter doesn't equal `group.version` exactly — no buffering, no lock-step recovery. This is the kicked-then-rotated race fix. Whenever membership or roles change, the inviter broadcasts the post-mutation `group.version` (via `MemberAdded`, `RoleChange`, `KeyRotation`) so receivers stay synchronised. If you add a mutation path, you must add the matching broadcast or the next message will get rejected.
+`decrypt_group_message` rejects any frame whose generation counter doesn't equal `group.version` exactly — no buffering, no lock-step recovery. This is the kicked-then-rotated race fix. Whenever membership or roles change, the mutating member distributes the post-mutation `group.version` (via `MemberAdded`, `RoleChange`, or the split `KeyRotationAnnounce`+`KeyDelivery` pair — the monolithic `KeyRotation` frame is retired: still a wire variant for tag stability, but inbound frames are ignored). If you add a mutation path, you must add the matching broadcast or the next message will get rejected.
 
 Membership cap: `QUBEE_MAX_GROUP_MEMBERS = 16`. Roles: Owner / Admin / Moderator / Member / Observer. Owner-only mints invites and promotes/demotes.
 

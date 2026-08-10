@@ -19,8 +19,8 @@ use qubee_crypto::groups::group_handshake::{
 use qubee_crypto::groups::group_invite::InvitePayload;
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType};
 use qubee_crypto::groups::handshake_handlers::{
-    plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
-    HandshakeOutcome,
+    plan_key_rotation_split, process_join_accepted, process_key_delivery,
+    process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
 use qubee_crypto::storage::secure_keystore::SecureKeyStore;
@@ -470,8 +470,8 @@ fn key_rotation_after_removal_converges_on_new_key() {
         carol_gm.export_group_key(&group_id).unwrap()
     );
 
-    // -------- Alice kicks Bob --------
-    let rotation_signed = plan_key_rotation(
+    // -------- Alice kicks Bob (split rotation) --------
+    let (announce, deliveries) = plan_key_rotation_split(
         &mut alice_gm,
         &alice_kp,
         group_id,
@@ -479,8 +479,17 @@ fn key_rotation_after_removal_converges_on_new_key() {
         "test removal",
     )
     .unwrap();
-    let (rotation_body, rotation_sig) = match rotation_signed {
-        GroupHandshake::KeyRotation { body, signature } => (body, signature),
+    let announce_signed = announce.expect("a removal rotation must carry a broadcast announce");
+    let (announce_body, announce_sig) = match announce_signed {
+        GroupHandshake::KeyRotationAnnounce { body, signature } => (body, signature),
+        _ => unreachable!(),
+    };
+    // Deliveries go to the remaining members only — Carol, not Bob.
+    assert_eq!(deliveries.len(), 1);
+    let (delivery_recipient, delivery_signed) = deliveries.into_iter().next().unwrap();
+    assert_eq!(delivery_recipient, carol_kp.identity_id());
+    let (delivery_body, delivery_sig) = match delivery_signed {
+        GroupHandshake::KeyDelivery { body, signature } => (body, signature),
         _ => unreachable!(),
     };
 
@@ -488,12 +497,25 @@ fn key_rotation_after_removal_converges_on_new_key() {
     let post_rotation_key_alice = alice_gm.export_group_key(&group_id).unwrap();
     assert_ne!(post_rotation_key_alice, pre_rotation_key);
 
-    // Carol applies the rotation broadcast.
-    process_key_rotation(
+    // Carol sees the broadcast announce first (worst-case ordering),
+    // then her directed delivery — only the delivery installs the key.
+    process_key_rotation_announce(
         &mut carol_gm,
         carol_kp.identity_id(),
-        &rotation_body,
-        &rotation_sig,
+        &announce_body,
+        &announce_sig,
+    )
+    .unwrap();
+    assert_eq!(
+        carol_gm.export_group_key(&group_id).unwrap(),
+        pre_rotation_key,
+        "the announce alone must never install a key",
+    );
+    process_key_delivery(
+        &mut carol_gm,
+        carol_kp.identity_id(),
+        &delivery_body,
+        &delivery_sig,
     )
     .unwrap();
     assert_eq!(
@@ -502,14 +524,14 @@ fn key_rotation_after_removal_converges_on_new_key() {
         "Carol must converge on Alice's new group key",
     );
 
-    // Bob applies the rotation broadcast — he's the removed member,
-    // so he should NOT pick up the new key. His local membership
-    // record drops the kyber secret.
-    process_key_rotation(
+    // Bob only ever sees the broadcast announce — he's the removed
+    // member, gets no delivery, and must NOT pick up the new key. The
+    // announce wipes his per-group Kyber secret.
+    process_key_rotation_announce(
         &mut bob_gm,
         bob_kp.identity_id(),
-        &rotation_body,
-        &rotation_sig,
+        &announce_body,
+        &announce_sig,
     )
     .unwrap();
     assert_ne!(

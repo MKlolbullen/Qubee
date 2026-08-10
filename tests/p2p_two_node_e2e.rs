@@ -23,8 +23,8 @@ use qubee_crypto::groups::group_handshake::{
 use qubee_crypto::groups::group_manager::{GroupManager, GroupSettings, GroupType};
 use qubee_crypto::groups::group_message::{decrypt_group_message, encrypt_group_message};
 use qubee_crypto::groups::handshake_handlers::{
-    plan_key_rotation, process_join_accepted, process_key_rotation, process_request_join,
-    HandshakeOutcome,
+    plan_key_rotation_split, process_join_accepted, process_key_delivery,
+    process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
 use qubee_crypto::network::p2p_node::{
@@ -469,16 +469,29 @@ async fn p2p_key_rotation_e2e() {
     .await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // -------- Alice runs plan_key_rotation locally, broadcasts it --------
-    let signed_rotation = plan_key_rotation(
+    // -------- Alice plans a split rotation, routes both frames --------
+    // The announce is broadcast on the group topic; the directed
+    // KeyDelivery is routed over the wire as well (in the app it rides
+    // /qubee/direct/1, but frames are self-describing — this exercises
+    // the wire round-trip of both split frames through a real node).
+    let (announce, deliveries) = plan_key_rotation_split(
         &mut alice_gm,
         &alice_kp,
         group_id,
         Some(bob_kp.identity_id()),
         "test removal",
     )
-    .expect("plan_key_rotation");
-    let rotation_wire = signed_rotation.to_wire().expect("wire encode rotation");
+    .expect("plan_key_rotation_split");
+    let announce_wire = announce
+        .expect("removal rotation carries an announce")
+        .to_wire()
+        .expect("wire encode announce");
+    let (delivery_recipient, delivery_frame) = deliveries
+        .into_iter()
+        .next()
+        .expect("one delivery for Carol");
+    assert_eq!(delivery_recipient, carol_kp.identity_id());
+    let delivery_wire = delivery_frame.to_wire().expect("wire encode delivery");
     let post_key_alice = alice_gm.export_group_key(&group_id).unwrap();
     assert_ne!(
         post_key_alice, pre_key,
@@ -488,28 +501,58 @@ async fn p2p_key_rotation_e2e() {
     send_cmd(
         &alice_node,
         P2PCommand::PublishToTopic {
-            topic,
-            data: rotation_wire,
+            topic: topic.clone(),
+            data: announce_wire,
         },
         "alice",
     )
     .await;
 
-    // -------- Carol receives the broadcast and applies it --------
+    // -------- Carol receives the announce (roster-only, no key) --------
     let evt = next_matching(&mut carol_node, Duration::from_secs(5), |evt| {
         matches!(evt, NodeEvent::MessageReceived { .. })
     })
     .await;
-    let NodeEvent::MessageReceived { data: rot_data, .. } = evt else {
+    let NodeEvent::MessageReceived { data: ann_data, .. } = evt else {
         unreachable!()
     };
-    let inbound = GroupHandshake::from_wire(&rot_data).expect("decode KeyRotation wire");
-    let (rot_body, rot_sig) = match inbound {
-        GroupHandshake::KeyRotation { body, signature } => (body, signature),
-        other => panic!("expected KeyRotation, got {other:?}"),
+    let inbound = GroupHandshake::from_wire(&ann_data).expect("decode announce wire");
+    let (ann_body, ann_sig) = match inbound {
+        GroupHandshake::KeyRotationAnnounce { body, signature } => (body, signature),
+        other => panic!("expected KeyRotationAnnounce, got {other:?}"),
     };
-    process_key_rotation(&mut carol_gm, carol_kp.identity_id(), &rot_body, &rot_sig)
-        .expect("process_key_rotation on Carol");
+    process_key_rotation_announce(&mut carol_gm, carol_kp.identity_id(), &ann_body, &ann_sig)
+        .expect("process announce on Carol");
+    assert_eq!(
+        carol_gm.export_group_key(&group_id).unwrap(),
+        pre_key,
+        "announce alone must not install a key",
+    );
+
+    // -------- Carol receives her directed delivery and applies it --------
+    send_cmd(
+        &alice_node,
+        P2PCommand::PublishToTopic {
+            topic,
+            data: delivery_wire,
+        },
+        "alice",
+    )
+    .await;
+    let evt = next_matching(&mut carol_node, Duration::from_secs(5), |evt| {
+        matches!(evt, NodeEvent::MessageReceived { .. })
+    })
+    .await;
+    let NodeEvent::MessageReceived { data: del_data, .. } = evt else {
+        unreachable!()
+    };
+    let inbound = GroupHandshake::from_wire(&del_data).expect("decode delivery wire");
+    let (del_body, del_sig) = match inbound {
+        GroupHandshake::KeyDelivery { body, signature } => (body, signature),
+        other => panic!("expected KeyDelivery, got {other:?}"),
+    };
+    process_key_delivery(&mut carol_gm, carol_kp.identity_id(), &del_body, &del_sig)
+        .expect("process_key_delivery on Carol");
 
     // -------- Convergence assertions --------
     assert_eq!(

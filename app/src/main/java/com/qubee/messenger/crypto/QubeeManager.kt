@@ -177,12 +177,46 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    /** Deterministic 16-byte id of an exact QUBEE_DMS frame, as hex. */
+    suspend fun extractDirectMessageId(wire: ByteArray): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeExtractDirectMessageId(wire)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust direct-message-id JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Direct message id extraction failed")
+            null
+        }
+    }
+
+    /**
+     * Build a ratchet-authenticated, deniable delivery receipt for one exact
+     * direct frame. No long-term identity signature is produced.
+     */
+    suspend fun createDirectMessageAck(peerIdHex: String, messageIdHex: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeCreateDirectMessageAck(peerIdHex, messageIdHex)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust direct-ack JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Direct ack creation failed")
+                null
+            }
+        }
+
     /**
      * Decrypt an inbound QUBEE_DMS frame (Ratchet Stage 3d/5),
      * establishing the responder side of the session on a
      * conversation's first message, and decode its tagged payload.
      * Returns a JSON string:
-     * `{"senderId": hex, "kind": "text", "text": str}` for chat, or
+     * `{"senderId": hex, "kind": "text", "text": str}` for chat,
+     * `{"senderId": hex, "kind": "ack", "messageId": hex}` for a
+     * deniable delivery receipt, or
      * `{"senderId": hex, "kind": "senderKeyDistribution", "groupId":
      * hex}` for a Stage 4 sender key that Rust has already
      * membership-checked and installed. Null on wrong frame type,
@@ -892,6 +926,8 @@ class QubeeManager @Inject constructor(
     private external fun nativeBuildLocalPrekeyBundle(): ByteArray?
     private external fun nativeInstallPeerPrekeyBundle(bundleWire: ByteArray): String?
     private external fun nativeEncryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray?
+    private external fun nativeExtractDirectMessageId(wire: ByteArray): String?
+    private external fun nativeCreateDirectMessageAck(peerIdHex: String, messageIdHex: String): ByteArray?
     private external fun nativeDecryptDirectMessage(wire: ByteArray): String?
     private external fun nativeInspectDirectMessageSender(wire: ByteArray): String?
     private external fun nativeCreateSenderKeyDistribution(groupIdHex: String): ByteArray?

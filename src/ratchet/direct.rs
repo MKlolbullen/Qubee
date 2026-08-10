@@ -46,7 +46,8 @@ use anyhow::{anyhow, bail, Result};
 use crate::groups::group_handshake::{verify_prekey_bundle, GroupHandshake};
 use crate::identity::identity_key::IdentityId;
 use crate::ratchet::direct_message::{
-    direct_identity_selector, DirectMessage, DIRECT_ID_SELECTOR_LEN, DIRECT_ROUTE_NONCE_LEN,
+    direct_identity_selector, DirectMessage, DIRECT_ID_SELECTOR_LEN, DIRECT_MESSAGE_ID_LEN,
+    DIRECT_ROUTE_NONCE_LEN,
 };
 use crate::ratchet::pqxdh::WireInitialMessage;
 use crate::ratchet::prekey_store::{
@@ -260,10 +261,10 @@ fn resolve_direct_selector(
 ) -> Result<IdentityId> {
     let mut matched: Option<IdentityId> = None;
     for candidate in list_peer_bundle_ids(ks)? {
-        if direct_identity_selector(&candidate, route_nonce) == *selector {
-            if matched.replace(candidate).is_some() {
-                bail!("ambiguous direct identity selector collision");
-            }
+        if direct_identity_selector(&candidate, route_nonce) == *selector
+            && matched.replace(candidate).is_some()
+        {
+            bail!("ambiguous direct identity selector collision");
         }
     }
     matched.ok_or_else(|| anyhow!("direct identity selector does not match a verified peer"))
@@ -326,6 +327,8 @@ pub fn reset_direct_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Resul
 
 pub const PAYLOAD_TAG_TEXT: u8 = 0x01;
 pub const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
+/// Deniable delivery receipt for an exact QUBEE_DMS wire id.
+pub const PAYLOAD_TAG_ACK: u8 = 0x03;
 /// Version of the tagged payload envelope *inside* the ratchet ciphertext.
 /// v1 adds an optional sender libp2p PeerId hint before the payload tag.
 pub const DIRECT_PAYLOAD_ENVELOPE_VERSION: u8 = 0x01;
@@ -341,6 +344,9 @@ pub enum DirectPayload {
     /// [`crate::ratchet::sender_keys::install_sender_key`] — never the
     /// distribution's own claim.
     SenderKeyDistribution(SenderKeyDistribution),
+    /// Delivery receipt authenticated only by the 1:1 ratchet session. It is
+    /// deliberately not identity-signed, preserving transcript deniability.
+    Ack([u8; DIRECT_MESSAGE_ID_LEN]),
 }
 
 fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
@@ -358,6 +364,12 @@ fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
             out.extend_from_slice(&body);
             Ok(out)
         }
+        DirectPayload::Ack(message_id) => {
+            let mut out = Vec::with_capacity(1 + DIRECT_MESSAGE_ID_LEN);
+            out.push(PAYLOAD_TAG_ACK);
+            out.extend_from_slice(message_id);
+            Ok(out)
+        }
     }
 }
 
@@ -372,6 +384,12 @@ fn decode_tagged_payload(bytes: &[u8]) -> Result<DirectPayload> {
         PAYLOAD_TAG_SENDER_KEY_DIST => Ok(DirectPayload::SenderKeyDistribution(
             SenderKeyDistribution::from_bytes(body)?,
         )),
+        PAYLOAD_TAG_ACK => {
+            let message_id: [u8; DIRECT_MESSAGE_ID_LEN] = body.try_into().map_err(|_| {
+                anyhow!("direct ack message id must be {DIRECT_MESSAGE_ID_LEN} bytes")
+            })?;
+            Ok(DirectPayload::Ack(message_id))
+        }
         other => bail!("unknown direct payload tag {other:#04x}"),
     }
 }
@@ -479,6 +497,31 @@ pub fn encrypt_direct_distribution_with_route(
         &DirectPayload::SenderKeyDistribution(dist.clone()),
         sender_peer_id,
     )?;
+    encrypt_direct(ks, local_id, peer_id, &payload, now)
+}
+
+/// Encrypt a deniable delivery receipt over the same ratchet session. The
+/// receipt authenticates possession of the session state but carries no
+/// long-term identity signature.
+pub fn encrypt_direct_ack(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    message_id: [u8; DIRECT_MESSAGE_ID_LEN],
+    now: u64,
+) -> Result<Vec<u8>> {
+    encrypt_direct_ack_with_route(ks, local_id, peer_id, message_id, None, now)
+}
+
+pub fn encrypt_direct_ack_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    message_id: [u8; DIRECT_MESSAGE_ID_LEN],
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload = encode_payload_with_route(&DirectPayload::Ack(message_id), sender_peer_id)?;
     encrypt_direct(ks, local_id, peer_id, &payload, now)
 }
 
@@ -798,6 +841,7 @@ mod tests {
     fn payload_tags_are_pinned() {
         assert_eq!(PAYLOAD_TAG_TEXT, 0x01);
         assert_eq!(PAYLOAD_TAG_SENDER_KEY_DIST, 0x02);
+        assert_eq!(PAYLOAD_TAG_ACK, 0x03);
     }
 
     #[test]
@@ -809,6 +853,30 @@ mod tests {
         let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &w, 1).unwrap();
         assert_eq!(sender, aid);
         assert_eq!(payload, DirectPayload::Text("tagged hello".to_string()));
+    }
+
+    #[test]
+    fn deniable_delivery_ack_round_trips_over_ratchet() {
+        use crate::ratchet::direct_message::extract_direct_message_id;
+
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+
+        let text_wire = encrypt_direct_text(&mut a.ks, aid, bid, "please ack", 1).unwrap();
+        let message_id = extract_direct_message_id(&text_wire).unwrap();
+        let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &text_wire, 1).unwrap();
+        assert_eq!(sender, aid);
+        assert_eq!(payload, DirectPayload::Text("please ack".to_string()));
+
+        let ack_wire = encrypt_direct_ack(&mut b.ks, bid, aid, message_id, 2).unwrap();
+        let (sender, payload) = decrypt_direct_payload(&mut a.ks, aid, &ack_wire, 2).unwrap();
+        assert_eq!(sender, bid);
+        assert_eq!(payload, DirectPayload::Ack(message_id));
+        assert_ne!(
+            extract_direct_message_id(&ack_wire).unwrap(),
+            message_id,
+            "the receipt is its own ratchet frame, not an echo of the message",
+        );
     }
 
     #[test]

@@ -550,6 +550,29 @@ class MessageService : Service(), NetworkCallback {
         // not by sender resolution: an unknown/tampered selector is still a
         // direct frame and must fail closed here rather than reach legacy decrypt.
         if (isDirectV2Frame(data)) {
+            val directMessageId = qubeeManager.extractDirectMessageId(data)
+            if (directMessageId == null) {
+                Timber.w("Malformed QUBEE_DMS frame from %s", peerId)
+                return true
+            }
+
+            // Lost-receipt recovery: retries deliberately reuse the exact wire
+            // bytes, while the Double Ratchet correctly rejects decrypting the
+            // same frame twice. Persisting the inbound wireId lets us recognise
+            // an already-accepted frame and issue a fresh encrypted receipt
+            // without weakening ratchet replay protection. This survives a
+            // process death because the evidence is in Room, not a RAM cache.
+            val prior = messageRepository.getMessageByWireId(directMessageId)
+            if (prior != null && !prior.isFromMe) {
+                sendOrReplayDirectDeliveryAck(
+                    inboundMessage = prior,
+                    originalWire = data,
+                    messageIdHex = directMessageId,
+                    authenticatedSenderIdentityHex = null,
+                )
+                return true
+            }
+
             val resultJson = qubeeManager.decryptDirectMessage(data)
             if (resultJson == null) {
                 Timber.w("Ratchet 1:1 decrypt failed from %s", peerId)
@@ -582,18 +605,18 @@ class MessageService : Service(), NetworkCallback {
                         Timber.w("Cannot route ratchet 1:1 from %s", senderIdentityHex)
                         return true
                     }
-                    messageRepository.saveMessage(
-                        Message(
-                            id = UUID.randomUUID().toString(),
-                            conversationId = conversationId,
-                            senderId = routedSenderId,
-                            content = result.optString("text"),
-                            contentType = MessageType.TEXT,
-                            timestamp = System.currentTimeMillis(),
-                            status = MessageStatus.DELIVERED,
-                            isFromMe = false,
-                        ),
+                    val inboundMessage = Message(
+                        id = UUID.randomUUID().toString(),
+                        conversationId = conversationId,
+                        senderId = routedSenderId,
+                        content = result.optString("text"),
+                        contentType = MessageType.TEXT,
+                        timestamp = System.currentTimeMillis(),
+                        status = MessageStatus.DELIVERED,
+                        isFromMe = false,
+                        wireId = directMessageId,
                     )
+                    messageRepository.saveMessage(inboundMessage)
                     if (contact != null) {
                         contactRepository.updateOnlineStatus(
                             contact.id,
@@ -601,6 +624,47 @@ class MessageService : Service(), NetworkCallback {
                             System.currentTimeMillis(),
                         )
                     }
+                    // Receipt only after the plaintext is durably persisted. Cache
+                    // the exact encrypted receipt before transmit; if it is lost, an
+                    // exact text retry re-sends the same receipt bytes without advancing
+                    // our send ratchet a second time.
+                    sendOrReplayDirectDeliveryAck(
+                        inboundMessage = inboundMessage,
+                        originalWire = data,
+                        messageIdHex = directMessageId,
+                        authenticatedSenderIdentityHex = senderIdentityHex,
+                    )
+                }
+                "ack" -> {
+                    val ackedWireId = result.optString("messageId")
+                    if (ackedWireId.isBlank()) {
+                        Timber.w("Ratchet direct ack from %s has no message id", senderIdentityHex)
+                    } else {
+                        val contact = contactRepository.getContactByIdentityId(senderIdentityHex)
+                        val participantId = contact?.id ?: senderIdentityHex
+                        val directConversationId =
+                            conversationRepository.findDirectConversationId(participantId)
+                        if (directConversationId == null) {
+                            Timber.w(
+                                "Ignored direct ack from %s: no matching direct conversation",
+                                senderIdentityHex,
+                            )
+                        } else {
+                            val applied = messageRepository.applyAck(
+                                ackedWireId,
+                                senderIdentityHex,
+                                directConversationId,
+                            )
+                            if (!applied) {
+                                Timber.d(
+                                    "Ignored direct ack for wireId=%s outside conversation=%s",
+                                    ackedWireId,
+                                    directConversationId,
+                                )
+                            }
+                        }
+                    }
+                    // Never ack an ack: that would create an infinite receipt loop.
                 }
                 "senderKeyDistribution" -> {
                     // Rust has already membership-checked + installed it.
@@ -643,6 +707,43 @@ class MessageService : Service(), NetworkCallback {
         }
 
         return false
+    }
+
+    private suspend fun sendOrReplayDirectDeliveryAck(
+        inboundMessage: Message,
+        originalWire: ByteArray,
+        messageIdHex: String,
+        authenticatedSenderIdentityHex: String?,
+    ) {
+        var ackWire = inboundMessage.wireBytes
+        if (ackWire == null) {
+            // Normal first delivery already has an authenticated sender from the
+            // successful decrypt. The duplicate-after-crash path may only have the
+            // durable original wire, so resolve its opaque sender selector against
+            // Rust's signature-verified peer cache.
+            val recipientIdentityHex = authenticatedSenderIdentityHex
+                ?.takeIf { it.isNotBlank() }
+                ?: qubeeManager.inspectDirectMessageSender(originalWire)
+            if (recipientIdentityHex.isNullOrBlank()) {
+                Timber.w("Cannot create direct receipt: sender selector is unresolved")
+                return
+            }
+            ackWire = qubeeManager.createDirectMessageAck(recipientIdentityHex, messageIdHex)
+            if (ackWire == null) {
+                Timber.w("Could not create direct delivery ack for %s", messageIdHex)
+                return
+            }
+            // Persist before transmit. A crash or an active replay after this point
+            // can only cause this exact receipt ciphertext to be re-published; it
+            // cannot repeatedly advance our Double Ratchet send chain.
+            messageRepository.cacheInboundDirectReceipt(inboundMessage.id, ackWire)
+        }
+
+        // Rust owns QUBEE_DMS routing from the frame's opaque recipient selector.
+        // Empty compatibility hint makes that authority explicit.
+        if (!qubeeManager.sendP2PMessage("", ackWire)) {
+            Timber.d("Direct delivery ack enqueue failed for %s; exact-text retry can replay it", messageIdHex)
+        }
     }
 
     private fun isDirectV2Frame(data: ByteArray): Boolean {
@@ -711,9 +812,17 @@ class MessageService : Service(), NetworkCallback {
         )
         serviceScope.launch {
             try {
-                val applied = messageRepository.applyAck(messageIdHex, ackerIdHex)
+                val applied = messageRepository.applyAck(
+                    messageIdHex,
+                    ackerIdHex,
+                    groupIdHex,
+                )
                 if (!applied) {
-                    Timber.d("Ignored ack for unknown wireId=%s", messageIdHex)
+                    Timber.d(
+                        "Ignored ack for wireId=%s outside group=%s",
+                        messageIdHex,
+                        groupIdHex,
+                    )
                 }
             } catch (e: Exception) {
                 Timber.e(

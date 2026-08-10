@@ -57,10 +57,14 @@ class ConversationRepository @Inject constructor(
     /// Returns the empty string if onboarding hasn't completed
     /// (no active identity ⇒ Rust refuses `createGroup`); callers
     /// should treat empty as "cannot send / receive yet".
-    suspend fun getOrCreateConversationId(contactId: String): String {
-        val existing = conversationDao.getConversationsByType(ConversationType.DIRECT)
+    suspend fun findDirectConversationId(contactId: String): String? =
+        conversationDao.getConversationsByType(ConversationType.DIRECT)
             .firstOrNull { it.participants.contains(contactId) }
-        if (existing != null) return existing.id
+            ?.id
+
+    suspend fun getOrCreateConversationId(contactId: String): String {
+        val existingId = findDirectConversationId(contactId)
+        if (existingId != null) return existingId
 
         val groupIdHex = mintRustGroupForDirect(contactId) ?: return ""
 

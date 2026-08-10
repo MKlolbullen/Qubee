@@ -33,11 +33,12 @@ use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
-    decrypt_direct_payload_with_route, encrypt_direct_distribution_with_route,
-    encrypt_direct_text_with_route, inspect_direct_recipient, inspect_direct_sender,
-    install_peer_bundle, reset_direct_session, DirectPayload,
+    decrypt_direct_payload_with_route, encrypt_direct_ack_with_route,
+    encrypt_direct_distribution_with_route, encrypt_direct_text_with_route,
+    inspect_direct_recipient, inspect_direct_sender, install_peer_bundle, reset_direct_session,
+    DirectPayload,
 };
-use crate::ratchet::direct_message::is_direct_message_frame;
+use crate::ratchet::direct_message::{extract_direct_message_id, is_direct_message_frame};
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
@@ -2904,6 +2905,84 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
+/// Extract the deterministic 16-byte id of an exact QUBEE_DMS frame as
+/// 32-char lowercase hex. Returns null for malformed/non-direct bytes.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtractDirectMessageId(
+    env: JNIEnv,
+    _class: JClass,
+    wire: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let result: anyhow::Result<jstring> = (|| {
+            let bytes = env
+                .convert_byte_array(&wire)
+                .map_err(|e| anyhow::anyhow!("invalid direct wire: {e}"))?;
+            let id = match extract_direct_message_id(&bytes) {
+                Some(id) => id,
+                None => return Ok(std::ptr::null_mut()),
+            };
+            let java_str = env
+                .new_string(hex::encode(id))
+                .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+            Ok(java_str.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Build a deniable direct delivery receipt. `message_id_hex` names the exact
+/// accepted QUBEE_DMS wire frame; authentication comes from the Double Ratchet
+/// rather than a long-term identity signature.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreateDirectMessageAck(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    message_id_hex: JString,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_hex: String = env
+                .get_string(&peer_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+                .into();
+            let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+            let message_hex: String = env
+                .get_string(&message_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid message_id_hex: {e}"))?
+                .into();
+            let decoded = hex::decode(message_hex.trim())
+                .map_err(|e| anyhow::anyhow!("bad direct message id hex: {e}"))?;
+            let message_id: [u8; 16] = decoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("direct message id must be 16 bytes"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let local_peer_id = LOCAL_PEER_ID.lock().unwrap().clone();
+            let wire = encrypt_direct_ack_with_route(
+                ks,
+                local_id,
+                peer_id,
+                message_id,
+                local_peer_id.as_deref(),
+                now_secs(),
+            )?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Encrypt this device's sender key for `group_id_hex` to one peer over
 /// the 1:1 ratchet session (Ratchet Stage 5 plumbing). Creates the
 /// group sender chain on first use. Call once per group member; the
@@ -3003,6 +3082,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
                     "senderId": sender_hex,
                     "kind": "text",
                     "text": text,
+                })),
+                DirectPayload::Ack(message_id) => Ok(json!({
+                    "senderId": sender_hex,
+                    "kind": "ack",
+                    "messageId": hex::encode(message_id),
                 })),
                 DirectPayload::SenderKeyDistribution(dist) => {
                     {

@@ -48,6 +48,13 @@ class MessageRepository @Inject constructor(
         messageDao.updateMessageStatus(messageId, status)
     }
 
+    suspend fun getMessageByWireId(wireId: String): Message? =
+        messageDao.getMessageByWireId(wireId)
+
+    suspend fun cacheInboundDirectReceipt(messageId: String, receiptWire: ByteArray) {
+        messageDao.cacheInboundDirectReceipt(messageId, receiptWire)
+    }
+
     /**
      * Return outbound rows whose retry timer has fired and whose
      * budget hasn't been exhausted. Used by `MessageService`'s
@@ -90,7 +97,10 @@ class MessageRepository @Inject constructor(
     }
 
     /**
-     * Apply an inbound `MessageAck` to the local outbound row.
+     * Apply an authenticated acknowledgement to the local outbound row.
+     * `expectedConversationId` is mandatory: a wire id alone is correlation,
+     * not authorization. Direct receipts derive the conversation from the
+     * ratchet-authenticated sender; group receipts use their signed group id.
      *
      * Delegates to [MessageDao.applyAckTransactional] so the
      * read-modify-write happens inside one SQLite transaction.
@@ -103,8 +113,12 @@ class MessageRepository @Inject constructor(
      * when no row carried this `wireId` — caller logs the latter
      * at debug level without surfacing to the user.
      */
-    suspend fun applyAck(wireId: String, ackerIdHex: String): Boolean =
-        when (messageDao.applyAckTransactional(wireId, ackerIdHex)) {
+    suspend fun applyAck(
+        wireId: String,
+        ackerIdHex: String,
+        expectedConversationId: String,
+    ): Boolean =
+        when (messageDao.applyAckTransactional(wireId, ackerIdHex, expectedConversationId)) {
             is ApplyAckResult.NotFound -> false
             is ApplyAckResult.AlreadyApplied,
             is ApplyAckResult.Applied -> true

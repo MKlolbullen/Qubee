@@ -10,6 +10,7 @@ import com.qubee.messenger.data.model.MessageType
 import com.qubee.messenger.data.repository.database.dao.MessageDao
 import kotlinx.coroutines.test.runTest
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -155,6 +156,87 @@ class MessageDaoInstrumentedTest {
             "DAO doesn't dedupe; that's the repo's job",
             listOf("alice", "bob", "alice"),
             afterThird.deliveredAckers,
+        )
+    }
+
+    @Test
+    fun ack_is_bound_to_expected_conversation_before_retry_is_retired() = runTest {
+        val sharedWireId = "abababababababababababababababab"
+        val intended = Message(
+            id = "bound-ack-1",
+            conversationId = "direct-alice",
+            senderId = "me",
+            status = MessageStatus.SENT,
+            isFromMe = true,
+            wireId = sharedWireId,
+            wireBytes = byteArrayOf(1, 2, 3),
+            nextRetryAt = 10L,
+        )
+        dao.insertMessage(intended)
+
+        assertTrue(
+            dao.applyAckTransactional(
+                sharedWireId,
+                "alice-identity",
+                "direct-alice",
+            ) is com.qubee.messenger.data.repository.database.dao.ApplyAckResult.Applied,
+        )
+        val after = dao.getMessageById(intended.id)!!
+        assertEquals(MessageStatus.DELIVERED, after.status)
+        assertNull(after.wireBytes)
+        assertNull(after.nextRetryAt)
+
+        val wrongConversation = Message(
+            id = "bound-ack-2",
+            conversationId = "direct-bob",
+            senderId = "me",
+            status = MessageStatus.SENT,
+            isFromMe = true,
+            wireId = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            wireBytes = byteArrayOf(4, 5, 6),
+            nextRetryAt = 20L,
+        )
+        dao.insertMessage(wrongConversation)
+        val rejected = dao.applyAckTransactional(
+            wrongConversation.wireId!!,
+            "alice-identity",
+            "direct-alice",
+        )
+        assertTrue(
+            rejected is com.qubee.messenger.data.repository.database.dao.ApplyAckResult.NotFound,
+        )
+        val untouched = dao.getMessageById(wrongConversation.id)!!
+        assertEquals(MessageStatus.SENT, untouched.status)
+        assertArrayEquals(byteArrayOf(4, 5, 6), untouched.wireBytes)
+        assertEquals(20L, untouched.nextRetryAt)
+    }
+
+    @Test
+    fun inbound_direct_receipt_cache_roundtrips_without_entering_retry_queue() = runTest {
+        val inbound = Message(
+            id = "inbound-direct-1",
+            conversationId = "direct-1",
+            senderId = "peer",
+            content = "accepted text",
+            contentType = MessageType.TEXT,
+            timestamp = 4_000L,
+            status = MessageStatus.DELIVERED,
+            isFromMe = false,
+            wireId = "33333333333333333333333333333333",
+        )
+        dao.insertMessage(inbound)
+        val receiptWire = byteArrayOf(0x51, 0x55, 0x42, 0x45, 0x45)
+        dao.cacheInboundDirectReceipt(inbound.id, receiptWire)
+
+        val stored = dao.getMessageById(inbound.id)!!
+        assertArrayEquals(receiptWire, stored.wireBytes)
+        assertTrue(
+            "inbound receipt cache must never be selected by the outbound retry query",
+            dao.getRetryableOutbound(
+                now = Long.MAX_VALUE,
+                maxAttempts = 99,
+                limit = 100,
+            ).none { it.id == inbound.id },
         )
     }
 

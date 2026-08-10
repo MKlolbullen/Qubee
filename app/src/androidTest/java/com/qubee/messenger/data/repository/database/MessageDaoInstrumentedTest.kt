@@ -10,6 +10,7 @@ import com.qubee.messenger.data.model.MessageType
 import com.qubee.messenger.data.repository.database.dao.MessageDao
 import kotlinx.coroutines.test.runTest
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -155,6 +156,35 @@ class MessageDaoInstrumentedTest {
             "DAO doesn't dedupe; that's the repo's job",
             listOf("alice", "bob", "alice"),
             afterThird.deliveredAckers,
+        )
+    }
+
+    @Test
+    fun inbound_direct_receipt_cache_roundtrips_without_entering_retry_queue() = runTest {
+        val inbound = Message(
+            id = "inbound-direct-1",
+            conversationId = "direct-1",
+            senderId = "peer",
+            content = "accepted text",
+            contentType = MessageType.TEXT,
+            timestamp = 4_000L,
+            status = MessageStatus.DELIVERED,
+            isFromMe = false,
+            wireId = "33333333333333333333333333333333",
+        )
+        dao.insertMessage(inbound)
+        val receiptWire = byteArrayOf(0x51, 0x55, 0x42, 0x45, 0x45)
+        dao.cacheInboundDirectReceipt(inbound.id, receiptWire)
+
+        val stored = dao.getMessageById(inbound.id)!!
+        assertArrayEquals(receiptWire, stored.wireBytes)
+        assertTrue(
+            "inbound receipt cache must never be selected by the outbound retry query",
+            dao.getRetryableOutbound(
+                now = Long.MAX_VALUE,
+                maxAttempts = 99,
+                limit = 100,
+            ).none { it.id == inbound.id },
         )
     }
 

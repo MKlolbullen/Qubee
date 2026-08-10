@@ -65,6 +65,16 @@ abstract class MessageDao {
     @Query("SELECT * FROM messages WHERE wireId = :wireId LIMIT 1")
     abstract suspend fun getMessageByWireId(wireId: String): Message?
 
+    /// Persist the exact encrypted direct receipt produced for an inbound text.
+    /// Duplicate delivery of the original ciphertext re-sends these same bytes
+    /// instead of encrypting another ACK and advancing the send ratchet again.
+    /// The isFromMe predicate prevents accidental writes to outbound retry rows.
+    @Query(
+        "UPDATE messages SET wireBytes = :receiptWire " +
+            "WHERE id = :messageId AND isFromMe = 0"
+    )
+    abstract suspend fun cacheInboundDirectReceipt(messageId: String, receiptWire: ByteArray)
+
     /// Outbound rows the offline-retry loop should re-publish: `SENT` or
     /// a network-send `FAILED` row that still carries durable wire bytes.
     /// Encrypt failures never have `wireBytes`, so they remain excluded.

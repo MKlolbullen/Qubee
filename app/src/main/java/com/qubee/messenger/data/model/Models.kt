@@ -165,13 +165,15 @@ data class Message(
     /// the same recipient (set semantics) and rendering the
     /// "delivered to N of M" hint on the chat row.
     val deliveredAckers: List<String> = emptyList(),
-    /// The raw wire bytes (sealed outer envelope) produced by the
-    /// first encrypt. Kept around so the offline-retry loop can
-    /// re-publish *the same bytes* — preserving the row's `wireId`
-    /// so any late-arriving `MessageAck` still correlates back to
-    /// this row. Cleared once the first ack arrives; null on rows
-    /// that don't need retry (DELIVERED / READ already, or the
-    /// retry budget is exhausted).
+    /// Durable opaque wire bytes associated with this row. For outbound
+    /// messages this is the first encrypted frame, retained so retries re-send
+    /// exactly the same bytes and preserve `wireId`. For inbound direct texts
+    /// it caches the first encrypted delivery-receipt frame: duplicate text
+    /// delivery re-sends that exact receipt rather than advancing our send
+    /// ratchet again. `getRetryableOutbound` is scoped to `isFromMe = 1`, so
+    /// inbound receipt caches never enter the normal retry queue. Outbound bytes
+    /// are cleared when the first receipt lands; inbound caches live with the
+    /// message row and disappear when that message is deleted/expired.
     val wireBytes: ByteArray? = null,
     /// Number of times the offline-retry loop has re-published
     /// `wireBytes`. Bounded by `OFFLINE_RETRY_MAX_ATTEMPTS` (see

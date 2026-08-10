@@ -564,12 +564,12 @@ class MessageService : Service(), NetworkCallback {
             // process death because the evidence is in Room, not a RAM cache.
             val prior = messageRepository.getMessageByWireId(directMessageId)
             if (prior != null && !prior.isFromMe) {
-                val senderIdentityHex = qubeeManager.inspectDirectMessageSender(data)
-                if (!senderIdentityHex.isNullOrBlank()) {
-                    sendDirectDeliveryAck(senderIdentityHex, directMessageId)
-                } else {
-                    Timber.w("Cannot re-ack direct replay: sender selector is unresolved")
-                }
+                sendOrReplayDirectDeliveryAck(
+                    inboundMessage = prior,
+                    originalWire = data,
+                    messageIdHex = directMessageId,
+                    authenticatedSenderIdentityHex = null,
+                )
                 return true
             }
 
@@ -605,19 +605,18 @@ class MessageService : Service(), NetworkCallback {
                         Timber.w("Cannot route ratchet 1:1 from %s", senderIdentityHex)
                         return true
                     }
-                    messageRepository.saveMessage(
-                        Message(
-                            id = UUID.randomUUID().toString(),
-                            conversationId = conversationId,
-                            senderId = routedSenderId,
-                            content = result.optString("text"),
-                            contentType = MessageType.TEXT,
-                            timestamp = System.currentTimeMillis(),
-                            status = MessageStatus.DELIVERED,
-                            isFromMe = false,
-                            wireId = directMessageId,
-                        ),
+                    val inboundMessage = Message(
+                        id = UUID.randomUUID().toString(),
+                        conversationId = conversationId,
+                        senderId = routedSenderId,
+                        content = result.optString("text"),
+                        contentType = MessageType.TEXT,
+                        timestamp = System.currentTimeMillis(),
+                        status = MessageStatus.DELIVERED,
+                        isFromMe = false,
+                        wireId = directMessageId,
                     )
+                    messageRepository.saveMessage(inboundMessage)
                     if (contact != null) {
                         contactRepository.updateOnlineStatus(
                             contact.id,
@@ -625,10 +624,16 @@ class MessageService : Service(), NetworkCallback {
                             System.currentTimeMillis(),
                         )
                     }
-                    // Receipt only after the plaintext is durably persisted. If
-                    // this send is lost, the sender retries the same ciphertext
-                    // and the prior-wireId branch above emits a fresh receipt.
-                    sendDirectDeliveryAck(senderIdentityHex, directMessageId)
+                    // Receipt only after the plaintext is durably persisted. Cache
+                    // the exact encrypted receipt before transmit; if it is lost, an
+                    // exact text retry re-sends the same receipt bytes without advancing
+                    // our send ratchet a second time.
+                    sendOrReplayDirectDeliveryAck(
+                        inboundMessage = inboundMessage,
+                        originalWire = data,
+                        messageIdHex = directMessageId,
+                        authenticatedSenderIdentityHex = senderIdentityHex,
+                    )
                 }
                 "ack" -> {
                     val ackedWireId = result.optString("messageId")
@@ -685,16 +690,40 @@ class MessageService : Service(), NetworkCallback {
         return false
     }
 
-    private suspend fun sendDirectDeliveryAck(recipientIdentityHex: String, messageIdHex: String) {
-        val ackWire = qubeeManager.createDirectMessageAck(recipientIdentityHex, messageIdHex)
+    private suspend fun sendOrReplayDirectDeliveryAck(
+        inboundMessage: Message,
+        originalWire: ByteArray,
+        messageIdHex: String,
+        authenticatedSenderIdentityHex: String?,
+    ) {
+        var ackWire = inboundMessage.wireBytes
         if (ackWire == null) {
-            Timber.w("Could not create direct delivery ack for %s", messageIdHex)
-            return
+            // Normal first delivery already has an authenticated sender from the
+            // successful decrypt. The duplicate-after-crash path may only have the
+            // durable original wire, so resolve its opaque sender selector against
+            // Rust's signature-verified peer cache.
+            val recipientIdentityHex = authenticatedSenderIdentityHex
+                ?.takeIf { it.isNotBlank() }
+                ?: qubeeManager.inspectDirectMessageSender(originalWire)
+            if (recipientIdentityHex.isNullOrBlank()) {
+                Timber.w("Cannot create direct receipt: sender selector is unresolved")
+                return
+            }
+            ackWire = qubeeManager.createDirectMessageAck(recipientIdentityHex, messageIdHex)
+            if (ackWire == null) {
+                Timber.w("Could not create direct delivery ack for %s", messageIdHex)
+                return
+            }
+            // Persist before transmit. A crash or an active replay after this point
+            // can only cause this exact receipt ciphertext to be re-published; it
+            // cannot repeatedly advance our Double Ratchet send chain.
+            messageRepository.cacheInboundDirectReceipt(inboundMessage.id, ackWire)
         }
-        // Rust owns QUBEE_DMS routing from the frame's opaque recipient
-        // selector. Empty compatibility hint makes that authority explicit.
+
+        // Rust owns QUBEE_DMS routing from the frame's opaque recipient selector.
+        // Empty compatibility hint makes that authority explicit.
         if (!qubeeManager.sendP2PMessage("", ackWire)) {
-            Timber.d("Direct delivery ack enqueue failed for %s; sender retry will solicit another", messageIdHex)
+            Timber.d("Direct delivery ack enqueue failed for %s; exact-text retry can replay it", messageIdHex)
         }
     }
 

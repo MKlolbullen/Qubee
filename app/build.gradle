@@ -93,11 +93,18 @@ android {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            // Only attach the signingConfig when the env wired it
-            // up. Unsigned local release builds remain installable
-            // via `adb install` for emulator smoke testing.
+            // Attach the real signingConfig when the env wired it up;
+            // otherwise fall back to the debug keystore. `adb install`
+            // rejects unsigned APKs on physical devices, and the
+            // Category-B runbook wants an R8-minified install — so the
+            // no-secrets release build must still carry *a* signature.
+            // No leak risk toward real releases: release.yml hard-fails
+            // before assembling when the keystore secrets are absent,
+            // so a debug-signed APK can never reach a tagged release.
             if (hasReleaseSigning) {
                 signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
             }
         }
         debug {

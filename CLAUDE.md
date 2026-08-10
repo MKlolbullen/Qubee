@@ -60,7 +60,7 @@ Failing screenshots write side-by-side diffs to `app/build/paparazzi/failures/`.
 
 ### Release build / signing
 
-`./gradlew assembleRelease -PqubeeVersionName=$tag -PqubeeVersionCode=$(git rev-list --count HEAD)`. `versionCode` must be monotonic for Android's upgrade comparator. Signing pulls `RELEASE_KEYSTORE_FILE`/`_PASSWORD`/`_KEY_ALIAS`/`_KEY_PASSWORD` from env; without them, the release build is unsigned but installable for emulator smoke testing.
+`./gradlew assembleRelease -PqubeeVersionName=$tag -PqubeeVersionCode=$(git rev-list --count HEAD)`. `versionCode` must be monotonic for Android's upgrade comparator. Signing pulls `RELEASE_KEYSTORE_FILE`/`_PASSWORD`/`_KEY_ALIAS`/`_KEY_PASSWORD` from env; without them, the release build falls back to debug signing so it stays installable on physical devices (`adb install` rejects unsigned APKs). Never distributable that way — `release.yml` refuses to build a tag without the real keystore. For an on-demand installable build from any branch, run the "Build APK (on demand)" workflow (`.github/workflows/apk.yml`).
 
 ## Architecture invariants worth knowing before editing
 

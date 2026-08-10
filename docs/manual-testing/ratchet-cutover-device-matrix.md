@@ -27,6 +27,10 @@ exchange 1:1 and group messages.
   Prefer an `assembleRelease` (R8-minified) install for at least one
   device — several rows only fail on the minified build.
   `adb install -r app/build/outputs/apk/release/app-release.apk`.
+  Easiest source: run the **"Build APK (on demand)"** workflow
+  (Actions tab, pick the branch under test) and download the artifact —
+  it contains a debug APK and a debug-signed R8 release APK, both
+  `apksigner`-verified installable, with SHA256SUMS.
 - **Minimum device coverage** for the OEM-sensitive rows (7 Doze, 8 R8):
   at least one near-AOSP device (Pixel / Android One) **and** one
   aggressive-background-management OEM skin (Samsung One UI or Xiaomi

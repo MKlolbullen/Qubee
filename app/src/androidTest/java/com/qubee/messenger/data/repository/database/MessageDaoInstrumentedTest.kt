@@ -160,6 +160,58 @@ class MessageDaoInstrumentedTest {
     }
 
     @Test
+    fun ack_is_bound_to_expected_conversation_before_retry_is_retired() = runTest {
+        val sharedWireId = "abababababababababababababababab"
+        val intended = Message(
+            id = "bound-ack-1",
+            conversationId = "direct-alice",
+            senderId = "me",
+            status = MessageStatus.SENT,
+            isFromMe = true,
+            wireId = sharedWireId,
+            wireBytes = byteArrayOf(1, 2, 3),
+            nextRetryAt = 10L,
+        )
+        dao.insertMessage(intended)
+
+        assertTrue(
+            dao.applyAckTransactional(
+                sharedWireId,
+                "alice-identity",
+                "direct-alice",
+            ) is com.qubee.messenger.data.repository.database.dao.ApplyAckResult.Applied,
+        )
+        val after = dao.getMessageById(intended.id)!!
+        assertEquals(MessageStatus.DELIVERED, after.status)
+        assertNull(after.wireBytes)
+        assertNull(after.nextRetryAt)
+
+        val wrongConversation = Message(
+            id = "bound-ack-2",
+            conversationId = "direct-bob",
+            senderId = "me",
+            status = MessageStatus.SENT,
+            isFromMe = true,
+            wireId = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            wireBytes = byteArrayOf(4, 5, 6),
+            nextRetryAt = 20L,
+        )
+        dao.insertMessage(wrongConversation)
+        val rejected = dao.applyAckTransactional(
+            wrongConversation.wireId!!,
+            "alice-identity",
+            "direct-alice",
+        )
+        assertTrue(
+            rejected is com.qubee.messenger.data.repository.database.dao.ApplyAckResult.NotFound,
+        )
+        val untouched = dao.getMessageById(wrongConversation.id)!!
+        assertEquals(MessageStatus.SENT, untouched.status)
+        assertArrayEquals(byteArrayOf(4, 5, 6), untouched.wireBytes)
+        assertEquals(20L, untouched.nextRetryAt)
+    }
+
+    @Test
     fun inbound_direct_receipt_cache_roundtrips_without_entering_retry_queue() = runTest {
         val inbound = Message(
             id = "inbound-direct-1",

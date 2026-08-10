@@ -640,9 +640,28 @@ class MessageService : Service(), NetworkCallback {
                     if (ackedWireId.isBlank()) {
                         Timber.w("Ratchet direct ack from %s has no message id", senderIdentityHex)
                     } else {
-                        val applied = messageRepository.applyAck(ackedWireId, senderIdentityHex)
-                        if (!applied) {
-                            Timber.d("Ignored direct ack for unknown wireId=%s", ackedWireId)
+                        val contact = contactRepository.getContactByIdentityId(senderIdentityHex)
+                        val participantId = contact?.id ?: senderIdentityHex
+                        val directConversationId =
+                            conversationRepository.findDirectConversationId(participantId)
+                        if (directConversationId == null) {
+                            Timber.w(
+                                "Ignored direct ack from %s: no matching direct conversation",
+                                senderIdentityHex,
+                            )
+                        } else {
+                            val applied = messageRepository.applyAck(
+                                ackedWireId,
+                                senderIdentityHex,
+                                directConversationId,
+                            )
+                            if (!applied) {
+                                Timber.d(
+                                    "Ignored direct ack for wireId=%s outside conversation=%s",
+                                    ackedWireId,
+                                    directConversationId,
+                                )
+                            }
                         }
                     }
                     // Never ack an ack: that would create an infinite receipt loop.
@@ -793,9 +812,17 @@ class MessageService : Service(), NetworkCallback {
         )
         serviceScope.launch {
             try {
-                val applied = messageRepository.applyAck(messageIdHex, ackerIdHex)
+                val applied = messageRepository.applyAck(
+                    messageIdHex,
+                    ackerIdHex,
+                    groupIdHex,
+                )
                 if (!applied) {
-                    Timber.d("Ignored ack for unknown wireId=%s", messageIdHex)
+                    Timber.d(
+                        "Ignored ack for wireId=%s outside group=%s",
+                        messageIdHex,
+                        groupIdHex,
+                    )
                 }
             } catch (e: Exception) {
                 Timber.e(

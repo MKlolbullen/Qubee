@@ -65,6 +65,15 @@ abstract class MessageDao {
     @Query("SELECT * FROM messages WHERE wireId = :wireId LIMIT 1")
     abstract suspend fun getMessageByWireId(wireId: String): Message?
 
+    @Query(
+        "SELECT * FROM messages " +
+            "WHERE wireId = :wireId AND conversationId = :conversationId LIMIT 1"
+    )
+    abstract suspend fun getMessageByWireIdForConversation(
+        wireId: String,
+        conversationId: String,
+    ): Message?
+
     /// Persist the exact encrypted direct receipt produced for an inbound text.
     /// Duplicate delivery of the original ciphertext re-sends these same bytes
     /// instead of encrypting another ACK and advancing the send ratchet again.
@@ -153,7 +162,8 @@ abstract class MessageDao {
     abstract suspend fun recoverOrphanedSendingOutbound(): Int
 
     /**
-     * Atomically read + update the row matched by `wireId` to record
+     * Atomically read + update the row matched by both `wireId` and the
+     * authenticated protocol context's `expectedConversationId`, then record
      * `ackerIdHex` as a recipient that ack'd this message. Runs the
      * read and the write inside a single SQLite transaction so two
      * acks arriving simultaneously can't lose one to a last-write-
@@ -177,8 +187,10 @@ abstract class MessageDao {
     open suspend fun applyAckTransactional(
         wireId: String,
         ackerIdHex: String,
+        expectedConversationId: String,
     ): ApplyAckResult {
-        val row = getMessageByWireId(wireId) ?: return ApplyAckResult.NotFound
+        val row = getMessageByWireIdForConversation(wireId, expectedConversationId)
+            ?: return ApplyAckResult.NotFound
         if (row.deliveredAckers.contains(ackerIdHex)) {
             return ApplyAckResult.AlreadyApplied
         }

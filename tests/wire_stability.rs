@@ -94,6 +94,25 @@ fn group_message_v3_magic_is_pinned() {
 }
 
 #[test]
+fn group_message_v5_magic_is_pinned() {
+    use qubee_crypto::ratchet::sender_keys::MAGIC_GROUP_MESSAGE_V5;
+    // `\x05` is the keyed-selector sender-keys format (metadata parity
+    // with the sealed `\x04` envelope: no plaintext group id on the
+    // wire). Coexists with `\x03` through its migration window.
+    assert_eq!(MAGIC_GROUP_MESSAGE_V5, b"QUBEE_GMS\x05");
+}
+
+#[test]
+fn v5_group_selector_is_pinned() {
+    use qubee_crypto::ratchet::sender_keys::v5_group_selector;
+    // Golden vector for the selector KDF (context, hash, truncation):
+    // a silent change strands every deployed receiver — their
+    // trial-match never hits and v5 frames become undecryptable.
+    let selector = v5_group_selector(&[0x11; 32], &[0x22; 12]);
+    assert_eq!(selector, [0xa0, 0xc8, 0xbf, 0x13, 0x10, 0x0b, 0x4d, 0xb4]);
+}
+
+#[test]
 fn sender_key_distribution_round_trips() {
     use qubee_crypto::groups::group_manager::GroupId;
     use qubee_crypto::ratchet::sender_keys::SenderKeyDistribution;

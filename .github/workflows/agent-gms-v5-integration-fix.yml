@@ -1,0 +1,99 @@
+name: agent-gms-v5-integration-fix
+
+on:
+  push:
+    branches:
+      - agent/gms-v5-anonymous-routing
+    paths:
+      - .github/workflows/agent-gms-v5-integration-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gms-v5-anonymous-routing
+          fetch-depth: 0
+
+      - name: Apply guarded x05 product patch
+        run: python3 tools/patch_gms_v5.py
+
+      - name: Apply targeted sender-key test compile fix
+        run: python3 tools/fix_gms_v5_test_compile.py
+
+      - name: Apply direct integration migration fix
+        run: python3 tools/fix_gms_v5_direct_integration.py
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android compile SDK
+        run: sdkmanager 'platform-tools' 'platforms;android-34' 'build-tools;34.0.0'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy,rustfmt
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Sender-key protocol tests
+        run: cargo test ratchet::sender_keys -- --nocapture
+
+      - name: Direct sender-key integration test
+        run: cargo test ratchet::direct::tests::distribution_rides_the_channel_into_a_working_group_decrypt -- --nocapture
+
+      - name: Wire stability
+        run: cargo test --test wire_stability
+
+      - name: Parser robustness
+        run: cargo test --test wire_parser_robustness
+
+      - name: Full Rust suite
+        run: cargo test --all-targets
+
+      - name: Sender-key fuzz target compiles
+        run: cargo check --manifest-path fuzz/Cargo.toml --bin parse_sender_key_group
+
+      - name: JNI symbol contract
+        run: bash scripts/check_jni_contracts.sh
+
+      - name: JNI bridge audit
+        run: bash scripts/audit_message_file_bridge.sh
+
+      - name: Host JNI typecheck
+        run: cargo build --features _typecheck_jni
+
+      - name: Clippy warnings are errors
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Android Kotlin compile
+        run: ./gradlew :app:compileDebugKotlin --stacktrace
+
+      - name: Commit validated product changes and self-clean
+        run: |
+          rm -f \
+            tools/patch_gms_v5.py \
+            tools/fix_gms_v5_test_compile.py \
+            tools/fix_gms_v5_direct_integration.py \
+            .github/workflows/agent-gms-v5.yml \
+            .github/workflows/agent-gms-v5-fix.yml \
+            .github/workflows/agent-gms-v5-integration-fix.yml
+          git add -A
+          git status --short
+          git config user.name 'openai-agent'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(privacy): hide sender-key group ids in x05 wire'
+          git push origin HEAD:agent/gms-v5-anonymous-routing

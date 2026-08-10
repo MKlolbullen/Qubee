@@ -74,15 +74,27 @@ abstract class MessageDao {
         conversationId: String,
     ): Message?
 
+    /// Receipt-replay lookup is deliberately narrower than the generic wire-id
+    /// lookup: only a live inbound row is evidence that this device should
+    /// answer an exact ciphertext replay. Soft-deleted rows are invisible.
+    @Query(
+        "SELECT * FROM messages " +
+            "WHERE wireId = :wireId AND isFromMe = 0 AND isDeleted = 0 LIMIT 1"
+    )
+    abstract suspend fun getActiveInboundMessageByWireId(wireId: String): Message?
+
     /// Persist the exact encrypted direct receipt produced for an inbound text.
     /// Duplicate delivery of the original ciphertext re-sends these same bytes
     /// instead of encrypting another ACK and advancing the send ratchet again.
     /// The isFromMe predicate prevents accidental writes to outbound retry rows.
     @Query(
         "UPDATE messages SET wireBytes = :receiptWire " +
-            "WHERE id = :messageId AND isFromMe = 0"
+            "WHERE id = :messageId AND isFromMe = 0 AND isDeleted = 0 AND wireBytes IS NULL"
     )
-    abstract suspend fun cacheInboundDirectReceipt(messageId: String, receiptWire: ByteArray)
+    abstract suspend fun cacheInboundDirectReceipt(
+        messageId: String,
+        receiptWire: ByteArray,
+    ): Int
 
     /// Outbound rows the offline-retry loop should re-publish: `SENT` or
     /// a network-send `FAILED` row that still carries durable wire bytes.
@@ -217,7 +229,11 @@ abstract class MessageDao {
     @Query("UPDATE messages SET status = 'READ' WHERE conversationId = :conversationId AND isFromMe = 0")
     abstract suspend fun markAllMessagesAsRead(conversationId: String)
 
-    @Query("UPDATE messages SET isDeleted = 1, deletedAt = :deletedAt WHERE id = :messageId")
+    @Query(
+        "UPDATE messages SET isDeleted = 1, deletedAt = :deletedAt, " +
+            "wireBytes = CASE WHEN isFromMe = 0 THEN NULL ELSE wireBytes END " +
+            "WHERE id = :messageId"
+    )
     abstract suspend fun markMessageAsDeleted(messageId: String, deletedAt: Long)
 
     @Query("DELETE FROM messages WHERE id = :messageId")

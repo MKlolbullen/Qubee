@@ -66,7 +66,7 @@ Qubee is an experimental Android messenger built around four principles:
 
 ### `v0.2.0 — Ratchet Cutover`
 
-The current priority is not adding another crypto primitive. It is validating the forward-secret path already in the tree and making it safe to become the default.
+The current priority is not adding another crypto primitive. It was validating the forward-secret path already in the tree and making it safe to become the default — which it now is. What follows is soak validation and legacy retirement.
 
 **Automated / host-verifiable work now includes:**
 
@@ -79,15 +79,19 @@ The current priority is not adding another crypto primitive. It is validating th
 - property-based parser robustness against arbitrary bytes, truncation, corruption and hostile length prefixes.
 - full-byte golden vectors for deterministic signed protocol payloads.
 
-**Still required before the ratchet send path should become the default:**
+**Gate that was cleared before the send default flipped** (the physical-device matrix):
 
 - physical-device validation across multiple Android/OEM combinations;
 - Doze/background-kill and network-transition testing;
 - release/R8 JNI callback validation;
-- auth-bound datastore validation on real hardware;
+- auth-bound datastore validation on real hardware.
+
+**Known remaining work while the new default soaks** (the flag stays available as a kill-switch):
+
 - complete 1:1 delivery acknowledgement semantics;
 - correct durable direct-message retry routing;
-- metadata-parity hardening for the sender-key group wire format before it replaces the current group envelope.
+- metadata-parity hardening for the sender-key group wire format;
+- retiring legacy (v2) envelope emission after the deprecation window.
 
 See [`docs/manual-testing/ratchet-cutover-device-matrix.md`](docs/manual-testing/ratchet-cutover-device-matrix.md) and [`tests/ratchet_cutover_e2e.rs`](tests/ratchet_cutover_e2e.rs).
 
@@ -124,9 +128,9 @@ The distinction between **active**, **dark-launched**, **foundation-only** and *
 | `QUBEE_GMS\x04` group envelope | ✅ Active | Current signed-envelope group path removes the plaintext group id using a per-message keyed selector. |
 | SQLCipher-backed Android storage | ✅ Active | Messages, contacts and conversations are encrypted at rest. |
 | App screen lock | ✅ Active | Optional biometric/device-credential gate with `FLAG_SECURE`. |
-| Auth-bound datastore key | 🟡 Device-validation pending | Cold-process datastore access is intended to require user authentication when Screen Lock is enabled. |
-| PQXDH + Double Ratchet | 🟡 Dark-launched | Send + receive paths are wired, fail closed and persist sessions; emission is still gated. |
-| Group sender keys | 🟡 Dark-launched | Distribution, rekey and receive paths are wired; default emission remains gated. |
+| Auth-bound datastore key | ✅ Active | Cold-process datastore access requires user authentication when Screen Lock is enabled; validated on the physical-device matrix. |
+| PQXDH + Double Ratchet | ✅ Active | Default 1:1 send path since the cutover; fail-closed, sessions persist. Kill-switch retained for the soak window. |
+| Group sender keys | ✅ Active | Default group send path since the cutover; distribution, rekey and receive paths live. |
 | Crash-consistent outbound FSM | 🟡 Cutover validation | `PREPARED` rows prevent silent loss around ratchet advancement; durable ciphertext is retried verbatim. |
 | Delivery acknowledgements | 🟡 Partial | Group sender-key ACKs exist; 1:1 ratchet delivery semantics still need completion. |
 | Tor / Nym transport posture | 🟡 Foundation only | `Direct`, `TorOnion`, `NymMixnet` config + fail-closed guards exist, but no anonymising transport is wired yet. |
@@ -211,7 +215,7 @@ Qubee uses hybrid long-term identity signatures:
 
 - **ML-KEM-768** supplies post-quantum KEM protection.
 - **X25519** participates in the ratchet/prekey design.
-- The dark-launched direct-message path uses PQXDH-style establishment followed by a persistent Double Ratchet.
+- The default direct-message path uses PQXDH-style establishment followed by a persistent Double Ratchet.
 
 ### Message encryption
 
@@ -266,8 +270,8 @@ The Rust keystore uses authenticated encryption, slot-specific associated data, 
 | Hybrid long-term authentication | Yes |
 | NIST PQ KEM/signature primitives | Yes — ML-KEM-768 + ML-DSA-44 |
 | Local database encryption | Yes |
-| Ratchet forward secrecy | Implemented, dark-launched pending device validation |
-| Post-compromise security | Implemented in the ratchet design; not yet the default message path |
+| Ratchet forward secrecy | Yes — default send path since the cutover (kill-switch retained for the soak window) |
+| Post-compromise security | Yes on the default ratchet path; legacy conversations lack it until v2 emission is retired |
 | Deniability | Ratcheted formats are designed for it; legacy signed envelopes are non-repudiable |
 | Group-author `PeerId` exposure in gossip | Reduced — gossip authorship is anonymous |
 | Stable plaintext group identifier on active `\x04` envelope | No |

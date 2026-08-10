@@ -96,32 +96,33 @@ why.
 These are known and are not vulnerabilities — they're the shape of
 the pre-alpha:
 
-- **No forward secrecy or post-compromise security on the live
-  message path (yet).** The *live* group and 1:1 send path still uses a
-  single per-group symmetric key, rotated only on membership change (or
-  a proactive rotation). Compromise of a member's device therefore
-  exposes the group's message history back to the last key rotation.
-  The hybrid Double Ratchet (1:1) + sender keys (groups) that closes
-  this gap is **implemented, tested, and dark-launched** (see
-  `docs/double-ratchet-design.md`, Stages 1–5): the receive path
-  already understands `QUBEE_DMS` / `QUBEE_GMS\x03` frames, and the
-  send path is gated behind `PreferenceRepository.ratchetSendEnabled`
-  (default off) pending the two-device validation checklist. This is
-  the highest-priority cryptographic work; until the send cutover
-  ships, treat live message confidentiality as "secure against a
-  network adversary, not against later device compromise."
-- **Messages on the live (v2) path are cryptographically
-  non-repudiable.** Every current wire frame carries a hybrid
+- **Forward secrecy on the send path is newly default — treat it as
+  fresh.** Since the v0.2.0 cutover, outbound 1:1 traffic uses PQXDH +
+  hybrid Double Ratchet (`QUBEE_DMS`) and outbound group traffic uses
+  sender keys (`QUBEE_GMS\x03`) by default
+  (`PreferenceRepository.ratchetSendEnabled`, retained as an emergency
+  kill-switch for the soak window; see `docs/double-ratchet-design.md`,
+  Stages 1–5, and the physical-device matrix in
+  `docs/manual-testing/ratchet-cutover-device-matrix.md` that gated the
+  flip). The legacy single-key group envelope is still *accepted*
+  inbound for compatibility, and peers on older builds (or with the
+  kill-switch off) still emit it — for those conversations the old
+  caveat holds: compromise of a member's device exposes group history
+  back to the last key rotation. Full closure comes when legacy
+  emission is retired at the end of the deprecation window.
+- **Messages on the legacy (v2) path are cryptographically
+  non-repudiable.** Every legacy wire frame carries a hybrid
   Ed25519 + ML-DSA-44 signature over the long-term identity keys, so a
   recipient (or anyone who captures the frame + the signer's public
   key) can *prove* who authored it — the opposite of Signal's
-  deniability-by-MAC. **This is being reversed.** The locked decision
-  (see `docs/double-ratchet-design.md`) moves Qubee to the
-  full-deniability model: per-message identity signatures are removed
-  and messages are authenticated only by the AEAD/MAC under the ratchet
-  keys, matching Signal / SimpleX / Session. Identity keys will sign
-  only the prekey bundle, never messages. Until the ratchet send path
-  is cut over, treat live messages as non-repudiable.
+  deniability-by-MAC. **The cutover reverses this.** The locked
+  decision (see `docs/double-ratchet-design.md`) moves Qubee to the
+  full-deniability model: messages on the ratchet formats are
+  authenticated by keys derived under the ratchet rather than by
+  per-message long-term identity signatures, matching Signal /
+  SimpleX / Session; identity keys sign only the prekey bundle. Treat
+  any message still sent on the legacy path (older peers, kill-switch
+  off) as non-repudiable until legacy emission is retired.
 - **Network metadata / IP exposure.** The libp2p transport uses direct
   TCP (+ Noise), so every peer you connect to or gossip with learns
   your IP address. There is no onion routing or mixnet, and an

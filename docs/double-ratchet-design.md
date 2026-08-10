@@ -48,10 +48,10 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
     produces the signed wire frame for the Android side to publish.
   Bundles are **published + cached but not consumed** by send/receive —
   the current v2 symmetric-group path is unchanged.
-* **Stage 3 — DONE (dark-launched).** The full 1:1 path is implemented
-  and callable over JNI, but MessageService still routes live traffic
-  through the legacy envelope; the default flips only after the
-  two-device checklist (`docs/two-device-walkthrough.md`) passes.
+* **Stage 3 — DONE.** The full 1:1 path is implemented and callable
+  over JNI. It shipped dark-launched (legacy envelope still live) until
+  the device checklists passed; since the v0.2.0 cutover it is the
+  default 1:1 send path.
   * *Foundation* — `DoubleRatchet::serialize_state` / `deserialize_state`
     so a session survives an app restart without reusing a message key.
   * *3b* — `src/ratchet/session.rs`: a `Session` ties PQXDH + the Double
@@ -101,12 +101,13 @@ privacy-messenger default (Signal / SimpleX / Session all do this).
   `QUBEE_DMS`/`QUBEE_GMS\x03` frames unconditionally (receivers must
   understand v3 before any sender emits it), routes 1:1 text through
   the same peer↔identity trust observation as the legacy path, and
-  persists v3 group messages through the shared handler. The send side
-  stays legacy behind `PreferenceRepository.ratchetSendEnabled`
-  (default off). What remains: the send-path flip (1:1 via
-  `encryptDirectMessage`, groups via `encryptGroupMessageV3`,
-  distribution fan-out on group join/rekey) once the device checklists
-  pass — then dropping v2 after the deprecation window.
+  persists v3 group messages through the shared handler. **Send side is
+  now default**: `PreferenceRepository.ratchetSendEnabled` defaults to
+  true since the v0.2.0 cutover (1:1 via `encryptDirectMessage`, groups
+  via `encryptGroupMessageV3`, distribution fan-out via
+  `RatchetSender`), retained as an emergency kill-switch for the soak
+  window. What remains: dropping v2 emission entirely after the
+  deprecation window.
 
 ## What's currently broken
 
@@ -236,11 +237,12 @@ wire frame (`src/ratchet/direct_message.rs`), and the live orchestration
 + JNI bridge (`src/ratchet/direct.rs`, four `nativeDirect*`/bundle
 symbols). Replay protection comes from consumed message keys plus an
 accepted-initial hash record — a dedicated `(chain_idx, msg_idx)` window
-proved unnecessary. The path is dark: MessageService still sends 1:1
-over the legacy envelope until the two-device checklist passes.
+proved unnecessary. Shipped dark; default 1:1 send path since the
+v0.2.0 cutover.
 
-**Stage 4 (LANDED, dark):** sender-keys group messaging on top of DR —
-`src/ratchet/sender_keys.rs`, wire `QUBEE_GMS\x03`, JNI dark-launched.
+**Stage 4 (LANDED):** sender-keys group messaging on top of DR —
+`src/ratchet/sender_keys.rs`, wire `QUBEE_GMS\x03`; default group send
+path since the v0.2.0 cutover.
 Migration plan unchanged: existing groups keep the v2 symmetric key for
 one release; new groups (and any group after a member-add /
 member-remove) start on v3. Cleanup batch removes v2 support after a

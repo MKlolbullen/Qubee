@@ -1,12 +1,19 @@
 //! Signaling primitives for establishing WebRTC sessions over the
 //! encrypted Qubee messaging channel. The signaling layer is
 //! responsible for exchanging call invitations, SDP offers/answers
-//! and ICE candidates between participants. It does not perform any
-//! network I/O itself; instead it routes messages through an in‑memory
-//! server so that unit tests and local peer connections can be
-//! exercised without external dependencies.
+//! and ICE candidates between participants.
+//!
+//! [`CallManager`](crate::calling::call_manager::CallManager) depends
+//! only on the [`SignalingTransport`] trait, so the concrete carrier
+//! is pluggable. Two implementations live here: [`SignalingServer`],
+//! an in‑memory loopback that routes messages between registered
+//! clients without any network I/O (used by tests and local runs),
+//! and [`ChannelSignalingTransport`], which serialises each message
+//! and hands it to an outbound channel at the session boundary for the
+//! encrypt‑and‑send layer to carry (see issue #67).
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,7 +97,6 @@ impl SignalingServer {
             clients.insert(identity, tx);
         }
         SignalingClient {
-            identity,
             server: Arc::new(self.clone()),
             receiver: rx,
         }
@@ -124,15 +130,73 @@ impl Clone for SignalingServer {
     }
 }
 
+/// Carrier abstraction for outbound signaling. `CallManager` sends
+/// every [`SignalingMessage`] through this trait and never names a
+/// concrete transport, so the loopback [`SignalingServer`] (tests,
+/// local runs) and the session-backed carrier (issue #67) are
+/// interchangeable.
+#[async_trait]
+pub trait SignalingTransport: Send + Sync {
+    /// Deliver `message` to `recipient`. Returns an error if the
+    /// message cannot be handed off (e.g. no route to the recipient).
+    async fn send(&self, recipient: IdentityId, message: SignalingMessage) -> Result<()>;
+}
+
+#[async_trait]
+impl SignalingTransport for SignalingServer {
+    async fn send(&self, recipient: IdentityId, message: SignalingMessage) -> Result<()> {
+        self.send_message(recipient, message).await
+    }
+}
+
+/// One serialised signaling payload addressed to a recipient identity,
+/// handed off at the session boundary.
+///
+/// The encrypt-and-send layer (issue #67) drains these, encrypts
+/// `payload` under the 1:1 session it holds for `recipient`, and
+/// delivers it; the peer decrypts and feeds the bytes back through
+/// [`SignalingMessage::from_bytes`].
+#[derive(Clone, Debug)]
+pub struct OutboundSignal {
+    pub recipient: IdentityId,
+    pub payload: Vec<u8>,
+}
+
+/// [`SignalingTransport`] that serialises each message and enqueues it
+/// on an outbound channel. It stops at the session boundary on
+/// purpose: it neither chooses a wire path nor encrypts — that is the
+/// consumer's job (issue #67) — which keeps call logic independent of
+/// how signaling is actually carried.
+pub struct ChannelSignalingTransport {
+    out: mpsc::UnboundedSender<OutboundSignal>,
+}
+
+impl ChannelSignalingTransport {
+    /// Wrap an outbound sink. The receiving half is owned by the
+    /// encrypt-and-send layer.
+    pub fn new(out: mpsc::UnboundedSender<OutboundSignal>) -> Self {
+        Self { out }
+    }
+}
+
+#[async_trait]
+impl SignalingTransport for ChannelSignalingTransport {
+    async fn send(&self, recipient: IdentityId, message: SignalingMessage) -> Result<()> {
+        let payload = message
+            .to_bytes()
+            .map_err(|e| anyhow::anyhow!("signaling encode failed: {e}"))?;
+        self.out
+            .send(OutboundSignal { recipient, payload })
+            .map_err(|_| anyhow::anyhow!("signaling outbound channel closed"))?;
+        Ok(())
+    }
+}
+
 /// Client handle for receiving and sending signaling messages. Each
 /// participant in a call holds a `SignalingClient` associated with
 /// their `IdentityId`. The client can be used to await incoming
 /// messages and to send messages via the server.
 pub struct SignalingClient {
-    /// Retained for the receive-loop filtering this scaffold doesn't
-    /// implement yet.
-    #[allow(dead_code)]
-    identity: IdentityId,
     server: Arc<SignalingServer>,
     receiver: mpsc::UnboundedReceiver<SignalingMessage>,
 }
@@ -165,5 +229,84 @@ impl SignalingMessage {
     /// Tries to parse bytes into a `SignalingMessage`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_hangup(sender: IdentityId) -> SignalingMessage {
+        SignalingMessage::HangUp {
+            call_id: CallId::from([3u8; 16]),
+            sender,
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_transport_routes_to_registered_client() {
+        let server = SignalingServer::new().await.unwrap();
+        let bob = IdentityId::from([2u8; 32]);
+        let mut bob_inbox = server.register_client(bob).await;
+
+        let transport: &dyn SignalingTransport = &server;
+        transport
+            .send(bob, sample_hangup(IdentityId::from([1u8; 32])))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            bob_inbox.recv().await,
+            Some(SignalingMessage::HangUp { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_process_transport_fails_for_unknown_recipient() {
+        let server = SignalingServer::new().await.unwrap();
+        let transport: &dyn SignalingTransport = &server;
+        assert!(transport
+            .send(
+                IdentityId::from([9u8; 32]),
+                sample_hangup(IdentityId::from([1u8; 32]))
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn channel_transport_encodes_and_enqueues_round_trippable_bytes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let transport = ChannelSignalingTransport::new(tx);
+        let recipient = IdentityId::from([2u8; 32]);
+        let sender = IdentityId::from([1u8; 32]);
+
+        transport
+            .send(recipient, sample_hangup(sender))
+            .await
+            .unwrap();
+
+        let out = rx.recv().await.expect("payload enqueued");
+        assert_eq!(out.recipient, recipient);
+        // The consumer feeds these bytes straight back through from_bytes
+        // after decrypting, so the round trip must hold.
+        match SignalingMessage::from_bytes(&out.payload).unwrap() {
+            SignalingMessage::HangUp { sender: s, .. } => assert_eq!(s, sender),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_transport_fails_closed_when_consumer_gone() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let transport = ChannelSignalingTransport::new(tx);
+        assert!(transport
+            .send(
+                IdentityId::from([2u8; 32]),
+                sample_hangup(IdentityId::from([1u8; 32]))
+            )
+            .await
+            .is_err());
     }
 }

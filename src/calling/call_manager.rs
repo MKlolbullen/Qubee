@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::calling::media_encryption::MediaEncryption;
-use crate::calling::signaling::{SignalingMessage, SignalingServer};
+use crate::calling::signaling::{SignalingMessage, SignalingTransport};
 use crate::calling::webrtc_manager::{WebRTCConfig, WebRTCManager};
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
@@ -20,8 +20,9 @@ pub struct CallManager {
     webrtc_manager: WebRTCManager,
     /// Media encryption for secure streams
     media_encryption: MediaEncryption,
-    /// Signaling server for call setup
-    signaling_server: Arc<SignalingServer>,
+    /// Signaling carrier for call setup (loopback in tests, session-
+    /// backed in production — see issue #67)
+    signaling: Arc<dyn SignalingTransport>,
     /// Event sender for call events
     event_sender: mpsc::UnboundedSender<CallEvent>,
     /// Configuration
@@ -53,6 +54,12 @@ pub struct CallId([u8; 16]);
 impl CallId {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
+    }
+}
+
+impl From<[u8; 16]> for CallId {
+    fn from(bytes: [u8; 16]) -> Self {
+        CallId(bytes)
     }
 }
 
@@ -267,9 +274,20 @@ pub struct TurnServer {
 
 impl CallManager {
     /// Create a new call manager
+    /// Create a new call manager.
+    ///
+    /// `media_root` is the per-call secret both endpoints share (in
+    /// Qubee, material derived from the 1:1 session — issue #67); media
+    /// keys derive from it so the two sides interoperate. `signaling`
+    /// is the carrier for call-setup messages: [`SignalingServer`] for
+    /// tests/local runs, the session-backed transport in production.
+    ///
+    /// [`SignalingServer`]: crate::calling::signaling::SignalingServer
     pub async fn new(
         config: CallManagerConfig,
         event_sender: mpsc::UnboundedSender<CallEvent>,
+        media_root: [u8; 32],
+        signaling: Arc<dyn SignalingTransport>,
     ) -> Result<Self> {
         let webrtc_config = WebRTCConfig {
             stun_servers: config.stun_servers.clone(),
@@ -279,15 +297,14 @@ impl CallManager {
         };
 
         let webrtc_manager = WebRTCManager::new(webrtc_config).await?;
-        let media_encryption = MediaEncryption::new()?;
-        let signaling_server = Arc::new(SignalingServer::new().await?);
+        let media_encryption = MediaEncryption::from_shared_root(media_root);
         let contact_manager = Arc::new(ContactManager::new());
 
         Ok(CallManager {
             calls: Arc::new(RwLock::new(HashMap::new())),
             webrtc_manager,
             media_encryption,
-            signaling_server,
+            signaling,
             event_sender,
             config,
             contact_manager,
@@ -542,74 +559,96 @@ impl CallManager {
         Ok(())
     }
 
-    /// Toggle mute for a participant
+    /// Toggle mute for a participant.
+    ///
+    /// The WebRTC track is switched *before* the participant's state is
+    /// committed, so a failed media update leaves the stored state and
+    /// the actual track in agreement rather than diverging. Full
+    /// serialisation of overlapping toggles is tracked in issue #67.
     pub async fn toggle_mute(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
-        let mut calls = self.calls.write().await;
-        let call = calls
-            .get_mut(&call_id)
-            .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
+        let target_muted = {
+            let calls = self.calls.read().await;
+            let participant_info = calls
+                .get(&call_id)
+                .ok_or_else(|| anyhow::anyhow!("Call not found"))?
+                .participants
+                .get(&participant)
+                .ok_or_else(|| anyhow::anyhow!("Participant not found in call"))?;
+            !participant_info.is_muted
+        };
 
-        if let Some(participant_info) = call.participants.get_mut(&participant) {
-            participant_info.is_muted = !participant_info.is_muted;
-            participant_info.media_state.audio_enabled = !participant_info.is_muted;
+        // Apply to the WebRTC audio track first; on failure nothing is
+        // committed and the error propagates.
+        self.webrtc_manager
+            .set_audio_enabled(call_id, participant, !target_muted)
+            .await?;
 
-            let muted = participant_info.is_muted;
-            let new_state = participant_info.media_state.clone();
-            drop(calls);
+        let new_state = {
+            let mut calls = self.calls.write().await;
+            let participant_info = calls
+                .get_mut(&call_id)
+                .ok_or_else(|| anyhow::anyhow!("Call not found"))?
+                .participants
+                .get_mut(&participant)
+                .ok_or_else(|| anyhow::anyhow!("Participant not found in call"))?;
+            participant_info.is_muted = target_muted;
+            participant_info.media_state.audio_enabled = !target_muted;
+            participant_info.media_state.clone()
+        };
 
-            // Update WebRTC audio track
-            self.webrtc_manager
-                .set_audio_enabled(call_id, participant, !muted)
-                .await?;
+        self.event_sender
+            .send(CallEvent::MediaStateChanged {
+                call_id,
+                participant,
+                media_state: new_state,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
 
-            // Send event
-            self.event_sender
-                .send(CallEvent::MediaStateChanged {
-                    call_id,
-                    participant,
-                    media_state: new_state,
-                })
-                .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-
-            Ok(muted)
-        } else {
-            Err(anyhow::anyhow!("Participant not found in call"))
-        }
+        Ok(target_muted)
     }
 
-    /// Toggle video for a participant
+    /// Toggle video for a participant.
+    ///
+    /// Same ordering discipline as [`toggle_mute`](Self::toggle_mute):
+    /// the track is switched before the state is committed.
     pub async fn toggle_video(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
-        let mut calls = self.calls.write().await;
-        let call = calls
-            .get_mut(&call_id)
-            .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
+        let target_enabled = {
+            let calls = self.calls.read().await;
+            let participant_info = calls
+                .get(&call_id)
+                .ok_or_else(|| anyhow::anyhow!("Call not found"))?
+                .participants
+                .get(&participant)
+                .ok_or_else(|| anyhow::anyhow!("Participant not found in call"))?;
+            !participant_info.is_video_enabled
+        };
 
-        if let Some(participant_info) = call.participants.get_mut(&participant) {
-            participant_info.is_video_enabled = !participant_info.is_video_enabled;
-            participant_info.media_state.video_enabled = participant_info.is_video_enabled;
+        self.webrtc_manager
+            .set_video_enabled(call_id, participant, target_enabled)
+            .await?;
 
-            let video_enabled = participant_info.is_video_enabled;
-            let new_state = participant_info.media_state.clone();
-            drop(calls);
+        let new_state = {
+            let mut calls = self.calls.write().await;
+            let participant_info = calls
+                .get_mut(&call_id)
+                .ok_or_else(|| anyhow::anyhow!("Call not found"))?
+                .participants
+                .get_mut(&participant)
+                .ok_or_else(|| anyhow::anyhow!("Participant not found in call"))?;
+            participant_info.is_video_enabled = target_enabled;
+            participant_info.media_state.video_enabled = target_enabled;
+            participant_info.media_state.clone()
+        };
 
-            // Update WebRTC video track
-            self.webrtc_manager
-                .set_video_enabled(call_id, participant, video_enabled)
-                .await?;
+        self.event_sender
+            .send(CallEvent::MediaStateChanged {
+                call_id,
+                participant,
+                media_state: new_state,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
 
-            // Send event
-            self.event_sender
-                .send(CallEvent::MediaStateChanged {
-                    call_id,
-                    participant,
-                    media_state: new_state,
-                })
-                .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
-
-            Ok(video_enabled)
-        } else {
-            Err(anyhow::anyhow!("Participant not found in call"))
-        }
+        Ok(target_enabled)
     }
 
     /// Start screen sharing
@@ -710,9 +749,7 @@ impl CallManager {
                     settings: call.settings.clone(),
                 };
 
-                self.signaling_server
-                    .send_message(*participant_id, message)
-                    .await?;
+                self.signaling.send(*participant_id, message).await?;
 
                 // Send event
                 self.event_sender
@@ -925,26 +962,27 @@ impl std::fmt::Debug for CallId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calling::signaling::SignalingServer;
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_call_creation() {
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
         let config = CallManagerConfig::default();
-        let call_manager = CallManager::new(config, event_sender)
+
+        // The invite rides the in-process signaling server; an
+        // unregistered recipient makes initiate_call fail (correctly —
+        // there is nobody to ring). Register the callee before building
+        // the manager, then hand the server in as the transport.
+        let server = Arc::new(SignalingServer::new().await.unwrap());
+        let _callee_inbox = server.register_client(IdentityId::from([2u8; 32])).await;
+
+        let call_manager = CallManager::new(config, event_sender, [7u8; 32], server)
             .await
             .expect("Should create call manager");
 
         let initiator = IdentityId::from([1u8; 32]);
         let participants = vec![IdentityId::from([2u8; 32])];
-
-        // The invite rides the in-process signaling server; an
-        // unregistered recipient makes initiate_call fail (correctly —
-        // there is nobody to ring). Register the callee first.
-        let _callee_inbox = call_manager
-            .signaling_server
-            .register_client(IdentityId::from([2u8; 32]))
-            .await;
 
         let call_id = call_manager
             .initiate_call(

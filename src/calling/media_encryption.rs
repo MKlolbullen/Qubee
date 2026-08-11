@@ -19,8 +19,6 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretBox};
 use sha2::Sha256;
 
-use crate::security::secure_rng;
-
 /// Opaque wrapper around a 32‑byte media key used for deriving stream keys.
 ///
 /// The contents are kept in a [`SecretBox`] to ensure they are cleared
@@ -48,11 +46,18 @@ impl MediaKey {
     }
 }
 
-/// Root media-key manager, one per [`CallManager`]: derives an
-/// independent [`MediaKey`] for every `(call, participant)` pair from a
-/// random per-process root. Interim design — the root will be replaced
-/// by ratchet-derived material when signaling rides the 1:1 sessions,
-/// at which point this becomes a thin KDF over that shared secret.
+/// Root media-key manager, one per call: derives an independent
+/// [`MediaKey`] for every `(call, participant)` pair from a **shared**
+/// root that both endpoints already hold.
+///
+/// The root must be a secret both sides agree on out of band — in
+/// Qubee that is material derived from the established 1:1 session
+/// (see issue #67). Because the derivation is a pure KDF over that
+/// shared root, two endpoints given the same root derive identical
+/// keys for the same `(call, participant)`; a per-process random root
+/// would make them derive *different* keys and silently fail to
+/// interoperate, so there is deliberately no random-root constructor
+/// on the production path.
 pub struct MediaEncryption {
     root: SecretBox<[u8; 32]>,
 }
@@ -60,12 +65,14 @@ pub struct MediaEncryption {
 const MEDIA_KEY_KDF_INFO: &[u8] = b"qubee media key v1";
 
 impl MediaEncryption {
-    /// Create a manager with a fresh random root.
-    pub fn new() -> Result<Self> {
-        let root = secure_rng::random::array::<32>()?;
-        Ok(Self {
+    /// Build a manager from a root secret shared by both endpoints
+    /// (the per-call secret derived from the 1:1 session). This is the
+    /// only non-test constructor: media keys are only interoperable
+    /// when both sides start from the same root.
+    pub fn from_shared_root(root: [u8; 32]) -> Self {
+        Self {
             root: SecretBox::new(Box::new(root)),
-        })
+        }
     }
 
     /// Derive the media key for one participant in one call. Same
@@ -164,9 +171,11 @@ impl<'a> StreamEncryption<'a> {
 mod tests {
     use super::*;
 
+    const TEST_ROOT: [u8; 32] = [7u8; 32];
+
     #[test]
     fn frame_round_trips_per_stream() {
-        let root = MediaEncryption::new().unwrap();
+        let root = MediaEncryption::from_shared_root(TEST_ROOT);
         let key = root.generate_media_key(&[1u8; 16], &[2u8; 32]);
         let frame = key.encrypt_frame(0, b"voice frame").unwrap();
         assert_eq!(key.decrypt_frame(0, &frame).unwrap(), b"voice frame");
@@ -177,7 +186,7 @@ mod tests {
 
     #[test]
     fn keys_are_isolated_per_call_and_participant() {
-        let root = MediaEncryption::new().unwrap();
+        let root = MediaEncryption::from_shared_root(TEST_ROOT);
         let k_a = root.generate_media_key(&[1u8; 16], &[2u8; 32]);
         let k_b = root.generate_media_key(&[1u8; 16], &[3u8; 32]);
         let k_c = root.generate_media_key(&[9u8; 16], &[2u8; 32]);
@@ -190,8 +199,37 @@ mod tests {
     }
 
     #[test]
+    fn two_endpoints_sharing_a_root_interoperate() {
+        // The whole point of the shared root: an endpoint that only
+        // holds the same root secret derives the identical key and can
+        // open the peer's frame. A different root must not.
+        let call = [4u8; 16];
+        let participant = [5u8; 32];
+
+        let alice = MediaEncryption::from_shared_root(TEST_ROOT);
+        let bob = MediaEncryption::from_shared_root(TEST_ROOT);
+        let mallory = MediaEncryption::from_shared_root([9u8; 32]);
+
+        let frame = alice
+            .generate_media_key(&call, &participant)
+            .encrypt_frame(0, b"hello over the call")
+            .unwrap();
+
+        assert_eq!(
+            bob.generate_media_key(&call, &participant)
+                .decrypt_frame(0, &frame)
+                .unwrap(),
+            b"hello over the call"
+        );
+        assert!(mallory
+            .generate_media_key(&call, &participant)
+            .decrypt_frame(0, &frame)
+            .is_err());
+    }
+
+    #[test]
     fn tampered_frame_is_rejected() {
-        let root = MediaEncryption::new().unwrap();
+        let root = MediaEncryption::from_shared_root(TEST_ROOT);
         let key = root.generate_media_key(&[1u8; 16], &[2u8; 32]);
         let mut frame = key.encrypt_frame(0, b"tamper me").unwrap();
         let last = frame.len() - 1;
@@ -202,7 +240,7 @@ mod tests {
 
     #[test]
     fn duplicate_holds_the_same_key() {
-        let root = MediaEncryption::new().unwrap();
+        let root = MediaEncryption::from_shared_root(TEST_ROOT);
         let key = root.generate_media_key(&[1u8; 16], &[2u8; 32]);
         let copy = key.duplicate();
         let frame = StreamEncryption::new(&key, 7)

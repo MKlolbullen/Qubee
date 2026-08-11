@@ -29,7 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # This job compiles and runs PR-controlled test code; don't leave
+      # the GITHUB_TOKEN in the local git config where that code could
+      # read it. Nothing here pushes or fetches private deps.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

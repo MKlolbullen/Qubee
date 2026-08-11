@@ -4,9 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::calling::call_manager::CallId;
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::webrtc_manager::MediaStats;
-use crate::calling::webrtc_manager::OutboundIce;
 use crate::calling::webrtc_manager::WebRTCConfig;
+use crate::calling::webrtc_manager::{MediaKind, OutboundIce, RemoteMedia};
 use crate::identity::identity_key::IdentityId;
+use bytes::Bytes;
+use std::time::{Duration, SystemTime};
+use webrtc::media::Sample;
+use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
 // Imports updated for webrtc 0.14:
 //   * `peer_connection::peer_connection::RTCPeerConnection` was
@@ -131,6 +135,7 @@ impl PeerConnection {
         call_id: CallId,
         participant: IdentityId,
         ice_out: mpsc::UnboundedSender<OutboundIce>,
+        remote_media_out: mpsc::UnboundedSender<RemoteMedia>,
     ) -> Result<Self> {
         // Convert CallManager's WebRTCConfig into the lower-level RTCConfiguration
         // used by webrtc-rs. Each STUN/TURN server becomes an RTCIceServer.
@@ -191,6 +196,37 @@ impl PeerConnection {
                                 candidate: init.candidate,
                             },
                         });
+                    }
+                }
+            })
+        }));
+
+        // Pump encoded frames off each remote track out to the app for
+        // decode + playback. webrtc-rs hands us RTP packets; we forward
+        // each packet's codec payload tagged with the media kind.
+        pc.on_track(Box::new(move |track, _receiver, _transceiver| {
+            let remote_media_out = remote_media_out.clone();
+            Box::pin(async move {
+                let kind = match track.kind() {
+                    RTPCodecType::Audio => MediaKind::Audio,
+                    RTPCodecType::Video => MediaKind::Video,
+                    _ => return,
+                };
+                // Reads end (Err) when the track closes.
+                while let Ok((packet, _)) = track.read_rtp().await {
+                    if packet.payload.is_empty() {
+                        continue;
+                    }
+                    if remote_media_out
+                        .send(RemoteMedia {
+                            call_id,
+                            participant,
+                            kind,
+                            payload: packet.payload.to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break; // CallManager dropped the receiver
                     }
                 }
             })
@@ -543,6 +579,43 @@ impl PeerConnection {
             .await
             .context("Failed to set remote description")?;
         Ok(())
+    }
+
+    /// Write one encoded audio frame (an Opus bitstream) to the local
+    /// audio track. The app captures the mic and encodes; webrtc-rs
+    /// packetizes and sends. Requires the audio track to exist (enable
+    /// audio first).
+    pub async fn write_audio_sample(&self, data: &[u8], duration: Duration) -> Result<()> {
+        let track_guard = self.audio_track.lock().await;
+        let track = track_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("audio track not enabled"))?;
+        track
+            .write_sample(&Sample {
+                data: Bytes::copy_from_slice(data),
+                duration,
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            })
+            .await
+            .context("failed to write audio sample")
+    }
+
+    /// Write one encoded video frame to the local video track.
+    pub async fn write_video_sample(&self, data: &[u8], duration: Duration) -> Result<()> {
+        let track_guard = self.video_track.lock().await;
+        let track = track_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("video track not enabled"))?;
+        track
+            .write_sample(&Sample {
+                data: Bytes::copy_from_slice(data),
+                duration,
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            })
+            .await
+            .context("failed to write video sample")
     }
 
     /// Apply a bandwidth limit in kilobits per second. No behaviour in

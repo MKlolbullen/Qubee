@@ -64,10 +64,20 @@ class CallRepository @Inject constructor(
 
     /** Accept the currently-ringing call (media root came from the invite). */
     suspend fun acceptCall(callIdHex: String, peerIdHex: String): Boolean {
+        // Snapshot the ringing state before suspending: a terminal
+        // lifecycle callback (hang-up, timeout) can land while
+        // acceptCall() awaits, and we must not clobber it.
+        val callType = (_state.value as? CallUiState.Incoming)
+            ?.takeIf { it.callIdHex == callIdHex }
+            ?.callType
+            ?: return false
         val accepted = qubeeManager.acceptCall(callIdHex, peerIdHex)
         if (accepted) {
-            val callType = (_state.value as? CallUiState.Incoming)?.callType ?: 0
-            _state.value = CallUiState.Active(callIdHex, peerIdHex, callType)
+            // Only transition if this call is still the one ringing.
+            val current = _state.value
+            if (current is CallUiState.Incoming && current.callIdHex == callIdHex) {
+                _state.value = CallUiState.Active(callIdHex, peerIdHex, callType)
+            }
         }
         return accepted
     }

@@ -120,4 +120,18 @@ interface NetworkCallback {
     fun onCallStateChanged(callIdHex: String, state: String) {
         // default no-op
     }
+
+    /**
+     * An encoded media frame arrived on a remote call track. The app
+     * decodes `payload` (Opus for audio, VP8/etc. for video) and plays
+     * or renders it. Fires at media rate, so keep the handler cheap.
+     *
+     * @param callIdHex   hex-encoded CallId.
+     * @param senderIdHex hex-encoded remote IdentityId.
+     * @param kind        0 = audio, 1 = video.
+     * @param payload     the codec bitstream from one RTP packet.
+     */
+    fun onRemoteMedia(callIdHex: String, senderIdHex: String, kind: Int, payload: ByteArray) {
+        // default no-op
+    }
 }

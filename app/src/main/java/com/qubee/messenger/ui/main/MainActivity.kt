@@ -44,6 +44,7 @@ import com.qubee.messenger.ui.call.CallViewModel
 import com.qubee.messenger.ui.theme.QubeeTheme
 import javax.inject.Inject
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -331,12 +332,13 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                callViewModel.state.collect { state ->
-                    if (state is CallRepository.CallUiState.Idle) {
-                        hideCallOverlay()
-                    } else {
-                        showCallOverlay()
-                    }
+                // Show the call overlay only when a call is live AND the
+                // device is unlocked, so the lock gate always stays on
+                // top of (and hides) call controls while locked.
+                combine(callViewModel.state, appLockManager.locked) { call, locked ->
+                    call !is CallRepository.CallUiState.Idle && !locked
+                }.collect { visible ->
+                    if (visible) showCallOverlay() else hideCallOverlay()
                 }
             }
         }

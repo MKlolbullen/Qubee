@@ -7,7 +7,9 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::calling::media_encryption::MediaEncryption;
 use crate::calling::signaling::{SignalingMessage, SignalingTransport};
-use crate::calling::webrtc_manager::{OutboundIce, WebRTCConfig, WebRTCManager};
+use crate::calling::webrtc_manager::{
+    MediaKind, OutboundIce, RemoteMedia, WebRTCConfig, WebRTCManager,
+};
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
@@ -67,6 +69,21 @@ impl From<[u8; 16]> for CallId {
     fn from(bytes: [u8; 16]) -> Self {
         CallId(bytes)
     }
+}
+
+/// The two call participants' identities in a canonical (sorted) order,
+/// so both endpoints derive the same per-call media key from the shared
+/// root regardless of which side is "local".
+fn canonical_peer_pair(a: IdentityId, b: IdentityId) -> [u8; 64] {
+    let (lo, hi): (&[u8], &[u8]) = if a.as_ref() <= b.as_ref() {
+        (a.as_ref(), b.as_ref())
+    } else {
+        (b.as_ref(), a.as_ref())
+    };
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(lo);
+    out[32..].copy_from_slice(hi);
+    out
 }
 
 /// Types of calls supported
@@ -256,6 +273,15 @@ pub enum CallEvent {
     },
     /// Call error occurred
     CallError { call_id: CallId, error: String },
+    /// An encoded media frame arrived on a remote track — the app
+    /// decodes `payload` (Opus for audio, VP8/etc. for video) and plays
+    /// or renders it.
+    RemoteMedia {
+        call_id: CallId,
+        participant: IdentityId,
+        kind: MediaKind,
+        payload: Vec<u8>,
+    },
 }
 
 /// Call manager configuration
@@ -309,13 +335,20 @@ impl CallManager {
         // connections on this channel; a background task trickles each
         // to the remote over signaling.
         let (ice_out, ice_in) = mpsc::unbounded_channel();
-        let webrtc_manager = WebRTCManager::new(webrtc_config, ice_out).await?;
+        // Encoded frames from remote tracks flow out on this channel; a
+        // background task republishes them as CallEvents for the app.
+        let (remote_media_out, remote_media_in) = mpsc::unbounded_channel();
+        let webrtc_manager = WebRTCManager::new(webrtc_config, ice_out, remote_media_out).await?;
         let contact_manager = Arc::new(ContactManager::new());
 
         tokio::spawn(Self::forward_local_ice(
             ice_in,
             signaling.clone(),
             local_identity,
+        ));
+        tokio::spawn(Self::forward_remote_media(
+            remote_media_in,
+            event_sender.clone(),
         ));
 
         Ok(CallManager {
@@ -362,6 +395,55 @@ impl CallManager {
         }
     }
 
+    /// Drain encoded frames from remote tracks and republish them as
+    /// [`CallEvent::RemoteMedia`] so the app can decode and play them.
+    async fn forward_remote_media(
+        mut remote_media_in: mpsc::UnboundedReceiver<RemoteMedia>,
+        event_sender: mpsc::UnboundedSender<CallEvent>,
+    ) {
+        while let Some(media) = remote_media_in.recv().await {
+            if event_sender
+                .send(CallEvent::RemoteMedia {
+                    call_id: media.call_id,
+                    participant: media.participant,
+                    kind: media.kind,
+                    payload: media.payload,
+                })
+                .is_err()
+            {
+                break; // no event consumer left
+            }
+        }
+    }
+
+    /// Write one encoded audio frame captured by the app to the call's
+    /// outbound track.
+    pub async fn write_audio_sample(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        data: &[u8],
+        duration: Duration,
+    ) -> Result<()> {
+        self.webrtc_manager
+            .write_audio_sample(call_id, participant, data, duration)
+            .await
+    }
+
+    /// Write one encoded video frame captured by the app to the call's
+    /// outbound track.
+    pub async fn write_video_sample(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        data: &[u8],
+        duration: Duration,
+    ) -> Result<()> {
+        self.webrtc_manager
+            .write_video_sample(call_id, participant, data, duration)
+            .await
+    }
+
     /// Initiate a new call. The caller mints a fresh random media root
     /// for the call and ships it inside the (E2E-encrypted) invitation,
     /// so the callee derives the same media keys without a separate key
@@ -376,7 +458,6 @@ impl CallManager {
     ) -> Result<CallId> {
         let call_id = self.generate_call_id()?;
         let media_root = secure_rng::random::array::<32>()?;
-        self.set_call_media_root(call_id, media_root).await;
 
         // Validate participants
         if participants.is_empty() {
@@ -439,10 +520,13 @@ impl CallManager {
             quality_stats: CallQualityStats::default(),
         };
 
-        // Store the call
+        // Store the call, then its media root — only once validation and
+        // construction have succeeded, so a rejected request leaves no
+        // stray entry in `call_media`.
         let mut calls = self.calls.write().await;
         calls.insert(call_id, call);
         drop(calls);
+        self.set_call_media_root(call_id, media_root).await;
 
         // Send invitations to participants, carrying the call's media root.
         self.send_call_invitations(call_id, media_root).await?;
@@ -617,10 +701,6 @@ impl CallManager {
             }
         }
 
-        // Store the caller's media root now, so accepting the call needs
-        // no separate key exchange.
-        self.set_call_media_root(call_id, media_root).await;
-
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let caller_participant = CallParticipant {
             identity_id: caller,
@@ -662,6 +742,10 @@ impl CallManager {
             }
             calls.insert(call_id, call);
         }
+
+        // Only the handler that won the insert stores the media root, so a
+        // duplicate invitation can't overwrite it with a different value.
+        self.set_call_media_root(call_id, media_root).await;
 
         self.event_sender
             .send(CallEvent::IncomingCall {
@@ -1155,12 +1239,18 @@ impl CallManager {
         // Derive the media key from this call's shared root, provisioned
         // at initiate/accept. A missing root means the call was never
         // set up on this side — fail closed rather than invent one.
+        //
+        // Key on a *canonical* peer pair (the two identities sorted), not
+        // the remote id: both endpoints must derive the same key from the
+        // same root, and each sees the other as "the remote", so keying on
+        // the remote alone would give the two sides different keys.
         let media_key = {
             let call_media = self.call_media.read().await;
             let encryption = call_media.get(&call_id).ok_or_else(|| {
                 anyhow::anyhow!("no media root provisioned for call; call initiate/accept first")
             })?;
-            encryption.generate_media_key(call_id.as_bytes(), participant.as_ref())
+            let pair = canonical_peer_pair(self.local_identity, participant);
+            encryption.generate_media_key(call_id.as_bytes(), &pair)
         };
 
         // Create WebRTC peer connection
@@ -1567,6 +1657,34 @@ mod tests {
             }
         }
         assert!(saw_ice, "expected a local ICE candidate to be trickled out");
+    }
+
+    #[test]
+    fn canonical_peer_pair_is_order_independent() {
+        let a = IdentityId::from([1u8; 32]);
+        let b = IdentityId::from([2u8; 32]);
+        assert_eq!(canonical_peer_pair(a, b), canonical_peer_pair(b, a));
+    }
+
+    #[test]
+    fn both_endpoints_derive_the_same_media_key() {
+        use crate::calling::media_encryption::MediaEncryption;
+        // Same shared root + call, opposite local/remote roles: the two
+        // sides must derive interoperable media keys (regression test for
+        // keying on the remote id, which gave them different keys).
+        let enc = MediaEncryption::from_shared_root([7u8; 32]);
+        let call = [9u8; 16];
+        let caller = IdentityId::from([1u8; 32]);
+        let callee = IdentityId::from([2u8; 32]);
+
+        let caller_key = enc.generate_media_key(&call, &canonical_peer_pair(caller, callee));
+        let callee_key = enc.generate_media_key(&call, &canonical_peer_pair(callee, caller));
+
+        let frame = caller_key.encrypt_frame(0, b"media from caller").unwrap();
+        assert_eq!(
+            callee_key.decrypt_frame(0, &frame).unwrap(),
+            b"media from caller"
+        );
     }
 
     #[tokio::test]

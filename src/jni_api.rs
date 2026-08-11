@@ -71,6 +71,8 @@ use crate::calling::call_manager::{
 };
 #[cfg(feature = "calling")]
 use crate::calling::signaling::{ChannelSignalingTransport, OutboundSignal};
+#[cfg(feature = "calling")]
+use crate::calling::webrtc_manager::MediaKind;
 
 // --- Global State ---
 
@@ -4191,6 +4193,40 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
         CallEvent::CallError { call_id, error } => {
             emit_state(&mut env, call_id, &format!("error: {error}"))
         }
+        CallEvent::RemoteMedia {
+            call_id,
+            participant,
+            kind,
+            payload,
+        } => {
+            let j_call = match env.new_string(hex::encode(call_id.as_bytes())) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let j_sender = match env.new_string(hex::encode(participant.as_ref() as &[u8])) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let j_payload = match env.byte_array_from_slice(&payload) {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let kind_code = match kind {
+                MediaKind::Audio => 0,
+                MediaKind::Video => 1,
+            };
+            let _ = env.call_method(
+                callback_obj,
+                "onRemoteMedia",
+                "(Ljava/lang/String;Ljava/lang/String;I[B)V",
+                &[
+                    JValue::Object(&j_call),
+                    JValue::Object(&j_sender),
+                    JValue::Int(kind_code),
+                    JValue::Object(&j_payload),
+                ],
+            );
+        }
         CallEvent::MediaStateChanged { .. } | CallEvent::QualityChanged { .. } => {}
     }
 }
@@ -4438,4 +4474,72 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeToggle
         }
     }))
     .unwrap_or(-1)
+}
+
+/// Write one captured, encoded audio frame (Opus bitstream) to a call's
+/// outbound track. `duration_ms` is the frame duration. Returns true on
+/// success. The app captures + encodes; the Rust side packetizes.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteAudioSample(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+    frame: JByteArray,
+    duration_ms: jni::sys::jint,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let frame = env.convert_byte_array(&frame)?;
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let duration = std::time::Duration::from_millis(duration_ms.max(0) as u64);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.write_audio_sample(cid, pid, &frame, duration))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::debug!(error = %e, "nativeWriteAudioSample failed");
+                0
+            }
+        }
+    })
+}
+
+/// Write one captured, encoded video frame to a call's outbound track.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteVideoSample(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+    frame: JByteArray,
+    duration_ms: jni::sys::jint,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let frame = env.convert_byte_array(&frame)?;
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let duration = std::time::Duration::from_millis(duration_ms.max(0) as u64);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.write_video_sample(cid, pid, &frame, duration))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::debug!(error = %e, "nativeWriteVideoSample failed");
+                0
+            }
+        }
+    })
 }

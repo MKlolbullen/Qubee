@@ -18,8 +18,10 @@ pub struct CallManager {
     calls: Arc<RwLock<HashMap<CallId, Call>>>,
     /// WebRTC manager for media handling
     webrtc_manager: WebRTCManager,
-    /// Media encryption for secure streams
-    media_encryption: MediaEncryption,
+    /// Per-call media encryption. Each call's root is the shared secret
+    /// both endpoints derive from their 1:1 session (provisioned at
+    /// initiate/accept), so the two sides derive identical media keys.
+    call_media: Arc<RwLock<HashMap<CallId, MediaEncryption>>>,
     /// This node's own identity, stamped as the `sender` of outbound
     /// SDP offers/answers so the remote can attribute them.
     local_identity: IdentityId,
@@ -279,19 +281,20 @@ impl CallManager {
     /// Create a new call manager.
     ///
     /// `local_identity` is this node's own id, stamped as the `sender`
-    /// of outbound SDP offers/answers. `media_root` is the per-call
-    /// secret both endpoints share (in Qubee, material derived from the
-    /// 1:1 session — issue #67); media keys derive from it so the two
-    /// sides interoperate. `signaling` is the carrier for call-setup
-    /// messages: [`SignalingServer`] for tests/local runs, the
-    /// session-backed transport in production.
+    /// of outbound SDP offers/answers. `signaling` is the carrier for
+    /// call-setup messages: [`SignalingServer`] for tests/local runs,
+    /// the session-backed transport in production.
+    ///
+    /// Each call's media root is provisioned per call at
+    /// [`initiate_call`](Self::initiate_call) /
+    /// [`accept_call`](Self::accept_call) — the shared secret both
+    /// endpoints derive from their 1:1 session (issue #67).
     ///
     /// [`SignalingServer`]: crate::calling::signaling::SignalingServer
     pub async fn new(
         config: CallManagerConfig,
         event_sender: mpsc::UnboundedSender<CallEvent>,
         local_identity: IdentityId,
-        media_root: [u8; 32],
         signaling: Arc<dyn SignalingTransport>,
     ) -> Result<Self> {
         let webrtc_config = WebRTCConfig {
@@ -306,7 +309,6 @@ impl CallManager {
         // to the remote over signaling.
         let (ice_out, ice_in) = mpsc::unbounded_channel();
         let webrtc_manager = WebRTCManager::new(webrtc_config, ice_out).await?;
-        let media_encryption = MediaEncryption::from_shared_root(media_root);
         let contact_manager = Arc::new(ContactManager::new());
 
         tokio::spawn(Self::forward_local_ice(
@@ -318,13 +320,23 @@ impl CallManager {
         Ok(CallManager {
             calls: Arc::new(RwLock::new(HashMap::new())),
             webrtc_manager,
-            media_encryption,
+            call_media: Arc::new(RwLock::new(HashMap::new())),
             local_identity,
             signaling,
             event_sender,
             config,
             contact_manager,
         })
+    }
+
+    /// Provision the shared media root for a call. Both endpoints call
+    /// this with the same secret (derived from their 1:1 session)
+    /// before their peer connection is established.
+    async fn set_call_media_root(&self, call_id: CallId, media_root: [u8; 32]) {
+        self.call_media
+            .write()
+            .await
+            .insert(call_id, MediaEncryption::from_shared_root(media_root));
     }
 
     /// Drain locally-gathered ICE candidates and trickle each to its
@@ -349,7 +361,8 @@ impl CallManager {
         }
     }
 
-    /// Initiate a new call
+    /// Initiate a new call. `media_root` is the shared secret (derived
+    /// from the 1:1 session) both endpoints use to derive media keys.
     pub async fn initiate_call(
         &self,
         initiator: IdentityId,
@@ -357,8 +370,10 @@ impl CallManager {
         call_type: CallType,
         group_id: Option<GroupId>,
         settings: CallSettings,
+        media_root: [u8; 32],
     ) -> Result<CallId> {
         let call_id = self.generate_call_id()?;
+        self.set_call_media_root(call_id, media_root).await;
 
         // Validate participants
         if participants.is_empty() {
@@ -672,6 +687,7 @@ impl CallManager {
 
         // Best-effort teardown; a missing connection is not an error.
         let _ = self.close_peer_connection(call_id, sender).await;
+        self.clear_call_media_root(call_id).await;
 
         self.event_sender
             .send(CallEvent::ParticipantLeft {
@@ -684,7 +700,12 @@ impl CallManager {
     }
 
     /// Accept an incoming call
-    pub async fn accept_call(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
+    pub async fn accept_call(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        media_root: [u8; 32],
+    ) -> Result<()> {
         let mut calls = self.calls.write().await;
         let call = calls
             .get_mut(&call_id)
@@ -719,6 +740,10 @@ impl CallManager {
 
         let call_type = call.call_type.clone();
         drop(calls);
+
+        // Provision this call's shared media root before the peer
+        // connection is built (establish_peer_connection reads it).
+        self.set_call_media_root(call_id, media_root).await;
 
         // Establish WebRTC connection, add the media tracks this call
         // type carries (so the offer advertises real m-lines with ICE
@@ -849,6 +874,7 @@ impl CallManager {
 
         // Close peer connections
         self.close_peer_connection(call_id, participant).await?;
+        self.clear_call_media_root(call_id).await;
 
         // Send event
         self.event_sender
@@ -1123,10 +1149,16 @@ impl CallManager {
         call_id: CallId,
         participant: IdentityId,
     ) -> Result<()> {
-        // Generate media encryption key
-        let media_key = self
-            .media_encryption
-            .generate_media_key(call_id.as_bytes(), participant.as_ref());
+        // Derive the media key from this call's shared root, provisioned
+        // at initiate/accept. A missing root means the call was never
+        // set up on this side — fail closed rather than invent one.
+        let media_key = {
+            let call_media = self.call_media.read().await;
+            let encryption = call_media.get(&call_id).ok_or_else(|| {
+                anyhow::anyhow!("no media root provisioned for call; call initiate/accept first")
+            })?;
+            encryption.generate_media_key(call_id.as_bytes(), participant.as_ref())
+        };
 
         // Create WebRTC peer connection
         self.webrtc_manager
@@ -1134,6 +1166,11 @@ impl CallManager {
             .await?;
 
         Ok(())
+    }
+
+    /// Drop a finished call's media root.
+    async fn clear_call_media_root(&self, call_id: CallId) {
+        self.call_media.write().await.remove(&call_id);
     }
 
     /// Close peer connection for a participant
@@ -1282,7 +1319,7 @@ mod tests {
         let _callee_inbox = server.register_client(IdentityId::from([2u8; 32])).await;
 
         let initiator = IdentityId::from([1u8; 32]);
-        let call_manager = CallManager::new(config, event_sender, initiator, [7u8; 32], server)
+        let call_manager = CallManager::new(config, event_sender, initiator, server)
             .await
             .expect("Should create call manager");
 
@@ -1295,6 +1332,7 @@ mod tests {
                 CallType::VoiceCall,
                 None,
                 CallSettings::default(),
+                [7u8; 32],
             )
             .await
             .expect("Should initiate call");
@@ -1317,7 +1355,6 @@ mod tests {
             CallManagerConfig::default(),
             event_sender,
             IdentityId::from([2u8; 32]),
-            [7u8; 32],
             server,
         )
         .await
@@ -1490,7 +1527,6 @@ mod tests {
             CallManagerConfig::default(),
             callee_ev,
             callee,
-            [7u8; 32],
             Arc::new(ChannelSignalingTransport::new(callee_tx)),
         )
         .await
@@ -1509,7 +1545,10 @@ mod tests {
             .await
             .unwrap();
         // Accepting sets a local description, which starts ICE gathering.
-        callee_mgr.accept_call(call_id, caller).await.unwrap();
+        callee_mgr
+            .accept_call(call_id, caller, [7u8; 32])
+            .await
+            .unwrap();
 
         // The SDP offer goes out first; at least one host ICE candidate
         // should follow within a short gathering window.
@@ -1546,7 +1585,6 @@ mod tests {
             CallManagerConfig::default(),
             caller_ev,
             caller,
-            root,
             Arc::new(ChannelSignalingTransport::new(caller_tx)),
         )
         .await
@@ -1555,13 +1593,14 @@ mod tests {
             CallManagerConfig::default(),
             callee_ev,
             callee,
-            root,
             Arc::new(ChannelSignalingTransport::new(callee_tx)),
         )
         .await
         .unwrap();
 
         // 1. Caller initiates → CallInvitation goes out to the callee.
+        // Both sides use the same per-call root (their shared session
+        // secret) so their media keys match.
         let call_id = caller_mgr
             .initiate_call(
                 caller,
@@ -1569,6 +1608,7 @@ mod tests {
                 CallType::VoiceCall,
                 None,
                 CallSettings::default(),
+                root,
             )
             .await
             .unwrap();
@@ -1580,7 +1620,7 @@ mod tests {
             .handle_inbound_signaling(caller, &invite.payload)
             .await
             .unwrap();
-        callee_mgr.accept_call(call_id, caller).await.unwrap();
+        callee_mgr.accept_call(call_id, caller, root).await.unwrap();
         let offer = callee_rx.recv().await.expect("offer sent");
         assert_eq!(offer.recipient, caller);
         assert!(matches!(

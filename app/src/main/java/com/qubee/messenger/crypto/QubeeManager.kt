@@ -191,6 +191,97 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    // --- Calling (voice/video) ---
+
+    /**
+     * Start the calling subsystem for the active identity. Must be
+     * called once (after onboarding) before initiating or accepting
+     * calls. Returns false if no identity is active or the native
+     * layer isn't linked.
+     */
+    suspend fun startCalling(): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        try {
+            nativeStartCalling()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Calling JNI is not linked (calling feature off?)")
+            false
+        } catch (e: Exception) {
+            Timber.e(e, "startCalling failed")
+            false
+        }
+    }
+
+    /**
+     * Initiate a 1:1 call. [mediaRoot] is the 32-byte shared secret
+     * derived from the peer's established 1:1 session. Returns the new
+     * call id (hex) or null.
+     */
+    suspend fun initiateCall(participantIdHex: String, callType: Int, mediaRoot: ByteArray): String? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeInitiateCall(participantIdHex, callType, mediaRoot)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "initiateCall failed")
+                null
+            }
+        }
+
+    /**
+     * Accept an incoming call. [mediaRoot] is the 32-byte shared secret
+     * derived from the caller's 1:1 session (same value both sides use).
+     */
+    suspend fun acceptCall(callIdHex: String, participantIdHex: String, mediaRoot: ByteArray): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext false
+            try {
+                nativeAcceptCall(callIdHex, participantIdHex, mediaRoot)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                false
+            } catch (e: Exception) {
+                Timber.e(e, "acceptCall failed")
+                false
+            }
+        }
+
+    /** End (or leave) a call. */
+    suspend fun endCall(callIdHex: String, participantIdHex: String): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext false
+            try {
+                nativeEndCall(callIdHex, participantIdHex)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                false
+            } catch (e: Exception) {
+                Timber.e(e, "endCall failed")
+                false
+            }
+        }
+
+    /**
+     * Feed an inbound call signaling frame (received over the sender's
+     * 1:1 session and decrypted) into the call state machine.
+     */
+    suspend fun handleCallSignal(senderIdHex: String, payload: ByteArray): Boolean =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext false
+            try {
+                nativeHandleCallSignal(senderIdHex, payload)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                false
+            } catch (e: Exception) {
+                Timber.e(e, "handleCallSignal failed")
+                false
+            }
+        }
+
     /**
      * Build a ratchet-authenticated, deniable delivery receipt for one exact
      * direct frame. No long-term identity signature is produced.
@@ -990,6 +1081,21 @@ class QubeeManager @Inject constructor(
         plaintext: ByteArray,
     ): String?
     private external fun nativeResetIdentity(dataDir: String): Boolean
+
+    // --- Calling (voice/video) ---
+    private external fun nativeStartCalling(): Boolean
+    private external fun nativeInitiateCall(
+        participantIdHex: String,
+        callType: Int,
+        mediaRoot: ByteArray,
+    ): String?
+    private external fun nativeAcceptCall(
+        callIdHex: String,
+        participantIdHex: String,
+        mediaRoot: ByteArray,
+    ): Boolean
+    private external fun nativeEndCall(callIdHex: String, participantIdHex: String): Boolean
+    private external fun nativeHandleCallSignal(senderIdHex: String, payload: ByteArray): Boolean
 
     external fun nativeCleanup()
 }

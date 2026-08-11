@@ -2,7 +2,6 @@ package com.qubee.messenger.calling
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaCodec
@@ -31,6 +30,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * (not universal), the exact Opus decoder CSD headers, buffer timing,
  * and echo/AGC — must be validated on a physical device. Treat it as a
  * reviewed scaffold, not a proven pipeline.
+ *
+ * Remote audio is intentionally buffered only for a small real-time window.
+ * If decode/playback falls behind we drop the oldest compressed frame rather
+ * than allowing an untrusted or simply faster producer to grow memory without
+ * bound and then play stale speech seconds later.
  */
 class AudioCallEngine(private val qubeeManager: QubeeManager) {
 
@@ -38,8 +42,10 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
     private var captureThread: Thread? = null
     private var playbackThread: Thread? = null
 
-    // Opus packets received from the remote track, awaiting decode+playback.
-    private val remoteFrames = LinkedBlockingQueue<ByteArray>()
+    // 12 x 20 ms ≈ 240 ms maximum compressed-audio backlog. This is a
+    // latency/backpressure boundary, not a delivery queue: real-time media
+    // prefers dropping stale frames to accumulating unbounded history.
+    private val remoteFrames = LinkedBlockingQueue<ByteArray>(REMOTE_QUEUE_CAPACITY)
 
     @Volatile private var callIdHex: String = ""
     @Volatile private var peerIdHex: String = ""
@@ -57,7 +63,9 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
     /** Stop capture + playback and release all codecs/devices. */
     fun stop() {
         if (!running.compareAndSet(true, false)) return
-        // Unblock the playback thread's queue take().
+        // Discard stale media and guarantee the poison marker can be queued even
+        // when the bounded backlog was full at the moment teardown started.
+        remoteFrames.clear()
         remoteFrames.offer(POISON)
         captureThread?.join(TEARDOWN_JOIN_MS)
         playbackThread?.join(TEARDOWN_JOIN_MS)
@@ -67,7 +75,18 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
 
     /** Hand an Opus packet from the remote track to the playback decoder. */
     fun onRemoteAudioFrame(opus: ByteArray) {
-        if (running.get()) remoteFrames.offer(opus)
+        if (!running.get()) return
+        if (opus.isEmpty() || opus.size > MAX_REMOTE_FRAME_BYTES) {
+            Timber.w("Dropping invalid remote Opus frame (%d bytes)", opus.size)
+            return
+        }
+
+        // Keep the freshest audio. A full queue means playback/decoding is
+        // behind; dropping the oldest frame bounds memory *and* latency.
+        if (!remoteFrames.offer(opus)) {
+            remoteFrames.poll()
+            remoteFrames.offer(opus)
+        }
     }
 
     // --- Capture: mic → Opus → writeAudioSample --------------------------
@@ -193,6 +212,15 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
                 if (inIndex >= 0) {
                     val inBuf = decoder.getInputBuffer(inIndex) ?: continue
                     inBuf.clear()
+                    if (opus.size > inBuf.remaining()) {
+                        Timber.w(
+                            "Dropping Opus frame larger than decoder input buffer (%d > %d)",
+                            opus.size,
+                            inBuf.remaining(),
+                        )
+                        decoder.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
+                        continue
+                    }
                     inBuf.put(opus)
                     decoder.queueInputBuffer(inIndex, 0, opus.size, ptsUs, 0)
                     ptsUs += FRAME_DURATION_US
@@ -254,6 +282,8 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
         const val PRE_SKIP_NS = PRE_SKIP_SAMPLES.toLong() * 1_000_000_000L / SAMPLE_RATE
         const val DEQUEUE_TIMEOUT_US = 10_000L
         const val TEARDOWN_JOIN_MS = 500L
+        const val REMOTE_QUEUE_CAPACITY = 12
+        const val MAX_REMOTE_FRAME_BYTES = 64 * 1024
         val POISON = ByteArray(0)
     }
 }

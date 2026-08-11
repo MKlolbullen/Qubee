@@ -15,7 +15,7 @@ use qubee_crypto::ratchet::direct::{
 };
 use qubee_crypto::ratchet::prekey_store::{build_body, get_or_create_local_bundle};
 use qubee_crypto::ratchet::sender_keys::{
-    create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
+    create_or_get_own_sender_key, decrypt_sender_key_message_v5, encrypt_sender_key_message_v5,
     install_sender_key, reset_group_sender_state,
 };
 use qubee_crypto::storage::secure_keystore::SecureKeyStore;
@@ -99,12 +99,26 @@ fn mesh(devices: &mut [Device], group: &GroupId, now: u64) {
 
 fn send(dev: &mut Device, group: &GroupId, group_key: &[u8; 32], text: &[u8]) -> Vec<u8> {
     let id = dev.id();
-    encrypt_sender_key_message(&mut dev.ks, group, group_key, id, text).unwrap()
+    encrypt_sender_key_message_v5(&mut dev.ks, group, group_key, id, text).unwrap()
 }
 
-fn recv(dev: &mut Device, group_key: &[u8; 32], wire: &[u8]) -> (IdentityId, Vec<u8>) {
-    let (_, sender, pt) = decrypt_sender_key_message(&mut dev.ks, group_key, wire).unwrap();
+fn recv(
+    dev: &mut Device,
+    group: &GroupId,
+    group_key: &[u8; 32],
+    wire: &[u8],
+) -> (IdentityId, Vec<u8>) {
+    let (_, sender, pt) = try_recv(dev, group, group_key, wire).unwrap();
     (sender, pt)
+}
+
+fn try_recv(
+    dev: &mut Device,
+    group: &GroupId,
+    group_key: &[u8; 32],
+    wire: &[u8],
+) -> anyhow::Result<(GroupId, IdentityId, Vec<u8>)> {
+    decrypt_sender_key_message_v5(&mut dev.ks, vec![(*group, *group_key)], wire)
 }
 
 #[test]
@@ -125,15 +139,15 @@ fn three_member_mesh_full_choreography() {
             if r == s {
                 // No recv chain for self — the app keeps the local
                 // plaintext; it never round-trips its own frames.
-                assert!(decrypt_sender_key_message(&mut devs[r].ks, &group_key, &wire).is_err());
+                assert!(try_recv(&mut devs[r], &group, &group_key, &wire).is_err());
                 continue;
             }
             let sender_id = devs[s].id();
-            let (from, pt) = recv(&mut devs[r], &group_key, &wire);
+            let (from, pt) = recv(&mut devs[r], &group, &group_key, &wire);
             assert_eq!((from, pt), (sender_id, format!("from {s}").into_bytes()));
             // Forward secrecy at the state level: the consumed message
             // key is gone, so the captured frame is dead on replay.
-            let err = decrypt_sender_key_message(&mut devs[r].ks, &group_key, &wire).unwrap_err();
+            let err = try_recv(&mut devs[r], &group, &group_key, &wire).unwrap_err();
             assert!(err.to_string().contains("consumed"), "{err}");
         }
     }
@@ -147,8 +161,8 @@ fn removal_rekey_locks_out_removed_member() {
     mesh(&mut devs, &group, 1);
 
     let w = send(&mut devs[0], &group, &old_key, b"before removal");
-    recv(&mut devs[1], &old_key, &w);
-    recv(&mut devs[2], &old_key, &w);
+    recv(&mut devs[1], &group, &old_key, &w);
+    recv(&mut devs[2], &group, &old_key, &w);
 
     // Carol (index 2) is removed. The v2 rotation delivers a fresh
     // group key to the remaining members; each wipes every chain for
@@ -163,27 +177,27 @@ fn removal_rekey_locks_out_removed_member() {
     }
 
     let w = send(&mut devs[0], &group, &new_key, b"after removal");
-    let (from, pt) = recv(&mut devs[1], &new_key, &w);
+    let (from, pt) = recv(&mut devs[1], &group, &new_key, &w);
     assert_eq!(
         (from, pt.as_slice()),
         (devs[0].id(), b"after removal".as_slice())
     );
 
-    // Carol never received the rotated group key: the outer envelope
-    // fails before anything else runs.
-    assert!(decrypt_sender_key_message(&mut devs[2].ks, &old_key, &w).is_err());
+    // Carol never received the rotated group key: her stale key's
+    // selector never matches the frame, so nothing even opens.
+    assert!(try_recv(&mut devs[2], &group, &old_key, &w).is_err());
 
     // Even if the new group key leaks to her, Alice's fresh chain does
     // not match the stale distribution Carol still holds.
-    assert!(decrypt_sender_key_message(&mut devs[2].ks, &new_key, &w).is_err());
+    assert!(try_recv(&mut devs[2], &group, &new_key, &w).is_err());
 
     // Carol's own sends are equally dead: under the old key the outer
     // AEAD fails, and under a leaked new key the remaining members
     // wiped her chain, so there is nothing to verify against.
     let stale = send(&mut devs[2], &group, &old_key, b"i am still here");
-    assert!(decrypt_sender_key_message(&mut devs[0].ks, &new_key, &stale).is_err());
+    assert!(try_recv(&mut devs[0], &group, &new_key, &stale).is_err());
     let leaked = send(&mut devs[2], &group, &new_key, b"with the new key");
-    let err = decrypt_sender_key_message(&mut devs[0].ks, &new_key, &leaked).unwrap_err();
+    let err = try_recv(&mut devs[0], &group, &new_key, &leaked).unwrap_err();
     assert!(err.to_string().contains("no sender key"), "{err}");
 }
 
@@ -197,7 +211,7 @@ fn late_joiner_reads_forward_never_backward() {
     let mut history = Vec::new();
     for i in 0..3u8 {
         let w = send(&mut devs[0], &group, &group_key, &[i]);
-        recv(&mut devs[1], &group_key, &w);
+        recv(&mut devs[1], &group, &group_key, &w);
         history.push(w);
     }
 
@@ -226,14 +240,14 @@ fn late_joiner_reads_forward_never_backward() {
     }
 
     let w = send(&mut devs[0], &group, &group_key, b"welcome dave");
-    let (from, pt) = recv(&mut dave, &group_key, &w);
+    let (from, pt) = recv(&mut dave, &group, &group_key, &w);
     assert_eq!(
         (from, pt.as_slice()),
         (devs[0].id(), b"welcome dave".as_slice())
     );
 
     for old in &history {
-        let err = decrypt_sender_key_message(&mut dave.ks, &group_key, old).unwrap_err();
+        let err = try_recv(&mut dave, &group, &group_key, old).unwrap_err();
         assert!(err.to_string().contains("consumed"), "{err}");
     }
 }
@@ -246,25 +260,25 @@ fn state_survives_restart_mid_conversation() {
     mesh(&mut devs, &group, 1);
 
     let f1 = send(&mut devs[0], &group, &group_key, b"before restart");
-    recv(&mut devs[1], &group_key, &f1);
+    recv(&mut devs[1], &group, &group_key, &f1);
 
     devs[0].restart();
     devs[1].restart();
 
     // Consumed keys stay consumed across the restart — a captured
     // frame must not become decryptable again by rebooting.
-    assert!(decrypt_sender_key_message(&mut devs[1].ks, &group_key, &f1).is_err());
+    assert!(try_recv(&mut devs[1], &group, &group_key, &f1).is_err());
 
     // Chains continue where they left off, in both directions, with no
     // re-pairing and no redistribution.
     let f2 = send(&mut devs[1], &group, &group_key, b"b after restart");
     assert_eq!(
-        recv(&mut devs[0], &group_key, &f2).1,
+        recv(&mut devs[0], &group, &group_key, &f2).1,
         b"b after restart".to_vec()
     );
     let f3 = send(&mut devs[0], &group, &group_key, b"a after restart");
     assert_eq!(
-        recv(&mut devs[1], &group_key, &f3).1,
+        recv(&mut devs[1], &group, &group_key, &f3).1,
         b"a after restart".to_vec()
     );
 }
@@ -345,16 +359,16 @@ fn frame_sealed_for_one_group_key_is_rejected_under_another() {
 
     let wire = send(&mut devs[0], &group, &key_1, b"group one only");
 
-    // Wrong group key → rejected at the outer seal, before any chain state
-    // is touched.
+    // Wrong group key → its selector never matches, so the frame is
+    // rejected before any chain state is touched.
     assert!(
-        decrypt_sender_key_message(&mut devs[1].ks, &key_2, &wire).is_err(),
+        try_recv(&mut devs[1], &group, &key_2, &wire).is_err(),
         "a frame sealed under one group key must not open under another",
     );
     // The failed attempt left the receiver's state intact: the correct key
     // still opens the same frame.
     let sender_id = devs[0].id();
-    let (from, pt) = recv(&mut devs[1], &key_1, &wire);
+    let (from, pt) = recv(&mut devs[1], &group, &key_1, &wire);
     assert_eq!((from, pt), (sender_id, b"group one only".to_vec()));
 }
 
@@ -466,6 +480,6 @@ fn crash_after_advance_never_reuses_a_group_iteration() {
     let wire = send(&mut devs[0], &group, &key, b"after restart");
 
     let sender_id = devs[0].id();
-    let (from, pt) = recv(&mut devs[1], &key, &wire);
+    let (from, pt) = recv(&mut devs[1], &group, &key, &wire);
     assert_eq!((from, pt), (sender_id, b"after restart".to_vec()));
 }

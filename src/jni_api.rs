@@ -42,9 +42,9 @@ use crate::ratchet::direct_message::{extract_direct_message_id, is_direct_messag
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, decrypt_sender_key_message_v5,
-    encrypt_sender_key_message, extract_v3_message_id, extract_v5_message_id, install_sender_key,
-    is_group_message_v5_frame, own_chain_iteration, peek_v3_group_id, reset_group_sender_state,
-    SenderKeyDistribution,
+    encrypt_sender_key_message_v5, extract_v3_message_id, extract_v5_message_id,
+    install_sender_key, is_group_message_v5_frame, own_chain_iteration, peek_v3_group_id,
+    reset_group_sender_state, SenderKeyDistribution,
 };
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
@@ -3277,10 +3277,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInstal
     })
 }
 
-/// Encrypt a UTF-8 plaintext for a group over the v3 sender-keys
-/// format (Ratchet Stage 4). Returns the `QUBEE_GMS\x03` wire frame,
-/// or `null` on failure. Dark-launched: live group traffic still rides
-/// the v2 path via `nativeSendGroupMessage`.
+/// Encrypt a UTF-8 plaintext for a group over the sender-keys format.
+/// Emits the keyed-selector `QUBEE_GMS\x05` frame (no plaintext group
+/// id on the wire); the `V3` in the symbol name is historical — see
+/// `nativeDecryptGroupMessageV3`, which accepts both formats. Returns
+/// the wire frame, or `null` on failure.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptGroupMessageV3(
     mut env: JNIEnv,
@@ -3310,7 +3311,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
             let ks = ks_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-            let wire = encrypt_sender_key_message(
+            let wire = encrypt_sender_key_message_v5(
                 ks,
                 &group_id,
                 &group_key,

@@ -63,6 +63,10 @@ hex = "0.4"
 # `cargo build` works out of the box; pass `--features calling` to
 # pull WebRTC in.
 webrtc = { version = "0.14", optional = true }
+# `bytes::Bytes` is the payload type of `webrtc::media::Sample` (the
+# capture-sample write API). Already in the tree via webrtc; declared
+# here so the calling media path can name it. Calling-only.
+bytes = { version = "1", optional = true }
 # Logging is used by the WebRTC crate for diagnostics. Pulled in
 # unconditionally — it's small, it's a well-behaved facade, and
 # several other deps want it too.
@@ -131,7 +135,7 @@ default = []
 # JNI surface or the Android app yet — signaling-over-P2P, the call
 # UI, and ratchet-derived media keys are still to come. Off by default
 # so the shipped .so stays lean; enable it for calling development.
-calling = ["dep:webrtc"]
+calling = ["dep:webrtc", "dep:bytes"]
 # Compile the legacy prototype modules (`hybrid_ratchet`,
 # `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
 # They reference dependency APIs that have since drifted; enabling

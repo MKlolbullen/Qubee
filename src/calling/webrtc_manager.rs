@@ -19,6 +19,25 @@ pub struct OutboundIce {
     pub candidate: ICECandidate,
 }
 
+/// Which media stream an encoded frame belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaKind {
+    Audio,
+    Video,
+}
+
+/// One encoded media frame received from a remote peer's track. The
+/// payload is the codec bitstream (Opus for audio, VP8/etc. for video)
+/// carried in one RTP packet; the app decodes and renders it. The Rust
+/// side does not decode media.
+#[derive(Clone, Debug)]
+pub struct RemoteMedia {
+    pub call_id: CallId,
+    pub participant: IdentityId,
+    pub kind: MediaKind,
+    pub payload: Vec<u8>,
+}
+
 /// WebRTC manager for handling real-time media communication
 pub struct WebRTCManager {
     /// Active peer connections
@@ -32,6 +51,9 @@ pub struct WebRTCManager {
     /// Sink for locally-gathered ICE candidates, drained by
     /// `CallManager` and trickled to the remote over signaling.
     ice_out: mpsc::UnboundedSender<OutboundIce>,
+    /// Sink for encoded frames received on remote tracks, drained by
+    /// `CallManager` and surfaced to the app for decode + playback.
+    remote_media_out: mpsc::UnboundedSender<RemoteMedia>,
 }
 
 /// Per-(call, participant) ICE candidate buffer.
@@ -169,6 +191,7 @@ impl WebRTCManager {
     pub async fn new(
         config: WebRTCConfig,
         ice_out: mpsc::UnboundedSender<OutboundIce>,
+        remote_media_out: mpsc::UnboundedSender<RemoteMedia>,
     ) -> Result<Self> {
         let media_devices = MediaDevicesManager::new().await?;
 
@@ -178,6 +201,7 @@ impl WebRTCManager {
             media_devices,
             ice_candidates: Arc::new(RwLock::new(HashMap::new())),
             ice_out,
+            remote_media_out,
         })
     }
 
@@ -195,6 +219,7 @@ impl WebRTCManager {
             call_id,
             participant,
             self.ice_out.clone(),
+            self.remote_media_out.clone(),
         )
         .await?;
 
@@ -202,6 +227,38 @@ impl WebRTCManager {
         connections.insert((call_id, participant), peer_connection);
 
         Ok(())
+    }
+
+    /// Write one encoded audio frame to a participant's outbound track.
+    /// The app captures + encodes; the Rust side just packetizes and
+    /// sends. Fails if the audio track isn't up yet.
+    pub async fn write_audio_sample(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        data: &[u8],
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        let connections = self.peer_connections.read().await;
+        let connection = connections
+            .get(&(call_id, participant))
+            .ok_or_else(|| anyhow::anyhow!("no peer connection for call"))?;
+        connection.write_audio_sample(data, duration).await
+    }
+
+    /// Write one encoded video frame to a participant's outbound track.
+    pub async fn write_video_sample(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        data: &[u8],
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        let connections = self.peer_connections.read().await;
+        let connection = connections
+            .get(&(call_id, participant))
+            .ok_or_else(|| anyhow::anyhow!("no peer connection for call"))?;
+        connection.write_video_sample(data, duration).await
     }
 
     /// Whether a peer connection currently exists for this

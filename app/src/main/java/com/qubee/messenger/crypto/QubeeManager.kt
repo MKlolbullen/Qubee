@@ -233,11 +233,9 @@ class QubeeManager @Inject constructor(
     }
 
     /**
-     * Initiate a 1:1 call. [mediaRoot] is the 32-byte shared secret
-     * derived from the peer's established 1:1 session. Returns the new
-     * call id (hex) or null. The call's media root is minted natively
-     * and carried in the encrypted invitation, so the caller supplies
-     * no key.
+     * Initiate a 1:1 call. Returns the new call id (hex) or null. The
+     * call's media root is minted natively and carried in the encrypted
+     * invitation, so the caller supplies no key.
      */
     suspend fun initiateCall(participantIdHex: String, callType: Int): String? =
         withContext(Dispatchers.IO) {
@@ -341,6 +339,44 @@ class QubeeManager @Inject constructor(
         1 -> true
         0 -> false
         else -> null
+    }
+
+    /**
+     * Push one encoded audio frame (Opus) into a call's outbound track.
+     * Called at media rate from the capture thread, so this is a plain
+     * blocking call rather than a coroutine.
+     */
+    fun writeAudioSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean {
+        if (!isInitialized) return false
+        return try {
+            nativeWriteAudioSample(callIdHex, participantIdHex, frame, durationMs)
+        } catch (e: UnsatisfiedLinkError) {
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Push one encoded video frame into a call's outbound track. */
+    fun writeVideoSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean {
+        if (!isInitialized) return false
+        return try {
+            nativeWriteVideoSample(callIdHex, participantIdHex, frame, durationMs)
+        } catch (e: UnsatisfiedLinkError) {
+            false
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
@@ -1158,6 +1194,18 @@ class QubeeManager @Inject constructor(
     private external fun nativeHandleCallSignal(senderIdHex: String, payload: ByteArray): Boolean
     private external fun nativeToggleMute(callIdHex: String, participantIdHex: String): Int
     private external fun nativeToggleVideo(callIdHex: String, participantIdHex: String): Int
+    private external fun nativeWriteAudioSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean
+    private external fun nativeWriteVideoSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean
 
     external fun nativeCleanup()
 }

@@ -304,6 +304,45 @@ class QubeeManager @Inject constructor(
             }
         }
 
+    /** Toggle mute for the local participant; returns the new muted
+     * state, or null on error. */
+    suspend fun toggleMute(callIdHex: String, participantIdHex: String): Boolean? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeToggleMute(callIdHex, participantIdHex).toToggleState()
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "toggleMute failed")
+                null
+            }
+        }
+
+    /** Toggle video for the local participant; returns the new enabled
+     * state, or null on error. */
+    suspend fun toggleVideo(callIdHex: String, participantIdHex: String): Boolean? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeToggleVideo(callIdHex, participantIdHex).toToggleState()
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "toggleVideo failed")
+                null
+            }
+        }
+
+    /** Map the native toggle result (1 on, 0 off, -1 error) to a state. */
+    private fun Int.toToggleState(): Boolean? = when (this) {
+        1 -> true
+        0 -> false
+        else -> null
+    }
+
     /**
      * Build a ratchet-authenticated, deniable delivery receipt for one exact
      * direct frame. No long-term identity signature is produced.
@@ -1117,6 +1156,8 @@ class QubeeManager @Inject constructor(
     ): Boolean
     private external fun nativeEndCall(callIdHex: String, participantIdHex: String): Boolean
     private external fun nativeHandleCallSignal(senderIdHex: String, payload: ByteArray): Boolean
+    private external fun nativeToggleMute(callIdHex: String, participantIdHex: String): Int
+    private external fun nativeToggleVideo(callIdHex: String, participantIdHex: String): Int
 
     external fun nativeCleanup()
 }

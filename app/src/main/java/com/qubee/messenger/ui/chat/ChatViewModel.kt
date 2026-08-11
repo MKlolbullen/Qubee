@@ -39,6 +39,7 @@ class ChatViewModel @Inject constructor(
     private val groupRepository: com.qubee.messenger.data.repository.GroupRepository,
     private val qubeeManager: QubeeManager,
     private val ratchetSender: com.qubee.messenger.crypto.RatchetSender,
+    private val callRepository: com.qubee.messenger.data.repository.CallRepository,
 ) : ViewModel() {
 
     private val contactId: String = savedStateHandle["contactId"] ?: ""
@@ -330,7 +331,19 @@ class ChatViewModel @Inject constructor(
      * a yet-unbuilt signalling layer. Surfaces a notice for now.
      */
     fun requestSecureCall() {
-        notice("Secure calling lands post-alpha (calling feature flag)")
+        val peerIdHex = peerIdentityIdHex
+        if (peerIdHex == null) {
+            notice("Can't call yet — no verified peer identity for this contact")
+            return
+        }
+        viewModelScope.launch {
+            // Voice call for now; the CallOverlay drives accept/answer.
+            // A null id means the native .so was built without the
+            // calling feature, or startup hasn't provisioned it.
+            if (callRepository.initiateCall(peerIdHex, isVideo = false) == null) {
+                notice("Calling is unavailable in this build")
+            }
+        }
     }
 
     /**

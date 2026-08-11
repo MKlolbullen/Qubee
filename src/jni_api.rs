@@ -4377,3 +4377,65 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandle
         }
     })
 }
+
+/// Toggle the local participant's mute. Returns the new state: 1 muted,
+/// 0 unmuted, -1 on error.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeToggleMute(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result: anyhow::Result<bool> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.toggle_mute(cid, pid))
+        })();
+        match result {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeToggleMute failed");
+                -1
+            }
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Toggle the local participant's video. Returns the new state: 1 on,
+/// 0 off, -1 on error.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeToggleVideo(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result: anyhow::Result<bool> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.toggle_video(cid, pid))
+        })();
+        match result {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeToggleVideo failed");
+                -1
+            }
+        }
+    }))
+    .unwrap_or(-1)
+}

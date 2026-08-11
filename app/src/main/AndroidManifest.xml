@@ -83,6 +83,15 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- Microphone foreground service hosting the audio capture/playback
+             engine for the lifetime of an active call. Started by
+             MessageService on the Active call transition. -->
+        <service
+            android:name=".calling.CallMediaService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
     </application>
 
 </manifest>

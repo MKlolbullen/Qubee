@@ -15,6 +15,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.qubee.messenger.QubeeApplication
 import com.qubee.messenger.R
+import com.qubee.messenger.calling.CallMediaService
 import com.qubee.messenger.crypto.EncryptedMessage
 import com.qubee.messenger.crypto.QubeeManager
 import com.qubee.messenger.data.model.Message
@@ -98,6 +99,9 @@ class MessageService : Service(), NetworkCallback {
         /// alone.
         private const val OFFLINE_RETRY_MAX_ATTEMPTS: Int = 5
         private const val DIRECT_FRAME_LOCK_STRIPES: Int = 64
+        /// onRemoteMedia kind discriminant: 0=audio (Opus), 1=video.
+        /// Mirrors MediaKind in src/calling/webrtc_manager.rs.
+        private const val MEDIA_KIND_AUDIO: Int = 0
 
         /// Prekey bundles ride gossipsub, so peers offline at publish
         /// time miss them and can never initiate v3 toward us. A
@@ -168,6 +172,7 @@ class MessageService : Service(), NetworkCallback {
                 startP2PNetwork()
                 startOfflineRetryLoop()
                 startPrekeyRepublishLoop()
+                startCallMediaLoop()
                 isRunning = true
                 Timber.d("MessageService started")
             } catch (e: Exception) {
@@ -290,6 +295,35 @@ class MessageService : Service(), NetworkCallback {
                     }
                 } catch (e: Exception) {
                     Timber.w(e, "prekey republish tick failed")
+                }
+            }
+        }
+    }
+
+    /**
+     * Bind the microphone [CallMediaService] lifetime to the call state.
+     * The service is started while a call is Active (mic capture + remote
+     * playback) and stopped otherwise, so audio outlives a backgrounded UI
+     * but never runs without a live call. Starts are idempotent for the
+     * same call id; the service replaces its engine if the call changes.
+     */
+    private fun startCallMediaLoop() {
+        serviceScope.launch {
+            var activeCallId: String? = null
+            callRepository.state.collect { s ->
+                val active = s as? com.qubee.messenger.data.repository.CallRepository.CallUiState.Active
+                if (active != null) {
+                    if (active.callIdHex != activeCallId) {
+                        activeCallId = active.callIdHex
+                        CallMediaService.start(
+                            this@MessageService,
+                            active.callIdHex,
+                            active.peerIdHex,
+                        )
+                    }
+                } else if (activeCallId != null) {
+                    activeCallId = null
+                    CallMediaService.stop(this@MessageService)
                 }
             }
         }
@@ -948,6 +982,19 @@ class MessageService : Service(), NetworkCallback {
     override fun onCallStateChanged(callIdHex: String, state: String) {
         Timber.d("Call %s state: %s", callIdHex, state)
         callRepository.onStateChanged(callIdHex, state)
+    }
+
+    /**
+     * Encoded remote media from a call track. Audio (kind 0) is Opus and
+     * goes to the [CallMediaService] engine for decode + playback; video
+     * (kind 1) has no renderer yet and is dropped. Fires at media rate, so
+     * this stays cheap — a queue offer inside the engine, no allocation
+     * beyond the payload we were handed.
+     */
+    override fun onRemoteMedia(callIdHex: String, senderIdHex: String, kind: Int, payload: ByteArray) {
+        if (kind == MEDIA_KIND_AUDIO) {
+            CallMediaService.deliverRemoteAudio(callIdHex, payload)
+        }
     }
 
     /** Decode lowercase hex to bytes; null if malformed. */

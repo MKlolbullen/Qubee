@@ -63,16 +63,35 @@ pub struct MediaEncryption {
 }
 
 const MEDIA_KEY_KDF_INFO: &[u8] = b"qubee media key v1";
+const MEDIA_ROOT_KDF_INFO: &[u8] = b"qubee call media root v1";
 
 impl MediaEncryption {
     /// Build a manager from a root secret shared by both endpoints
     /// (the per-call secret derived from the 1:1 session). This is the
-    /// only non-test constructor: media keys are only interoperable
+    /// only raw-root constructor: media keys are only interoperable
     /// when both sides start from the same root.
     pub fn from_shared_root(root: [u8; 32]) -> Self {
         Self {
             root: SecretBox::new(Box::new(root)),
         }
+    }
+
+    /// Derive the shared per-call root from an established 1:1 session
+    /// secret and the call id, then build the manager from it.
+    ///
+    /// Both endpoints already hold the same `session_secret` (from the
+    /// ratchet) and address the same `call_id`, so both derive the same
+    /// root and therefore the same media keys. `call_id` is bound in as
+    /// the KDF salt so two concurrent calls on one session get
+    /// independent roots. This is the production entry point (issue
+    /// #67); `from_shared_root` stays available for callers that hold a
+    /// root directly.
+    pub fn from_session_secret(session_secret: &[u8], call_id: &[u8]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(call_id), session_secret);
+        let mut root = [0u8; 32];
+        hk.expand(MEDIA_ROOT_KDF_INFO, &mut root)
+            .expect("HKDF expand into 32 bytes never fails");
+        Self::from_shared_root(root)
     }
 
     /// Derive the media key for one participant in one call. Same
@@ -225,6 +244,55 @@ mod tests {
             .generate_media_key(&call, &participant)
             .decrypt_frame(0, &frame)
             .is_err());
+    }
+
+    #[test]
+    fn session_secret_derives_matching_roots_on_both_endpoints() {
+        // Both sides hold the same 1:1-session secret and address the
+        // same call, so both derive the same media key and interoperate.
+        let session_secret = b"ratchet-derived shared session secret";
+        let call = [4u8; 16];
+        let participant = [5u8; 32];
+
+        let alice = MediaEncryption::from_session_secret(session_secret, &call);
+        let bob = MediaEncryption::from_session_secret(session_secret, &call);
+
+        let frame = alice
+            .generate_media_key(&call, &participant)
+            .encrypt_frame(0, b"session-rooted frame")
+            .unwrap();
+        assert_eq!(
+            bob.generate_media_key(&call, &participant)
+                .decrypt_frame(0, &frame)
+                .unwrap(),
+            b"session-rooted frame"
+        );
+    }
+
+    #[test]
+    fn session_root_is_bound_to_secret_and_call() {
+        let call = [4u8; 16];
+        let other_call = [8u8; 16];
+        let participant = [5u8; 32];
+
+        let base = MediaEncryption::from_session_secret(b"secret-one", &call);
+        let frame = base
+            .generate_media_key(&call, &participant)
+            .encrypt_frame(0, b"bound")
+            .unwrap();
+
+        // A different session secret must not open it...
+        assert!(MediaEncryption::from_session_secret(b"secret-two", &call)
+            .generate_media_key(&call, &participant)
+            .decrypt_frame(0, &frame)
+            .is_err());
+        // ...nor the same secret under a different call id.
+        assert!(
+            MediaEncryption::from_session_secret(b"secret-one", &other_call)
+                .generate_media_key(&call, &participant)
+                .decrypt_frame(0, &frame)
+                .is_err()
+        );
     }
 
     #[test]

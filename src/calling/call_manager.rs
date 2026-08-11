@@ -1,13 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 
-use crate::calling::media_encryption::{MediaEncryption, MediaKey};
-use crate::calling::peer_connection::{PeerConnection, PeerConnectionState};
-use crate::calling::signaling::{SignalingClient, SignalingMessage, SignalingServer};
+use crate::calling::media_encryption::MediaEncryption;
+use crate::calling::signaling::{SignalingMessage, SignalingServer};
 use crate::calling::webrtc_manager::{WebRTCConfig, WebRTCManager};
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
@@ -51,8 +50,14 @@ pub struct Call {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallId([u8; 16]);
 
+impl CallId {
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
 /// Types of calls supported
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CallType {
     /// One-on-one voice call
     VoiceCall,
@@ -151,7 +156,7 @@ pub struct ConnectionQuality {
 }
 
 /// Call settings and preferences
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CallSettings {
     pub max_participants: Option<usize>,
     pub require_encryption: bool,
@@ -165,7 +170,7 @@ pub struct CallSettings {
 }
 
 /// Video quality settings
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum VideoQuality {
     Low,    // 240p
     Medium, // 480p
@@ -176,7 +181,7 @@ pub enum VideoQuality {
 }
 
 /// Audio quality settings
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum AudioQuality {
     Low,    // 8kHz, mono
     Medium, // 16kHz, mono
@@ -548,12 +553,13 @@ impl CallManager {
             participant_info.is_muted = !participant_info.is_muted;
             participant_info.media_state.audio_enabled = !participant_info.is_muted;
 
+            let muted = participant_info.is_muted;
             let new_state = participant_info.media_state.clone();
             drop(calls);
 
             // Update WebRTC audio track
             self.webrtc_manager
-                .set_audio_enabled(call_id, participant, !participant_info.is_muted)
+                .set_audio_enabled(call_id, participant, !muted)
                 .await?;
 
             // Send event
@@ -565,7 +571,7 @@ impl CallManager {
                 })
                 .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
 
-            Ok(participant_info.is_muted)
+            Ok(muted)
         } else {
             Err(anyhow::anyhow!("Participant not found in call"))
         }
@@ -582,12 +588,13 @@ impl CallManager {
             participant_info.is_video_enabled = !participant_info.is_video_enabled;
             participant_info.media_state.video_enabled = participant_info.is_video_enabled;
 
+            let video_enabled = participant_info.is_video_enabled;
             let new_state = participant_info.media_state.clone();
             drop(calls);
 
             // Update WebRTC video track
             self.webrtc_manager
-                .set_video_enabled(call_id, participant, participant_info.is_video_enabled)
+                .set_video_enabled(call_id, participant, video_enabled)
                 .await?;
 
             // Send event
@@ -599,7 +606,7 @@ impl CallManager {
                 })
                 .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
 
-            Ok(participant_info.is_video_enabled)
+            Ok(video_enabled)
         } else {
             Err(anyhow::anyhow!("Participant not found in call"))
         }
@@ -779,7 +786,7 @@ impl CallManager {
         // Generate media encryption key
         let media_key = self
             .media_encryption
-            .generate_media_key(call_id, participant)?;
+            .generate_media_key(call_id.as_bytes(), participant.as_ref());
 
         // Create WebRTC peer connection
         self.webrtc_manager
@@ -930,6 +937,14 @@ mod tests {
 
         let initiator = IdentityId::from([1u8; 32]);
         let participants = vec![IdentityId::from([2u8; 32])];
+
+        // The invite rides the in-process signaling server; an
+        // unregistered recipient makes initiate_call fail (correctly —
+        // there is nobody to ring). Register the callee first.
+        let _callee_inbox = call_manager
+            .signaling_server
+            .register_client(IdentityId::from([2u8; 32]))
+            .await;
 
         let call_id = call_manager
             .initiate_call(

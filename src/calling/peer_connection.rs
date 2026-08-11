@@ -143,7 +143,6 @@ impl PeerConnection {
                 urls: vec![turn.url.clone()],
                 username: turn.username.clone(),
                 credential: turn.credential.clone(),
-                ..Default::default()
             });
         }
         let rtc_config = RTCConfiguration {
@@ -341,13 +340,11 @@ impl PeerConnection {
                         .context("Failed to enable video track")?;
                 }
             }
-        } else {
-            if let Some(sender) = sender_opt.as_ref() {
-                sender
-                    .replace_track(None)
-                    .await
-                    .context("Failed to disable video track")?;
-            }
+        } else if let Some(sender) = sender_opt.as_ref() {
+            sender
+                .replace_track(None)
+                .await
+                .context("Failed to disable video track")?;
         }
         Ok(())
     }
@@ -385,17 +382,8 @@ impl PeerConnection {
     /// since the crate doesn't decode), so they remain at their default
     /// zero/None values.
     pub async fn get_stats(&self) -> Result<MediaStats> {
-        // Fetch the internal WebRTC stats report. This returns a map of
-        // statistics for each transport and track. Summarising these into
-        // a high‑level MediaStats struct requires parsing the report.
-        let _report = self
-            .webrtc_pc
-            .get_stats()
-            .await
-            .context("Failed to retrieve WebRTC stats")?;
-        // TODO: Parse stats report into our MediaStats struct. This is
-        // left as an exercise because the report structure is complex.
-        // For now we return zeroed metrics.
+        // Fetch the internal WebRTC stats report (infallible in
+        // webrtc 0.14 — it snapshots internal counters).
         let report = self.webrtc_pc.get_stats().await;
 
         let mut bytes_sent: u64 = 0;

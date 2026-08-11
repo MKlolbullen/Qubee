@@ -1,0 +1,47 @@
+name: Calling feature
+
+# The `calling` feature (voice/video over webrtc 0.14) is off by
+# default and not in the shipped .so, so the default CI never compiles
+# it. This gates it on its own so a WebRTC/API drift can't rot it back
+# to the broken state it was in before the port — build, clippy, and
+# its unit tests, feature-gated.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: calling-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  calling:
+    name: cargo test --features calling
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-calling
+
+      - name: cargo clippy --features calling
+        run: cargo clippy --features calling --all-targets -- -D warnings
+
+      - name: cargo test --features calling
+        run: cargo test --features calling

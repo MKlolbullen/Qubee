@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::calling::call_manager::{CallId, TurnServer};
 use crate::calling::media_encryption::MediaKey;
-use crate::calling::peer_connection::{ICECandidate, PeerConnection, PeerConnectionState};
+use crate::calling::peer_connection::{ICECandidate, PeerConnection};
 use crate::identity::identity_key::IdentityId;
 
 /// WebRTC manager for handling real-time media communication
@@ -18,8 +18,11 @@ pub struct WebRTCManager {
     /// Media devices manager
     media_devices: MediaDevicesManager,
     /// ICE candidate cache
-    ice_candidates: Arc<RwLock<HashMap<(CallId, IdentityId), Vec<ICECandidate>>>>,
+    ice_candidates: CandidateCache,
 }
+
+/// Per-(call, participant) ICE candidate buffer.
+type CandidateCache = Arc<RwLock<HashMap<(CallId, IdentityId), Vec<ICECandidate>>>>;
 
 /// WebRTC configuration
 #[derive(Clone, Serialize, Deserialize)]

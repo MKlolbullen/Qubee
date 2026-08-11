@@ -125,10 +125,12 @@ libc = "0.2"
 
 [features]
 default = []
-# Pull in the WebRTC stack and the in-progress `calling` module. It
-# does *not* compile clean today — the API paths target an older
-# version of webrtc-rs and several files reference types that have
-# moved. Enabling this is for active development, not for users.
+# Pull in the WebRTC stack and the `calling` module (voice/video).
+# Compiles clean on webrtc 0.14 and is clippy-/test-covered in CI
+# (see .github/workflows/calling.yml), but it is NOT wired into the
+# JNI surface or the Android app yet — signaling-over-P2P, the call
+# UI, and ratchet-derived media keys are still to come. Off by default
+# so the shipped .so stays lean; enable it for calling development.
 calling = ["dep:webrtc"]
 # Compile the legacy prototype modules (`hybrid_ratchet`,
 # `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).

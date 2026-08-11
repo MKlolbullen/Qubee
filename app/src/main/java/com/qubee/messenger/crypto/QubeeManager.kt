@@ -177,6 +177,26 @@ class QubeeManager @Inject constructor(
         }
     }
 
+    /**
+     * Encrypt an opaque call-signaling frame to [peerIdHex] over the
+     * peer's 1:1 ratchet session (tagged as a call signal, not chat).
+     * Returns the QUBEE_DMS wire bytes. The peer decrypts it and routes
+     * the frame to the native call state machine.
+     */
+    suspend fun encryptDirectCallSignal(peerIdHex: String, frame: ByteArray): ByteArray? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeEncryptDirectCallSignal(peerIdHex, frame)
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Rust call-signal-encrypt JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "Call signal encryption failed")
+                null
+            }
+        }
+
     /** Deterministic 16-byte id of an exact QUBEE_DMS frame, as hex. */
     suspend fun extractDirectMessageId(wire: ByteArray): String? = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext null
@@ -1017,6 +1037,7 @@ class QubeeManager @Inject constructor(
     private external fun nativeBuildLocalPrekeyBundle(): ByteArray?
     private external fun nativeInstallPeerPrekeyBundle(bundleWire: ByteArray): String?
     private external fun nativeEncryptDirectMessage(peerIdHex: String, plaintext: String): ByteArray?
+    private external fun nativeEncryptDirectCallSignal(peerIdHex: String, frame: ByteArray): ByteArray?
     private external fun nativeExtractDirectMessageId(wire: ByteArray): String?
     private external fun nativeCreateDirectMessageAck(peerIdHex: String, messageIdHex: String): ByteArray?
     private external fun nativeDecryptDirectMessage(wire: ByteArray): String?

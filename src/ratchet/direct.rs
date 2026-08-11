@@ -329,6 +329,12 @@ pub const PAYLOAD_TAG_TEXT: u8 = 0x01;
 pub const PAYLOAD_TAG_SENDER_KEY_DIST: u8 = 0x02;
 /// Deniable delivery receipt for an exact QUBEE_DMS wire id.
 pub const PAYLOAD_TAG_ACK: u8 = 0x03;
+/// Opaque call-signaling frame (WebRTC invite/offer/answer/ICE/hangup)
+/// carried over the 1:1 session — the same confidential, authenticated
+/// channel as chat, so signaling inherits its forward secrecy and
+/// deniability. The bytes are a serialized `calling::SignalingMessage`;
+/// the ratchet treats them as opaque.
+pub const PAYLOAD_TAG_CALL_SIGNAL: u8 = 0x04;
 /// Version of the tagged payload envelope *inside* the ratchet ciphertext.
 /// v1 adds an optional sender libp2p PeerId hint before the payload tag.
 pub const DIRECT_PAYLOAD_ENVELOPE_VERSION: u8 = 0x01;
@@ -347,6 +353,8 @@ pub enum DirectPayload {
     /// Delivery receipt authenticated only by the 1:1 ratchet session. It is
     /// deliberately not identity-signed, preserving transcript deniability.
     Ack([u8; DIRECT_MESSAGE_ID_LEN]),
+    /// An opaque call-signaling frame (see [`PAYLOAD_TAG_CALL_SIGNAL`]).
+    CallSignal(Vec<u8>),
 }
 
 fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
@@ -370,6 +378,12 @@ fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
             out.extend_from_slice(message_id);
             Ok(out)
         }
+        DirectPayload::CallSignal(frame) => {
+            let mut out = Vec::with_capacity(1 + frame.len());
+            out.push(PAYLOAD_TAG_CALL_SIGNAL);
+            out.extend_from_slice(frame);
+            Ok(out)
+        }
     }
 }
 
@@ -390,6 +404,7 @@ fn decode_tagged_payload(bytes: &[u8]) -> Result<DirectPayload> {
             })?;
             Ok(DirectPayload::Ack(message_id))
         }
+        PAYLOAD_TAG_CALL_SIGNAL => Ok(DirectPayload::CallSignal(body.to_vec())),
         other => bail!("unknown direct payload tag {other:#04x}"),
     }
 }
@@ -522,6 +537,22 @@ pub fn encrypt_direct_ack_with_route(
     now: u64,
 ) -> Result<Vec<u8>> {
     let payload = encode_payload_with_route(&DirectPayload::Ack(message_id), sender_peer_id)?;
+    encrypt_direct(ks, local_id, peer_id, &payload, now)
+}
+
+/// Encrypt an opaque call-signaling frame to `peer_id` over the 1:1
+/// session. `frame` is a serialized `calling::SignalingMessage`; it is
+/// carried inside the ratchet like any other tagged payload.
+pub fn encrypt_direct_call_signal_with_route(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    frame: &[u8],
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<Vec<u8>> {
+    let payload =
+        encode_payload_with_route(&DirectPayload::CallSignal(frame.to_vec()), sender_peer_id)?;
     encrypt_direct(ks, local_id, peer_id, &payload, now)
 }
 
@@ -842,6 +873,21 @@ mod tests {
         assert_eq!(PAYLOAD_TAG_TEXT, 0x01);
         assert_eq!(PAYLOAD_TAG_SENDER_KEY_DIST, 0x02);
         assert_eq!(PAYLOAD_TAG_ACK, 0x03);
+        assert_eq!(PAYLOAD_TAG_CALL_SIGNAL, 0x04);
+    }
+
+    #[test]
+    fn call_signal_round_trips_over_the_channel() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+
+        // Opaque bytes standing in for a serialized SignalingMessage.
+        let frame = vec![0xAB; 96];
+        let wire =
+            encrypt_direct_call_signal_with_route(&mut a.ks, aid, bid, &frame, None, 1).unwrap();
+        let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &wire, 1).unwrap();
+        assert_eq!(sender, aid);
+        assert_eq!(payload, DirectPayload::CallSignal(frame));
     }
 
     #[test]

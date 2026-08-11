@@ -60,6 +60,7 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var conversationRepository: ConversationRepository
     @Inject lateinit var contactRepository: ContactRepository
     @Inject lateinit var ratchetSender: com.qubee.messenger.crypto.RatchetSender
+    @Inject lateinit var callRepository: com.qubee.messenger.data.repository.CallRepository
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // Network callbacks launch concurrently. Stripe by exact direct wire id so
@@ -188,6 +189,16 @@ class MessageService : Service(), NetworkCallback {
     private fun startP2PNetwork() {
         serviceScope.launch {
             if (qubeeManager.initialize()) {
+                // Bring up the native call subsystem BEFORE we register the
+                // callback and start the node. An inbound call signal
+                // decrypts exactly once (the ratchet frame is consumed and
+                // can't be replayed), so the CallManager must already exist
+                // when the node begins delivering frames — otherwise the
+                // first signal of a call is lost. No-op when the .so was
+                // built without the calling feature.
+                if (!callRepository.start()) {
+                    Timber.d("Calling subsystem not started (feature off or no identity)")
+                }
                 qubeeManager.setNetworkCallback(this@MessageService)
                 if (qubeeManager.startNetworkNode()) {
                     Timber.d("P2P Network Node started successfully")
@@ -690,6 +701,21 @@ class MessageService : Service(), NetworkCallback {
                             senderIdentityHex,
                         )
                     }
+                    "callSignal" -> {
+                        // A WebRTC signaling frame arrived over the 1:1
+                        // session. Feed the opaque bytes to the native call
+                        // state machine, attributed to the channel-
+                        // authenticated sender (never a self-claimed field).
+                        val frame = hexToBytesOrNull(result.optString("callSignalHex"))
+                        if (frame == null) {
+                            Timber.w("Malformed call signal from %s", senderIdentityHex)
+                        } else {
+                            if (peerId.isNotEmpty()) {
+                                contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
+                            }
+                            qubeeManager.handleCallSignal(senderIdentityHex, frame)
+                        }
+                    }
                     else -> Timber.w("Unknown ratchet payload kind from %s", senderIdentityHex)
                 }
                 return@withLock true
@@ -887,6 +913,52 @@ class MessageService : Service(), NetworkCallback {
             } catch (e: Exception) {
                 Timber.e(e, "onPeerLinked failed for identity=%s", identityIdHex)
             }
+        }
+    }
+
+    /**
+     * Outbound call signaling: the native call layer asks us to deliver
+     * [payload] to [recipientIdHex] over that peer's 1:1 session. We
+     * encrypt it as a tagged call-signal frame and send it the same way
+     * as a chat message (Rust routes by the frame's opaque selector, so
+     * the peer hint is empty, as with delivery acks).
+     */
+    override fun onCallSignal(recipientIdHex: String, payload: ByteArray) {
+        serviceScope.launch {
+            try {
+                val wire = qubeeManager.encryptDirectCallSignal(recipientIdHex, payload)
+                if (wire == null) {
+                    Timber.w("Failed to encrypt call signal for %s", recipientIdHex)
+                    return@launch
+                }
+                if (!qubeeManager.sendP2PMessage("", wire)) {
+                    Timber.w("Failed to send call signal to %s", recipientIdHex)
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "onCallSignal failed for %s", recipientIdHex)
+            }
+        }
+    }
+
+    override fun onIncomingCall(callIdHex: String, callerIdHex: String, callType: Int) {
+        Timber.i("Incoming call %s from %s (type %d)", callIdHex, callerIdHex, callType)
+        callRepository.onIncoming(callIdHex, callerIdHex, callType)
+    }
+
+    override fun onCallStateChanged(callIdHex: String, state: String) {
+        Timber.d("Call %s state: %s", callIdHex, state)
+        callRepository.onStateChanged(callIdHex, state)
+    }
+
+    /** Decode lowercase hex to bytes; null if malformed. */
+    private fun hexToBytesOrNull(hex: String): ByteArray? {
+        if (hex.isEmpty() || hex.length % 2 != 0) return null
+        return try {
+            ByteArray(hex.length / 2) { i ->
+                hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        } catch (e: NumberFormatException) {
+            null
         }
     }
 

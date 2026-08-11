@@ -189,6 +189,16 @@ class MessageService : Service(), NetworkCallback {
     private fun startP2PNetwork() {
         serviceScope.launch {
             if (qubeeManager.initialize()) {
+                // Bring up the native call subsystem BEFORE we register the
+                // callback and start the node. An inbound call signal
+                // decrypts exactly once (the ratchet frame is consumed and
+                // can't be replayed), so the CallManager must already exist
+                // when the node begins delivering frames — otherwise the
+                // first signal of a call is lost. No-op when the .so was
+                // built without the calling feature.
+                if (!callRepository.start()) {
+                    Timber.d("Calling subsystem not started (feature off or no identity)")
+                }
                 qubeeManager.setNetworkCallback(this@MessageService)
                 if (qubeeManager.startNetworkNode()) {
                     Timber.d("P2P Network Node started successfully")
@@ -200,12 +210,6 @@ class MessageService : Service(), NetworkCallback {
                     // closed on their side.
                     if (!qubeeManager.publishLocalPrekeyBundle()) {
                         Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
-                    }
-                    // Bring up the native call subsystem so inbound call
-                    // signals have a CallManager to route into. No-op when
-                    // the .so was built without the calling feature.
-                    if (!callRepository.start()) {
-                        Timber.d("Calling subsystem not started (feature off or no identity)")
                     }
                 } else {
                     Timber.e("Failed to start P2P Network Node")
@@ -938,12 +942,12 @@ class MessageService : Service(), NetworkCallback {
 
     override fun onIncomingCall(callIdHex: String, callerIdHex: String, callType: Int) {
         Timber.i("Incoming call %s from %s (type %d)", callIdHex, callerIdHex, callType)
-        callRepository.publishIncoming(callIdHex, callerIdHex, callType)
+        callRepository.onIncoming(callIdHex, callerIdHex, callType)
     }
 
     override fun onCallStateChanged(callIdHex: String, state: String) {
         Timber.d("Call %s state: %s", callIdHex, state)
-        callRepository.publishStateChanged(callIdHex, state)
+        callRepository.onStateChanged(callIdHex, state)
     }
 
     /** Decode lowercase hex to bytes; null if malformed. */

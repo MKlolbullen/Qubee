@@ -51,17 +51,20 @@ class CallRepository @Inject constructor(
     /** Bring up the native call subsystem for the active identity. */
     suspend fun start(): Boolean = qubeeManager.startCalling()
 
-    /** Place a call. Returns the new call id (hex) or null. */
-    suspend fun initiateCall(peerIdHex: String, isVideo: Boolean, mediaRoot: ByteArray): String? {
+    /**
+     * Place a call. The media root is minted natively and shipped in
+     * the encrypted invitation. Returns the new call id (hex) or null.
+     */
+    suspend fun initiateCall(peerIdHex: String, isVideo: Boolean): String? {
         val callType = if (isVideo) 1 else 0
-        val callIdHex = qubeeManager.initiateCall(peerIdHex, callType, mediaRoot) ?: return null
+        val callIdHex = qubeeManager.initiateCall(peerIdHex, callType) ?: return null
         _state.value = CallUiState.Active(callIdHex, peerIdHex, callType)
         return callIdHex
     }
 
-    /** Accept the currently-ringing call. */
-    suspend fun acceptCall(callIdHex: String, peerIdHex: String, mediaRoot: ByteArray): Boolean {
-        val accepted = qubeeManager.acceptCall(callIdHex, peerIdHex, mediaRoot)
+    /** Accept the currently-ringing call (media root came from the invite). */
+    suspend fun acceptCall(callIdHex: String, peerIdHex: String): Boolean {
+        val accepted = qubeeManager.acceptCall(callIdHex, peerIdHex)
         if (accepted) {
             val callType = (_state.value as? CallUiState.Incoming)?.callType ?: 0
             _state.value = CallUiState.Active(callIdHex, peerIdHex, callType)

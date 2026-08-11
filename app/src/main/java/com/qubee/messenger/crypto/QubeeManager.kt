@@ -235,13 +235,15 @@ class QubeeManager @Inject constructor(
     /**
      * Initiate a 1:1 call. [mediaRoot] is the 32-byte shared secret
      * derived from the peer's established 1:1 session. Returns the new
-     * call id (hex) or null.
+     * call id (hex) or null. The call's media root is minted natively
+     * and carried in the encrypted invitation, so the caller supplies
+     * no key.
      */
-    suspend fun initiateCall(participantIdHex: String, callType: Int, mediaRoot: ByteArray): String? =
+    suspend fun initiateCall(participantIdHex: String, callType: Int): String? =
         withContext(Dispatchers.IO) {
             if (!isInitialized) return@withContext null
             try {
-                nativeInitiateCall(participantIdHex, callType, mediaRoot)
+                nativeInitiateCall(participantIdHex, callType)
             } catch (e: UnsatisfiedLinkError) {
                 Timber.e(e, "Calling JNI is not linked")
                 null
@@ -252,14 +254,14 @@ class QubeeManager @Inject constructor(
         }
 
     /**
-     * Accept an incoming call. [mediaRoot] is the 32-byte shared secret
-     * derived from the caller's 1:1 session (same value both sides use).
+     * Accept an incoming call. The media root was provisioned from the
+     * caller's invitation, so none is passed.
      */
-    suspend fun acceptCall(callIdHex: String, participantIdHex: String, mediaRoot: ByteArray): Boolean =
+    suspend fun acceptCall(callIdHex: String, participantIdHex: String): Boolean =
         withContext(Dispatchers.IO) {
             if (!isInitialized) return@withContext false
             try {
-                nativeAcceptCall(callIdHex, participantIdHex, mediaRoot)
+                nativeAcceptCall(callIdHex, participantIdHex)
             } catch (e: UnsatisfiedLinkError) {
                 Timber.e(e, "Calling JNI is not linked")
                 false
@@ -1108,12 +1110,10 @@ class QubeeManager @Inject constructor(
     private external fun nativeInitiateCall(
         participantIdHex: String,
         callType: Int,
-        mediaRoot: ByteArray,
     ): String?
     private external fun nativeAcceptCall(
         callIdHex: String,
         participantIdHex: String,
-        mediaRoot: ByteArray,
     ): Boolean
     private external fun nativeEndCall(callIdHex: String, participantIdHex: String): Boolean
     private external fun nativeHandleCallSignal(senderIdHex: String, payload: ByteArray): Boolean

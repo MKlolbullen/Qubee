@@ -9,7 +9,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import timber.log.Timber
 import javax.inject.Inject
 
 /**
@@ -35,17 +34,14 @@ class CallViewModel @Inject constructor(
     val videoOn: StateFlow<Boolean> = _videoOn.asStateFlow()
 
     /**
-     * Accept the ringing call. Pending #67: the callee needs the same
-     * 32-byte media root the caller used, provisioned from the shared
-     * 1:1 session. Until that lands there is no honest root to pass, so
-     * we do not fake one.
+     * Accept the ringing call. The media root was provisioned from the
+     * caller's encrypted invitation, so no key is passed here.
      */
     fun accept() {
         val incoming = state.value as? CallUiState.Incoming ?: return
-        Timber.w(
-            "Accept for call %s deferred: media-root provisioning pending (#67)",
-            incoming.callIdHex,
-        )
+        viewModelScope.launch {
+            callRepository.acceptCall(incoming.callIdHex, incoming.peerIdHex)
+        }
     }
 
     /** Reject the ringing call. */

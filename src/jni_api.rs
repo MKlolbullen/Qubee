@@ -4084,12 +4084,6 @@ fn parse_call_id(s: &str) -> anyhow::Result<CallId> {
     Ok(CallId::from(arr))
 }
 
-#[cfg(feature = "calling")]
-fn media_root_from_bytes(v: &[u8]) -> anyhow::Result<[u8; 32]> {
-    v.try_into()
-        .map_err(|_| anyhow::anyhow!("media root must be 32 bytes"))
-}
-
 /// Forward one outbound signaling frame to Kotlin (`onCallSignal`),
 /// which sends it over the recipient's 1:1 session.
 #[cfg(feature = "calling")]
@@ -4260,9 +4254,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
     })
 }
 
-/// Initiate a 1:1 call to `participant`. `media_root` is the 32-byte
-/// shared secret (from the 1:1 session). Returns JSON `{call_id_hex}`
-/// or null on failure.
+/// Initiate a 1:1 call to `participant`. The call's media root is minted
+/// internally and shipped in the (E2E-encrypted) invitation, so the
+/// caller supplies no key. Returns JSON `{call_id_hex}` or null.
 #[no_mangle]
 #[cfg(feature = "calling")]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitiateCall(
@@ -4270,19 +4264,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     _class: JClass,
     participant: JString,
     call_type: jni::sys::jint,
-    media_root: JByteArray,
 ) -> jstring {
     jni_catch_jstring(|| {
         let participant_hex: String = match env.get_string(&participant) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let root_vec = match env.convert_byte_array(&media_root) {
-            Ok(v) => v,
-            Err(_) => return std::ptr::null_mut(),
-        };
         let result: anyhow::Result<serde_json::Value> = (|| {
-            let root = media_root_from_bytes(&root_vec)?;
             let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
             let call_type = call_type_from_i32(call_type)?;
             let initiator = active_identity()?
@@ -4295,7 +4283,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
                 call_type,
                 None,
                 CallSettings::default(),
-                root,
             ))?;
             Ok(json!({ "call_id_hex": hex::encode(call_id.as_bytes()) }))
         })();
@@ -4303,7 +4290,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     })
 }
 
-/// Accept an incoming call. `media_root` is the 32-byte shared secret.
+/// Accept an incoming call. The media root was provisioned from the
+/// invitation, so none is passed here.
 #[no_mangle]
 #[cfg(feature = "calling")]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAcceptCall(
@@ -4311,17 +4299,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
     _class: JClass,
     call_id: JString,
     participant: JString,
-    media_root: JByteArray,
 ) -> jboolean {
     catch_unwind_result(|| {
         let result: anyhow::Result<()> = (|| {
             let call_id_hex: String = env.get_string(&call_id)?.into();
             let participant_hex: String = env.get_string(&participant)?.into();
-            let root = media_root_from_bytes(&env.convert_byte_array(&media_root)?)?;
             let cid = parse_call_id(&call_id_hex)?;
             let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
             let cm = call_manager()?;
-            CALL_RUNTIME.block_on(cm.accept_call(cid, participant_id, root))?;
+            CALL_RUNTIME.block_on(cm.accept_call(cid, participant_id))?;
             Ok(())
         })();
         match result {

@@ -11,6 +11,7 @@ use crate::calling::webrtc_manager::{OutboundIce, WebRTCConfig, WebRTCManager};
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
+use crate::security::secure_rng;
 
 /// Comprehensive call management system
 pub struct CallManager {
@@ -361,8 +362,10 @@ impl CallManager {
         }
     }
 
-    /// Initiate a new call. `media_root` is the shared secret (derived
-    /// from the 1:1 session) both endpoints use to derive media keys.
+    /// Initiate a new call. The caller mints a fresh random media root
+    /// for the call and ships it inside the (E2E-encrypted) invitation,
+    /// so the callee derives the same media keys without a separate key
+    /// exchange.
     pub async fn initiate_call(
         &self,
         initiator: IdentityId,
@@ -370,9 +373,9 @@ impl CallManager {
         call_type: CallType,
         group_id: Option<GroupId>,
         settings: CallSettings,
-        media_root: [u8; 32],
     ) -> Result<CallId> {
         let call_id = self.generate_call_id()?;
+        let media_root = secure_rng::random::array::<32>()?;
         self.set_call_media_root(call_id, media_root).await;
 
         // Validate participants
@@ -441,8 +444,8 @@ impl CallManager {
         calls.insert(call_id, call);
         drop(calls);
 
-        // Send invitations to participants
-        self.send_call_invitations(call_id).await?;
+        // Send invitations to participants, carrying the call's media root.
+        self.send_call_invitations(call_id, media_root).await?;
 
         // Update call state to ringing
         self.update_call_state(call_id, CallState::Ringing).await?;
@@ -474,8 +477,9 @@ impl CallManager {
                 caller,
                 call_type,
                 settings,
+                media_root,
             } => {
-                self.on_call_invitation(call_id, caller, call_type, settings)
+                self.on_call_invitation(call_id, caller, call_type, settings, media_root)
                     .await
             }
             SignalingMessage::HangUp { call_id, sender } => {
@@ -597,6 +601,7 @@ impl CallManager {
         caller: IdentityId,
         call_type: CallType,
         settings: CallSettings,
+        media_root: [u8; 32],
     ) -> Result<()> {
         {
             let calls = self.calls.read().await;
@@ -611,6 +616,10 @@ impl CallManager {
                 return Err(anyhow::anyhow!("Maximum concurrent calls reached"));
             }
         }
+
+        // Store the caller's media root now, so accepting the call needs
+        // no separate key exchange.
+        self.set_call_media_root(call_id, media_root).await;
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let caller_participant = CallParticipant {
@@ -699,13 +708,9 @@ impl CallManager {
         Ok(())
     }
 
-    /// Accept an incoming call
-    pub async fn accept_call(
-        &self,
-        call_id: CallId,
-        participant: IdentityId,
-        media_root: [u8; 32],
-    ) -> Result<()> {
+    /// Accept an incoming call. The media root was already provisioned
+    /// from the invitation ([`on_call_invitation`](Self::on_call_invitation)).
+    pub async fn accept_call(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
         let mut calls = self.calls.write().await;
         let call = calls
             .get_mut(&call_id)
@@ -740,10 +745,6 @@ impl CallManager {
 
         let call_type = call.call_type.clone();
         drop(calls);
-
-        // Provision this call's shared media root before the peer
-        // connection is built (establish_peer_connection reads it).
-        self.set_call_media_root(call_id, media_root).await;
 
         // Establish WebRTC connection, add the media tracks this call
         // type carries (so the offer advertises real m-lines with ICE
@@ -1062,8 +1063,9 @@ impl CallManager {
         Ok(CallId(bytes))
     }
 
-    /// Send call invitations to participants
-    async fn send_call_invitations(&self, call_id: CallId) -> Result<()> {
+    /// Send call invitations to participants, each carrying the call's
+    /// media root so the callee can derive matching media keys.
+    async fn send_call_invitations(&self, call_id: CallId, media_root: [u8; 32]) -> Result<()> {
         let calls = self.calls.read().await;
         let call = calls
             .get(&call_id)
@@ -1076,6 +1078,7 @@ impl CallManager {
                     caller: call.initiator,
                     call_type: call.call_type.clone(),
                     settings: call.settings.clone(),
+                    media_root,
                 };
 
                 self.signaling.send(*participant_id, message).await?;
@@ -1332,7 +1335,6 @@ mod tests {
                 CallType::VoiceCall,
                 None,
                 CallSettings::default(),
-                [7u8; 32],
             )
             .await
             .expect("Should initiate call");
@@ -1373,6 +1375,7 @@ mod tests {
             caller,
             call_type: CallType::VideoCall,
             settings: CallSettings::default(),
+            media_root: [7u8; 32],
         }
         .to_bytes()
         .unwrap();
@@ -1410,6 +1413,7 @@ mod tests {
             caller,
             call_type: CallType::VoiceCall,
             settings: CallSettings::default(),
+            media_root: [7u8; 32],
         }
         .to_bytes()
         .unwrap();
@@ -1537,6 +1541,7 @@ mod tests {
             caller,
             call_type: CallType::VoiceCall,
             settings: CallSettings::default(),
+            media_root: [7u8; 32],
         }
         .to_bytes()
         .unwrap();
@@ -1545,10 +1550,7 @@ mod tests {
             .await
             .unwrap();
         // Accepting sets a local description, which starts ICE gathering.
-        callee_mgr
-            .accept_call(call_id, caller, [7u8; 32])
-            .await
-            .unwrap();
+        callee_mgr.accept_call(call_id, caller).await.unwrap();
 
         // The SDP offer goes out first; at least one host ICE candidate
         // should follow within a short gathering window.
@@ -1573,7 +1575,6 @@ mod tests {
 
         let caller = IdentityId::from([1u8; 32]);
         let callee = IdentityId::from([2u8; 32]);
-        let root = [7u8; 32];
 
         let (caller_tx, mut caller_rx) = mpsc::unbounded_channel::<OutboundSignal>();
         let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<OutboundSignal>();
@@ -1608,7 +1609,6 @@ mod tests {
                 CallType::VoiceCall,
                 None,
                 CallSettings::default(),
-                root,
             )
             .await
             .unwrap();
@@ -1620,7 +1620,7 @@ mod tests {
             .handle_inbound_signaling(caller, &invite.payload)
             .await
             .unwrap();
-        callee_mgr.accept_call(call_id, caller, root).await.unwrap();
+        callee_mgr.accept_call(call_id, caller).await.unwrap();
         let offer = callee_rx.recv().await.expect("offer sent");
         assert_eq!(offer.recipient, caller);
         assert!(matches!(

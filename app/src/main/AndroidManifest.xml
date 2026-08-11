@@ -17,10 +17,16 @@
          timeout-capped. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
-    <!-- CAMERA backs the QR scanner. RECORD_AUDIO was requested for an
-         audio-note feature that isn't implemented; dropped until it
-         ships (over-broad permissions are a review/privacy flag). -->
+    <!-- CAMERA backs the QR scanner and video calls. RECORD_AUDIO backs
+         voice/video calls (the calling feature). Both are runtime
+         permissions requested at call time, not on launch. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- A voice/video call is a microphone+camera foreground service on
+         Android 14+; these types must be declared to start it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

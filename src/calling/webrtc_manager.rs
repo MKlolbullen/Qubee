@@ -2,12 +2,22 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::calling::call_manager::{CallId, TurnServer};
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::peer_connection::{ICECandidate, PeerConnection};
 use crate::identity::identity_key::IdentityId;
+
+/// A locally-gathered ICE candidate to be trickled to the remote. The
+/// peer connection emits these as they are discovered; `CallManager`
+/// forwards each to `participant` over signaling.
+#[derive(Clone, Debug)]
+pub struct OutboundIce {
+    pub call_id: CallId,
+    pub participant: IdentityId,
+    pub candidate: ICECandidate,
+}
 
 /// WebRTC manager for handling real-time media communication
 pub struct WebRTCManager {
@@ -19,6 +29,9 @@ pub struct WebRTCManager {
     media_devices: MediaDevicesManager,
     /// ICE candidate cache
     ice_candidates: CandidateCache,
+    /// Sink for locally-gathered ICE candidates, drained by
+    /// `CallManager` and trickled to the remote over signaling.
+    ice_out: mpsc::UnboundedSender<OutboundIce>,
 }
 
 /// Per-(call, participant) ICE candidate buffer.
@@ -153,7 +166,10 @@ pub struct MediaStats {
 
 impl WebRTCManager {
     /// Create a new WebRTC manager
-    pub async fn new(config: WebRTCConfig) -> Result<Self> {
+    pub async fn new(
+        config: WebRTCConfig,
+        ice_out: mpsc::UnboundedSender<OutboundIce>,
+    ) -> Result<Self> {
         let media_devices = MediaDevicesManager::new().await?;
 
         Ok(WebRTCManager {
@@ -161,18 +177,26 @@ impl WebRTCManager {
             config,
             media_devices,
             ice_candidates: Arc::new(RwLock::new(HashMap::new())),
+            ice_out,
         })
     }
 
-    /// Create a new peer connection
+    /// Create a new peer connection. Locally-gathered ICE candidates are
+    /// forwarded to `ice_out` tagged with this `(call, participant)`.
     pub async fn create_peer_connection(
         &self,
         call_id: CallId,
         participant: IdentityId,
         media_key: MediaKey,
     ) -> Result<()> {
-        let peer_connection =
-            PeerConnection::new(self.config.clone(), media_key, call_id, participant).await?;
+        let peer_connection = PeerConnection::new(
+            self.config.clone(),
+            media_key,
+            call_id,
+            participant,
+            self.ice_out.clone(),
+        )
+        .await?;
 
         let mut connections = self.peer_connections.write().await;
         connections.insert((call_id, participant), peer_connection);

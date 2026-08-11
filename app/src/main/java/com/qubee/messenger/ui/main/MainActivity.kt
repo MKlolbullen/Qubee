@@ -38,8 +38,13 @@ import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.databinding.ActivityMainBinding
 import com.qubee.messenger.service.MessageService
 import com.qubee.messenger.util.PermissionHelper
+import com.qubee.messenger.data.repository.CallRepository
+import com.qubee.messenger.ui.call.CallOverlay
+import com.qubee.messenger.ui.call.CallViewModel
+import com.qubee.messenger.ui.theme.QubeeTheme
 import javax.inject.Inject
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -51,6 +56,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var appBarConfiguration: AppBarConfiguration
     
     private val viewModel: MainViewModel by viewModels()
+    private val callViewModel: CallViewModel by viewModels()
+    private lateinit var callOverlay: ComposeView
 
     @Inject
     lateinit var preferences: PreferenceRepository
@@ -96,6 +103,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         setupLockOverlay()
+        setupCallOverlay()
 
         setupToolbar()
         setupNavigation(isFreshLaunch = savedInstanceState == null)
@@ -305,6 +313,51 @@ class MainActivity : AppCompatActivity() {
         (lockOverlay.parent as? android.view.ViewGroup)?.removeView(lockOverlay)
         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
         lockError = null
+    }
+
+    /**
+     * Host the call UI over the activity content. Like the lock overlay,
+     * the view is added only while a call is ringing or active (it is
+     * removed when idle) so no dormant full-screen view lingers and
+     * swallows touches. [CallOverlay] itself renders the incoming or
+     * active call screen from the shared [CallViewModel].
+     */
+    private fun setupCallOverlay() {
+        callOverlay = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            setContent {
+                QubeeTheme { CallOverlay(callViewModel) }
+            }
+        }
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                // Show the call overlay only when a call is live AND the
+                // device is unlocked, so the lock gate always stays on
+                // top of (and hides) call controls while locked.
+                combine(callViewModel.state, appLockManager.locked) { call, locked ->
+                    call !is CallRepository.CallUiState.Idle && !locked
+                }.collect { visible ->
+                    if (visible) showCallOverlay() else hideCallOverlay()
+                }
+            }
+        }
+    }
+
+    private fun showCallOverlay() {
+        if (callOverlay.parent == null) {
+            addContentView(
+                callOverlay,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+    }
+
+    private fun hideCallOverlay() {
+        (callOverlay.parent as? android.view.ViewGroup)?.removeView(callOverlay)
     }
 
     /**

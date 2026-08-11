@@ -233,15 +233,15 @@ class QubeeManager @Inject constructor(
     }
 
     /**
-     * Initiate a 1:1 call. [mediaRoot] is the 32-byte shared secret
-     * derived from the peer's established 1:1 session. Returns the new
-     * call id (hex) or null.
+     * Initiate a 1:1 call. Returns the new call id (hex) or null. The
+     * call's media root is minted natively and carried in the encrypted
+     * invitation, so the caller supplies no key.
      */
-    suspend fun initiateCall(participantIdHex: String, callType: Int, mediaRoot: ByteArray): String? =
+    suspend fun initiateCall(participantIdHex: String, callType: Int): String? =
         withContext(Dispatchers.IO) {
             if (!isInitialized) return@withContext null
             try {
-                nativeInitiateCall(participantIdHex, callType, mediaRoot)
+                nativeInitiateCall(participantIdHex, callType)
             } catch (e: UnsatisfiedLinkError) {
                 Timber.e(e, "Calling JNI is not linked")
                 null
@@ -252,14 +252,14 @@ class QubeeManager @Inject constructor(
         }
 
     /**
-     * Accept an incoming call. [mediaRoot] is the 32-byte shared secret
-     * derived from the caller's 1:1 session (same value both sides use).
+     * Accept an incoming call. The media root was provisioned from the
+     * caller's invitation, so none is passed.
      */
-    suspend fun acceptCall(callIdHex: String, participantIdHex: String, mediaRoot: ByteArray): Boolean =
+    suspend fun acceptCall(callIdHex: String, participantIdHex: String): Boolean =
         withContext(Dispatchers.IO) {
             if (!isInitialized) return@withContext false
             try {
-                nativeAcceptCall(callIdHex, participantIdHex, mediaRoot)
+                nativeAcceptCall(callIdHex, participantIdHex)
             } catch (e: UnsatisfiedLinkError) {
                 Timber.e(e, "Calling JNI is not linked")
                 false
@@ -301,6 +301,83 @@ class QubeeManager @Inject constructor(
                 false
             }
         }
+
+    /** Toggle mute for the local participant; returns the new muted
+     * state, or null on error. */
+    suspend fun toggleMute(callIdHex: String, participantIdHex: String): Boolean? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeToggleMute(callIdHex, participantIdHex).toToggleState()
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "toggleMute failed")
+                null
+            }
+        }
+
+    /** Toggle video for the local participant; returns the new enabled
+     * state, or null on error. */
+    suspend fun toggleVideo(callIdHex: String, participantIdHex: String): Boolean? =
+        withContext(Dispatchers.IO) {
+            if (!isInitialized) return@withContext null
+            try {
+                nativeToggleVideo(callIdHex, participantIdHex).toToggleState()
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.e(e, "Calling JNI is not linked")
+                null
+            } catch (e: Exception) {
+                Timber.e(e, "toggleVideo failed")
+                null
+            }
+        }
+
+    /** Map the native toggle result (1 on, 0 off, -1 error) to a state. */
+    private fun Int.toToggleState(): Boolean? = when (this) {
+        1 -> true
+        0 -> false
+        else -> null
+    }
+
+    /**
+     * Push one encoded audio frame (Opus) into a call's outbound track.
+     * Called at media rate from the capture thread, so this is a plain
+     * blocking call rather than a coroutine.
+     */
+    fun writeAudioSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean {
+        if (!isInitialized) return false
+        return try {
+            nativeWriteAudioSample(callIdHex, participantIdHex, frame, durationMs)
+        } catch (e: UnsatisfiedLinkError) {
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Push one encoded video frame into a call's outbound track. */
+    fun writeVideoSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean {
+        if (!isInitialized) return false
+        return try {
+            nativeWriteVideoSample(callIdHex, participantIdHex, frame, durationMs)
+        } catch (e: UnsatisfiedLinkError) {
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
 
     /**
      * Build a ratchet-authenticated, deniable delivery receipt for one exact
@@ -1108,15 +1185,27 @@ class QubeeManager @Inject constructor(
     private external fun nativeInitiateCall(
         participantIdHex: String,
         callType: Int,
-        mediaRoot: ByteArray,
     ): String?
     private external fun nativeAcceptCall(
         callIdHex: String,
         participantIdHex: String,
-        mediaRoot: ByteArray,
     ): Boolean
     private external fun nativeEndCall(callIdHex: String, participantIdHex: String): Boolean
     private external fun nativeHandleCallSignal(senderIdHex: String, payload: ByteArray): Boolean
+    private external fun nativeToggleMute(callIdHex: String, participantIdHex: String): Int
+    private external fun nativeToggleVideo(callIdHex: String, participantIdHex: String): Int
+    private external fun nativeWriteAudioSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean
+    private external fun nativeWriteVideoSample(
+        callIdHex: String,
+        participantIdHex: String,
+        frame: ByteArray,
+        durationMs: Int,
+    ): Boolean
 
     external fun nativeCleanup()
 }

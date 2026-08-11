@@ -71,6 +71,8 @@ use crate::calling::call_manager::{
 };
 #[cfg(feature = "calling")]
 use crate::calling::signaling::{ChannelSignalingTransport, OutboundSignal};
+#[cfg(feature = "calling")]
+use crate::calling::webrtc_manager::MediaKind;
 
 // --- Global State ---
 
@@ -4084,12 +4086,6 @@ fn parse_call_id(s: &str) -> anyhow::Result<CallId> {
     Ok(CallId::from(arr))
 }
 
-#[cfg(feature = "calling")]
-fn media_root_from_bytes(v: &[u8]) -> anyhow::Result<[u8; 32]> {
-    v.try_into()
-        .map_err(|_| anyhow::anyhow!("media root must be 32 bytes"))
-}
-
 /// Forward one outbound signaling frame to Kotlin (`onCallSignal`),
 /// which sends it over the recipient's 1:1 session.
 #[cfg(feature = "calling")]
@@ -4197,6 +4193,40 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
         CallEvent::CallError { call_id, error } => {
             emit_state(&mut env, call_id, &format!("error: {error}"))
         }
+        CallEvent::RemoteMedia {
+            call_id,
+            participant,
+            kind,
+            payload,
+        } => {
+            let j_call = match env.new_string(hex::encode(call_id.as_bytes())) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let j_sender = match env.new_string(hex::encode(participant.as_ref() as &[u8])) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let j_payload = match env.byte_array_from_slice(&payload) {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let kind_code = match kind {
+                MediaKind::Audio => 0,
+                MediaKind::Video => 1,
+            };
+            let _ = env.call_method(
+                callback_obj,
+                "onRemoteMedia",
+                "(Ljava/lang/String;Ljava/lang/String;I[B)V",
+                &[
+                    JValue::Object(&j_call),
+                    JValue::Object(&j_sender),
+                    JValue::Int(kind_code),
+                    JValue::Object(&j_payload),
+                ],
+            );
+        }
         CallEvent::MediaStateChanged { .. } | CallEvent::QualityChanged { .. } => {}
     }
 }
@@ -4260,9 +4290,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
     })
 }
 
-/// Initiate a 1:1 call to `participant`. `media_root` is the 32-byte
-/// shared secret (from the 1:1 session). Returns JSON `{call_id_hex}`
-/// or null on failure.
+/// Initiate a 1:1 call to `participant`. The call's media root is minted
+/// internally and shipped in the (E2E-encrypted) invitation, so the
+/// caller supplies no key. Returns JSON `{call_id_hex}` or null.
 #[no_mangle]
 #[cfg(feature = "calling")]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitiateCall(
@@ -4270,19 +4300,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     _class: JClass,
     participant: JString,
     call_type: jni::sys::jint,
-    media_root: JByteArray,
 ) -> jstring {
     jni_catch_jstring(|| {
         let participant_hex: String = match env.get_string(&participant) {
             Ok(s) => s.into(),
             Err(_) => return std::ptr::null_mut(),
         };
-        let root_vec = match env.convert_byte_array(&media_root) {
-            Ok(v) => v,
-            Err(_) => return std::ptr::null_mut(),
-        };
         let result: anyhow::Result<serde_json::Value> = (|| {
-            let root = media_root_from_bytes(&root_vec)?;
             let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
             let call_type = call_type_from_i32(call_type)?;
             let initiator = active_identity()?
@@ -4295,7 +4319,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
                 call_type,
                 None,
                 CallSettings::default(),
-                root,
             ))?;
             Ok(json!({ "call_id_hex": hex::encode(call_id.as_bytes()) }))
         })();
@@ -4303,7 +4326,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
     })
 }
 
-/// Accept an incoming call. `media_root` is the 32-byte shared secret.
+/// Accept an incoming call. The media root was provisioned from the
+/// invitation, so none is passed here.
 #[no_mangle]
 #[cfg(feature = "calling")]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAcceptCall(
@@ -4311,17 +4335,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
     _class: JClass,
     call_id: JString,
     participant: JString,
-    media_root: JByteArray,
 ) -> jboolean {
     catch_unwind_result(|| {
         let result: anyhow::Result<()> = (|| {
             let call_id_hex: String = env.get_string(&call_id)?.into();
             let participant_hex: String = env.get_string(&participant)?.into();
-            let root = media_root_from_bytes(&env.convert_byte_array(&media_root)?)?;
             let cid = parse_call_id(&call_id_hex)?;
             let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
             let cm = call_manager()?;
-            CALL_RUNTIME.block_on(cm.accept_call(cid, participant_id, root))?;
+            CALL_RUNTIME.block_on(cm.accept_call(cid, participant_id))?;
             Ok(())
         })();
         match result {
@@ -4386,6 +4408,136 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandle
             Ok(()) => 1,
             Err(e) => {
                 tracing::warn!(error = %e, "nativeHandleCallSignal failed");
+                0
+            }
+        }
+    })
+}
+
+/// Toggle the local participant's mute. Returns the new state: 1 muted,
+/// 0 unmuted, -1 on error.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeToggleMute(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result: anyhow::Result<bool> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.toggle_mute(cid, pid))
+        })();
+        match result {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeToggleMute failed");
+                -1
+            }
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Toggle the local participant's video. Returns the new state: 1 on,
+/// 0 off, -1 on error.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeToggleVideo(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+) -> jni::sys::jint {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result: anyhow::Result<bool> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.toggle_video(cid, pid))
+        })();
+        match result {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeToggleVideo failed");
+                -1
+            }
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Write one captured, encoded audio frame (Opus bitstream) to a call's
+/// outbound track. `duration_ms` is the frame duration. Returns true on
+/// success. The app captures + encodes; the Rust side packetizes.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteAudioSample(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+    frame: JByteArray,
+    duration_ms: jni::sys::jint,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let frame = env.convert_byte_array(&frame)?;
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let duration = std::time::Duration::from_millis(duration_ms.max(0) as u64);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.write_audio_sample(cid, pid, &frame, duration))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::debug!(error = %e, "nativeWriteAudioSample failed");
+                0
+            }
+        }
+    })
+}
+
+/// Write one captured, encoded video frame to a call's outbound track.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteVideoSample(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+    frame: JByteArray,
+    duration_ms: jni::sys::jint,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let frame = env.convert_byte_array(&frame)?;
+            let cid = parse_call_id(&call_id_hex)?;
+            let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let duration = std::time::Duration::from_millis(duration_ms.max(0) as u64);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.write_video_sample(cid, pid, &frame, duration))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::debug!(error = %e, "nativeWriteVideoSample failed");
                 0
             }
         }

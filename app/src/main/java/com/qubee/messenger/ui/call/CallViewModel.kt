@@ -9,7 +9,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import timber.log.Timber
 import javax.inject.Inject
 
 /**
@@ -34,18 +33,36 @@ class CallViewModel @Inject constructor(
     private val _videoOn = MutableStateFlow(false)
     val videoOn: StateFlow<Boolean> = _videoOn.asStateFlow()
 
+    init {
+        // Reset the local control state whenever the call changes (or
+        // ends), so a new call never inherits the previous call's
+        // mute/video indicators.
+        viewModelScope.launch {
+            var lastCallId: String? = null
+            state.collect { s ->
+                val callId = when (s) {
+                    is CallUiState.Active -> s.callIdHex
+                    is CallUiState.Incoming -> s.callIdHex
+                    CallUiState.Idle -> null
+                }
+                if (callId != lastCallId) {
+                    _muted.value = false
+                    _videoOn.value = false
+                    lastCallId = callId
+                }
+            }
+        }
+    }
+
     /**
-     * Accept the ringing call. Pending #67: the callee needs the same
-     * 32-byte media root the caller used, provisioned from the shared
-     * 1:1 session. Until that lands there is no honest root to pass, so
-     * we do not fake one.
+     * Accept the ringing call. The media root was provisioned from the
+     * caller's encrypted invitation, so no key is passed here.
      */
     fun accept() {
         val incoming = state.value as? CallUiState.Incoming ?: return
-        Timber.w(
-            "Accept for call %s deferred: media-root provisioning pending (#67)",
-            incoming.callIdHex,
-        )
+        viewModelScope.launch {
+            callRepository.acceptCall(incoming.callIdHex, incoming.peerIdHex)
+        }
     }
 
     /** Reject the ringing call. */
@@ -67,13 +84,31 @@ class CallViewModel @Inject constructor(
         viewModelScope.launch { callRepository.endCall(callIdHex, peerIdHex) }
     }
 
-    /** Toggle mute. Local UI only until the native toggle is exposed (#67). */
+    /** Toggle mute on the active call; reflects the native result. */
     fun toggleMute() {
-        _muted.value = !_muted.value
+        val active = state.value as? CallUiState.Active ?: return
+        val callId = active.callIdHex
+        viewModelScope.launch {
+            val result = callRepository.toggleMute(active.callIdHex, active.peerIdHex) ?: return@launch
+            // Apply only if that same call is still active (a delayed
+            // result must not touch a later call's controls).
+            val now = state.value
+            if (now is CallUiState.Active && now.callIdHex == callId) {
+                _muted.value = result
+            }
+        }
     }
 
-    /** Toggle video. Local UI only until the native toggle is exposed (#67). */
+    /** Toggle video on the active call; reflects the native result. */
     fun toggleVideo() {
-        _videoOn.value = !_videoOn.value
+        val active = state.value as? CallUiState.Active ?: return
+        val callId = active.callIdHex
+        viewModelScope.launch {
+            val result = callRepository.toggleVideo(active.callIdHex, active.peerIdHex) ?: return@launch
+            val now = state.value
+            if (now is CallUiState.Active && now.callIdHex == callId) {
+                _videoOn.value = result
+            }
+        }
     }
 }

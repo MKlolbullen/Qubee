@@ -1,275 +1,243 @@
 # Security policy
 
-Qubee is a research-grade post-quantum P2P messenger. The cryptographic
-primitives we depend on (ML-KEM-768, ML-DSA-44, Ed25519, X25519,
-ChaCha20-Poly1305, BLAKE3) are all standardised and well-audited; the
-interesting attack surface is the glue around them — wire-format
-parsers, the JNI bridge, the libp2p transport, the Android storage
-layer, and the trust-state policy.
+Qubee is a **pre-alpha, research-grade post-quantum P2P messenger**.
 
-This document covers how to report a vulnerability and what's in scope.
+The cryptographic primitives are not the only — or even the most likely — place for a serious defect. The highest-value attack surface is the glue around them: wire parsing, JNI, protocol state, persistence, libp2p routing, Android lifecycle, trust policy and the feature-gated calling stack.
 
-## Project status
-
-**Pre-alpha. Do not use Qubee for safety-of-life communications.** The
-README is honest about which roadmap items aren't shipped. This policy
-exists so that when you find something, you know how to tell us.
+> **Do not use Qubee for safety-of-life communications or high-risk operational traffic.**
+> The project has not received an independent security audit.
 
 ## Reporting a vulnerability
 
-**Please do not open a public GitHub issue.** Use one of the following
-private channels instead:
+**Please do not open a public GitHub issue for a suspected vulnerability.**
 
-1. **GitHub private vulnerability report**:
+Preferred reporting path:
+
+1. **GitHub private vulnerability report**
    <https://github.com/MKlolbullen/Qubee/security/advisories/new>
-   (preferred — keeps the disclosure log on the repo).
-2. **Email** the maintainer directly. The contact address lives in
-   the repo owner's GitHub profile; if you need a fixed address, open
-   a placeholder issue titled "request security contact" and we'll
-   reach out off-list.
+2. If GitHub private reporting is unavailable, contact the maintainer through the address published on the repository owner's GitHub profile.
 
-Encrypt sensitive reports if you can. We'll publish a PGP key
-fingerprint here once the maintainer has one rotated for this purpose.
+If you need a fixed security contact and cannot reach the maintainer privately, open a public placeholder issue titled only **"request security contact"** without vulnerability details.
+
+A dedicated PGP key/fingerprint may be added here when one is maintained for this project.
 
 ### What to include
 
-- A clear description of the issue.
-- A minimal reproducer (a failing `cargo test`, a crafted wire-format
-  blob, an `adb shell` command, etc.).
-- The commit hash you tested against.
-- The affected component (Rust core, Android client, build script,
-  CI workflow).
-- Your assessment of impact and exploitability.
-- Whether you've shared the report elsewhere.
+A useful report contains:
 
-### What to expect
+- a clear description of the bug;
+- the commit SHA and build type tested;
+- the affected component;
+- a minimal reproducer where practical;
+- expected vs. observed behavior;
+- your impact/exploitability assessment;
+- whether the report has been shared elsewhere.
 
-| Stage | Target turnaround |
-|-------|-------------------|
-| Acknowledgement of receipt | 72 hours |
+Good reproducers include a failing `cargo test`, crafted wire bytes, a small Android test, an `adb` procedure, or a deterministic state-machine trace.
+
+### Response targets
+
+| Stage | Target |
+|---|---:|
+| Acknowledge receipt | 72 hours |
 | Initial triage / severity | 7 days |
-| Fix + coordinated disclosure plan | 30 days for high/critical, 90 days otherwise |
-| Public advisory | After a fix lands on `main` and a release is tagged |
+| High / critical fix + disclosure plan | 30 days |
+| Other accepted issues | 90 days |
+| Public advisory | After a fix lands and an affected release is addressed |
 
-These are targets, not guarantees — Qubee is maintained by volunteers.
-We will tell you if a fix is taking longer than the target window and
-why.
+These are targets rather than contractual SLAs; Qubee is maintained as a research project.
 
-## Scope
+## In scope
 
-### In scope
+The following are explicitly in scope:
 
-- The Rust core (`src/`) and its public APIs (lib + JNI).
-- Wire-format parsers (`src/groups/group_handshake.rs`,
-  `src/groups/group_message.rs`, `src/onboarding/`,
-  `src/groups/group_invite.rs`).
-- The libp2p transport configuration (`src/network/p2p_node.rs`).
-- Cryptographic state machines (group key rotation, generation
-  counter, trust-state policy).
-- Android storage (`QubeeDatabase`, `SecureKeyStore`, Keystore-backed
-  key derivation).
-- The JNI bridge (`src/jni_api.rs` + `app/src/main/java/com/qubee/messenger/crypto/QubeeManager.kt`).
-- Build scripts (`build_rust.sh`, `build_rust.ps1`) and CI workflows
-  (`.github/workflows/`).
+- Rust core (`src/`) and public APIs;
+- JNI boundary (`src/jni_api.rs` and the Kotlin `QubeeManager` contract);
+- identity, onboarding and trust-state transitions;
+- PQXDH-style prekey/session establishment;
+- Double Ratchet state, replay handling and persistence;
+- sender-key distribution, membership checks and rekey behavior;
+- group/direct wire-format parsers;
+- retry/ACK/crash-consistency behavior;
+- libp2p transport configuration and application routing decisions;
+- Android Room/SQLCipher persistence;
+- Android Keystore / auth-bound key handling;
+- app-lock behavior where it is intended to protect locked-device state;
+- build/release scripts and GitHub Actions;
+- feature-gated calling code, including signaling, JNI, call-state transitions, ICE/SDP handling and Android media plumbing.
 
-### Out of scope
+### Calling is now in scope
 
-- Side-channel resistance of the underlying `pqcrypto-mlkem` /
-  `pqcrypto-mldsa` primitives. These crates wrap the NIST reference
-  implementations; report side-channel issues upstream.
-- Denial-of-service from a peer flooding the gossipsub topic. libp2p
-  has its own backpressure knobs; Qubee doesn't add a second layer.
-- Issues that require a rooted device with physical access *and* an
-  unlocked screen. The threat model assumes a locked device; an
-  attacker with full physical access has already won.
-- Bugs in the `legacy` feature-gated modules (`hybrid_ratchet`,
-  `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
-  These are documented as broken in `docs/build-status.md`; they're
-  not built by default and not part of any release.
-- Bugs in the `calling` feature (WebRTC). It compiles on webrtc 0.14
-  and is CI-gated, but it is not wired into the JNI surface or the
-  Android app, is off by default, and is not in any release — so it is
-  not reachable by a shipped build. In scope once it's wired up.
-- Phishing / social-engineering of the OOB verification gesture. We
-  document the gesture; users have to perform it.
+Calling used to be a disconnected Rust experiment. That is no longer true.
 
-### Already acknowledged limitations
+The tree now contains:
 
-These are known and are not vulnerabilities — they're the shape of
-the pre-alpha:
+- Rust call-state + WebRTC orchestration;
+- ratchet-carried call signaling;
+- JNI call controls and media-sample methods;
+- Compose incoming/active call UI;
+- microphone foreground-service plumbing;
+- Android `AudioRecord` / Opus `MediaCodec` / `AudioTrack` scaffolding.
 
-- **Forward secrecy on the send path is newly default — treat it as
-  fresh.** Since the v0.2.0 cutover, outbound 1:1 traffic uses PQXDH +
-  hybrid Double Ratchet (`QUBEE_DMS`) and outbound group traffic uses
-  sender keys (`QUBEE_GMS\x03`) by default
-  (`PreferenceRepository.ratchetSendEnabled`, retained as an emergency
-  kill-switch for the soak window; see `docs/double-ratchet-design.md`,
-  Stages 1–5, and the physical-device matrix in
-  `docs/manual-testing/ratchet-cutover-device-matrix.md` that gated the
-  flip). The legacy single-key group envelope is still *accepted*
-  inbound for compatibility, and peers on older builds (or with the
-  kill-switch off) still emit it — for those conversations the old
-  caveat holds: compromise of a member's device exposes group history
-  back to the last key rotation. Full closure comes when legacy
-  emission is retired at the end of the deprecation window.
-- **Messages on the legacy (v2) path are cryptographically
-  non-repudiable.** Every legacy wire frame carries a hybrid
-  Ed25519 + ML-DSA-44 signature over the long-term identity keys, so a
-  recipient (or anyone who captures the frame + the signer's public
-  key) can *prove* who authored it — the opposite of Signal's
-  deniability-by-MAC. **The cutover reverses this.** The locked
-  decision (see `docs/double-ratchet-design.md`) moves Qubee to the
-  full-deniability model: messages on the ratchet formats are
-  authenticated by keys derived under the ratchet rather than by
-  per-message long-term identity signatures, matching Signal /
-  SimpleX / Session; identity keys sign only the prekey bundle. Treat
-  any message still sent on the legacy path (older peers, kill-switch
-  off) as non-repudiable until legacy emission is retired.
-- **Network metadata / IP exposure.** The libp2p transport uses direct
-  TCP (+ Noise), so every peer you connect to or gossip with learns
-  your IP address. There is no onion routing or mixnet, and an
-  optional Tor transport is roadmap, not shipped. Traffic timing
-  stays observable to a network adversary.
+The `calling` Cargo feature is still **off by default** and the default release JNI library is built without it, so calling is not a normal shipped capability yet. Nevertheless, its attack surface is sufficiently integrated that security reports are welcome now.
 
-  The in-tree metadata reductions that *have* landed
-  (`docs/architecture/network-privacy.md`, Tier 1): gossip authorship
-  is anonymous, so a topic subscriber learns that a group has traffic
-  but not which `PeerId` authored a frame; plaintext on the
-  forward-secret paths (v3 sender-key and the 1:1 Double Ratchet) is
-  padded to fixed size classes, though the live v2 path is still
-  padded only at the envelope; mDNS is off by default; and the gossip
-  topic is a blinded rotating hash instead of the group id in the
-  clear, and the group-message envelope (`QUBEE_GMS\x04`) replaced its
-  plaintext `group_id` with a per-message keyed selector, and the
-  default sender-keys emission is the keyed-selector `QUBEE_GMS\x05`
-  format (its `\x03` predecessor, which named the group in the clear,
-  is still *accepted* inbound from pre-v5 builds until retired). Note
-  this hides *which* group, not *that* group traffic exists.
-- The Android Keystore master key that wraps both the SQLCipher
-  passphrase *and* the Rust core keystore passphrase is configured
-  with `setUserAuthenticationRequired(false)`, meaning local data
-  decrypts on boot before the user unlocks the device. Trade-off
-  explicitly documented in
-  `app/src/main/java/com/qubee/messenger/security/SqlCipherKeyProvider.kt`;
-  enables headless `MessageService` operation at the cost of no
-  per-open biometric/PIN gate on the *key material* — **unless the
-  opt-in Screen Lock is enabled** (see below). The key is
-  StrongBox-backed where available (TEE-backed otherwise).
-- **Opt-in Screen Lock (`AppLockManager` + `BiometricAuthenticator` +
-  `DatabaseKeyHolder`, Settings → Screen lock, default off).** Two
-  layers, both engaged by the one toggle:
-  1. *UI gate* — a biometric / device-credential prompt covers the
-     app on cold start and on return from the background past a grace
-     window (`FLAG_SECURE` while locked).
-  2. *Key binding* — the SQLCipher DB key **and** the Rust-core
-     keystore passphrase are re-wrapped under a second, **auth-bound**
-     Keystore key (`setUserAuthenticationRequired(true)`, per-use;
-     `AUTH_BIOMETRIC_STRONG | AUTH_DEVICE_CREDENTIAL` on API 30+), and
-     the auth-free copies are deleted. The unlock ceremony runs a
-     `BiometricPrompt` `CryptoObject` that authorises the very cipher
-     that unwraps the secrets; the plaintext keys live only in
-     `DatabaseKeyHolder` (in-memory, wiped on lock). **A cold process
-     while locked cannot open the database** — the "no DB while
-     locked" property. The PIN/pattern/password path is always an
-     accepted authenticator; on API 24–29 a `CryptoObject` prompt is
-     biometric-only, so the key binding there is gated by biometric
-     while the plain UI gate keeps its PIN fallback.
+Particularly interesting calling findings include:
 
-  Scope and caveats: an *already-open* DB connection in a live process
-  stays open across a background/lock (the binding is enforced at
-  cold-start / at-rest, not by closing a live SQLite handle). Enabling
-  the toggle is refused when the device has no biometric and no device
-  credential, so an auth-bound key can never be created that nobody
-  can satisfy. With Screen Lock **off**, behaviour is byte-identical
-  to before (auth-free hardware key, headless service works).
+- stale/replayed invitations;
+- call-id or participant substitution;
+- state confusion between overlapping calls;
+- signaling that escapes the authenticated 1:1 session;
+- unsafe ICE/SDP parsing or routing;
+- media queue/resource exhaustion;
+- media/key binding mistakes;
+- JNI confusion or malformed callback data;
+- permission/foreground-service failures that become privacy problems;
+- teardown races leaving microphone/camera capture active.
 
-  **Validation status:** the binding path is wired and builds green
-  but exercises auth-bound Keystore + `BiometricPrompt` semantics that
-  can only be verified on real hardware across API levels — treat it,
-  like the ratchet cutover, as landed-but-device-validation-pending
-  before relying on it.
-- The Rust core keystore (`qubee_keys.db` / `qubee_groups.db`, which
-  hold the Ed25519 + ML-DSA private identity keys) wraps its master
-  key under a 256-bit passphrase derived in the hardware Keystore and
-  passed in via `nativeInitialize`. **A `.master` file is useless
-  without that Keystore-bound passphrase.** The wrapping key is
-  derived with **Argon2id** (19 MiB / t=2 / p=1) over a per-install
-  random salt stored in the `.master` header — memory-hard
-  defence-in-depth even though the Android passphrase is full-entropy,
-  since nothing at the Rust boundary enforces entropy for other
-  callers. Plaintext key material and derived wrap keys are zeroised
-  (`zeroize`/`SecretBox`) before buffers are released. The passphrase
-  crosses JNI as a `byte[]` (never a Java `String`, which would pin
-  the secret in the immutable-string heap); both sides zero their
-  copies after the keystores open. Builds before
-  the passphrase change used a hardcoded `"default_password"`, and
-  builds before the Argon2id change used an unsalted single BLAKE3
-  derivation; both migrate transparently to the salted Argon2id layout
-  on first launch (one-directional — keys are never re-exposed under
-  an old derivation).
-- `MessageStatus.SENT` means "encrypted bytes left this device", not
-  "the peer acked". `DELIVERED` lands when the first signed
-  `MessageAck` arrives (delivery confirmation shipped in
-  `0.1.0-alpha`).
-- Local DB migrations run through a real `MIGRATION_*` chain
-  (`Migrations.kt`); `fallbackToDestructiveMigration` is retained only
-  as the safety net for version pairs the chain doesn't cover. Until
-  v0.2.0 ships the first stable schema, treat cross-version data
-  survival as best-effort, not guaranteed.
-- The legacy modules listed below (`hybrid_ratchet`, etc.) are
-  feature-gated and not built in default releases. They contain known
-  pre-NIST-standardisation crypto and are tracked for removal /
-  rewrite, not fixes in place.
+## Generally out of scope
+
+- Side-channel resistance inside upstream primitive implementations unless Qubee's use materially creates the problem.
+- Vulnerabilities that require a device to already be rooted, fully compromised and unlocked, where the attacker can simply read process memory or instrument the application.
+- Phishing/social engineering against the out-of-band verification ceremony itself.
+- Bugs only reachable in legacy modules excluded from default builds (`hybrid_ratchet`, legacy `secure_message`, legacy `file_transfer`, legacy `audio`, `sas`, `oob_secrets`) unless they become reachable from a supported build configuration.
+- Pure upstream WebRTC/libp2p defects with no Qubee-specific impact beyond the upstream issue. Qubee integration mistakes remain in scope.
+
+## Current acknowledged limitations
+
+These are security-relevant project limitations, but are not automatically vulnerabilities by themselves.
+
+### 1. Forward-secret messaging is default-on but still soaking
+
+`PreferenceRepository.ratchetSendEnabled()` currently defaults to `true`.
+
+Outbound 1:1 traffic uses the `QUBEE_DMS` PQXDH + Double Ratchet path. Outbound group traffic uses sender keys, with keyed-selector **v5** as the current group emission format.
+
+The emergency rollout flag remains as a temporary kill-switch. Compatibility paths also remain:
+
+- older direct/group formats may still be accepted;
+- sender-key v3 remains an inbound compatibility path;
+- legacy v2 emission/reception has not yet been completely retired.
+
+The physical-device runbook still calls for recorded release-build coverage across multiple OEMs. Treat the messaging design as **implemented and extensively host-tested, but not independently audited and not fully proven across every Android lifecycle/OEM condition**.
+
+### 2. Deniability differs by protocol generation
+
+The current ratcheted direct path authenticates messages/ACKs with keys derived from the session rather than long-term per-message identity signatures. That supports the intended deniable model.
+
+Legacy signed-envelope messages are different: long-term hybrid signatures can make authorship cryptographically attributable. Any peer that still emits a legacy format should be treated as using the older non-deniable model.
+
+### 3. Network metadata is not hidden by default
+
+Qubee's direct transport does not provide IP anonymity.
+
+Current metadata reductions include:
+
+- anonymous gossipsub authorship;
+- mDNS off by default;
+- blinded rotating group topics;
+- padding buckets on forward-secret paths;
+- keyed-selector group formats that avoid a plaintext group id.
+
+These measures do **not** prevent:
+
+- direct peers learning network addresses;
+- timing/volume correlation;
+- infrastructure observing connection metadata;
+- ICE/STUN/TURN metadata exposure when calling is enabled.
+
+Tor and Nym are currently architectural/fail-closed foundations, not working anonymising transports.
+
+### 4. Local protection depends on Screen Lock policy and process state
+
+With Screen Lock disabled, Qubee permits headless/background operation using auth-free Android Keystore wrapping. That is an explicit availability/usability trade-off.
+
+When Screen Lock is enabled, the app adds both a UI gate and auth-bound key handling intended to prevent a cold locked process from opening protected storage before biometric/device-credential authorization.
+
+Caveats:
+
+- a database connection that is already open in a live process is not equivalent to a cold locked process;
+- Android API/OEM behavior differs;
+- physical-device testing remains essential;
+- full unlocked-device compromise is outside the threat model.
+
+### 5. Rust keystore protection
+
+The Rust keystores holding identity/group state are protected with a high-entropy passphrase supplied from Android's Keystore-backed layer. The Rust wrapping key uses Argon2id with a per-install salt and authenticated encryption.
+
+The passphrase crosses JNI as mutable bytes, not as an immutable JVM `String`, and copies are zeroized where practical.
+
+Older pre-alpha layouts used weaker migration-era wrapping choices; supported migrations are one-way toward the current format.
+
+### 6. Calling is not a shipped security claim yet
+
+The default native build runs Cargo without `--features calling`. Kotlin catches missing calling JNI symbols and fails closed.
+
+When the feature is enabled for development, signaling is carried over the authenticated/encrypted direct-session path. The caller generates a fresh random per-call media root and carries it inside the encrypted invitation; both endpoints derive the same call media key using the call id and canonical participant pair.
+
+Actual encoded media is currently handed to WebRTC, which negotiates DTLS-SRTP. The in-tree `MediaEncryption` helper should **not** be interpreted as a second active application-layer encryption layer unless the sample path is explicitly wired through it.
+
+The Android audio pipeline is compile-verified scaffolding and still requires physical-device validation for codec availability, foreground-service rules, permission timing, audio routing and teardown behavior.
+
+### 7. Database migrations are still pre-stable
+
+Room has an explicit migration chain, but the project has not yet treated every schema snapshot as a stable release contract. Cross-version data survival before the first stable schema should be considered best-effort.
+
+Schema JSON snapshots should be committed once generated and used as migration-review/test artifacts.
+
+## Security invariants reviewers should challenge
+
+High-value reports often demonstrate a violation of one of these:
+
+1. **Rust remains the secret-state authority.**
+2. **Both hybrid signature components verify or authentication fails.**
+3. **Signed bytes are canonical, versioned and domain-separated.**
+4. **Untrusted lengths are bounded before allocation.**
+5. **Authentication succeeds before state mutation.**
+6. **Removed members never receive newly rotated group material.**
+7. **Identity-key changes never silently preserve Verified trust.**
+8. **JNI errors fail closed without aborting the Android process.**
+9. **Long-lived secrets do not cross JNI as immutable Java strings.**
+10. **Wire-format changes require an explicit compatibility/version story.**
+11. **Privacy-mode failure does not silently downgrade transport.**
+12. **A retry reuses durable ciphertext and never advances the ratchet twice.**
+13. **A frame for one session/group/call cannot be substituted into another.**
+14. **Resource use from untrusted peers is bounded.**
 
 ## Disclosure policy
 
-We follow coordinated disclosure. After we ship a fix:
+Qubee follows coordinated disclosure.
 
-1. We file a GitHub Security Advisory with a CVSS score, affected
-   versions, and credit to the reporter (unless they ask to stay
-   anonymous).
-2. We reference the fix commit and the advisory in `CHANGELOG.md`.
-3. If the issue affected a published release, we file a CVE through
-   GitHub's CNA.
+After an accepted issue affecting a release is fixed, the project may:
 
-If a vulnerability is being actively exploited in the wild we'll
-disclose immediately and ship the fix; we won't sit on an active
-exploit waiting for the 30/90 day window.
+1. publish a GitHub Security Advisory with severity/CVSS;
+2. credit the reporter unless anonymity is requested;
+3. reference the fix in `CHANGELOG.md`;
+4. request a CVE through GitHub when appropriate.
 
-## Safe-harbour for researchers
+If credible active exploitation is discovered, disclosure and mitigation may be accelerated rather than waiting for the normal coordination window.
 
-We will not pursue legal action against good-faith security
-researchers who:
+## Safe harbor for researchers
 
-- Report through the channels above.
-- Don't access, modify, or destroy data that isn't theirs.
-- Don't degrade service for other users.
-- Give us reasonable time to fix before going public.
+The project will not pursue legal action against good-faith researchers who:
 
-This isn't a bug bounty — there's no payout. Credit in advisories +
-the changelog is the recognition we can offer.
+- report through a private channel;
+- avoid accessing/modifying data that is not theirs;
+- avoid degrading service for other users;
+- provide reasonable time to investigate/fix before public disclosure.
+
+This is not currently a paid bug-bounty program.
 
 ## Cryptographic primitive sourcing
 
-For transparency, the post-quantum primitives in the default build
-are sourced as follows. Report supply-chain concerns about any of
-them through the same channel as a vulnerability.
+| Primitive | Rust crate | Purpose |
+|---|---|---|
+| ML-KEM-768 (FIPS 203) | `pqcrypto-mlkem` 0.1 | Post-quantum KEM component |
+| ML-DSA-44 (FIPS 204) | `pqcrypto-mldsa` 0.1 | Post-quantum identity-signature component |
+| Ed25519 | `ed25519-dalek` 2.2 | Classical identity-signature component |
+| X25519 | `x25519-dalek` 2.0 | Classical prekey/ratchet agreement component |
+| ChaCha20-Poly1305 | `chacha20poly1305` 0.10 | Authenticated encryption |
+| BLAKE3 | `blake3` 1.x | Hashing / identifiers / derivation support |
+| HKDF / SHA-2 | `hkdf` / `sha2` | Key derivation |
+| Argon2id | `argon2` | Rust keystore wrapping KDF |
 
-| Primitive | Crate | Upstream |
-|-----------|-------|----------|
-| ML-KEM-768 (FIPS 203) | `pqcrypto-mlkem` 0.1 | <https://github.com/rustpq/pqcrypto> |
-| ML-DSA-44 (FIPS 204) | `pqcrypto-mldsa` 0.1 | <https://github.com/rustpq/pqcrypto> |
-| Ed25519 | `ed25519-dalek` 2.2 | <https://github.com/dalek-cryptography/ed25519-dalek> |
-| X25519 | `x25519-dalek` 2.0 | <https://github.com/dalek-cryptography/curve25519-dalek> |
-| ChaCha20-Poly1305 | `chacha20poly1305` 0.10 | <https://github.com/RustCrypto/AEADs> |
-| BLAKE3 | `blake3` 1.8 | <https://github.com/BLAKE3-team/BLAKE3> |
-| HKDF / SHA-2 | `hkdf` 0.12 / `sha2` 0.10 | <https://github.com/RustCrypto/KDFs> |
-
-Cargo.lock is committed; CI runs `cargo audit` on every PR plus a
-weekly cron to catch new RustSec advisories on a green tree.
-Because cargo-audit only sees the RustSec database, CI additionally
-sweeps against OSV.dev (`scripts/osv_scan.sh`), which catches
-GHSA-only advisories that RustSec never imports: every Cargo.lock
-crate version-matched, direct Gradle coordinates, and workflow
-actions at package level (the script header documents each
-surface's fidelity and its allowlist discipline).
+`Cargo.lock` is committed. CI runs RustSec-oriented auditing and an additional OSV sweep so the dependency review is not limited to one advisory database.

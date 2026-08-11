@@ -78,6 +78,13 @@ class MessageService : Service(), NetworkCallback {
         /// src/ratchet/sender_keys.rs (pinned in wire_stability).
         private val GROUP_V3_MAGIC: ByteArray =
             "QUBEE_GMS".toByteArray(Charsets.US_ASCII) + byteArrayOf(0x03)
+
+        /// "QUBEE_GMS\x05" — the keyed-selector sender-keys frame (v5,
+        /// metadata parity with the sealed v4 envelope). Same decrypt
+        /// entry point Rust-side; recognised on receive before any
+        /// sender emits it. Kept in sync with MAGIC_GROUP_MESSAGE_V5.
+        private val GROUP_V5_MAGIC: ByteArray =
+            "QUBEE_GMS".toByteArray(Charsets.US_ASCII) + byteArrayOf(0x05)
         /// How often the retry loop wakes up to scan the DB. Cheap
         /// query (indexed on `status` already, `nextRetryAt`
         /// filtering is in-memory across the small SENT set); 30s
@@ -295,7 +302,7 @@ class MessageService : Service(), NetworkCallback {
             // row's conversationId IS the group id hex on that path.
             // Everything else re-publishes exactly as it was sent.
             val ok = runCatching {
-                if (isGroupV3Frame(wire)) {
+                if (isGroupV3Frame(wire) || isGroupV5Frame(wire)) {
                     qubeeManager.publishGroupFrame(row.conversationId, wire)
                 } else {
                     qubeeManager.sendP2PMessage(row.senderId, wire)
@@ -689,8 +696,10 @@ class MessageService : Service(), NetworkCallback {
             }
         }
 
-        // v3 sender-keys group frame (QUBEE_GMS\x03).
-        if (isGroupV3Frame(data)) {
+        // Sender-keys group frame: v3 (QUBEE_GMS\x03, plaintext group
+        // id) or v5 (QUBEE_GMS\x05, keyed selector). One decrypt entry
+        // point — Rust routes by magic internally.
+        if (isGroupV3Frame(data) || isGroupV5Frame(data)) {
             val resultJson = qubeeManager.decryptGroupMessageV3(data)
             if (resultJson == null) {
                 Timber.w("Ratchet group decrypt failed (peer %s)", peerId)
@@ -768,18 +777,16 @@ class MessageService : Service(), NetworkCallback {
         }
     }
 
-    private fun isDirectV2Frame(data: ByteArray): Boolean {
-        if (data.size < DIRECT_V2_MAGIC.size) return false
-        for (i in DIRECT_V2_MAGIC.indices) {
-            if (data[i] != DIRECT_V2_MAGIC[i]) return false
-        }
-        return true
-    }
+    private fun isDirectV2Frame(data: ByteArray): Boolean = hasMagic(data, DIRECT_V2_MAGIC)
 
-    private fun isGroupV3Frame(data: ByteArray): Boolean {
-        if (data.size < GROUP_V3_MAGIC.size) return false
-        for (i in GROUP_V3_MAGIC.indices) {
-            if (data[i] != GROUP_V3_MAGIC[i]) return false
+    private fun isGroupV3Frame(data: ByteArray): Boolean = hasMagic(data, GROUP_V3_MAGIC)
+
+    private fun isGroupV5Frame(data: ByteArray): Boolean = hasMagic(data, GROUP_V5_MAGIC)
+
+    private fun hasMagic(data: ByteArray, magic: ByteArray): Boolean {
+        if (data.size < magic.size) return false
+        for (i in magic.indices) {
+            if (data[i] != magic[i]) return false
         }
         return true
     }

@@ -41,9 +41,10 @@ use crate::ratchet::direct::{
 use crate::ratchet::direct_message::{extract_direct_message_id, is_direct_message_frame};
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
 use crate::ratchet::sender_keys::{
-    create_or_get_own_sender_key, decrypt_sender_key_message, encrypt_sender_key_message,
-    extract_v3_message_id, install_sender_key, own_chain_iteration, peek_v3_group_id,
-    reset_group_sender_state, SenderKeyDistribution,
+    create_or_get_own_sender_key, decrypt_sender_key_message, decrypt_sender_key_message_v5,
+    encrypt_sender_key_message, extract_v3_message_id, extract_v5_message_id, install_sender_key,
+    is_group_message_v5_frame, own_chain_iteration, peek_v3_group_id, reset_group_sender_state,
+    SenderKeyDistribution,
 };
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use blake3::Hasher;
@@ -1320,6 +1321,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeExtrac
             let bytes = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("convert_byte_array: {e}"))?;
+            if is_group_message_v5_frame(&bytes) {
+                let candidates = known_group_keys()?;
+                let id = match extract_v5_message_id(candidates.iter_cloned(), &bytes) {
+                    Some(id) => id,
+                    None => return Ok(std::ptr::null_mut()),
+                };
+                let java_str = env
+                    .new_string(hex::encode(id))
+                    .map_err(|e| anyhow::anyhow!("new_string: {e}"))?;
+                return Ok(java_str.into_raw());
+            }
             let group_id = match peek_v3_group_id(&bytes) {
                 Some(g) => g,
                 None => return Ok(std::ptr::null_mut()),
@@ -1542,6 +1554,47 @@ fn take_pending_kyber_secret(invitation_code: &str) -> Option<Vec<u8>> {
 /// is in. Called once after the network thread comes up, plus any time
 /// we need to re-establish (e.g. a network reset). Best-effort: a
 /// failure to subscribe is logged but doesn't take the node down.
+/// Snapshot of every group the active identity belongs to, paired with
+/// its installed group key — the candidate set the v5 keyed selector is
+/// trial-matched against (the frame no longer names its group, so the
+/// receiver has to ask "which of MY groups sealed this?"). The bulk key
+/// copies are wiped on drop; the snapshot lives only for the duration
+/// of one decrypt/extract call.
+struct GroupKeyCandidates(Vec<(crate::groups::group_manager::GroupId, [u8; 32])>);
+
+impl GroupKeyCandidates {
+    fn iter_cloned(
+        &self,
+    ) -> impl Iterator<Item = (crate::groups::group_manager::GroupId, [u8; 32])> + '_ {
+        self.0.iter().map(|(g, k)| (*g, *k))
+    }
+}
+
+impl Drop for GroupKeyCandidates {
+    fn drop(&mut self) {
+        for (_, key) in self.0.iter_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+/// Lock order (GROUP_MANAGER, then IDENTITY inside) matches
+/// `resubscribe_known_groups`.
+fn known_group_keys() -> anyhow::Result<GroupKeyCandidates> {
+    let gm_guard = GROUP_MANAGER.lock().unwrap();
+    let gm = gm_guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+    let active =
+        active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity available"))?;
+    Ok(GroupKeyCandidates(
+        gm.get_member_groups(&active.identity_id())
+            .iter()
+            .filter_map(|g| gm.export_group_key(&g.id).map(|k| (g.id, k)))
+            .collect(),
+    ))
+}
+
 fn resubscribe_known_groups() {
     let mut gm_guard = GROUP_MANAGER.lock().unwrap();
     let gm = match gm_guard.as_mut() {
@@ -3273,11 +3326,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
-/// Decrypt an inbound `QUBEE_GMS\x03` frame (Ratchet Stage 4). Returns
-/// a JSON object `{"groupId": hex, "senderId": hex, "plaintext": str}`
-/// — the sender is authenticated by the member's ephemeral group
-/// signing key, not just the AEAD. `null` on wrong frame type, unknown
-/// group, missing distribution, forgery, or replay.
+/// Decrypt an inbound sender-keys group frame — `QUBEE_GMS\x03` OR its
+/// keyed-selector successor `QUBEE_GMS\x05` (the `V3` in the symbol
+/// name is historical, kept so the Kotlin side doesn't need a
+/// coordinated rename mid-soak; retire it together with v3 emission).
+/// Returns a JSON object `{"groupId": hex, "senderId": hex,
+/// "plaintext": str}` — the sender is authenticated by the member's
+/// ephemeral group signing key, not just the AEAD. `null` on wrong
+/// frame type, unknown group, missing distribution, forgery, or
+/// replay.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryptGroupMessageV3(
     env: JNIEnv,
@@ -3289,21 +3346,30 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
             let wire_bytes = env
                 .convert_byte_array(&wire)
                 .map_err(|e| anyhow::anyhow!("invalid wire: {e}"))?;
-            let group_id = peek_v3_group_id(&wire_bytes)
-                .ok_or_else(|| anyhow::anyhow!("not a v3 group message frame"))?;
-            let group_key = {
-                let gm_guard = GROUP_MANAGER.lock().unwrap();
-                let gm = gm_guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
-                gm.export_group_key(&group_id)
-                    .ok_or_else(|| anyhow::anyhow!("group key not installed"))?
+            let (gid, sender, plaintext) = if is_group_message_v5_frame(&wire_bytes) {
+                let candidates = known_group_keys()?;
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                decrypt_sender_key_message_v5(ks, candidates.iter_cloned(), &wire_bytes)?
+            } else {
+                let group_id = peek_v3_group_id(&wire_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("not a v3/v5 group message frame"))?;
+                let group_key = {
+                    let gm_guard = GROUP_MANAGER.lock().unwrap();
+                    let gm = gm_guard
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("group manager not initialised"))?;
+                    gm.export_group_key(&group_id)
+                        .ok_or_else(|| anyhow::anyhow!("group key not installed"))?
+                };
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                decrypt_sender_key_message(ks, &group_key, &wire_bytes)?
             };
-            let mut ks_guard = KEYSTORE.lock().unwrap();
-            let ks = ks_guard
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-            let (gid, sender, plaintext) = decrypt_sender_key_message(ks, &group_key, &wire_bytes)?;
             let plaintext = String::from_utf8(plaintext)
                 .map_err(|e| anyhow::anyhow!("plaintext is not UTF-8: {e}"))?;
             Ok(json!({

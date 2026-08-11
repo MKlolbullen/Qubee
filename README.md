@@ -88,10 +88,10 @@ The current priority is not adding another crypto primitive. It was validating t
 
 **Known remaining work while the new default soaks** (the flag stays available as a kill-switch):
 
-- complete 1:1 delivery acknowledgement semantics;
-- correct durable direct-message retry routing;
-- metadata-parity hardening for the sender-key group wire format;
+- flip sender-key group emission from v3 (plaintext group id on the wire) to the keyed-selector v5 format once receivers have soaked — v5 receive support is already live;
 - retiring legacy (v2) envelope emission after the deprecation window.
+
+Previously listed here and since verified complete: 1:1 delivery acknowledgements (encrypted in-ratchet receipts, wire-id correlated) and durable direct-message retry routing (recipient derived from the authenticated frame itself; direct frames never fall back to gossip).
 
 See [`docs/manual-testing/ratchet-cutover-device-matrix.md`](docs/manual-testing/ratchet-cutover-device-matrix.md) and [`tests/ratchet_cutover_e2e.rs`](tests/ratchet_cutover_e2e.rs).
 

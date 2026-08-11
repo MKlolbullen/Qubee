@@ -320,6 +320,31 @@ pub fn encrypt_sender_key_message(
     local_id: IdentityId,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    let inner = build_signed_inner(ks, group, local_id, plaintext)?;
+    seal_outer_v3(group, group_key, &inner)
+}
+
+/// v5 variant of [`encrypt_sender_key_message`]: identical chain
+/// advance and signed inner, but the outer envelope carries a keyed
+/// selector instead of the plaintext group id (metadata parity with
+/// the sealed v4 legacy envelope).
+pub fn encrypt_sender_key_message_v5(
+    ks: &mut SecureKeyStore,
+    group: &GroupId,
+    group_key: &[u8; 32],
+    local_id: IdentityId,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let inner = build_signed_inner(ks, group, local_id, plaintext)?;
+    seal_outer_v5(group_key, &inner)
+}
+
+fn build_signed_inner(
+    ks: &mut SecureKeyStore,
+    group: &GroupId,
+    local_id: IdentityId,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     create_or_get_own_sender_key(ks, group, local_id)?;
     let mut state = load_own_state(ks, group)?.expect("own state just ensured");
 
@@ -351,15 +376,13 @@ pub fn encrypt_sender_key_message(
     let signature: Signature =
         signing.sign(&signature_digest(group, &local_id, iteration, &payload));
 
-    let inner = bincode::serialize(&SenderKeyMessage {
+    bincode::serialize(&SenderKeyMessage {
         sender_id: local_id,
         iteration,
         payload,
         signature: signature.to_bytes().to_vec(),
     })
-    .map_err(|e| anyhow!("serialize sender key message: {e}"))?;
-
-    seal_outer_v3(group, group_key, &inner)
+    .map_err(|e| anyhow!("serialize sender key message: {e}"))
 }
 
 /// Decrypt a v3 frame. Returns `(group_id, sender_id, plaintext)`.
@@ -372,7 +395,30 @@ pub fn decrypt_sender_key_message(
     wire: &[u8],
 ) -> Result<(GroupId, IdentityId, Vec<u8>)> {
     let (group, inner) = open_outer_v3(group_key, wire)?;
-    let msg: SenderKeyMessage = bounded_bincode_deserialize(&inner)?;
+    open_signed_inner(ks, group, &inner)
+}
+
+/// Decrypt a v5 frame by trial-matching the keyed selector against
+/// every candidate group key (see [`open_outer_v5`]); the inner
+/// verification pipeline is identical to v3. The group is
+/// authenticated, not asserted: only the right group key opens the
+/// outer AEAD, and the signature digest + inner AAD re-bind the
+/// matched group id at every layer below.
+pub fn decrypt_sender_key_message_v5(
+    ks: &mut SecureKeyStore,
+    candidates: impl IntoIterator<Item = (GroupId, [u8; 32])>,
+    wire: &[u8],
+) -> Result<(GroupId, IdentityId, Vec<u8>)> {
+    let (group, inner) = open_outer_v5(candidates, wire)?;
+    open_signed_inner(ks, group, &inner)
+}
+
+fn open_signed_inner(
+    ks: &mut SecureKeyStore,
+    group: GroupId,
+    inner: &[u8],
+) -> Result<(GroupId, IdentityId, Vec<u8>)> {
+    let msg: SenderKeyMessage = bounded_bincode_deserialize(inner)?;
 
     let mut state = load_recv_state(ks, &group, &msg.sender_id)?
         .ok_or_else(|| anyhow!("no sender key installed for this group member"))?;
@@ -595,6 +641,140 @@ fn open_outer_v3(group_key: &[u8; 32], wire: &[u8]) -> Result<(GroupId, Vec<u8>)
         )
         .map_err(|_| anyhow!("outer v3 open failed (wrong or rotated group key)"))?;
     Ok((group, inner))
+}
+
+/// v5 sender-key wire format: `MAGIC || nonce(12) || selector(8) ||
+/// outer_ciphertext` — metadata parity with the sealed v4 legacy
+/// envelope. v3 (the first sender-keys format) put the 32-byte group
+/// id on the wire in the clear, which both fingerprints a group's
+/// traffic across messages and undoes what blinded rotating topics
+/// hide. v5 replaces it with a keyed, per-message selector only a
+/// group-key-holder can compute; receivers trial-match it across
+/// their groups (one BLAKE3 per candidate, AEAD only on a hit).
+pub const MAGIC_GROUP_MESSAGE_V5: &[u8] = b"QUBEE_GMS\x05";
+
+/// Distinct from both the v3 outer-key context and the v4 selector
+/// context ("qubee group selector v1"): a v4 selector must never
+/// validate a v5 frame or vice versa, even under the same group key.
+const V5_SELECTOR_KDF_CONTEXT: &str = "qubee sender-key group selector v1";
+const OUTER_V5_KDF_CONTEXT: &str = "qubee sender-key outer envelope v5";
+
+/// Same length/collision trade-off as the v4 envelope's selector.
+pub const V5_SELECTOR_LEN: usize = 8;
+
+/// Keyed per-message selector: `keyed_hash(derive_key(ctx, group_key),
+/// nonce)`, truncated. Deterministic for a key-holder, opaque junk for
+/// everyone else.
+pub fn v5_group_selector(group_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; V5_SELECTOR_LEN] {
+    let selector_key = blake3::derive_key(V5_SELECTOR_KDF_CONTEXT, group_key);
+    let full = blake3::keyed_hash(&selector_key, nonce);
+    let mut out = [0u8; V5_SELECTOR_LEN];
+    out.copy_from_slice(&full.as_bytes()[..V5_SELECTOR_LEN]);
+    out
+}
+
+fn derive_outer_v5_key(group_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(OUTER_V5_KDF_CONTEXT, group_key)
+}
+
+fn seal_outer_v5(group_key: &[u8; 32], inner: &[u8]) -> Result<Vec<u8>> {
+    let outer_key = derive_outer_v5_key(group_key);
+    let nonce_bytes = secure_rng::random::array::<12>()?;
+    let selector = v5_group_selector(group_key, &nonce_bytes);
+    let cipher = ChaCha20Poly1305::new(&outer_key.into());
+    // The selector is the associated data: a captured ciphertext can't
+    // be re-published under a different selector, mirroring how v3
+    // bound the plaintext group id.
+    let mut aad = Vec::with_capacity(MAGIC_GROUP_MESSAGE_V5.len() + V5_SELECTOR_LEN);
+    aad.extend_from_slice(MAGIC_GROUP_MESSAGE_V5);
+    aad.extend_from_slice(&selector);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: inner,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| anyhow!("outer v5 seal: {e}"))?;
+
+    let mut out =
+        Vec::with_capacity(MAGIC_GROUP_MESSAGE_V5.len() + 12 + V5_SELECTOR_LEN + ciphertext.len());
+    out.extend_from_slice(MAGIC_GROUP_MESSAGE_V5);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&selector);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn open_outer_v5(
+    candidates: impl IntoIterator<Item = (GroupId, [u8; 32])>,
+    wire: &[u8],
+) -> Result<(GroupId, Vec<u8>)> {
+    let magic_len = MAGIC_GROUP_MESSAGE_V5.len();
+    if wire.len() < magic_len + 12 + V5_SELECTOR_LEN {
+        bail!("v5 frame too short");
+    }
+    if &wire[..magic_len] != MAGIC_GROUP_MESSAGE_V5 {
+        bail!("not a v5 group message frame");
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&wire[magic_len..magic_len + 12]);
+    let wire_selector = &wire[magic_len + 12..magic_len + 12 + V5_SELECTOR_LEN];
+    let ciphertext = &wire[magic_len + 12 + V5_SELECTOR_LEN..];
+
+    // Fail-closed on selector collision, mirroring the v4 envelope's
+    // `open_outer_envelope`: if a candidate's selector matches but its
+    // AEAD fails, the `?` below returns immediately — later candidates
+    // are NOT tried. An 8-byte cross-key collision is ~2^-64 per
+    // candidate; continuing past a failed AEAD would let a genuinely
+    // tampered frame masquerade as "unknown group" instead of erroring.
+    for (group, group_key) in candidates {
+        if v5_group_selector(&group_key, &nonce_bytes) != wire_selector {
+            continue;
+        }
+        let outer_key = derive_outer_v5_key(&group_key);
+        let cipher = ChaCha20Poly1305::new(&outer_key.into());
+        let mut aad = Vec::with_capacity(magic_len + V5_SELECTOR_LEN);
+        aad.extend_from_slice(MAGIC_GROUP_MESSAGE_V5);
+        aad.extend_from_slice(wire_selector);
+        let inner = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow!("outer v5 open failed (selector matched, AEAD did not)"))?;
+        return Ok((group, inner));
+    }
+    Err(anyhow!("v5 frame: unknown group / not a member"))
+}
+
+/// Cheap dispatcher probe for the v5 magic.
+pub fn is_group_message_v5_frame(wire: &[u8]) -> bool {
+    wire.len() >= MAGIC_GROUP_MESSAGE_V5.len()
+        && &wire[..MAGIC_GROUP_MESSAGE_V5.len()] == MAGIC_GROUP_MESSAGE_V5
+}
+
+/// Open a sealed v5 frame against the candidate set and compute its
+/// [`v3_message_id`] (the id derivation is format-independent: group +
+/// sender + iteration + inner ciphertext, so a v3 sender and a v5
+/// receiver — or vice versa during the migration window — still agree
+/// on the id an ack must carry).
+pub fn extract_v5_message_id(
+    candidates: impl IntoIterator<Item = (GroupId, [u8; 32])>,
+    wire: &[u8],
+) -> Option<[u8; 16]> {
+    let (group, inner) = open_outer_v5(candidates, wire).ok()?;
+    let msg: SenderKeyMessage = bounded_bincode_deserialize(&inner).ok()?;
+    Some(v3_message_id(
+        &group,
+        &msg.sender_id,
+        msg.iteration,
+        &msg.payload,
+    ))
 }
 
 #[cfg(test)]
@@ -931,5 +1111,131 @@ mod tests {
         let d1 = create_or_get_own_sender_key(&mut a.ks, &g, a.id).unwrap();
         let d2 = create_or_get_own_sender_key(&mut a.ks, &g, a.id).unwrap();
         assert_eq!(d1, d2, "second call must reload, not regenerate");
+    }
+
+    #[test]
+    fn v5_magic_is_pinned() {
+        assert_eq!(MAGIC_GROUP_MESSAGE_V5, b"QUBEE_GMS\x05");
+    }
+
+    #[test]
+    fn v5_selector_is_pinned() {
+        // Golden vector: a silent change to the selector KDF context,
+        // hash, or truncation strands every deployed receiver (their
+        // trial-match never hits). Fixed key + nonce, pinned output.
+        let selector = v5_group_selector(&[0x11; 32], &[0x22; 12]);
+        assert_eq!(selector, [0xa0, 0xc8, 0xbf, 0x13, 0x10, 0x0b, 0x4d, 0xb4]);
+    }
+
+    #[test]
+    fn v5_round_trips_across_members() {
+        let (mut a, mut b, mut c) = trio();
+        let g = group();
+        let wire =
+            encrypt_sender_key_message_v5(&mut a.ks, &g, &GROUP_KEY, a.id, b"hi v5").unwrap();
+        assert!(is_group_message_v5_frame(&wire));
+        assert!(!is_group_message_v3_frame(&wire));
+        // No plaintext group id anywhere on the wire.
+        assert!(
+            !wire.windows(32).any(|w| w == g.as_bytes()),
+            "v5 wire must not contain the group id in the clear",
+        );
+        for m in [&mut b, &mut c] {
+            let (gid, sender, pt) =
+                decrypt_sender_key_message_v5(&mut m.ks, vec![(g, GROUP_KEY)], &wire).unwrap();
+            assert_eq!(gid, g);
+            assert_eq!(sender, a.id);
+            assert_eq!(pt, b"hi v5");
+        }
+    }
+
+    #[test]
+    fn v5_trial_match_picks_the_right_group_among_many() {
+        let (mut a, mut b, _c) = trio();
+        let g = group();
+        let wire =
+            encrypt_sender_key_message_v5(&mut a.ks, &g, &GROUP_KEY, a.id, b"pick me").unwrap();
+        // Receiver holds several groups; only the right (id, key) pair
+        // may open the frame, regardless of candidate order.
+        let candidates = vec![
+            (GroupId::from_bytes([0x01; 32]), [0x01; 32]),
+            (GroupId::from_bytes([0x02; 32]), [0x02; 32]),
+            (g, GROUP_KEY),
+            (GroupId::from_bytes([0x03; 32]), [0x03; 32]),
+        ];
+        let (gid, _, pt) = decrypt_sender_key_message_v5(&mut b.ks, candidates, &wire).unwrap();
+        assert_eq!(gid, g);
+        assert_eq!(pt, b"pick me");
+    }
+
+    #[test]
+    fn v5_rejected_without_the_group_key() {
+        let (mut a, mut b, _c) = trio();
+        let g = group();
+        let wire =
+            encrypt_sender_key_message_v5(&mut a.ks, &g, &GROUP_KEY, a.id, b"secret").unwrap();
+        let wrong = vec![
+            (g, [0x99; 32]),
+            (GroupId::from_bytes([0x77; 32]), [0x77; 32]),
+        ];
+        assert!(decrypt_sender_key_message_v5(&mut b.ks, wrong, &wire).is_err());
+    }
+
+    #[test]
+    fn v5_tamper_is_rejected() {
+        let (mut a, mut b, _c) = trio();
+        let g = group();
+        let wire = encrypt_sender_key_message_v5(&mut a.ks, &g, &GROUP_KEY, a.id, b"seal").unwrap();
+        let last = wire.len() - 1;
+        for flip_at in [
+            MAGIC_GROUP_MESSAGE_V5.len(),
+            MAGIC_GROUP_MESSAGE_V5.len() + 12,
+            last,
+        ] {
+            let mut bad = wire.clone();
+            bad[flip_at] ^= 0x01;
+            assert!(
+                decrypt_sender_key_message_v5(&mut b.ks, vec![(g, GROUP_KEY)], &bad).is_err(),
+                "flipping byte {flip_at} must not decrypt",
+            );
+        }
+    }
+
+    #[test]
+    fn v5_and_v3_ids_are_derived_by_the_same_rule_per_chain_position() {
+        // The migration window has mixed senders, so both formats feed
+        // the same id derivation (`v3_message_id` over group + sender +
+        // iteration + inner ciphertext — the outer envelope never
+        // contributes). Consecutive sends occupy distinct chain
+        // positions and therefore must yield distinct ids.
+        let (mut a, mut b, _c) = trio();
+        let g = group();
+        let w3 = encrypt_sender_key_message(&mut a.ks, &g, &GROUP_KEY, a.id, b"same").unwrap();
+        let id3 = extract_v3_message_id(&GROUP_KEY, &w3).unwrap();
+        let (_, sender, _) = decrypt_sender_key_message(&mut b.ks, &GROUP_KEY, &w3).unwrap();
+        assert_eq!(sender, a.id);
+
+        let w5 = encrypt_sender_key_message_v5(&mut a.ks, &g, &GROUP_KEY, a.id, b"same").unwrap();
+        let id5 = extract_v5_message_id(vec![(g, GROUP_KEY)], &w5).unwrap();
+        assert_ne!(
+            id3, id5,
+            "different chain positions must give different ids"
+        );
+        let (gid, _, pt) =
+            decrypt_sender_key_message_v5(&mut b.ks, vec![(g, GROUP_KEY)], &w5).unwrap();
+        assert_eq!(gid, g);
+        assert_eq!(pt, b"same");
+    }
+
+    #[test]
+    fn v5_replay_is_rejected_by_consumed_message_key() {
+        let (mut a, mut b, _c) = trio();
+        let g = group();
+        let wire = encrypt_sender_key_message_v5(&mut a.ks, &g, &GROUP_KEY, a.id, b"once").unwrap();
+        decrypt_sender_key_message_v5(&mut b.ks, vec![(g, GROUP_KEY)], &wire).unwrap();
+        assert!(
+            decrypt_sender_key_message_v5(&mut b.ks, vec![(g, GROUP_KEY)], &wire).is_err(),
+            "replaying the same v5 frame must fail (message key consumed)",
+        );
     }
 }

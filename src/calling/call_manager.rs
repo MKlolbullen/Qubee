@@ -20,6 +20,9 @@ pub struct CallManager {
     webrtc_manager: WebRTCManager,
     /// Media encryption for secure streams
     media_encryption: MediaEncryption,
+    /// This node's own identity, stamped as the `sender` of outbound
+    /// SDP offers/answers so the remote can attribute them.
+    local_identity: IdentityId,
     /// Signaling carrier for call setup (loopback in tests, session-
     /// backed in production — see issue #67)
     signaling: Arc<dyn SignalingTransport>,
@@ -273,19 +276,21 @@ pub struct TurnServer {
 }
 
 impl CallManager {
-    /// Create a new call manager
     /// Create a new call manager.
     ///
-    /// `media_root` is the per-call secret both endpoints share (in
-    /// Qubee, material derived from the 1:1 session — issue #67); media
-    /// keys derive from it so the two sides interoperate. `signaling`
-    /// is the carrier for call-setup messages: [`SignalingServer`] for
-    /// tests/local runs, the session-backed transport in production.
+    /// `local_identity` is this node's own id, stamped as the `sender`
+    /// of outbound SDP offers/answers. `media_root` is the per-call
+    /// secret both endpoints share (in Qubee, material derived from the
+    /// 1:1 session — issue #67); media keys derive from it so the two
+    /// sides interoperate. `signaling` is the carrier for call-setup
+    /// messages: [`SignalingServer`] for tests/local runs, the
+    /// session-backed transport in production.
     ///
     /// [`SignalingServer`]: crate::calling::signaling::SignalingServer
     pub async fn new(
         config: CallManagerConfig,
         event_sender: mpsc::UnboundedSender<CallEvent>,
+        local_identity: IdentityId,
         media_root: [u8; 32],
         signaling: Arc<dyn SignalingTransport>,
     ) -> Result<Self> {
@@ -304,6 +309,7 @@ impl CallManager {
             calls: Arc::new(RwLock::new(HashMap::new())),
             webrtc_manager,
             media_encryption,
+            local_identity,
             signaling,
             event_sender,
             config,
@@ -437,16 +443,15 @@ impl CallManager {
                     .add_ice_candidate(call_id, sender, candidate)
                     .await
             }
-            // Ingest the remote SDP into the peer connection the accept
-            // path set up. Generating and sending back an SDP answer
-            // (the responder half, which also needs the local identity
-            // threaded through) is phase 2c — issue #67.
+            // Answerer side: take the remote offer, answer it, and send
+            // the answer back.
             SignalingMessage::SdpOffer {
                 call_id,
                 sdp,
                 sender,
-            }
-            | SignalingMessage::SdpAnswer {
+            } => self.on_sdp_offer(call_id, sender, sdp).await,
+            // Offerer side: install the remote answer to our earlier offer.
+            SignalingMessage::SdpAnswer {
                 call_id,
                 sdp,
                 sender,
@@ -456,6 +461,83 @@ impl CallManager {
                     .await
             }
         }
+    }
+
+    /// Answer an inbound SDP offer. Ensures a peer connection exists
+    /// for the offerer, produces an SDP answer (which also installs the
+    /// offer as the remote description), and sends it back stamped with
+    /// our own identity.
+    async fn on_sdp_offer(
+        &self,
+        call_id: CallId,
+        offerer: IdentityId,
+        offer: String,
+    ) -> Result<()> {
+        self.ensure_peer_connection(call_id, offerer).await?;
+        // Attach our own outbound tracks so the answer is bidirectional.
+        if let Some(call_type) = self.call_type_of(call_id).await {
+            self.attach_call_media(call_id, offerer, &call_type).await?;
+        }
+        let answer = self
+            .webrtc_manager
+            .create_answer(call_id, offerer, &offer)
+            .await?;
+        self.signaling
+            .send(
+                offerer,
+                SignalingMessage::SdpAnswer {
+                    call_id,
+                    sdp: answer,
+                    sender: self.local_identity,
+                },
+            )
+            .await
+    }
+
+    /// Attach the outbound media tracks a call type carries. Every call
+    /// has audio; video call types also add a video track. A connection
+    /// with at least one track produces an SDP offer/answer carrying ICE
+    /// parameters, which a media-less session description lacks.
+    async fn attach_call_media(
+        &self,
+        call_id: CallId,
+        participant: IdentityId,
+        call_type: &CallType,
+    ) -> Result<()> {
+        self.webrtc_manager
+            .set_audio_enabled(call_id, participant, true)
+            .await?;
+        if matches!(
+            call_type,
+            CallType::VideoCall | CallType::GroupVideoCall | CallType::Conference
+        ) {
+            self.webrtc_manager
+                .set_video_enabled(call_id, participant, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The type of a tracked call, if we know it.
+    async fn call_type_of(&self, call_id: CallId) -> Option<CallType> {
+        self.calls
+            .read()
+            .await
+            .get(&call_id)
+            .map(|call| call.call_type.clone())
+    }
+
+    /// Establish a peer connection for `(call_id, participant)` unless
+    /// one already exists.
+    async fn ensure_peer_connection(&self, call_id: CallId, participant: IdentityId) -> Result<()> {
+        if !self
+            .webrtc_manager
+            .has_connection(call_id, participant)
+            .await
+        {
+            self.establish_peer_connection(call_id, participant).await?;
+        }
+        Ok(())
     }
 
     /// Handle an inbound call invitation: register the call in the
@@ -603,10 +685,30 @@ impl CallManager {
             call.started_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
         }
 
+        let call_type = call.call_type.clone();
         drop(calls);
 
-        // Establish WebRTC connection
+        // Establish WebRTC connection, add the media tracks this call
+        // type carries (so the offer advertises real m-lines with ICE
+        // parameters), then drive negotiation as the offering side: the
+        // remote answers, and its answer comes back as an SdpAnswer.
         self.establish_peer_connection(call_id, participant).await?;
+        self.attach_call_media(call_id, participant, &call_type)
+            .await?;
+        let offer = self
+            .webrtc_manager
+            .create_offer(call_id, participant)
+            .await?;
+        self.signaling
+            .send(
+                participant,
+                SignalingMessage::SdpOffer {
+                    call_id,
+                    sdp: offer,
+                    sender: self.local_identity,
+                },
+            )
+            .await?;
 
         // Send event
         self.event_sender
@@ -1147,11 +1249,11 @@ mod tests {
         let server = Arc::new(SignalingServer::new().await.unwrap());
         let _callee_inbox = server.register_client(IdentityId::from([2u8; 32])).await;
 
-        let call_manager = CallManager::new(config, event_sender, [7u8; 32], server)
+        let initiator = IdentityId::from([1u8; 32]);
+        let call_manager = CallManager::new(config, event_sender, initiator, [7u8; 32], server)
             .await
             .expect("Should create call manager");
 
-        let initiator = IdentityId::from([1u8; 32]);
         let participants = vec![IdentityId::from([2u8; 32])];
 
         let call_id = call_manager
@@ -1174,12 +1276,15 @@ mod tests {
         assert_eq!(call.participants.len(), 1);
     }
 
+    /// A manager whose own identity is `[2; 32]` (the "us" that
+    /// receives inbound frames in these tests).
     async fn manager_with_events() -> (CallManager, mpsc::UnboundedReceiver<CallEvent>) {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let server = Arc::new(SignalingServer::new().await.unwrap());
         let manager = CallManager::new(
             CallManagerConfig::default(),
             event_sender,
+            IdentityId::from([2u8; 32]),
             [7u8; 32],
             server,
         )
@@ -1309,5 +1414,99 @@ mod tests {
             .handle_inbound_signaling(IdentityId::from([1u8; 32]), b"not a signaling frame")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn full_offer_answer_negotiation_between_two_endpoints() {
+        use crate::calling::signaling::{ChannelSignalingTransport, OutboundSignal};
+
+        let caller = IdentityId::from([1u8; 32]);
+        let callee = IdentityId::from([2u8; 32]);
+        let root = [7u8; 32];
+
+        let (caller_tx, mut caller_rx) = mpsc::unbounded_channel::<OutboundSignal>();
+        let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<OutboundSignal>();
+        // Keep the event receivers alive so state-change sends succeed.
+        let (caller_ev, _caller_ev_rx) = mpsc::unbounded_channel();
+        let (callee_ev, _callee_ev_rx) = mpsc::unbounded_channel();
+
+        let caller_mgr = CallManager::new(
+            CallManagerConfig::default(),
+            caller_ev,
+            caller,
+            root,
+            Arc::new(ChannelSignalingTransport::new(caller_tx)),
+        )
+        .await
+        .unwrap();
+        let callee_mgr = CallManager::new(
+            CallManagerConfig::default(),
+            callee_ev,
+            callee,
+            root,
+            Arc::new(ChannelSignalingTransport::new(callee_tx)),
+        )
+        .await
+        .unwrap();
+
+        // 1. Caller initiates → CallInvitation goes out to the callee.
+        let call_id = caller_mgr
+            .initiate_call(
+                caller,
+                vec![callee],
+                CallType::VoiceCall,
+                None,
+                CallSettings::default(),
+            )
+            .await
+            .unwrap();
+        let invite = caller_rx.recv().await.expect("invitation sent");
+        assert_eq!(invite.recipient, callee);
+
+        // 2. Callee rings, then accepts → SDP offer goes back to the caller.
+        callee_mgr
+            .handle_inbound_signaling(caller, &invite.payload)
+            .await
+            .unwrap();
+        callee_mgr.accept_call(call_id, caller).await.unwrap();
+        let offer = callee_rx.recv().await.expect("offer sent");
+        assert_eq!(offer.recipient, caller);
+        assert!(matches!(
+            SignalingMessage::from_bytes(&offer.payload).unwrap(),
+            SignalingMessage::SdpOffer { .. }
+        ));
+
+        // 3. Caller answers the offer → SDP answer goes to the callee,
+        //    stamped with the caller's own identity.
+        caller_mgr
+            .handle_inbound_signaling(callee, &offer.payload)
+            .await
+            .unwrap();
+        let answer = caller_rx.recv().await.expect("answer sent");
+        assert_eq!(answer.recipient, callee);
+        match SignalingMessage::from_bytes(&answer.payload).unwrap() {
+            SignalingMessage::SdpAnswer { sender, .. } => assert_eq!(sender, caller),
+            other => panic!("expected an SDP answer, got {other:?}"),
+        }
+
+        // 4. Callee installs the remote answer.
+        callee_mgr
+            .handle_inbound_signaling(caller, &answer.payload)
+            .await
+            .unwrap();
+
+        // Both ends now hold a peer connection for the negotiated pair.
+        assert!(
+            caller_mgr
+                .webrtc_manager
+                .has_connection(call_id, callee)
+                .await
+        );
+        assert!(
+            callee_mgr
+                .webrtc_manager
+                .has_connection(call_id, caller)
+                .await
+        );
     }
 }

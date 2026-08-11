@@ -15,9 +15,12 @@ use crate::identity::identity_key::IdentityId;
 //   * The `media::` namespace was flattened — track types now live
 //     directly under `webrtc::track::`.
 use std::sync::Arc;
+use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -149,12 +152,21 @@ impl PeerConnection {
             ice_servers,
             ..Default::default()
         };
-        // Build the WebRTC API and create a new peer connection. The API
-        // builder allows customising the media engine and interceptor
-        // registry; for now we stick with defaults. If SRTP/DTLS is
-        // disabled in the config, we could disable corresponding
-        // interceptors here.
-        let api = APIBuilder::new().build();
+        // Build the WebRTC API with the standard codec set and default
+        // interceptors (RTCP, NACK, TWCC). Without registered codecs an
+        // added track has no negotiable format and offer creation fails
+        // with "RTPSender created with no codecs".
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .context("Failed to register default codecs")?;
+        let mut registry = Registry::new();
+        registry = register_default_interceptors(registry, &mut media_engine)
+            .context("Failed to register default interceptors")?;
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
         let pc = api
             .new_peer_connection(rtc_config)
             .await

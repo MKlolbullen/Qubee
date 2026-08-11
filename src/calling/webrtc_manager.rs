@@ -180,6 +180,15 @@ impl WebRTCManager {
         Ok(())
     }
 
+    /// Whether a peer connection currently exists for this
+    /// `(call, participant)` pair.
+    pub async fn has_connection(&self, call_id: CallId, participant: IdentityId) -> bool {
+        self.peer_connections
+            .read()
+            .await
+            .contains_key(&(call_id, participant))
+    }
+
     /// Close a peer connection
     pub async fn close_peer_connection(
         &self,

@@ -138,12 +138,11 @@ the pre-alpha:
   padded only at the envelope; mDNS is off by default; and the gossip
   topic is a blinded rotating hash instead of the group id in the
   clear, and the group-message envelope (`QUBEE_GMS\x04`) replaced its
-  plaintext `group_id` with a per-message keyed selector. **Caveat:**
-  the default sender-keys format since the cutover (`QUBEE_GMS\x03`)
-  still carries the group id in the clear; its keyed-selector
-  successor (`QUBEE_GMS\x05`) is live on the receive side and takes
-  over emission after its soak window. Even then this hides *which*
-  group, not *that* group traffic exists.
+  plaintext `group_id` with a per-message keyed selector, and the
+  default sender-keys emission is the keyed-selector `QUBEE_GMS\x05`
+  format (its `\x03` predecessor, which named the group in the clear,
+  is still *accepted* inbound from pre-v5 builds until retired). Note
+  this hides *which* group, not *that* group traffic exists.
 - The Android Keystore master key that wraps both the SQLCipher
   passphrase *and* the Rust core keystore passphrase is configured
   with `setUserAuthenticationRequired(false)`, meaning local data

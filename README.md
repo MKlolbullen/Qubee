@@ -88,8 +88,7 @@ The current priority is not adding another crypto primitive. It was validating t
 
 **Known remaining work while the new default soaks** (the flag stays available as a kill-switch):
 
-- flip sender-key group emission from v3 (plaintext group id on the wire) to the keyed-selector v5 format once receivers have soaked — v5 receive support is already live;
-- retiring legacy (v2) envelope emission after the deprecation window.
+- retiring v3 sender-key *reception* and legacy (v2) envelope emission after their deprecation windows. Group emission is the keyed-selector v5 format (no plaintext group id on the wire); v3 and v2 remain accepted inbound for compatibility.
 
 Previously listed here and since verified complete: 1:1 delivery acknowledgements (encrypted in-ratchet receipts, wire-id correlated) and durable direct-message retry routing (recipient derived from the authenticated frame itself; direct frames never fall back to gossip).
 

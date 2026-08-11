@@ -86,8 +86,10 @@ why.
   `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
   These are documented as broken in `docs/build-status.md`; they're
   not built by default and not part of any release.
-- Bugs in the `calling` feature (WebRTC). It's gated, not yet ported
-  to webrtc 0.14, and not built by default.
+- Bugs in the `calling` feature (WebRTC). It compiles on webrtc 0.14
+  and is CI-gated, but it is not wired into the JNI surface or the
+  Android app, is off by default, and is not in any release — so it is
+  not reachable by a shipped build. In scope once it's wired up.
 - Phishing / social-engineering of the OOB verification gesture. We
   document the gesture; users have to perform it.
 

@@ -129,6 +129,9 @@ impl Clone for SignalingServer {
 /// their `IdentityId`. The client can be used to await incoming
 /// messages and to send messages via the server.
 pub struct SignalingClient {
+    /// Retained for the receive-loop filtering this scaffold doesn't
+    /// implement yet.
+    #[allow(dead_code)]
     identity: IdentityId,
     server: Arc<SignalingServer>,
     receiver: mpsc::UnboundedReceiver<SignalingMessage>,

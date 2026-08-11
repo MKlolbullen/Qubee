@@ -61,6 +61,17 @@ struct PersistedActiveIdentity {
     secret_bytes: Vec<u8>,
 }
 
+// Calling (voice/video) JNI surface. Gated on the `calling` feature so
+// the default host/typecheck build doesn't pull in the WebRTC stack;
+// the symbols still exist textually for the JNI contract check, and are
+// type-checked under `--features "_typecheck_jni,calling"` in CI.
+#[cfg(feature = "calling")]
+use crate::calling::call_manager::{
+    CallEvent, CallId, CallManager, CallManagerConfig, CallSettings, CallType,
+};
+#[cfg(feature = "calling")]
+use crate::calling::signaling::{ChannelSignalingTransport, OutboundSignal};
+
 // --- Global State ---
 
 /// Replay cache backing store: a membership `HashSet` for O(1) lookups
@@ -3950,5 +3961,381 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
             Ok(java_str.into_raw())
         })();
         result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
+// ---------------------------------------------------------------------
+// Calling (voice/video) JNI surface — feature = "calling".
+//
+// Signaling rides the encrypted 1:1 message session: outbound frames
+// are handed to Kotlin via `onCallSignal` (Kotlin encrypts + sends them
+// like any message), and inbound frames come back through
+// `nativeHandleCallSignal`. The per-call media root is provided by
+// Kotlin (derived from the same 1:1 session) on initiate/accept. See
+// issue #67.
+// ---------------------------------------------------------------------
+
+#[cfg(feature = "calling")]
+lazy_static! {
+    /// Dedicated multi-threaded runtime that owns the CallManager and
+    /// its background tasks (ICE trickle, signaling/event drains). JNI
+    /// calls `block_on` it; they never run on a runtime worker thread.
+    static ref CALL_RUNTIME: Runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("failed to build calling runtime");
+    static ref CALL_MANAGER: Mutex<Option<Arc<CallManager>>> = Mutex::new(None);
+}
+
+#[cfg(feature = "calling")]
+fn call_manager() -> anyhow::Result<Arc<CallManager>> {
+    CALL_MANAGER
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("calling not started; call nativeStartCalling first"))
+}
+
+#[cfg(feature = "calling")]
+fn call_type_from_i32(v: jni::sys::jint) -> anyhow::Result<CallType> {
+    Ok(match v {
+        0 => CallType::VoiceCall,
+        1 => CallType::VideoCall,
+        2 => CallType::GroupVoiceCall,
+        3 => CallType::GroupVideoCall,
+        4 => CallType::ScreenShare,
+        5 => CallType::Conference,
+        other => return Err(anyhow::anyhow!("unknown call type {other}")),
+    })
+}
+
+#[cfg(feature = "calling")]
+fn call_type_to_i32(t: &CallType) -> jni::sys::jint {
+    match t {
+        CallType::VoiceCall => 0,
+        CallType::VideoCall => 1,
+        CallType::GroupVoiceCall => 2,
+        CallType::GroupVideoCall => 3,
+        CallType::ScreenShare => 4,
+        CallType::Conference => 5,
+    }
+}
+
+#[cfg(feature = "calling")]
+fn parse_call_id(s: &str) -> anyhow::Result<CallId> {
+    let bytes = hex::decode(s).map_err(|_| anyhow::anyhow!("invalid call id hex"))?;
+    let arr: [u8; 16] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("call id must be 16 bytes"))?;
+    Ok(CallId::from(arr))
+}
+
+#[cfg(feature = "calling")]
+fn media_root_from_bytes(v: &[u8]) -> anyhow::Result<[u8; 32]> {
+    v.try_into()
+        .map_err(|_| anyhow::anyhow!("media root must be 32 bytes"))
+}
+
+/// Forward one outbound signaling frame to Kotlin (`onCallSignal`),
+/// which sends it over the recipient's 1:1 session.
+#[cfg(feature = "calling")]
+fn dispatch_call_signal_to_kotlin(recipient_hex: &str, payload: &[u8]) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let callback_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match callback_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+    let j_recipient = match env.new_string(recipient_hex) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let j_payload = match env.byte_array_from_slice(payload) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let _ = env.call_method(
+        callback_obj,
+        "onCallSignal",
+        "(Ljava/lang/String;[B)V",
+        &[JValue::Object(&j_recipient), JValue::Object(&j_payload)],
+    );
+}
+
+/// Translate a [`CallEvent`] into a Kotlin callback. Lifecycle events
+/// map to `onIncomingCall` / `onCallStateChanged`; per-frame media and
+/// quality events have no callback in this surface and are dropped.
+#[cfg(feature = "calling")]
+fn dispatch_call_event_to_kotlin(event: CallEvent) {
+    let jvm_lock = JVM.lock().unwrap();
+    let jvm = match jvm_lock.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let callback_lock = CALLBACK_HANDLER.lock().unwrap();
+    let callback_obj = match callback_lock.as_ref() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Helper: emit onCallStateChanged(callIdHex, state).
+    let emit_state = |env: &mut jni::AttachGuard, call_id: CallId, state: &str| {
+        let j_call = match env.new_string(hex::encode(call_id.as_bytes())) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let j_state = match env.new_string(state) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let _ = env.call_method(
+            callback_obj,
+            "onCallStateChanged",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&j_call), JValue::Object(&j_state)],
+        );
+    };
+
+    match event {
+        CallEvent::IncomingCall {
+            call_id,
+            caller,
+            call_type,
+        } => {
+            let j_call = match env.new_string(hex::encode(call_id.as_bytes())) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let j_caller = match env.new_string(hex::encode(caller.as_ref() as &[u8])) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = env.call_method(
+                callback_obj,
+                "onIncomingCall",
+                "(Ljava/lang/String;Ljava/lang/String;I)V",
+                &[
+                    JValue::Object(&j_call),
+                    JValue::Object(&j_caller),
+                    JValue::Int(call_type_to_i32(&call_type)),
+                ],
+            );
+        }
+        CallEvent::CallStateChanged {
+            call_id, new_state, ..
+        } => emit_state(&mut env, call_id, &format!("{new_state:?}")),
+        CallEvent::ParticipantJoined { call_id, .. } => emit_state(&mut env, call_id, "connected"),
+        CallEvent::ParticipantLeft {
+            call_id, reason, ..
+        } => emit_state(&mut env, call_id, &format!("left: {reason}")),
+        CallEvent::CallError { call_id, error } => {
+            emit_state(&mut env, call_id, &format!("error: {error}"))
+        }
+        CallEvent::MediaStateChanged { .. } | CallEvent::QualityChanged { .. } => {}
+    }
+}
+
+#[cfg(feature = "calling")]
+async fn drain_outbound_call_signals(mut rx: tokio::sync::mpsc::UnboundedReceiver<OutboundSignal>) {
+    while let Some(signal) = rx.recv().await {
+        let recipient_hex = hex::encode(signal.recipient.as_ref() as &[u8]);
+        dispatch_call_signal_to_kotlin(&recipient_hex, &signal.payload);
+    }
+}
+
+#[cfg(feature = "calling")]
+async fn drain_call_events(mut rx: tokio::sync::mpsc::UnboundedReceiver<CallEvent>) {
+    while let Some(event) = rx.recv().await {
+        dispatch_call_event_to_kotlin(event);
+    }
+}
+
+/// Start the calling subsystem for the active identity. Idempotent-ish:
+/// a second call replaces the manager. Returns false if no identity is
+/// active or the manager can't be built.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartCalling(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let identity = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required before calling"))?;
+            let local_identity = identity.identity_id();
+
+            let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundSignal>();
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CallEvent>();
+            let signaling = Arc::new(ChannelSignalingTransport::new(signal_tx));
+
+            let manager = CALL_RUNTIME.block_on(async {
+                CallManager::new(
+                    CallManagerConfig::default(),
+                    event_tx,
+                    local_identity,
+                    signaling,
+                )
+                .await
+            })?;
+
+            CALL_RUNTIME.spawn(drain_outbound_call_signals(signal_rx));
+            CALL_RUNTIME.spawn(drain_call_events(event_rx));
+            *CALL_MANAGER.lock().unwrap() = Some(Arc::new(manager));
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::error!(error = %e, "nativeStartCalling failed");
+                0
+            }
+        }
+    })
+}
+
+/// Initiate a 1:1 call to `participant`. `media_root` is the 32-byte
+/// shared secret (from the 1:1 session). Returns JSON `{call_id_hex}`
+/// or null on failure.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitiateCall(
+    mut env: JNIEnv,
+    _class: JClass,
+    participant: JString,
+    call_type: jni::sys::jint,
+    media_root: JByteArray,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let participant_hex: String = match env.get_string(&participant) {
+            Ok(s) => s.into(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let root_vec = match env.convert_byte_array(&media_root) {
+            Ok(v) => v,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            let root = media_root_from_bytes(&root_vec)?;
+            let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let call_type = call_type_from_i32(call_type)?;
+            let initiator = active_identity()?
+                .ok_or_else(|| anyhow::anyhow!("onboarding required"))?
+                .identity_id();
+            let cm = call_manager()?;
+            let call_id = CALL_RUNTIME.block_on(cm.initiate_call(
+                initiator,
+                vec![participant_id],
+                call_type,
+                None,
+                CallSettings::default(),
+                root,
+            ))?;
+            Ok(json!({ "call_id_hex": hex::encode(call_id.as_bytes()) }))
+        })();
+        ok_or_null(env, result)
+    })
+}
+
+/// Accept an incoming call. `media_root` is the 32-byte shared secret.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAcceptCall(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+    media_root: JByteArray,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let root = media_root_from_bytes(&env.convert_byte_array(&media_root)?)?;
+            let cid = parse_call_id(&call_id_hex)?;
+            let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.accept_call(cid, participant_id, root))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeAcceptCall failed");
+                0
+            }
+        }
+    })
+}
+
+/// End (or leave) a call.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEndCall(
+    mut env: JNIEnv,
+    _class: JClass,
+    call_id: JString,
+    participant: JString,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let call_id_hex: String = env.get_string(&call_id)?.into();
+            let participant_hex: String = env.get_string(&participant)?.into();
+            let cid = parse_call_id(&call_id_hex)?;
+            let participant_id = IdentityId::from(parse_hex32(Some(&participant_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.end_call(cid, participant_id))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeEndCall failed");
+                0
+            }
+        }
+    })
+}
+
+/// Feed an inbound signaling frame (received over the 1:1 session and
+/// decrypted by Kotlin) into the call state machine.
+#[no_mangle]
+#[cfg(feature = "calling")]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandleCallSignal(
+    mut env: JNIEnv,
+    _class: JClass,
+    sender: JString,
+    payload: JByteArray,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let result: anyhow::Result<()> = (|| {
+            let sender_hex: String = env.get_string(&sender)?.into();
+            let payload = env.convert_byte_array(&payload)?;
+            let sender_id = IdentityId::from(parse_hex32(Some(&sender_hex))?);
+            let cm = call_manager()?;
+            CALL_RUNTIME.block_on(cm.handle_inbound_signaling(sender_id, &payload))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeHandleCallSignal failed");
+                0
+            }
+        }
     })
 }

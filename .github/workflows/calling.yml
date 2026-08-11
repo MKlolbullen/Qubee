@@ -50,3 +50,12 @@ jobs:
 
       - name: cargo test --features calling
         run: cargo test --features calling
+
+      # Type-check the calling JNI surface on the host (no NDK): the
+      # calling native fns in src/jni_api.rs only compile with both
+      # features on, so a drift here would otherwise escape CI.
+      - name: typecheck JNI calling surface
+        run: cargo clippy --features "_typecheck_jni,calling" -- -D warnings
+
+      - name: JNI contract parity
+        run: bash scripts/check_jni_contracts.sh

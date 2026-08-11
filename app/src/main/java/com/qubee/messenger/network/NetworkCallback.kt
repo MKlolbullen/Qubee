@@ -83,4 +83,41 @@ interface NetworkCallback {
     ) {
         // default no-op
     }
+
+    /**
+     * Outbound call signaling. The Rust call layer asks the app to
+     * deliver `payload` to `recipientIdHex` over that peer's encrypted
+     * 1:1 session — the same authenticated, forward-secret path as chat
+     * messages. The peer feeds the bytes back via
+     * `nativeHandleCallSignal`. Default no-op.
+     *
+     * @param recipientIdHex hex-encoded recipient IdentityId.
+     * @param payload the opaque signaling frame to encrypt and send.
+     */
+    fun onCallSignal(recipientIdHex: String, payload: ByteArray) {
+        // default no-op
+    }
+
+    /**
+     * An inbound call invitation arrived and is ringing.
+     *
+     * @param callIdHex   hex-encoded CallId (16 bytes → 32 chars).
+     * @param callerIdHex hex-encoded caller IdentityId.
+     * @param callType    0=voice, 1=video, 2=group-voice,
+     *                    3=group-video, 4=screen-share, 5=conference.
+     */
+    fun onIncomingCall(callIdHex: String, callerIdHex: String, callType: Int) {
+        // default no-op
+    }
+
+    /**
+     * A call's lifecycle state changed (e.g. ringing → active, ended,
+     * a participant left, or an error). `state` is a short token.
+     *
+     * @param callIdHex hex-encoded CallId.
+     * @param state     human-readable lifecycle token.
+     */
+    fun onCallStateChanged(callIdHex: String, state: String) {
+        // default no-op
+    }
 }

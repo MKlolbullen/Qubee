@@ -81,7 +81,7 @@ pub enum CallType {
 }
 
 /// Current state of a call
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CallState {
     /// Call is being initiated
     Initiating,
@@ -398,6 +398,175 @@ impl CallManager {
         self.start_ring_timeout(call_id).await;
 
         Ok(call_id)
+    }
+
+    /// Entry point for a signaling payload received from `from`.
+    ///
+    /// The carrier (the encrypted 1:1 session — issue #67) hands the
+    /// decrypted bytes here; this decodes them and dispatches to the
+    /// matching handler. Undecodable input fails closed.
+    pub async fn handle_inbound_signaling(&self, from: IdentityId, payload: &[u8]) -> Result<()> {
+        let message = SignalingMessage::from_bytes(payload)
+            .map_err(|e| anyhow::anyhow!("undecodable signaling payload: {e}"))?;
+        self.dispatch_signaling(from, message).await
+    }
+
+    /// Route a decoded [`SignalingMessage`] to its handler. The
+    /// `sender` fields carried in the message identify the remote
+    /// endpoint the state applies to.
+    async fn dispatch_signaling(&self, _from: IdentityId, message: SignalingMessage) -> Result<()> {
+        match message {
+            SignalingMessage::CallInvitation {
+                call_id,
+                caller,
+                call_type,
+                settings,
+            } => {
+                self.on_call_invitation(call_id, caller, call_type, settings)
+                    .await
+            }
+            SignalingMessage::HangUp { call_id, sender } => {
+                self.on_remote_hangup(call_id, sender).await
+            }
+            SignalingMessage::IceCandidate {
+                call_id,
+                candidate,
+                sender,
+            } => {
+                self.webrtc_manager
+                    .add_ice_candidate(call_id, sender, candidate)
+                    .await
+            }
+            // Ingest the remote SDP into the peer connection the accept
+            // path set up. Generating and sending back an SDP answer
+            // (the responder half, which also needs the local identity
+            // threaded through) is phase 2c — issue #67.
+            SignalingMessage::SdpOffer {
+                call_id,
+                sdp,
+                sender,
+            }
+            | SignalingMessage::SdpAnswer {
+                call_id,
+                sdp,
+                sender,
+            } => {
+                self.webrtc_manager
+                    .set_remote_description(call_id, sender, &sdp)
+                    .await
+            }
+        }
+    }
+
+    /// Handle an inbound call invitation: register the call in the
+    /// ringing state with the caller as its remote participant and
+    /// surface an [`CallEvent::IncomingCall`] so the app can ring. A
+    /// duplicate invitation for a known call is ignored.
+    async fn on_call_invitation(
+        &self,
+        call_id: CallId,
+        caller: IdentityId,
+        call_type: CallType,
+        settings: CallSettings,
+    ) -> Result<()> {
+        {
+            let calls = self.calls.read().await;
+            if calls.contains_key(&call_id) {
+                return Ok(());
+            }
+            let active_calls = calls
+                .values()
+                .filter(|call| matches!(call.state, CallState::Active | CallState::Ringing))
+                .count();
+            if active_calls >= self.config.max_concurrent_calls {
+                return Err(anyhow::anyhow!("Maximum concurrent calls reached"));
+            }
+        }
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let caller_participant = CallParticipant {
+            identity_id: caller,
+            identity_key: self.get_identity_key(caller).await?,
+            display_name: self.get_display_name(caller).await?,
+            participant_state: ParticipantState::Invited,
+            media_state: MediaState::default(),
+            connection_quality: ConnectionQuality::default(),
+            joined_at: None,
+            left_at: None,
+            is_muted: settings.auto_mute_on_join,
+            is_video_enabled: matches!(call_type, CallType::VideoCall | CallType::GroupVideoCall),
+            is_screen_sharing: false,
+        };
+
+        let mut participants = HashMap::new();
+        participants.insert(caller, caller_participant);
+
+        let call = Call {
+            id: call_id,
+            call_type: call_type.clone(),
+            state: CallState::Ringing,
+            participants,
+            initiator: caller,
+            group_id: None,
+            created_at: now,
+            started_at: None,
+            ended_at: None,
+            settings,
+            quality_stats: CallQualityStats::default(),
+        };
+
+        {
+            let mut calls = self.calls.write().await;
+            // Re-check under the write lock: another inbound frame may
+            // have registered this call between the read and the write.
+            if calls.contains_key(&call_id) {
+                return Ok(());
+            }
+            calls.insert(call_id, call);
+        }
+
+        self.event_sender
+            .send(CallEvent::IncomingCall {
+                call_id,
+                caller,
+                call_type,
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+
+        self.start_ring_timeout(call_id).await;
+        Ok(())
+    }
+
+    /// Handle a remote hang-up: mark the call ended, tear down the
+    /// peer connection to the sender, and emit a leave event. An
+    /// unknown call is ignored.
+    async fn on_remote_hangup(&self, call_id: CallId, sender: IdentityId) -> Result<()> {
+        {
+            let mut calls = self.calls.write().await;
+            let call = match calls.get_mut(&call_id) {
+                Some(call) => call,
+                None => return Ok(()),
+            };
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            call.state = CallState::Ended;
+            call.ended_at = Some(now);
+            if let Some(participant_info) = call.participants.get_mut(&sender) {
+                participant_info.participant_state = ParticipantState::Left;
+                participant_info.left_at = Some(now);
+            }
+        }
+
+        // Best-effort teardown; a missing connection is not an error.
+        let _ = self.close_peer_connection(call_id, sender).await;
+
+        self.event_sender
+            .send(CallEvent::ParticipantLeft {
+                call_id,
+                participant: sender,
+                reason: "Remote hang up".to_string(),
+            })
+            .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
+        Ok(())
     }
 
     /// Accept an incoming call
@@ -962,6 +1131,7 @@ impl std::fmt::Debug for CallId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calling::peer_connection::ICECandidate;
     use crate::calling::signaling::SignalingServer;
     use tokio::sync::mpsc;
 
@@ -1002,5 +1172,142 @@ mod tests {
         assert_eq!(call.call_type, CallType::VoiceCall);
         assert_eq!(call.initiator, initiator);
         assert_eq!(call.participants.len(), 1);
+    }
+
+    async fn manager_with_events() -> (CallManager, mpsc::UnboundedReceiver<CallEvent>) {
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        let server = Arc::new(SignalingServer::new().await.unwrap());
+        let manager = CallManager::new(
+            CallManagerConfig::default(),
+            event_sender,
+            [7u8; 32],
+            server,
+        )
+        .await
+        .expect("build manager");
+        (manager, event_receiver)
+    }
+
+    #[tokio::test]
+    async fn inbound_invitation_rings_and_registers_call() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let call_id = CallId::from([9u8; 16]);
+
+        let payload = SignalingMessage::CallInvitation {
+            call_id,
+            caller,
+            call_type: CallType::VideoCall,
+            settings: CallSettings::default(),
+        }
+        .to_bytes()
+        .unwrap();
+
+        manager
+            .handle_inbound_signaling(caller, &payload)
+            .await
+            .expect("invitation handled");
+
+        let call = manager.get_call(call_id).await.expect("call registered");
+        assert_eq!(call.state, CallState::Ringing);
+        assert_eq!(call.initiator, caller);
+        assert!(call.participants.contains_key(&caller));
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CallEvent::IncomingCall { caller: c, .. }) if c == caller
+        ));
+
+        // A duplicate invitation for the same call is a no-op, not an error.
+        manager
+            .handle_inbound_signaling(caller, &payload)
+            .await
+            .expect("duplicate invitation ignored");
+    }
+
+    #[tokio::test]
+    async fn inbound_hangup_ends_the_call() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let call_id = CallId::from([9u8; 16]);
+
+        let invite = SignalingMessage::CallInvitation {
+            call_id,
+            caller,
+            call_type: CallType::VoiceCall,
+            settings: CallSettings::default(),
+        }
+        .to_bytes()
+        .unwrap();
+        manager
+            .handle_inbound_signaling(caller, &invite)
+            .await
+            .unwrap();
+        let _incoming = events.try_recv();
+
+        let hangup = SignalingMessage::HangUp {
+            call_id,
+            sender: caller,
+        }
+        .to_bytes()
+        .unwrap();
+        manager
+            .handle_inbound_signaling(caller, &hangup)
+            .await
+            .expect("hangup handled");
+
+        let call = manager.get_call(call_id).await.expect("call still tracked");
+        assert_eq!(call.state, CallState::Ended);
+        assert!(call.ended_at.is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CallEvent::ParticipantLeft { participant, .. }) if participant == caller
+        ));
+    }
+
+    #[tokio::test]
+    async fn inbound_hangup_for_unknown_call_is_ignored() {
+        let (manager, _events) = manager_with_events().await;
+        let payload = SignalingMessage::HangUp {
+            call_id: CallId::from([3u8; 16]),
+            sender: IdentityId::from([1u8; 32]),
+        }
+        .to_bytes()
+        .unwrap();
+        manager
+            .handle_inbound_signaling(IdentityId::from([1u8; 32]), &payload)
+            .await
+            .expect("unknown-call hangup is a no-op");
+    }
+
+    #[tokio::test]
+    async fn inbound_ice_candidate_before_connection_is_buffered() {
+        let (manager, _events) = manager_with_events().await;
+        let payload = SignalingMessage::IceCandidate {
+            call_id: CallId::from([9u8; 16]),
+            candidate: ICECandidate {
+                sdp_mid: "audio".to_string(),
+                sdp_mline_index: 0,
+                candidate: "candidate:1 1 UDP 2130706431 192.0.2.1 3478 typ host".to_string(),
+            },
+            sender: IdentityId::from([1u8; 32]),
+        }
+        .to_bytes()
+        .unwrap();
+        // No peer connection exists yet; the candidate is cached rather
+        // than rejected.
+        manager
+            .handle_inbound_signaling(IdentityId::from([1u8; 32]), &payload)
+            .await
+            .expect("early ICE candidate buffered");
+    }
+
+    #[tokio::test]
+    async fn undecodable_signaling_payload_fails_closed() {
+        let (manager, _events) = manager_with_events().await;
+        assert!(manager
+            .handle_inbound_signaling(IdentityId::from([1u8; 32]), b"not a signaling frame")
+            .await
+            .is_err());
     }
 }

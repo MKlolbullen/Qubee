@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::calling::media_encryption::MediaEncryption;
 use crate::calling::signaling::{SignalingMessage, SignalingTransport};
-use crate::calling::webrtc_manager::{WebRTCConfig, WebRTCManager};
+use crate::calling::webrtc_manager::{OutboundIce, WebRTCConfig, WebRTCManager};
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
@@ -301,9 +301,19 @@ impl CallManager {
             enable_srtp: true,
         };
 
-        let webrtc_manager = WebRTCManager::new(webrtc_config).await?;
+        // Locally-gathered ICE candidates flow out of the peer
+        // connections on this channel; a background task trickles each
+        // to the remote over signaling.
+        let (ice_out, ice_in) = mpsc::unbounded_channel();
+        let webrtc_manager = WebRTCManager::new(webrtc_config, ice_out).await?;
         let media_encryption = MediaEncryption::from_shared_root(media_root);
         let contact_manager = Arc::new(ContactManager::new());
+
+        tokio::spawn(Self::forward_local_ice(
+            ice_in,
+            signaling.clone(),
+            local_identity,
+        ));
 
         Ok(CallManager {
             calls: Arc::new(RwLock::new(HashMap::new())),
@@ -315,6 +325,28 @@ impl CallManager {
             config,
             contact_manager,
         })
+    }
+
+    /// Drain locally-gathered ICE candidates and trickle each to its
+    /// remote participant, stamped with our own identity. Runs until the
+    /// manager (and thus every peer connection) is dropped.
+    async fn forward_local_ice(
+        mut ice_in: mpsc::UnboundedReceiver<OutboundIce>,
+        signaling: Arc<dyn SignalingTransport>,
+        local_identity: IdentityId,
+    ) {
+        while let Some(out) = ice_in.recv().await {
+            let _ = signaling
+                .send(
+                    out.participant,
+                    SignalingMessage::IceCandidate {
+                        call_id: out.call_id,
+                        candidate: out.candidate,
+                        sender: local_identity,
+                    },
+                )
+                .await;
+        }
     }
 
     /// Initiate a new call
@@ -1414,6 +1446,86 @@ mod tests {
             .handle_inbound_signaling(IdentityId::from([1u8; 32]), b"not a signaling frame")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn forward_local_ice_trickles_candidate_to_remote() {
+        let remote = IdentityId::from([2u8; 32]);
+        let local = IdentityId::from([1u8; 32]);
+        let server = Arc::new(SignalingServer::new().await.unwrap());
+        let mut remote_inbox = server.register_client(remote).await;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(OutboundIce {
+            call_id: CallId::from([9u8; 16]),
+            participant: remote,
+            candidate: ICECandidate {
+                sdp_mid: "0".to_string(),
+                sdp_mline_index: 0,
+                candidate: "candidate:1 1 UDP 2130706431 192.0.2.1 3478 typ host".to_string(),
+            },
+        })
+        .unwrap();
+        drop(tx); // let the forwarder drain the one item and return
+
+        CallManager::forward_local_ice(rx, server, local).await;
+
+        match remote_inbox.recv().await {
+            Some(SignalingMessage::IceCandidate { sender, .. }) => assert_eq!(sender, local),
+            other => panic!("expected an ICE candidate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_call_gathers_and_trickles_local_ice() {
+        use crate::calling::signaling::{ChannelSignalingTransport, OutboundSignal};
+
+        let caller = IdentityId::from([1u8; 32]);
+        let callee = IdentityId::from([2u8; 32]);
+        let call_id = CallId::from([9u8; 16]);
+
+        let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<OutboundSignal>();
+        let (callee_ev, _callee_ev_rx) = mpsc::unbounded_channel();
+        let callee_mgr = CallManager::new(
+            CallManagerConfig::default(),
+            callee_ev,
+            callee,
+            [7u8; 32],
+            Arc::new(ChannelSignalingTransport::new(callee_tx)),
+        )
+        .await
+        .unwrap();
+
+        let invite = SignalingMessage::CallInvitation {
+            call_id,
+            caller,
+            call_type: CallType::VoiceCall,
+            settings: CallSettings::default(),
+        }
+        .to_bytes()
+        .unwrap();
+        callee_mgr
+            .handle_inbound_signaling(caller, &invite)
+            .await
+            .unwrap();
+        // Accepting sets a local description, which starts ICE gathering.
+        callee_mgr.accept_call(call_id, caller).await.unwrap();
+
+        // The SDP offer goes out first; at least one host ICE candidate
+        // should follow within a short gathering window.
+        let mut saw_ice = false;
+        while let Ok(Some(out)) =
+            tokio::time::timeout(Duration::from_secs(5), callee_rx.recv()).await
+        {
+            if let SignalingMessage::IceCandidate { sender, .. } =
+                SignalingMessage::from_bytes(&out.payload).unwrap()
+            {
+                assert_eq!(sender, callee);
+                saw_ice = true;
+                break;
+            }
+        }
+        assert!(saw_ice, "expected a local ICE candidate to be trickled out");
     }
 
     #[tokio::test]

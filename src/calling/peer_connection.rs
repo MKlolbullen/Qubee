@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::calling::call_manager::CallId;
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::webrtc_manager::MediaStats;
+use crate::calling::webrtc_manager::OutboundIce;
 use crate::calling::webrtc_manager::WebRTCConfig;
 use crate::identity::identity_key::IdentityId;
 
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -31,7 +32,7 @@ use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// Represents the state of a peer connection. Mirrors the variants
 /// exposed by webrtc-rs's `RTCPeerConnectionState` so `state()` can
@@ -129,6 +130,7 @@ impl PeerConnection {
         media_key: MediaKey,
         call_id: CallId,
         participant: IdentityId,
+        ice_out: mpsc::UnboundedSender<OutboundIce>,
     ) -> Result<Self> {
         // Convert CallManager's WebRTCConfig into the lower-level RTCConfiguration
         // used by webrtc-rs. Each STUN/TURN server becomes an RTCIceServer.
@@ -171,6 +173,29 @@ impl PeerConnection {
             .new_peer_connection(rtc_config)
             .await
             .context("Failed to create WebRTC peer connection")?;
+
+        // Trickle locally-gathered ICE candidates out to the call layer.
+        // The handler fires once per candidate as gathering proceeds and
+        // a final time with `None`, which we ignore.
+        pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+            let ice_out = ice_out.clone();
+            Box::pin(async move {
+                if let Some(candidate) = candidate {
+                    if let Ok(init) = candidate.to_json() {
+                        let _ = ice_out.send(OutboundIce {
+                            call_id,
+                            participant,
+                            candidate: ICECandidate {
+                                sdp_mid: init.sdp_mid.unwrap_or_default(),
+                                sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
+                                candidate: init.candidate,
+                            },
+                        });
+                    }
+                }
+            })
+        }));
+
         Ok(PeerConnection {
             call_id,
             participant,

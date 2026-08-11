@@ -63,13 +63,19 @@ class CallViewModel @Inject constructor(
         viewModelScope.launch { callRepository.endCall(callIdHex, peerIdHex) }
     }
 
-    /** Toggle mute. Local UI only until the native toggle is exposed (#67). */
+    /** Toggle mute on the active call; reflects the native result. */
     fun toggleMute() {
-        _muted.value = !_muted.value
+        val active = state.value as? CallUiState.Active ?: return
+        viewModelScope.launch {
+            callRepository.toggleMute(active.callIdHex, active.peerIdHex)?.let { _muted.value = it }
+        }
     }
 
-    /** Toggle video. Local UI only until the native toggle is exposed (#67). */
+    /** Toggle video on the active call; reflects the native result. */
     fun toggleVideo() {
-        _videoOn.value = !_videoOn.value
+        val active = state.value as? CallUiState.Active ?: return
+        viewModelScope.launch {
+            callRepository.toggleVideo(active.callIdHex, active.peerIdHex)?.let { _videoOn.value = it }
+        }
     }
 }

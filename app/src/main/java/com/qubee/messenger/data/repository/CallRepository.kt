@@ -83,6 +83,14 @@ class CallRepository @Inject constructor(
     suspend fun rejectCall(callIdHex: String, peerIdHex: String): Boolean =
         endCall(callIdHex, peerIdHex)
 
+    /** Toggle local mute; returns the new muted state, or null on error. */
+    suspend fun toggleMute(callIdHex: String, peerIdHex: String): Boolean? =
+        qubeeManager.toggleMute(callIdHex, peerIdHex)
+
+    /** Toggle local video; returns the new enabled state, or null on error. */
+    suspend fun toggleVideo(callIdHex: String, peerIdHex: String): Boolean? =
+        qubeeManager.toggleVideo(callIdHex, peerIdHex)
+
     /** From the NetworkCallback: a remote invite is ringing. */
     fun onIncoming(callIdHex: String, callerIdHex: String, callType: Int) {
         // Ignore a second invite while already busy with a call.

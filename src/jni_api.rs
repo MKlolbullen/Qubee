@@ -34,9 +34,9 @@ use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload_with_route, encrypt_direct_ack_with_route,
-    encrypt_direct_distribution_with_route, encrypt_direct_text_with_route,
-    inspect_direct_recipient, inspect_direct_sender, install_peer_bundle, reset_direct_session,
-    DirectPayload,
+    encrypt_direct_call_signal_with_route, encrypt_direct_distribution_with_route,
+    encrypt_direct_text_with_route, inspect_direct_recipient, inspect_direct_sender,
+    install_peer_bundle, reset_direct_session, DirectPayload,
 };
 use crate::ratchet::direct_message::{extract_direct_message_id, is_direct_message_frame};
 use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
@@ -2952,6 +2952,53 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
+/// Encrypt an opaque call-signaling frame to `peer_id_hex` over the 1:1
+/// ratchet session (tagged CALL_SIGNAL). Returns the QUBEE_DMS wire
+/// bytes, or null on failure. The peer decodes it as
+/// `{"kind":"callSignal","callSignalHex":...}` via
+/// `nativeDecryptDirectMessage`.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryptDirectCallSignal(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id_hex: JString,
+    frame: JByteArray,
+) -> jbyteArray {
+    jni_catch_jbytearray(|| {
+        let result: anyhow::Result<jbyteArray> = (|| {
+            let peer_hex: String = env
+                .get_string(&peer_id_hex)
+                .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
+                .into();
+            let peer_id = IdentityId::from(parse_hex32(Some(&peer_hex))?);
+            let frame_bytes = env
+                .convert_byte_array(&frame)
+                .map_err(|e| anyhow::anyhow!("invalid frame: {e}"))?;
+            let identity =
+                active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+            let local_id = identity.identity_id();
+            let mut ks_guard = KEYSTORE.lock().unwrap();
+            let ks = ks_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            let local_peer_id = LOCAL_PEER_ID.lock().unwrap().clone();
+            let wire = encrypt_direct_call_signal_with_route(
+                ks,
+                local_id,
+                peer_id,
+                &frame_bytes,
+                local_peer_id.as_deref(),
+                now_secs(),
+            )?;
+            let arr = env
+                .byte_array_from_slice(&wire)
+                .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+            Ok(arr.into_raw())
+        })();
+        result.unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Extract the deterministic 16-byte id of an exact QUBEE_DMS frame as
 /// 32-char lowercase hex. Returns null for malformed/non-direct bytes.
 #[no_mangle]
@@ -3134,6 +3181,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
                     "senderId": sender_hex,
                     "kind": "ack",
                     "messageId": hex::encode(message_id),
+                })),
+                DirectPayload::CallSignal(frame) => Ok(json!({
+                    "senderId": sender_hex,
+                    "kind": "callSignal",
+                    "callSignalHex": hex::encode(frame),
                 })),
                 DirectPayload::SenderKeyDistribution(dist) => {
                     {

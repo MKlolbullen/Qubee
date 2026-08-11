@@ -72,8 +72,8 @@ fn direct_message_round_trips_through_wire() {
 #[test]
 fn direct_payload_tags_are_pinned() {
     use qubee_crypto::ratchet::direct::{
-        DIRECT_PAYLOAD_ENVELOPE_VERSION, PAYLOAD_TAG_ACK, PAYLOAD_TAG_SENDER_KEY_DIST,
-        PAYLOAD_TAG_TEXT,
+        DIRECT_PAYLOAD_ENVELOPE_VERSION, PAYLOAD_TAG_ACK, PAYLOAD_TAG_CALL_SIGNAL,
+        PAYLOAD_TAG_SENDER_KEY_DIST, PAYLOAD_TAG_TEXT,
     };
     // These sit inside the 1:1 ratchet plaintext but are still a
     // cross-version compatibility surface: an old app receiving an
@@ -82,6 +82,7 @@ fn direct_payload_tags_are_pinned() {
     assert_eq!(PAYLOAD_TAG_TEXT, 0x01);
     assert_eq!(PAYLOAD_TAG_SENDER_KEY_DIST, 0x02);
     assert_eq!(PAYLOAD_TAG_ACK, 0x03);
+    assert_eq!(PAYLOAD_TAG_CALL_SIGNAL, 0x04);
 }
 
 #[test]

@@ -41,10 +41,18 @@ jobs:
       - name: Install required cargo
         run: cargo install clippy-sarif sarif-fmt
 
+      # Scan the shipped surface, matching ci.yml's blocking lint gate.
+      # --all-features would also compile the `legacy` and `calling`
+      # modules, which are deliberately gated as non-shipping (see
+      # Cargo.toml [features] and docs/build-status.md); their known
+      # compile drift produced dozens of permanent alerts that buried
+      # any real finding in shipped code and made this check
+      # unwinnable. Gated-feature health has its own gates
+      # (.github/workflows/calling.yml for `calling`).
       - name: Run rust-clippy
         run:
           cargo clippy
-          --all-features
+          --all-targets
           --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
         continue-on-error: true
 

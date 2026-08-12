@@ -141,7 +141,7 @@ impl Drop for DoubleRatchet {
         if let Some(ck) = self.ckr.as_mut() {
             ck.zeroize();
         }
-        for (_, mk) in self.skipped.iter_mut() {
+        for mk in self.skipped.values_mut() {
             mk.zeroize();
         }
     }

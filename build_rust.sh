@@ -37,10 +37,20 @@ export RUSTFLAGS="${RUSTFLAGS:-} \
 # identical compile produces byte-identical bytes.
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 
+# Optional Cargo features for the .so, e.g. QUBEE_CARGO_FEATURES=calling.
+# Empty (the default) builds default features only — the reproducible,
+# shipped configuration. Enabling extra features here is for on-demand
+# builds that need the corresponding JNI symbols present in the library.
+CARGO_FEATURE_ARGS=()
+if [ -n "${QUBEE_CARGO_FEATURES:-}" ]; then
+    CARGO_FEATURE_ARGS=(--features "$QUBEE_CARGO_FEATURES")
+    echo "Extra Cargo features: $QUBEE_CARGO_FEATURES"
+fi
+
 echo "Building Rust shared library for Android (release, --locked) ..."
 for abi in arm64-v8a armeabi-v7a x86_64 x86; do
     echo "  → $abi"
-    cargo ndk -t "$abi" -o "$ANDROID_JNI_DIR" build --release --locked
+    cargo ndk -t "$abi" -o "$ANDROID_JNI_DIR" build --release --locked "${CARGO_FEATURE_ARGS[@]}"
 done
 
 echo

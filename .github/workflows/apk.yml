@@ -43,7 +43,7 @@ jobs:
           # monotonic per branch) so a device-matrix install upgrades
           # cleanly to the eventual tagged release. versionName marks
           # the build as a dev build off a specific commit.
-          name="$(git describe --tags --always)-dev"
+          name="$(git describe --tags --always)-dev-calling"
           code=$(git rev-list --count HEAD)
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "code=$code" >> "$GITHUB_OUTPUT"
@@ -94,6 +94,11 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # Compile the calling feature into the .so so the WebRTC/JNI
+          # call symbols are present and the audio pipeline is exercisable
+          # on-device. Default-feature builds ship elsewhere (release.yml,
+          # android-smoke.yml); this on-demand build opts in.
+          QUBEE_CARGO_FEATURES: calling
         run: |
           chmod +x ./build_rust.sh
           ./build_rust.sh

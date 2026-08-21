@@ -16,6 +16,8 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
+use bincode::Options;
+
 use crate::identity::identity_key::{HybridSignature, IdentityId, IdentityKey, IdentityKeyPair};
 
 pub const QUBEE_IDENTITY_HOST: &str = "identity";
@@ -24,6 +26,12 @@ pub const ONBOARDING_DOMAIN_TAG: &[u8] = b"qubee_onboarding_v2";
 /// Maximum age of an onboarding bundle, in seconds. Older bundles are
 /// rejected at decode time so a leaked QR can't follow you forever.
 pub const ONBOARDING_BUNDLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Upper bounds for an externally supplied identity deep link. A valid hybrid
+/// identity bundle is only a few KiB; allowing 64 KiB leaves ample algorithm
+/// migration headroom without letting an intent allocate attacker-controlled
+/// amounts of memory during base64 or bincode decoding.
+const MAX_IDENTITY_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_IDENTITY_TOKEN_BYTES: usize = (MAX_IDENTITY_PAYLOAD_BYTES * 4 / 3) + 4;
 
 /// Public-facing onboarding bundle. Signed by the identity it advertises.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,11 +80,18 @@ impl OnboardingBundle {
             .strip_prefix(&prefix)
             .ok_or_else(|| anyhow!("not a qubee identity link"))?;
         let token = token.split(['?', '#']).next().unwrap_or(token);
+        if token.len() > MAX_IDENTITY_TOKEN_BYTES {
+            return Err(anyhow!("identity token exceeds size limit"));
+        }
         let bytes = URL_SAFE_NO_PAD
             .decode(token.as_bytes())
             .context("identity token is not valid base64url")?;
-        let bundle: OnboardingBundle =
-            bincode::deserialize(&bytes).context("identity payload could not be decoded")?;
+        let bundle: OnboardingBundle = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_IDENTITY_PAYLOAD_BYTES as u64)
+            .reject_trailing_bytes()
+            .deserialize(&bytes)
+            .context("identity payload could not be decoded")?;
         bundle.verify()?;
         Ok(bundle)
     }
@@ -142,6 +157,15 @@ mod tests {
         let mut bundle = OnboardingBundle::create(&kp1, "Alice", "uid-1").unwrap();
         bundle.public_key = kp2.public_key();
         let link = bundle.to_share_link().unwrap();
+        assert!(OnboardingBundle::from_share_link(&link).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_token_before_decoding() {
+        let link = format!(
+            "qubee://identity/{}",
+            "A".repeat(MAX_IDENTITY_TOKEN_BYTES + 1)
+        );
         assert!(OnboardingBundle::from_share_link(&link).is_err());
     }
 }

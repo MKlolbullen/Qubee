@@ -3,6 +3,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
+use bincode::Options;
+
 use crate::groups::group_manager::{GroupId, GroupInvitation, QUBEE_MAX_GROUP_MEMBERS};
 use crate::identity::identity_key::IdentityId;
 
@@ -13,6 +15,12 @@ pub const QUBEE_URI_SCHEME: &str = "qubee";
 
 /// Host used for invite links: `qubee://invite/<token>`.
 pub const QUBEE_INVITE_HOST: &str = "invite";
+
+/// Deep links are unauthenticated input delivered by Android intents. Valid
+/// invites are tiny, so cap both their encoded and decoded forms to prevent
+/// memory-exhaustion attacks before the fingerprint can be checked.
+const MAX_INVITE_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_INVITE_TOKEN_BYTES: usize = (MAX_INVITE_PAYLOAD_BYTES * 4 / 3) + 4;
 
 /// Compact, signed-ish payload that can be embedded in an invite link or
 /// rendered as a QR code. The `fingerprint` is a short BLAKE3 tag over the
@@ -68,11 +76,18 @@ impl InvitePayload {
             .ok_or_else(|| anyhow!("not a qubee invite link"))?;
         // Tolerate optional trailing `?foo=bar` (deep-link routing tags).
         let token = token.split(['?', '#']).next().unwrap_or(token);
+        if token.len() > MAX_INVITE_TOKEN_BYTES {
+            return Err(anyhow!("invite token exceeds size limit"));
+        }
         let bytes = URL_SAFE_NO_PAD
             .decode(token.as_bytes())
             .context("invite token is not valid base64url")?;
-        let payload: InvitePayload =
-            bincode::deserialize(&bytes).context("invite payload could not be decoded")?;
+        let payload: InvitePayload = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_INVITE_PAYLOAD_BYTES as u64)
+            .reject_trailing_bytes()
+            .deserialize(&bytes)
+            .context("invite payload could not be decoded")?;
         if payload.fingerprint != payload.compute_fingerprint() {
             return Err(anyhow!("invite link fingerprint mismatch (corrupt link?)"));
         }
@@ -147,5 +162,11 @@ mod tests {
     #[test]
     fn rejects_non_qubee_scheme() {
         assert!(InvitePayload::from_invite_link("https://example.com/foo").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_token_before_decoding() {
+        let link = format!("qubee://invite/{}", "A".repeat(MAX_INVITE_TOKEN_BYTES + 1));
+        assert!(InvitePayload::from_invite_link(&link).is_err());
     }
 }

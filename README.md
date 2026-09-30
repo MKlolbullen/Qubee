@@ -232,7 +232,7 @@ The durable outbound state machine is designed around that invariant and around 
 Qubee reduces several avoidable metadata leaks:
 
 - anonymous gossipsub authorship;
-- mDNS disabled by default;
+- mDNS is an explicit, user-controlled setting (the Rust library defaults it off; the Android app enables it by default and exposes the switch in Settings → Network, because with no bootstrap infrastructure it is the only zero-config way two phones find each other);
 - blinded rotating group topics;
 - padding buckets on forward-secret message paths;
 - keyed-selector group envelopes that avoid sending a plaintext group id.

@@ -150,6 +150,31 @@ class PreferenceRepository @Inject constructor(
     }
 
     /**
+     * Local-network peer discovery (libp2p mDNS). On by default: with no
+     * bootstrap infrastructure it is the only way two devices on one
+     * Wi-Fi find each other. Off hides this device's presence and LAN
+     * IP from other hosts on the network. Takes effect the next time
+     * the P2P node starts.
+     */
+    fun localDiscoveryEnabled(): Boolean = prefs.getBoolean(KEY_LOCAL_DISCOVERY, true)
+
+    fun setLocalDiscoveryEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_LOCAL_DISCOVERY, enabled).apply()
+    }
+
+    /**
+     * Newline-separated libp2p multiaddrs (`/ip4/…/tcp/…/p2p/…`) dialed
+     * when the node starts and seeded into its Kademlia routing table.
+     * Empty by default; the manual path for networks that block
+     * multicast.
+     */
+    fun bootstrapPeers(): String = prefs.getString(KEY_BOOTSTRAP_PEERS, null) ?: ""
+
+    fun setBootstrapPeers(value: String) {
+        prefs.edit().putString(KEY_BOOTSTRAP_PEERS, value).apply()
+    }
+
+    /**
      * Persist the ratchet sender-key "pending distribution" map
      * (groupIdHex → set of member identity hexes still owed the current
      * chain) as JSON, so a process restart doesn't drop members who
@@ -222,6 +247,8 @@ class PreferenceRepository @Inject constructor(
         private const val KEY_ONBOARDED = "onboarded"
         private const val KEY_RATCHET_SEND = "ratchet_send_enabled"
         private const val KEY_APP_LOCK = "app_lock_enabled"
+        private const val KEY_LOCAL_DISCOVERY = "local_discovery_enabled"
+        private const val KEY_BOOTSTRAP_PEERS = "bootstrap_peers"
         private const val KEY_PENDING_DIST = "ratchet_pending_distribution"
         private const val KEY_SECRET_PREFIX = "secret/"
     }

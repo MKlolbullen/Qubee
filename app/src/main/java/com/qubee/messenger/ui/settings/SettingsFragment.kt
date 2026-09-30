@@ -23,6 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -36,8 +37,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.Fragment
@@ -45,6 +49,7 @@ import androidx.fragment.app.viewModels
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.findNavController
 import com.qubee.messenger.R
+import com.qubee.messenger.network.NodeAddresses
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeePanel
@@ -122,7 +127,7 @@ private fun SettingsContent(
                 )
                 Spacer(Modifier.height(6.dp))
                 QubeeMutedText(
-                    "Theme, network bootstrap, contact verification and privacy controls belong here. Today this screen exposes the one dangerous switch that matters: destroying the local identity.",
+                    "Your identity, screen lock, how this device finds peers, and the one dangerous switch: destroying the local identity.",
                 )
 
                 Spacer(Modifier.height(26.dp))
@@ -132,6 +137,10 @@ private fun SettingsContent(
                 Spacer(Modifier.height(20.dp))
 
                 AppLockPanel(viewModel)
+
+                Spacer(Modifier.height(20.dp))
+
+                NetworkPanel(viewModel)
 
                 Spacer(Modifier.height(20.dp))
 
@@ -203,12 +212,20 @@ private fun SettingsContent(
 @Composable
 private fun AppLockPanel(viewModel: SettingsViewModel) {
     val enabled by viewModel.appLockEnabled.collectAsStateWithLifecycle()
-    AppLockPanelBody(enabled = enabled, onToggle = viewModel::setAppLockEnabled)
+    var notice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(viewModel) {
+        viewModel.appLockNotice.collect { notice = it }
+    }
+    AppLockPanelBody(enabled = enabled, onToggle = viewModel::setAppLockEnabled, notice = notice)
 }
 
 @Composable
 @androidx.annotation.VisibleForTesting
-internal fun AppLockPanelBody(enabled: Boolean, onToggle: (Boolean) -> Unit) {
+internal fun AppLockPanelBody(
+    enabled: Boolean,
+    onToggle: (Boolean) -> Unit,
+    notice: String? = null,
+) {
     QubeePanel {
         QubeeStatusPill(stringResource(R.string.app_lock_panel_status))
         Spacer(Modifier.height(14.dp))
@@ -231,6 +248,157 @@ internal fun AppLockPanelBody(enabled: Boolean, onToggle: (Boolean) -> Unit) {
                     uncheckedThumbColor = QubeePalette.MutedText,
                     uncheckedTrackColor = QubeePalette.PanelAlt,
                 ),
+            )
+        }
+        if (notice != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                notice,
+                color = QubeePalette.Warning,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+/**
+ * Peer-discovery controls. Without these the node listens but never
+ * dials anyone: mDNS is the zero-config LAN path, the bootstrap list is
+ * the manual path for networks that filter multicast, and the dial
+ * addresses are what the *other* device pastes into its list.
+ */
+@Composable
+private fun NetworkPanel(viewModel: SettingsViewModel) {
+    val localDiscovery by viewModel.localDiscoveryEnabled.collectAsStateWithLifecycle()
+    val savedPeers by viewModel.bootstrapPeers.collectAsStateWithLifecycle()
+    val addresses by viewModel.nodeAddresses.collectAsStateWithLifecycle()
+    val notice by viewModel.networkNotice.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
+    LaunchedEffect(Unit) { viewModel.refreshNodeAddresses() }
+    NetworkPanelBody(
+        localDiscoveryEnabled = localDiscovery,
+        onLocalDiscoveryToggle = viewModel::setLocalDiscoveryEnabled,
+        nodeAddresses = addresses,
+        savedBootstrapPeers = savedPeers,
+        notice = notice,
+        onCopyAddresses = { clipboard.setText(AnnotatedString(it)) },
+        onRefreshAddresses = viewModel::refreshNodeAddresses,
+        onSaveBootstrapPeers = viewModel::saveBootstrapPeers,
+    )
+}
+
+@Composable
+@androidx.annotation.VisibleForTesting
+internal fun NetworkPanelBody(
+    localDiscoveryEnabled: Boolean,
+    onLocalDiscoveryToggle: (Boolean) -> Unit,
+    nodeAddresses: NodeAddresses?,
+    savedBootstrapPeers: String,
+    notice: String?,
+    onCopyAddresses: (String) -> Unit,
+    onRefreshAddresses: () -> Unit,
+    onSaveBootstrapPeers: (String) -> Unit,
+) {
+    var draft by remember(savedBootstrapPeers) { mutableStateOf(savedBootstrapPeers) }
+    QubeePanel {
+        QubeeStatusPill(stringResource(R.string.network_panel_status))
+        Spacer(Modifier.height(14.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.network_local_discovery_title),
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                Spacer(Modifier.height(6.dp))
+                QubeeMutedText(stringResource(R.string.network_local_discovery_body))
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(
+                checked = localDiscoveryEnabled,
+                onCheckedChange = onLocalDiscoveryToggle,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = QubeePalette.Void,
+                    checkedTrackColor = QubeePalette.Cyan,
+                    uncheckedThumbColor = QubeePalette.MutedText,
+                    uncheckedTrackColor = QubeePalette.PanelAlt,
+                ),
+            )
+        }
+
+        Spacer(Modifier.height(18.dp))
+        Text(
+            stringResource(R.string.network_this_device_title),
+            color = QubeePalette.Text,
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(Modifier.height(6.dp))
+        if (nodeAddresses == null) {
+            QubeeMutedText(stringResource(R.string.network_node_not_running))
+        } else {
+            QubeeMutedText(stringResource(R.string.network_peer_id_label))
+            Text(
+                nodeAddresses.peerId,
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
+            Spacer(Modifier.height(6.dp))
+            QubeeMutedText(stringResource(R.string.network_dial_addrs_label))
+            if (nodeAddresses.dialAddrs.isEmpty()) {
+                QubeeMutedText(stringResource(R.string.network_no_listen_addrs))
+            }
+            nodeAddresses.dialAddrs.forEach { addr ->
+                Text(
+                    addr,
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            QubeeSecondaryButton(
+                text = stringResource(R.string.network_copy_addresses),
+                onClick = { nodeAddresses?.let { onCopyAddresses(it.dialAddrs.joinToString("\n")) } },
+                modifier = Modifier.weight(1f),
+                enabled = nodeAddresses?.dialAddrs?.isNotEmpty() == true,
+            )
+            QubeeSecondaryButton(
+                text = stringResource(R.string.network_refresh),
+                onClick = onRefreshAddresses,
+                modifier = Modifier.weight(1f),
+            )
+        }
+
+        Spacer(Modifier.height(18.dp))
+        Text(
+            stringResource(R.string.network_bootstrap_title),
+            color = QubeePalette.Text,
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(Modifier.height(6.dp))
+        QubeeMutedText(stringResource(R.string.network_bootstrap_body))
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            label = { Text(stringResource(R.string.network_bootstrap_label)) },
+            minLines = 2,
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(10.dp))
+        QubeeSecondaryButton(
+            text = stringResource(R.string.network_bootstrap_save),
+            onClick = { onSaveBootstrapPeers(draft) },
+        )
+        if (notice != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                notice,
+                color = QubeePalette.Cyan,
+                style = MaterialTheme.typography.bodySmall,
             )
         }
     }

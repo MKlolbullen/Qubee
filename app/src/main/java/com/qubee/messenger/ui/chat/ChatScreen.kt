@@ -105,6 +105,24 @@ fun ChatScreen(
                 viewModel.confirmContactVerification(scanned)
             }
         }
+        // RECORD_AUDIO is a runtime permission requested at call time; the
+        // microphone foreground service refuses to start without it.
+        val micPermissionLauncher = rememberLauncherForActivityResult(
+            androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            if (granted) viewModel.requestSecureCall() else viewModel.onMicrophoneDenied()
+        }
+        val requestCall = {
+            val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.RECORD_AUDIO,
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                viewModel.requestSecureCall()
+            } else {
+                micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+            }
+        }
 
         LaunchedEffect(viewModel) {
             viewModel.events.collect { event ->
@@ -138,7 +156,7 @@ fun ChatScreen(
                     contactName = uiState.contactName,
                     securityState = uiState.securityState,
                     onBackClick = onBackClick,
-                    onSecureCallClick = viewModel::requestSecureCall,
+                    onSecureCallClick = requestCall,
                     onDetailsClick = { showDetails = true },
                 )
             },

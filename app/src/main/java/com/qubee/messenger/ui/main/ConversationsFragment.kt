@@ -82,7 +82,10 @@ class ConversationsFragment : Fragment() {
             ConversationsScreen(
                 state = state,
                 onConversationClick = { summary ->
-                    val args = Bundle().apply { putString("contactId", summary.peerId) }
+                    // Groups are addressed by conversation id (the group
+                    // id hex); direct chats by the peer's contact id.
+                    val target = if (summary.isGroup) summary.conversationId else summary.peerId
+                    val args = Bundle().apply { putString("contactId", target) }
                     findNavController().navigate(R.id.action_to_chat, args)
                 },
                 onStartContact = {

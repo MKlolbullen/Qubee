@@ -1,8 +1,29 @@
 # Build status — verification snapshot
 
 This document captures what `cargo` and Gradle reported when run
-against the repo on the rounds q–t verification pass. Re-run the
-commands below to refresh.
+against the repo. Re-run the commands below to refresh.
+
+## Latest pass — 2026-09-30 (discovery wiring + glue fixes)
+
+Clean Linux container, Rust 1.88.0 (`rust-toolchain.toml`), JDK 21,
+Android SDK cmdline-tools + platform 34 + build-tools 34.0.0 + NDK
+26.1.10909125, cargo-ndk 3.5.4.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --locked --all-targets -- -D warnings` | clean |
+| `cargo test --locked --all-targets` | 147 unit + 88 integration/doc tests pass |
+| `cargo build --locked --features _typecheck_jni` | ok |
+| `cargo bench --locked --no-run` | ok |
+| `cargo clippy/test --features calling` (+ `_typecheck_jni`) | clean / pass |
+| `scripts/check_jni_contracts.sh`, `scripts/audit_message_file_bridge.sh` | ok |
+| `./build_rust.sh` (4 ABIs, release, `--locked`) | ok — arm64-v8a 7.1 MB, armeabi-v7a 4.9 MB, x86 8.8 MB, x86_64 8.4 MB |
+| `./gradlew :app:compileDebugKotlin` | ok (kapt: Room schema `app/schemas/…/4.json` generated and committed) |
+| `./gradlew :app:verifyPaparazziDebug` | all baselines match, incl. the new `NetworkPanelScreenshotTest` |
+| `./gradlew :app:assembleDebug` / `:app:assembleRelease` | ok — `app-debug.apk` 76 MB, `app-release.apk` 60 MB (R8, debug-signed fallback); all four `libqubee_crypto.so` packaged, JNI exports intact |
+
+Historical notes from the earlier rounds q–t pass follow.
 
 ```
 cargo check

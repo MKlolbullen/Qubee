@@ -39,7 +39,11 @@ import androidx.fragment.app.viewModels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
+import androidx.navigation.NavOptions
+import androidx.navigation.fragment.findNavController
+import com.qubee.messenger.R
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.identity.IdentityBundle
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
@@ -75,8 +79,22 @@ class AddContactFragment : Fragment() {
         val link = deepLinkUri()
         return ComposeView(requireContext()).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
-            setContent { AddContactScreen(viewModel, initialLink = link) }
+            setContent {
+                AddContactScreen(viewModel, initialLink = link, onSaved = ::openChat)
+            }
         }
+    }
+
+    /** Land in the new contact's chat, dropping this screen from the back stack. */
+    private fun openChat(contactId: String) {
+        val nav = findNavController()
+        nav.navigate(
+            R.id.chatFragment,
+            Bundle().apply { putString("contactId", contactId) },
+            NavOptions.Builder()
+                .setPopUpTo(R.id.addContactFragment, /* inclusive = */ true)
+                .build(),
+        )
     }
 
     private fun deepLinkUri(): String? {
@@ -88,10 +106,13 @@ class AddContactFragment : Fragment() {
 @HiltViewModel
 class AddContactViewModel @Inject constructor(
     private val qubeeManager: QubeeManager,
+    private val contactRepository: ContactRepository,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(AddContactState())
     val state: StateFlow<AddContactState> = _state.asStateFlow()
+
+    private var verifiedLink: String? = null
 
     fun verify(link: String) {
         viewModelScope.launch {
@@ -99,11 +120,36 @@ class AddContactViewModel @Inject constructor(
             val json = qubeeManager.verifyOnboardingLink(link)
             val bundle = IdentityBundle.fromJson(json)
             _state.value = if (bundle != null) {
+                verifiedLink = link
                 AddContactState(bundle = bundle)
             } else {
+                verifiedLink = null
                 AddContactState(error = "Invalid or tampered identity link")
             }
         }
+    }
+
+    /**
+     * Persist the verified identity as a Contact (re-verifying the link
+     * inside the repository, which is the single write path for
+     * link-sourced contacts) and hand the new row id to the UI.
+     */
+    fun save() {
+        val link = verifiedLink ?: return
+        val bundle = _state.value.bundle ?: return
+        viewModelScope.launch {
+            _state.value = AddContactState(bundle = bundle, isWorking = true)
+            val contact = contactRepository.addContactFromInviteLink(link)
+            _state.value = if (contact != null) {
+                AddContactState(bundle = bundle, savedContactId = contact.id)
+            } else {
+                AddContactState(bundle = bundle, error = "Couldn't save the contact — try scanning again")
+            }
+        }
+    }
+
+    fun consumeSaved() {
+        _state.value = _state.value.copy(savedContactId = null)
     }
 }
 
@@ -111,18 +157,27 @@ data class AddContactState(
     val isWorking: Boolean = false,
     val bundle: IdentityBundle? = null,
     val error: String? = null,
+    val savedContactId: String? = null,
 )
 
 @Composable
 private fun AddContactScreen(
     viewModel: AddContactViewModel,
     initialLink: String?,
+    onSaved: (String) -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
     LaunchedEffect(initialLink) {
         if (!initialLink.isNullOrBlank() && QrUtils.isIdentityLink(initialLink)) {
             viewModel.verify(initialLink)
+        }
+    }
+
+    LaunchedEffect(state.savedContactId) {
+        state.savedContactId?.let { id ->
+            viewModel.consumeSaved()
+            onSaved(id)
         }
     }
 
@@ -189,7 +244,7 @@ private fun AddContactScreen(
                         Spacer(Modifier.height(16.dp))
                         QubeePrimaryButton(
                             text = "Save contact",
-                            onClick = { /* hook into ContactRepository.addContact when wired */ },
+                            onClick = viewModel::save,
                         )
                     }
                     else -> Text(

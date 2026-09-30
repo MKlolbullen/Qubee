@@ -82,7 +82,12 @@ class ChatViewModel @Inject constructor(
             val isGroup =
                 conversation?.type == com.qubee.messenger.data.model.ConversationType.GROUP
             val contact = contactRepository.getContactById(contactId)
+            // Inbound from a peer with no Contact row is routed by the
+            // sender's identity hex (MessageService), so that hex is
+            // the conversation's participant id and a valid ratchet
+            // target even without an address-book entry.
             peerIdentityIdHex = contact?.identityId?.takeIf { it.isNotBlank() }
+                ?: contactId.takeIf(::looksLikeIdentityHex)
             val name = when {
                 isGroup -> conversation?.name?.takeIf { it.isNotBlank() } ?: "Group"
                 else -> contact?.displayName?.takeIf { it.isNotBlank() } ?: contactId.take(8)
@@ -330,6 +335,10 @@ class ChatViewModel @Inject constructor(
      * Secure calling — gated on the Rust `calling` feature flag and
      * a yet-unbuilt signalling layer. Surfaces a notice for now.
      */
+    fun onMicrophoneDenied() {
+        notice("Microphone permission is required for calls")
+    }
+
     fun requestSecureCall() {
         val peerIdHex = peerIdentityIdHex
         if (peerIdHex == null) {
@@ -775,6 +784,9 @@ class ChatViewModel @Inject constructor(
             _events.emit(ChatUiEvent.Notice("Chat cleared on this device"))
         }
     }
+
+    private fun looksLikeIdentityHex(value: String): Boolean =
+        value.length == 64 && value.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
 
     private fun notice(message: String) {
         viewModelScope.launch { _events.emit(ChatUiEvent.Notice(message)) }

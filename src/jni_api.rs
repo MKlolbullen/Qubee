@@ -30,7 +30,7 @@ use crate::groups::handshake_handlers::{
     process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
-use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
+use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode, P2PNodeConfig};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload_with_route, encrypt_direct_ack_with_route,
@@ -146,6 +146,11 @@ lazy_static! {
     /// join handshake's dependency on gossipsub broadcasting the author
     /// PeerId. `None` until `nativeStartNetwork` has loaded the node key.
     static ref LOCAL_PEER_ID: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Listen addresses the swarm has bound, as reported by
+    /// `NodeEvent::Listening`. Read by `nativeGetNodeAddresses` so the
+    /// Settings screen can show what another device should dial.
+    static ref LISTEN_ADDRS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
 
 /// Max entries retained in [`SEEN_MESSAGE_IDS`]. Bounds memory; oldest
@@ -425,22 +430,30 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRegist
 
 // --- Network Management ---
 
+/// Start the libp2p node. `bootstrap_nodes` is a comma / whitespace /
+/// newline separated list of multiaddrs dialed at startup (entries with
+/// a `/p2p/<PeerId>` suffix also seed Kademlia); `enable_local_discovery`
+/// turns on mDNS. Both default off in [`P2PNodeConfig`], so a caller
+/// that passes nothing gets a node that listens but never finds a peer.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartNetwork(
     mut env: JNIEnv,
     _class: JClass,
     bootstrap_nodes: JString,
+    enable_local_discovery: jboolean,
 ) -> jboolean {
     catch_unwind_result(|| {
-        // Read (currently unused) bootstrap list defensively: a
-        // malformed JString must not panic the process. Fail closed
+        // A malformed JString must not panic the process. Fail closed
         // (return 0 = network not started) instead.
-        let _bootstrap_str: String = match env.get_string(&bootstrap_nodes) {
+        let bootstrap_str: String = match env.get_string(&bootstrap_nodes) {
             Ok(s) => s.into(),
             Err(_) => return 0,
         };
+        let bootstrap_peers = parse_bootstrap_list(&bootstrap_str);
+        let enable_mdns = enable_local_discovery != 0;
+        LISTEN_ADDRS.lock().unwrap().clear();
 
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let id_keys = match load_or_create_libp2p_keypair() {
@@ -460,42 +473,39 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                 let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
                 let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32);
 
-                match P2PNode::new(id_keys, rx_cmd).await {
+                let config = P2PNodeConfig {
+                    enable_mdns,
+                    bootstrap_peers,
+                    ..P2PNodeConfig::default()
+                };
+                tracing::info!(
+                    mdns = enable_mdns,
+                    bootstrap_peers = config.bootstrap_peers.len(),
+                    "P2P discovery settings",
+                );
+                match P2PNode::with_config(id_keys, rx_cmd, config).await {
                     Ok(node) => {
                         *P2P_COMMANDER.lock().unwrap() = Some(tx_cmd);
 
-                        // Re-subscribe to every group the local
-                        // identity already belongs to so a process
-                        // restart doesn't drop us off the topic mesh.
-                        resubscribe_known_groups();
-
-                        // Also follow this identity's rotating direct inbox.
-                        // This is the fail-closed bootstrap path for a contact
-                        // that knows our Qubee identity but not our PeerId yet.
-                        subscribe_local_direct_inbox();
-
-                        // Now that the node's PeerId is known, stamp it
-                        // onto our own membership in each group so it
-                        // rides out in the roster snapshots we build.
-                        stamp_local_peer_id_in_groups();
+                        // Re-join the identity's groups, follow its
+                        // rotating direct inbox (the fail-closed bootstrap
+                        // path for a contact that knows our Qubee identity
+                        // but not our PeerId yet), and stamp the node's
+                        // PeerId into our roster entries. Re-run from
+                        // onboarding when the identity is created later.
+                        follow_active_identity_on_network();
 
                         tokio::spawn(async move {
                             while let Some(event) = rx_event.recv().await {
-                                // Intercept group-handshake traffic before
-                                // the regular Kotlin callback so the
-                                // Rust core can run protocol logic
-                                // without needing a JNI round-trip.
-                                if let NodeEvent::MessageReceived { sender, data, .. } = &event {
-                                    if let Some(handshake) = GroupHandshake::from_wire(data) {
-                                        handle_inbound_handshake(handshake, sender.clone());
-                                        continue;
-                                    }
-                                    if is_group_message_frame(data) {
-                                        handle_inbound_group_message(data.clone());
-                                        continue;
-                                    }
+                                // One panicking frame must not kill the
+                                // dispatcher task and silently stop all
+                                // inbound delivery until restart.
+                                let outcome = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| handle_node_event(event)),
+                                );
+                                if outcome.is_err() {
+                                    tracing::error!("panic while handling a node event; frame dropped");
                                 }
-                                dispatch_event_to_kotlin(event);
                             }
                         });
 
@@ -509,6 +519,126 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
         });
 
         1
+    })
+}
+
+/// Route one node event: Rust-side protocol handling first (group
+/// handshakes, sealed group frames, bookkeeping events), then the
+/// Kotlin callback for everything else.
+fn handle_node_event(event: NodeEvent) {
+    match &event {
+        NodeEvent::MessageReceived { sender, data, .. } => {
+            if let Some(handshake) = GroupHandshake::from_wire(data) {
+                handle_inbound_handshake(handshake, sender.clone());
+                return;
+            }
+            if is_group_message_frame(data) {
+                handle_inbound_group_message(data.clone());
+                return;
+            }
+        }
+        NodeEvent::Listening { multiaddr } => {
+            let mut addrs = LISTEN_ADDRS.lock().unwrap();
+            if !addrs.iter().any(|a| a == multiaddr) {
+                addrs.push(multiaddr.clone());
+            }
+            return;
+        }
+        NodeEvent::DirectDeliveryFailed { peer_id } => {
+            invalidate_peer_route(peer_id);
+            return;
+        }
+        NodeEvent::PeerDiscovered { .. } => {}
+    }
+    dispatch_event_to_kotlin(event);
+}
+
+/// Split a user-supplied bootstrap list into multiaddrs, dropping (and
+/// logging) entries that don't parse.
+fn parse_bootstrap_list(raw: &str) -> Vec<libp2p::Multiaddr> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                tracing::warn!(addr = s, error = %e, "ignoring invalid bootstrap multiaddr");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Forget every IdentityId→PeerId route that points at `peer_id`. Called
+/// when a `/qubee/direct/1` delivery to that peer fails, so the next
+/// retry of the same wire goes to the recipient's blinded inbox instead
+/// of the dead route. The route is re-learned from the peer's next
+/// authenticated frame.
+fn invalidate_peer_route(peer_id: &str) {
+    let mut dir = PEER_DIRECTORY.lock().unwrap();
+    let before = dir.len();
+    dir.retain(|_, v| v != peer_id);
+    if dir.len() != before {
+        tracing::info!(peer = %peer_id, "dropped stale direct route after delivery failure");
+    }
+}
+
+/// This node's PeerId plus its bound listen addresses as JSON
+/// `{"peerId", "listenAddrs", "dialAddrs"}`; `dialAddrs` carry the
+/// `/p2p/<PeerId>` suffix so they can be pasted straight into another
+/// device's bootstrap list. Null until the node has started.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGetNodeAddresses(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    jni_catch_jstring(|| {
+        let peer_id = match LOCAL_PEER_ID.lock().unwrap().clone() {
+            Some(p) if !p.is_empty() => p,
+            _ => return std::ptr::null_mut(),
+        };
+        let listen: Vec<String> = LISTEN_ADDRS.lock().unwrap().clone();
+        let dial: Vec<String> = listen
+            .iter()
+            .map(|a| format!("{a}/p2p/{peer_id}"))
+            .collect();
+        json_to_jstring(
+            env,
+            json!({
+                "peerId": peer_id,
+                "listenAddrs": listen,
+                "dialAddrs": dial,
+            }),
+        )
+    })
+}
+
+/// Dial one multiaddr now (same treatment as a startup bootstrap entry).
+/// Returns 0 when the address doesn't parse or the node isn't running.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDialPeer(
+    mut env: JNIEnv,
+    _class: JClass,
+    multiaddr: JString,
+) -> jboolean {
+    catch_unwind_result(|| {
+        let raw: String = match env.get_string(&multiaddr) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let addr = raw.trim().to_string();
+        if addr.parse::<libp2p::Multiaddr>().is_err() {
+            tracing::warn!(addr = %addr, "nativeDialPeer: not a multiaddr");
+            return 0;
+        }
+        let commander_lock = P2P_COMMANDER.lock().unwrap();
+        let commander = match commander_lock.as_ref() {
+            Some(c) => c,
+            None => return 0,
+        };
+        match commander.try_send(P2PCommand::Dial { multiaddr: addr }) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
     })
 }
 
@@ -731,17 +861,22 @@ fn dispatch_message_acked_to_kotlin(body: &MessageAckBody) {
         Err(_) => return,
     };
 
-    let _ = env.call_method(
-        callback_obj,
-        "onMessageAcked",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V",
-        &[
-            JValue::Object(&group_hex),
-            JValue::Object(&message_id_hex),
-            JValue::Object(&acker_hex),
-            JValue::Long(body.timestamp as i64),
-        ],
-    );
+    if env
+        .call_method(
+            callback_obj,
+            "onMessageAcked",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V",
+            &[
+                JValue::Object(&group_hex),
+                JValue::Object(&message_id_hex),
+                JValue::Object(&acker_hex),
+                JValue::Long(body.timestamp as i64),
+            ],
+        )
+        .is_err()
+    {
+        clear_callback_exception(&mut env, "onMessageAcked");
+    }
 }
 
 fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::DecryptedGroupMessage) {
@@ -773,17 +908,22 @@ fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::Decrypte
         Err(_) => return,
     };
 
-    let _ = env.call_method(
-        callback_obj,
-        "onGroupMessageReceived",
-        "(Ljava/lang/String;Ljava/lang/String;[BJ)V",
-        &[
-            JValue::Object(&group_hex),
-            JValue::Object(&sender_hex),
-            JValue::Object(&payload),
-            JValue::Long(msg.timestamp as i64),
-        ],
-    );
+    if env
+        .call_method(
+            callback_obj,
+            "onGroupMessageReceived",
+            "(Ljava/lang/String;Ljava/lang/String;[BJ)V",
+            &[
+                JValue::Object(&group_hex),
+                JValue::Object(&sender_hex),
+                JValue::Object(&payload),
+                JValue::Long(msg.timestamp as i64),
+            ],
+        )
+        .is_err()
+    {
+        clear_callback_exception(&mut env, "onGroupMessageReceived");
+    }
 }
 
 fn dispatch_event_to_kotlin(event: NodeEvent) {
@@ -806,32 +946,58 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
 
     match event {
         NodeEvent::MessageReceived { sender, data, .. } => {
-            let j_sender = env.new_string(sender).unwrap();
-            let j_data = env.byte_array_from_slice(&data).unwrap();
-
-            let _ = env.call_method(
-                callback_obj,
-                "onMessageReceived",
-                "(Ljava/lang/String;[B)V",
-                &[JValue::Object(&j_sender), JValue::Object(&j_data)],
-            );
+            let j_sender = match env.new_string(sender) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let j_data = match env.byte_array_from_slice(&data) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            if env
+                .call_method(
+                    callback_obj,
+                    "onMessageReceived",
+                    "(Ljava/lang/String;[B)V",
+                    &[JValue::Object(&j_sender), JValue::Object(&j_data)],
+                )
+                .is_err()
+            {
+                clear_callback_exception(&mut env, "onMessageReceived");
+            }
         }
         NodeEvent::PeerDiscovered { peer_id } => {
-            let j_peer = env.new_string(peer_id).unwrap();
-            let _ = env.call_method(
-                callback_obj,
-                "onPeerDiscovered",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&j_peer)],
-            );
+            let j_peer = match env.new_string(peer_id) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if env
+                .call_method(
+                    callback_obj,
+                    "onPeerDiscovered",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&j_peer)],
+                )
+                .is_err()
+            {
+                clear_callback_exception(&mut env, "onPeerDiscovered");
+            }
         }
-        NodeEvent::Listening { .. } => {
-            // Bound-address event used by integration tests; no
-            // Kotlin callback exists for it today, so silently
-            // ignore — the swarm is up by the time the JNI thread
-            // sees this and we don't need to forward.
-        }
+        // Consumed Rust-side in `handle_node_event`; no Kotlin callback.
+        NodeEvent::Listening { .. } | NodeEvent::DirectDeliveryFailed { .. } => {}
     }
+}
+
+/// A Kotlin callback that threw leaves the exception pending on the
+/// attached thread; detaching with it pending kills the process. Clear
+/// it (logging the trace) so one bad callback costs one event, not the
+/// app.
+fn clear_callback_exception(env: &mut JNIEnv, callback: &str) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    tracing::warn!(callback, "Kotlin callback failed; event dropped");
 }
 
 /// Create a brand new group owned by the active local identity.
@@ -1643,6 +1809,48 @@ fn subscribe_group(group_id_hex: String) -> bool {
     )
 }
 
+/// Bring a running node in line with the active identity: follow its
+/// blinded inbox, re-join its groups, stamp its PeerId into the rosters.
+/// Every step is a no-op before the node starts, so this is safe to call
+/// from onboarding (identity created after `nativeStartNetwork`) as well
+/// as from node start.
+fn follow_active_identity_on_network() {
+    subscribe_local_direct_inbox();
+    resubscribe_known_groups();
+    stamp_local_peer_id_in_groups();
+}
+
+/// Inverse of [`follow_active_identity_on_network`] for identity reset:
+/// drop the inbox window and group topics of the identity being wiped
+/// so the node doesn't keep receiving frames it can no longer decrypt.
+fn unfollow_active_identity_on_network() {
+    let identity = match active_identity() {
+        Ok(Some(id)) => id,
+        _ => return,
+    };
+    let identity_id_hex = hex::encode(identity.identity_id().as_ref() as &[u8]);
+    let groups: Vec<String> = {
+        let gm_guard = GROUP_MANAGER.lock().unwrap();
+        match gm_guard.as_ref() {
+            Some(gm) => gm
+                .get_member_groups(&identity.identity_id())
+                .iter()
+                .map(|g| hex::encode(g.id.as_ref()))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    let commander_lock = P2P_COMMANDER.lock().unwrap();
+    let commander = match commander_lock.as_ref() {
+        Some(c) => c,
+        None => return,
+    };
+    let _ = commander.try_send(P2PCommand::UnfollowDirectInbox { identity_id_hex });
+    for group_id_hex in groups {
+        let _ = commander.try_send(P2PCommand::UnsubscribeGroup { group_id_hex });
+    }
+}
+
 fn subscribe_local_direct_inbox() -> bool {
     let identity = match active_identity() {
         Ok(Some(id)) => id,
@@ -1902,12 +2110,17 @@ fn dispatch_peer_linked(peer_id: String, identity_id_hex: String) {
         Ok(s) => s,
         Err(_) => return,
     };
-    let _ = env.call_method(
-        callback_obj,
-        "onPeerLinked",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        &[JValue::Object(&j_peer), JValue::Object(&j_identity)],
-    );
+    if env
+        .call_method(
+            callback_obj,
+            "onPeerLinked",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&j_peer), JValue::Object(&j_identity)],
+        )
+        .is_err()
+    {
+        clear_callback_exception(&mut env, "onPeerLinked");
+    }
 }
 
 fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::Result<()> {
@@ -2369,6 +2582,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetI
             Err(_) => return 0,
         };
 
+        // Stop listening on the wiped identity's inbox + group topics
+        // while we still know what they are.
+        unfollow_active_identity_on_network();
+        #[cfg(feature = "calling")]
+        {
+            *CALL_MANAGER.lock().unwrap() = None;
+        }
+
         // Drop in-memory state first so any pending operation can't
         // race the file deletes and write a stale record back.
         *ACTIVE_IDENTITY.lock().unwrap() = None;
@@ -2476,6 +2697,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeCreate
             bundle_to_json(&bundle)
         })();
 
+        // The app starts the node before first-run onboarding, so the
+        // subscriptions taken at node start found no identity. Take
+        // them now; no-op if the node isn't up yet.
+        if result.is_ok() {
+            follow_active_identity_on_network();
+        }
+
         ok_or_null(env, result)
     })
 }
@@ -2495,6 +2723,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
             // was empty at boot but Kotlin called create afterwards).
             if ACTIVE_IDENTITY.lock().unwrap().is_none() {
                 load_identity_from_keystore()?;
+                follow_active_identity_on_network();
             }
             let identity = ACTIVE_IDENTITY
                 .lock()
@@ -3461,7 +3690,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetD
     _class: JClass,
     peer_id_hex: JString,
 ) -> jni::sys::jint {
-    let result: anyhow::Result<usize> = (|| {
+    let result: anyhow::Result<usize> = jni_catch_or(|| {
         let peer_hex: String = env
             .get_string(&peer_id_hex)
             .map_err(|e| anyhow::anyhow!("invalid peer_id_hex: {e}"))?
@@ -3472,7 +3701,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetD
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
         reset_direct_session(ks, &peer_id)
-    })();
+    });
     match result {
         Ok(n) => n as jni::sys::jint,
         Err(e) => {
@@ -3493,14 +3722,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeResetG
     _class: JClass,
     group_id_hex: JString,
 ) -> jni::sys::jint {
-    let result: anyhow::Result<usize> = (|| {
+    let result: anyhow::Result<usize> = jni_catch_or(|| {
         let group_id = parse_session_id(&mut env, group_id_hex)?;
         let mut ks_guard = KEYSTORE.lock().unwrap();
         let ks = ks_guard
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
         reset_group_sender_state(ks, &group_id)
-    })();
+    });
     match result {
         Ok(n) => n as jni::sys::jint,
         Err(e) => {
@@ -3522,14 +3751,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeOwnSen
     _class: JClass,
     group_id_hex: JString,
 ) -> jni::sys::jlong {
-    let result: anyhow::Result<Option<u32>> = (|| {
+    let result: anyhow::Result<Option<u32>> = jni_catch_or(|| {
         let group_id = parse_session_id(&mut env, group_id_hex)?;
         let mut ks_guard = KEYSTORE.lock().unwrap();
         let ks = ks_guard
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
         own_chain_iteration(ks, &group_id)
-    })();
+    });
     match result {
         Ok(Some(n)) => n as jni::sys::jlong,
         Ok(None) => -1,
@@ -4112,12 +4341,17 @@ fn dispatch_call_signal_to_kotlin(recipient_hex: &str, payload: &[u8]) {
         Ok(a) => a,
         Err(_) => return,
     };
-    let _ = env.call_method(
-        callback_obj,
-        "onCallSignal",
-        "(Ljava/lang/String;[B)V",
-        &[JValue::Object(&j_recipient), JValue::Object(&j_payload)],
-    );
+    if env
+        .call_method(
+            callback_obj,
+            "onCallSignal",
+            "(Ljava/lang/String;[B)V",
+            &[JValue::Object(&j_recipient), JValue::Object(&j_payload)],
+        )
+        .is_err()
+    {
+        clear_callback_exception(&mut env, "onCallSignal");
+    }
 }
 
 /// Translate a [`CallEvent`] into a Kotlin callback. Lifecycle events
@@ -4150,12 +4384,17 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let _ = env.call_method(
-            callback_obj,
-            "onCallStateChanged",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
-            &[JValue::Object(&j_call), JValue::Object(&j_state)],
-        );
+        if env
+            .call_method(
+                callback_obj,
+                "onCallStateChanged",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&j_call), JValue::Object(&j_state)],
+            )
+            .is_err()
+        {
+            clear_callback_exception(env, "onCallStateChanged");
+        }
     };
 
     match event {
@@ -4172,16 +4411,21 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let _ = env.call_method(
-                callback_obj,
-                "onIncomingCall",
-                "(Ljava/lang/String;Ljava/lang/String;I)V",
-                &[
-                    JValue::Object(&j_call),
-                    JValue::Object(&j_caller),
-                    JValue::Int(call_type_to_i32(&call_type)),
-                ],
-            );
+            if env
+                .call_method(
+                    callback_obj,
+                    "onIncomingCall",
+                    "(Ljava/lang/String;Ljava/lang/String;I)V",
+                    &[
+                        JValue::Object(&j_call),
+                        JValue::Object(&j_caller),
+                        JValue::Int(call_type_to_i32(&call_type)),
+                    ],
+                )
+                .is_err()
+            {
+                clear_callback_exception(&mut env, "onIncomingCall");
+            }
         }
         CallEvent::CallStateChanged {
             call_id, new_state, ..
@@ -4215,17 +4459,22 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
                 MediaKind::Audio => 0,
                 MediaKind::Video => 1,
             };
-            let _ = env.call_method(
-                callback_obj,
-                "onRemoteMedia",
-                "(Ljava/lang/String;Ljava/lang/String;I[B)V",
-                &[
-                    JValue::Object(&j_call),
-                    JValue::Object(&j_sender),
-                    JValue::Int(kind_code),
-                    JValue::Object(&j_payload),
-                ],
-            );
+            if env
+                .call_method(
+                    callback_obj,
+                    "onRemoteMedia",
+                    "(Ljava/lang/String;Ljava/lang/String;I[B)V",
+                    &[
+                        JValue::Object(&j_call),
+                        JValue::Object(&j_sender),
+                        JValue::Int(kind_code),
+                        JValue::Object(&j_payload),
+                    ],
+                )
+                .is_err()
+            {
+                clear_callback_exception(&mut env, "onRemoteMedia");
+            }
         }
         CallEvent::MediaStateChanged { .. } | CallEvent::QualityChanged { .. } => {}
     }
@@ -4257,6 +4506,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
 ) -> jboolean {
     catch_unwind_result(|| {
         let result: anyhow::Result<()> = (|| {
+            // Idempotent: the service re-runs its identity bring-up after
+            // onboarding and on every start command; a second manager
+            // would orphan the first one's drain tasks and drop any call
+            // state it held.
+            if CALL_MANAGER.lock().unwrap().is_some() {
+                return Ok(());
+            }
             let identity = active_identity()?
                 .ok_or_else(|| anyhow::anyhow!("onboarding required before calling"))?;
             let local_identity = identity.identity_id();

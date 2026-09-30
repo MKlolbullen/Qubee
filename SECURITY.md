@@ -133,7 +133,7 @@ Qubee's direct transport does not provide IP anonymity.
 Current metadata reductions include:
 
 - anonymous gossipsub authorship;
-- mDNS off by default;
+- mDNS is user-controlled (off in the Rust library default, on in the Android app default, switchable in Settings → Network — leaving it on announces this device and its LAN IP to the local network);
 - blinded rotating group topics;
 - padding buckets on forward-secret paths;
 - keyed-selector group formats that avoid a plaintext group id.

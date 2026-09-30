@@ -49,12 +49,32 @@ fun CallOverlay(viewModel: CallViewModel = hiltViewModel()) {
     val muted by viewModel.muted.collectAsStateWithLifecycle()
     val videoOn by viewModel.videoOn.collectAsStateWithLifecycle()
 
+    // Accepting needs the microphone: request RECORD_AUDIO on the spot,
+    // and treat a denial as a reject rather than an unanswerable ring.
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val micPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) viewModel.accept() else viewModel.reject()
+    }
+    val acceptWithMic = {
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.RECORD_AUDIO,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.accept()
+        } else {
+            micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
     when (val call = state) {
         is CallUiState.Idle -> Unit
         is CallUiState.Incoming -> IncomingCallBody(
             callerLabel = shortId(call.peerIdHex),
             isVideo = call.callType == CALL_TYPE_VIDEO,
-            onAccept = viewModel::accept,
+            onAccept = acceptWithMic,
             onReject = viewModel::reject,
         )
         is CallUiState.Active -> ActiveCallBody(

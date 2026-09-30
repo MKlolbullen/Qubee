@@ -6,7 +6,9 @@ use futures::StreamExt;
 use libp2p::{
     gossipsub,
     identity::Keypair,
-    kad, mdns, noise, request_response,
+    kad, mdns,
+    multiaddr::Protocol,
+    noise, request_response,
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
@@ -133,6 +135,8 @@ pub enum P2PCommand {
     /// Follow this identity's rotating blinded direct-inbox window.
     /// The identity id never appears in the topic string itself.
     FollowDirectInbox { identity_id_hex: String },
+    /// Drop an identity's inbox window (identity reset).
+    UnfollowDirectInbox { identity_id_hex: String },
     /// Publish a route-less direct frame to one recipient's blinded inbox.
     /// The publisher subscribes only transiently: enough for gossipsub mesh
     /// formation + publish, then the topic is dropped unless it is this node's
@@ -145,9 +149,10 @@ pub enum P2PCommand {
     /// subscribed for the publish to actually go out — gossipsub
     /// silently drops publishes on topics with no local subscription.
     PublishToTopic { topic: String, data: Vec<u8> },
-    /// Dial a peer at a known multiaddress. Used by integration tests
-    /// that skip mDNS; production peers find each other via Kademlia
-    /// or the local-network mDNS sweep.
+    /// Dial a peer at a known multiaddress. An address carrying a
+    /// `/p2p/<PeerId>` component also seeds Kademlia and pins the peer
+    /// as an explicit gossipsub peer, exactly like a startup bootstrap
+    /// entry ([`P2PNodeConfig::bootstrap_peers`]).
     Dial { multiaddr: String },
 }
 
@@ -257,11 +262,16 @@ pub enum NodeEvent {
         topic: String,
         data: Vec<u8>,
     },
-    /// Discovered a new peer (via mDNS or DHT)
+    /// Discovered a new peer (via mDNS, DHT, or a fresh connection).
     PeerDiscovered { peer_id: String },
     /// The swarm picked up a new listen address. Tests use this to
     /// learn what address node A bound to so node B can dial it.
     Listening { multiaddr: String },
+    /// A `/qubee/direct/1` request to `peer_id` could not be delivered.
+    /// The JNI layer drops any IdentityId→PeerId route pointing at that
+    /// peer so the next retry falls back to the blinded inbox instead
+    /// of re-dialing a dead route forever.
+    DirectDeliveryFailed { peer_id: String },
 }
 
 /// Tunables for `P2PNode`. Production callers should use
@@ -367,6 +377,11 @@ fn transport_unavailable(mode: TransportPrivacy) -> anyhow::Error {
 #[derive(Clone)]
 pub struct P2PNodeConfig {
     pub enable_mdns: bool,
+    /// Peers dialed at startup. Entries ending in `/p2p/<PeerId>` also
+    /// seed the Kademlia routing table and become explicit gossipsub
+    /// peers; bare addresses are only dialed. Empty by default — with
+    /// mDNS off too, the node listens but never finds anyone.
+    pub bootstrap_peers: Vec<Multiaddr>,
     /// Transport privacy posture. Defaults to [`TransportPrivacy::Direct`];
     /// the anonymising modes are foundation-only and currently refuse to
     /// start (fail closed).
@@ -398,6 +413,7 @@ impl Default for P2PNodeConfig {
             // opt-in local-discovery convenience, not a requirement —
             // default it OFF and let a caller re-enable it explicitly.
             enable_mdns: false,
+            bootstrap_peers: Vec::new(),
             transport_privacy: TransportPrivacy::Direct,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("hardcoded multiaddr"),
             quic_listen_addr: Some(
@@ -591,7 +607,7 @@ impl P2PNode {
             swarm.listen_on(quic_addr.clone())?;
         }
 
-        Ok(Self {
+        let mut node = Self {
             swarm,
             command_receiver,
             followed_groups: HashSet::new(),
@@ -599,7 +615,36 @@ impl P2PNode {
             followed_direct_inboxes: HashSet::new(),
             live_direct_inbox_topics: HashSet::new(),
             pending_direct_inbox_publishes: Vec::new(),
-        })
+        };
+        for addr in &config.bootstrap_peers {
+            node.dial_bootstrap(addr);
+        }
+        if !config.bootstrap_peers.is_empty() {
+            if let Err(e) = node.swarm.behaviour_mut().kademlia.bootstrap() {
+                eprintln!("Kademlia bootstrap deferred: {e:?}");
+            }
+        }
+        Ok(node)
+    }
+
+    /// Dial `addr`; when it names a peer, also pin that peer as a
+    /// Kademlia contact and an explicit gossipsub peer so a small
+    /// hand-configured network forms a mesh without any DHT.
+    fn dial_bootstrap(&mut self, addr: &Multiaddr) {
+        if let Some(peer) = peer_id_from_multiaddr(addr) {
+            let bare: Multiaddr = addr
+                .iter()
+                .filter(|p| !matches!(p, Protocol::P2p(_)))
+                .collect();
+            self.swarm.behaviour_mut().kademlia.add_address(&peer, bare);
+            self.swarm
+                .behaviour_mut()
+                .gossipsub
+                .add_explicit_peer(&peer);
+        }
+        if let Err(e) = self.swarm.dial(addr.clone()) {
+            eprintln!("Dial error for {addr}: {e:?}");
+        }
     }
 
     /// Bring the subscribed topic set in line with the current epoch
@@ -793,6 +838,11 @@ impl P2PNode {
                             self.resync_direct_inbox_topics();
                         }
                     }
+                    Some(P2PCommand::UnfollowDirectInbox { identity_id_hex }) => {
+                        if self.followed_direct_inboxes.remove(&identity_id_hex) {
+                            self.resync_direct_inbox_topics();
+                        }
+                    }
                     Some(P2PCommand::PublishDirectInbox { recipient_id_hex, data }) => {
                         let topic_name = direct_inbox_topic(&recipient_id_hex);
                         let topic = gossipsub::IdentTopic::new(topic_name.clone());
@@ -823,11 +873,7 @@ impl P2PNode {
                     }
                     Some(P2PCommand::Dial { multiaddr }) => {
                         match multiaddr.parse::<Multiaddr>() {
-                            Ok(addr) => {
-                                if let Err(e) = self.swarm.dial(addr) {
-                                    eprintln!("Dial error for {multiaddr}: {e:?}");
-                                }
-                            }
+                            Ok(addr) => self.dial_bootstrap(&addr),
                             Err(e) => eprintln!("Invalid multiaddr {multiaddr}: {e}"),
                         }
                     }
@@ -840,6 +886,13 @@ impl P2PNode {
                             .send(NodeEvent::Listening { multiaddr: address.to_string() })
                             .await;
                     }
+                    SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
+                        if num_established.get() == 1 {
+                            let _ = event_sender
+                                .send(NodeEvent::PeerDiscovered { peer_id: peer_id.to_string() })
+                                .await;
+                        }
+                    }
                     SwarmEvent::Behaviour(QubeeBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, multiaddr) in list {
                             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
@@ -847,6 +900,11 @@ impl P2PNode {
                             let _ = event_sender
                                 .send(NodeEvent::PeerDiscovered { peer_id: peer_id.to_string() })
                                 .await;
+                        }
+                    }
+                    SwarmEvent::Behaviour(QubeeBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                        for (peer_id, _) in list {
+                            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(QubeeBehaviourEvent::Direct(request_response::Event::Message {
@@ -887,8 +945,12 @@ impl P2PNode {
                         // A directed frame could not be delivered. We do NOT
                         // fall back to broadcasting it — that would leak the
                         // very metadata this path exists to hide. The caller's
-                        // retry/timeout logic is responsible for recovery.
+                        // retry/timeout logic is responsible for recovery; the
+                        // event lets the JNI layer forget the dead route first.
                         eprintln!("Direct delivery to {peer} failed: {error}");
+                        let _ = event_sender
+                            .send(NodeEvent::DirectDeliveryFailed { peer_id: peer.to_string() })
+                            .await;
                     }
                     SwarmEvent::Behaviour(QubeeBehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, .. })) => {
                         let _ = event_sender
@@ -924,11 +986,77 @@ impl P2PNode {
     }
 }
 
+/// The `/p2p/<PeerId>` component of a multiaddr, if it carries one.
+pub fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|p| match p {
+        Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GROUP_A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+    #[test]
+    fn peer_id_is_read_from_the_p2p_component() {
+        let peer = PeerId::random();
+        let with: Multiaddr = format!("/ip4/10.0.0.2/tcp/4001/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let without: Multiaddr = "/ip4/10.0.0.2/tcp/4001".parse().unwrap();
+        assert_eq!(peer_id_from_multiaddr(&with), Some(peer));
+        assert_eq!(peer_id_from_multiaddr(&without), None);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_peers_are_dialed_and_seed_kademlia() {
+        // Node A listens; node B is configured with A's address as a
+        // bootstrap peer and must connect without mDNS.
+        let keys_a = libp2p::identity::Keypair::generate_ed25519();
+        let peer_a = PeerId::from(keys_a.public());
+        let (_tx_a, rx_a) = mpsc::channel(8);
+        let node_a = P2PNode::with_config(keys_a, rx_a, P2PNodeConfig::for_testing())
+            .await
+            .unwrap();
+        let (ev_a_tx, mut ev_a_rx) = mpsc::channel(64);
+        tokio::spawn(node_a.run(ev_a_tx));
+        let listen = loop {
+            match tokio::time::timeout(Duration::from_secs(10), ev_a_rx.recv()).await {
+                Ok(Some(NodeEvent::Listening { multiaddr })) if multiaddr.contains("/tcp/") => {
+                    break multiaddr
+                }
+                Ok(Some(_)) => continue,
+                _ => panic!("node A never reported a TCP listen address"),
+            }
+        };
+
+        let keys_b = libp2p::identity::Keypair::generate_ed25519();
+        let (_tx_b, rx_b) = mpsc::channel(8);
+        let config = P2PNodeConfig {
+            bootstrap_peers: vec![format!("{listen}/p2p/{peer_a}").parse().unwrap()],
+            ..P2PNodeConfig::for_testing()
+        };
+        let node_b = P2PNode::with_config(keys_b, rx_b, config).await.unwrap();
+        let (ev_b_tx, mut ev_b_rx) = mpsc::channel(64);
+        tokio::spawn(node_b.run(ev_b_tx));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, ev_b_rx.recv()).await {
+                Ok(Some(NodeEvent::PeerDiscovered { peer_id }))
+                    if peer_id == peer_a.to_string() =>
+                {
+                    break
+                }
+                Ok(Some(_)) => continue,
+                _ => panic!("node B never connected to its bootstrap peer"),
+            }
+        }
+    }
     const GROUP_B: &str = "ffeeddccbbaa99887766554433221100";
 
     #[test]

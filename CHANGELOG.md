@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 once it leaves the `0.x` line. Until then, expect breaking changes
 between minor versions.
 
+## [Unreleased]
+
+### Fixed
+
+- **Peer discovery was never wired.** `nativeStartNetwork` discarded the
+  bootstrap list and built the node with `P2PNodeConfig::default()`,
+  whose mDNS is off, so a shipped app listened but never dialed anyone.
+  The node now takes `bootstrap_peers` (dialed at start, `/p2p/`-suffixed
+  entries seed Kademlia and become explicit gossipsub peers) and an mDNS
+  switch; `nativeStartNetwork(bootstrapNodes, enableLocalDiscovery)` passes
+  both through, `nativeGetNodeAddresses` / `nativeDialPeer` back a new
+  Settings → Network panel (local-discovery toggle, this device's dial
+  addresses, a persisted bootstrap list dialed on save), and
+  `MessageService` holds a Wi-Fi multicast lock while mDNS is on.
+- **Identity created after node start was invisible on the network.**
+  The inbox-follow / group re-subscribe / PeerId stamping ran once at
+  node start and found no identity on a fresh install; they now re-run
+  when onboarding creates (or lazily loads) the identity, and
+  `OnboardingFragment` tells the running service to announce the prekey
+  bundle and start the call manager instead of waiting for a restart.
+- **`MessageService` start latch.** The service latched `isRunning`
+  before the node was up, so a start while the datastore was still
+  locked (Screen Lock binding, sticky restart) left it without a node
+  until the next process death. Bring-up is now an idempotent
+  `ensureNetworkStarted()` that every start command retries.
+- **Stale direct routes.** A failed `/qubee/direct/1` delivery now emits
+  `NodeEvent::DirectDeliveryFailed`, and the JNI layer drops the
+  IdentityId→PeerId entry so the retry uses the blinded inbox instead of
+  re-dialing a dead route for the whole retry budget.
+- **Prekey bundles reach late joiners.** `onPeerDiscovered` schedules a
+  debounced re-broadcast of the local prekey bundle (15 s after the mesh
+  forms, at most once per gossipsub duplicate window), so a peer that
+  comes online after our startup broadcast can still open a ratchet
+  session without waiting for the 30-minute republish.
+- **"Save contact" did nothing.** `AddContactFragment` now persists the
+  verified identity through `ContactRepository.addContactFromInviteLink`
+  and opens the chat; previously no code path ever inserted a contact.
+- **Tapping a group in the inbox minted a new 1:1 conversation.**
+  `getOrCreateConversationId` resolves an existing conversation id first
+  and the inbox passes the group id for group rows.
+- **Replies to a peer without a Contact row failed to encrypt.**
+  `ChatViewModel` accepts the conversation's identity-hex participant as
+  the ratchet target when no contact exists.
+- **Calls never asked for the microphone.** `RECORD_AUDIO` is requested
+  before initiating or accepting a call; the microphone foreground
+  service refuses to start without it.
+- **Screen Lock off could lock the datastore for good.** The preference
+  no longer flips when unbinding the auth-bound key fails, and the
+  refusal is shown in Settings.
+- Retried rows that finally leave the device move `FAILED → SENT`; the
+  init-error dialog fires once per error; `nativeStartCalling` is
+  idempotent and `nativeResetIdentity` drops the call manager; the
+  three sender-state JNI exports gained the panic guard; Kotlin callback
+  exceptions are cleared instead of killing the process; the node event
+  dispatcher survives a panicking frame.
+- Toolchain references aligned with the 1.88.0 pin (`jni-contracts.yml`,
+  `CONTRIBUTING.md`, `build_rust.sh`).
+
 ## [0.1.0-alpha] — 2026-08-06
 
 ### Added

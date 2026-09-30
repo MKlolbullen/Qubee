@@ -11,6 +11,7 @@ import androidx.fragment.app.viewModels
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.findNavController
 import com.qubee.messenger.R
+import com.qubee.messenger.service.MessageService
 import dagger.hilt.android.AndroidEntryPoint
 
 /**
@@ -35,6 +36,10 @@ class OnboardingFragment : Fragment() {
         setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
         setContent {
             OnboardingScreen(viewModel = viewModel) {
+                // The service (and its node) started before the identity
+                // existed; have it take the identity's subscriptions and
+                // announce the prekey bundle now instead of at next launch.
+                MessageService.identityReady(requireContext())
                 val nav = findNavController()
                 nav.navigate(
                     R.id.navigation_conversations,

@@ -23,10 +23,16 @@ believe instead of seeing real behavior.
   caveat is that `adb install` over an existing install with a
   different signing cert needs `adb uninstall` first.
 * Both devices on the same local network so libp2p mDNS / loopback
-  TCP can find each other. mDNS-only deployments also work as long
-  as the network doesn't suppress multicast (most home Wi-Fi
-  networks do; tether off a phone hotspot if the corporate network
-  blocks it).
+  TCP can find each other. **Settings → Network → Local network
+  discovery** must be on (it is by default); `MessageService` holds
+  a Wi-Fi multicast lock while it is. mDNS-only deployments work as
+  long as the network doesn't suppress multicast (most home Wi-Fi
+  networks are fine; tether off a phone hotspot if a corporate or
+  guest network blocks it).
+* If multicast is blocked, connect manually: on device A open
+  Settings → Network, tap **Copy addresses** under "This device",
+  paste them into device B's **Bootstrap peers** box and tap **Save &
+  connect**. The list persists and is dialed on every service start.
 * Notification permission granted on both devices (the foreground
   P2P service runs under
   `NOTIFICATION_CHANNEL_SERVICE`).
@@ -282,6 +288,12 @@ useful when running the walkthrough against an older build.)
   group, or libp2p isn't routing). Check that B's app is
   foregrounded (the foreground service stays alive in the
   background, but mDNS discovery is fragile across screen-off).
+* **The devices never see each other** (no `onPeerDiscovered` /
+  `onPeerLinked` in logcat on either side): local discovery is off,
+  or the Wi-Fi drops multicast. Turn on Settings → Network → Local
+  network discovery on both devices, or paste A's dial addresses
+  into B's bootstrap list (see Prerequisites). Peers must be
+  reachable over TCP or QUIC on the ports shown under "This device".
 * **"Verification bridge unreachable"**: the
   `nativeVerifyIdentityKey` JNI symbol failed to load. Means the
   shared library didn't link the Rust bridge — check the build

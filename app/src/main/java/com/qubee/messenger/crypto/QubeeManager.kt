@@ -82,9 +82,53 @@ class QubeeManager @Inject constructor(
         nativeRegisterCallback(callback)
     }
 
-    suspend fun startNetworkNode(bootstrapNodes: String = ""): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * Start the libp2p node. [bootstrapNodes] is a comma/whitespace/
+     * newline-separated list of multiaddrs to dial at startup (each
+     * ideally ending in `/p2p/<PeerId>` so it also seeds Kademlia);
+     * [localDiscovery] enables mDNS on the local network. With both
+     * empty/off the node listens but never finds anyone.
+     */
+    suspend fun startNetworkNode(
+        bootstrapNodes: String = "",
+        localDiscovery: Boolean = true,
+    ): Boolean = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext false
-        nativeStartNetwork(bootstrapNodes)
+        nativeStartNetwork(bootstrapNodes, localDiscovery)
+    }
+
+    /**
+     * This node's libp2p PeerId and dialable listen addresses as JSON
+     * `{"peerId": str, "listenAddrs": [str], "dialAddrs": [str]}`, where
+     * `dialAddrs` carry the `/p2p/<PeerId>` suffix and can be pasted
+     * into another device's bootstrap list as-is. Null until the node
+     * has started.
+     */
+    suspend fun getNodeAddresses(): String? = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext null
+        try {
+            nativeGetNodeAddresses()
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust node-addresses JNI is not linked")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Node address lookup failed")
+            null
+        }
+    }
+
+    /** Dial one multiaddr now (in addition to the startup bootstrap list). */
+    suspend fun dialPeer(multiaddr: String): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        try {
+            nativeDialPeer(multiaddr)
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "Rust dial JNI is not linked")
+            false
+        } catch (e: Exception) {
+            Timber.e(e, "Dial failed")
+            false
+        }
     }
 
     suspend fun sendP2PMessage(peerId: String, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
@@ -1106,7 +1150,9 @@ class QubeeManager @Inject constructor(
 
     private external fun nativeInitialize(dataDir: String, keystorePassphrase: ByteArray): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
-    private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
+    private external fun nativeStartNetwork(bootstrapNodes: String, enableLocalDiscovery: Boolean): Boolean
+    private external fun nativeGetNodeAddresses(): String?
+    private external fun nativeDialPeer(multiaddr: String): Boolean
     private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean
 
     // Direct-message/session JNI owned by Rust.

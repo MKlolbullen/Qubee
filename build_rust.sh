@@ -3,7 +3,7 @@
 #
 # Reproducible-build inputs (must stay in sync with the values
 # documented in `docs/reproducible-builds.md`):
-#   - Rust toolchain: pinned in `rust-toolchain.toml` (1.86.0)
+#   - Rust toolchain: pinned in `rust-toolchain.toml` (1.88.0)
 #   - Cargo.lock: committed; `--locked` enforces it
 #   - NDK: r26b (`ndkVersion` in `app/build.gradle`, `ndk-version`
 #     in the GitHub Actions workflows)

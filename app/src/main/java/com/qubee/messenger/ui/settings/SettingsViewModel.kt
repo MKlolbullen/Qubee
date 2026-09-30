@@ -7,6 +7,7 @@ import com.qubee.messenger.data.repository.PreferenceRepository
 import android.content.Context
 import androidx.biometric.BiometricManager
 import com.qubee.messenger.identity.IdentityBundle
+import com.qubee.messenger.network.NodeAddresses
 import com.qubee.messenger.security.AppLockManager
 import com.qubee.messenger.security.DatabaseKeyHolder
 import com.qubee.messenger.security.SqlCipherKeyProvider
@@ -49,8 +50,65 @@ class SettingsViewModel @Inject constructor(
     private val _appLockNotice = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val appLockNotice = _appLockNotice.asSharedFlow()
 
+    private val _localDiscoveryEnabled = MutableStateFlow(preferences.localDiscoveryEnabled())
+    val localDiscoveryEnabled: StateFlow<Boolean> = _localDiscoveryEnabled.asStateFlow()
+
+    private val _bootstrapPeers = MutableStateFlow(preferences.bootstrapPeers())
+    val bootstrapPeers: StateFlow<String> = _bootstrapPeers.asStateFlow()
+
+    private val _nodeAddresses = MutableStateFlow<NodeAddresses?>(null)
+    val nodeAddresses: StateFlow<NodeAddresses?> = _nodeAddresses.asStateFlow()
+
+    private val _networkNotice = MutableStateFlow<String?>(null)
+    val networkNotice: StateFlow<String?> = _networkNotice.asStateFlow()
+
     init {
         loadIdentity()
+        refreshNodeAddresses()
+    }
+
+    /**
+     * mDNS toggle. The running node keeps its current behaviour; the
+     * new value is read the next time MessageService starts the node.
+     */
+    fun setLocalDiscoveryEnabled(enabled: Boolean) {
+        preferences.setLocalDiscoveryEnabled(enabled)
+        _localDiscoveryEnabled.value = enabled
+        _networkNotice.value = if (enabled) {
+            "Local discovery on. Applies when the P2P service next starts."
+        } else {
+            "Local discovery off. Peers must be reached through bootstrap addresses."
+        }
+    }
+
+    fun refreshNodeAddresses() {
+        viewModelScope.launch {
+            _nodeAddresses.value = NodeAddresses.fromJson(qubeeManager.getNodeAddresses())
+        }
+    }
+
+    /**
+     * Persist the bootstrap list (one multiaddr per line) and dial each
+     * entry immediately so the user doesn't have to restart the service
+     * to test a manual connection.
+     */
+    fun saveBootstrapPeers(text: String) {
+        val entries = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val normalised = entries.joinToString("\n")
+        preferences.setBootstrapPeers(normalised)
+        _bootstrapPeers.value = normalised
+        viewModelScope.launch {
+            var queued = 0
+            for (addr in entries) {
+                if (qubeeManager.dialPeer(addr)) queued++
+            }
+            _networkNotice.value = when {
+                entries.isEmpty() -> "Bootstrap list cleared."
+                queued == entries.size -> "Saved. Dialing $queued address(es)…"
+                else -> "Saved. ${entries.size - queued} of ${entries.size} address(es) rejected " +
+                    "(node not running or not a valid multiaddr)."
+            }
+        }
     }
 
     /**
@@ -78,8 +136,17 @@ class SettingsViewModel @Inject constructor(
                 return
             }
         } else {
-            runCatching { keyProvider.disableAuthBinding(keyHolder) }
-                .onFailure { Timber.e(it, "Failed to unbind DB key; leaving binding in place") }
+            // The pref and the Keystore binding must move together: a
+            // pref of "off" with the binding still in place means no
+            // unlock prompt ever runs, so the auth-bound key can never
+            // be unwrapped and the datastore is locked for good.
+            val unbound = runCatching { keyProvider.disableAuthBinding(keyHolder) }
+            if (unbound.isFailure) {
+                Timber.e(unbound.exceptionOrNull(), "Failed to unbind DB key; leaving binding in place")
+                _appLockNotice.tryEmit("Couldn't turn off Screen Lock. Unlock the app and try again.")
+                _appLockEnabled.value = true
+                return
+            }
         }
         preferences.setAppLockEnabled(enabled)
         _appLockEnabled.value = enabled

@@ -223,6 +223,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     state.error != null -> {
                         showError(state.error)
+                        viewModel.clearError()
                     }
                     state.isInitialized -> {
                         // App is ready

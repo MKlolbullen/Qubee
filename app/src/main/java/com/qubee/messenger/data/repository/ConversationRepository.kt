@@ -63,6 +63,10 @@ class ConversationRepository @Inject constructor(
             ?.id
 
     suspend fun getOrCreateConversationId(contactId: String): String {
+        // A conversation id (group or direct) resolves to itself; the
+        // inbox passes group rows by id, and minting a fresh 1:1 group
+        // for a group id would hide the group's history.
+        conversationDao.getConversationById(contactId)?.let { return it.id }
         val existingId = findDirectConversationId(contactId)
         if (existingId != null) return existingId
 

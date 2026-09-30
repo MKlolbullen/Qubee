@@ -35,5 +35,19 @@
     <string name="unlock_button">Unlock</string>
     <string name="app_lock_panel_status">SCREEN LOCK</string>
     <string name="app_lock_panel_title">Require unlock</string>
+    <string name="network_panel_status">NETWORK</string>
+    <string name="network_local_discovery_title">Local network discovery</string>
+    <string name="network_local_discovery_body">Find peers on the same Wi-Fi with mDNS. Announces this device and its LAN address to other hosts on the network. Changes apply when the P2P service next starts.</string>
+    <string name="network_this_device_title">This device</string>
+    <string name="network_node_not_running">P2P node not running yet — open Settings again once the service has started.</string>
+    <string name="network_peer_id_label">Peer ID</string>
+    <string name="network_dial_addrs_label">Dial addresses (paste into the other device\'s bootstrap list)</string>
+    <string name="network_no_listen_addrs">No listen addresses reported yet.</string>
+    <string name="network_copy_addresses">Copy addresses</string>
+    <string name="network_refresh">Refresh</string>
+    <string name="network_bootstrap_title">Bootstrap peers</string>
+    <string name="network_bootstrap_body">Manual connection for networks that block multicast: one multiaddr per line, e.g. /ip4/192.168.1.20/tcp/4001/p2p/12D3KooW…. Dialed on save and every time the node starts.</string>
+    <string name="network_bootstrap_label">Multiaddrs, one per line</string>
+    <string name="network_bootstrap_save">Save &amp; connect</string>
     <string name="app_lock_panel_body">Ask for your fingerprint, face, or device PIN when Qubee opens or returns from the background. Gates the app UI; it does not yet encrypt the database under your unlock.</string>
 </resources>

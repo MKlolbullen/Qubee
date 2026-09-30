@@ -11,7 +11,7 @@ below is the long form of that.
 # 1. Clone and check the toolchain Qubee expects.
 git clone https://github.com/MKlolbullen/Qubee.git
 cd Qubee
-rustup show           # honours rust-toolchain.toml (1.86 stable)
+rustup show           # honours rust-toolchain.toml (1.88.0)
 
 # 2. Sanity-check your environment (Rust, Android NDK, cargo-ndk, etc.).
 ./scripts/qubee_doctor.sh

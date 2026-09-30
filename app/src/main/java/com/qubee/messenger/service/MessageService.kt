@@ -62,13 +62,27 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var contactRepository: ContactRepository
     @Inject lateinit var ratchetSender: com.qubee.messenger.crypto.RatchetSender
     @Inject lateinit var callRepository: com.qubee.messenger.data.repository.CallRepository
+    @Inject lateinit var preferenceRepository: com.qubee.messenger.data.repository.PreferenceRepository
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // libp2p mDNS needs multicast UDP; most Android Wi-Fi drivers filter
+    // multicast unless an app holds a MulticastLock. Held only while local
+    // discovery is on and the node is running.
+    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
     // Network callbacks launch concurrently. Stripe by exact direct wire id so
     // duplicates of one ciphertext cannot race the read -> ratchet-encrypt ->
     // receipt-cache sequence, while keeping memory bounded under hostile input.
     private val directFrameLocks = Array(DIRECT_FRAME_LOCK_STRIPES) { Mutex() }
-    private var isRunning = false
+    private var foregroundStarted = false
+    // Set only once the node is actually up. A start while the core can't
+    // initialise (datastore locked, sticky restart without the key
+    // holder) leaves it false so the next start command retries.
+    @Volatile
+    private var networkStarted = false
+    private val startLock = Mutex()
+    private var discoveryRepublishJob: kotlinx.coroutines.Job? = null
+    @Volatile
+    private var lastPrekeyPublishAt = 0L
 
     companion object {
         private const val NOTIFICATION_ID = 1001
@@ -112,6 +126,14 @@ class MessageService : Service(), NetworkCallback {
         /// Soft cap on rows processed per tick to keep the DB scan
         /// cheap even with a large backlog.
         private const val RETRY_BATCH_LIMIT: Int = 32
+        /// A peer that just appeared missed every earlier bundle
+        /// broadcast; re-announce after the gossipsub mesh has had a
+        /// heartbeat to form, coalescing bursts of discoveries.
+        private const val DISCOVERY_REPUBLISH_DELAY_MS: Long = 15_000L
+        /// gossipsub drops an identical publish inside its 60 s
+        /// duplicate cache, so never republish faster than that.
+        private const val MIN_PREKEY_REPUBLISH_INTERVAL_MS: Long = 65_000L
+        private const val ACTION_IDENTITY_READY = "com.qubee.messenger.action.IDENTITY_READY"
 
         /**
          * Start the P2P foreground service. Must be called from a
@@ -136,6 +158,23 @@ class MessageService : Service(), NetworkCallback {
         fun stop(context: Context) {
             context.stopService(Intent(context, MessageService::class.java))
         }
+
+        /**
+         * Onboarding just created the identity. The service usually
+         * started before that (MainActivity starts it in onCreate), so
+         * its node has no inbox subscription, no prekey bundle out, and
+         * no call manager. Same foreground-start rules as [start].
+         */
+        fun identityReady(context: Context) {
+            try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, MessageService::class.java).setAction(ACTION_IDENTITY_READY),
+                )
+            } catch (e: Exception) {
+                Timber.w(e, "Could not signal identity-ready to MessageService")
+            }
+        }
     }
 
     override fun onCreate() {
@@ -144,7 +183,7 @@ class MessageService : Service(), NetworkCallback {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!isRunning) {
+        if (!foregroundStarted) {
             try {
                 // Explicitly bind the foreground-service type. On API
                 // 34+ a FGS started without the matching type (or
@@ -169,11 +208,10 @@ class MessageService : Service(), NetworkCallback {
                         0
                     },
                 )
-                startP2PNetwork()
+                foregroundStarted = true
                 startOfflineRetryLoop()
                 startPrekeyRepublishLoop()
                 startCallMediaLoop()
-                isRunning = true
                 Timber.d("MessageService started")
             } catch (e: Exception) {
                 // API 31+ throws ForegroundServiceStartNotAllowedException
@@ -188,38 +226,93 @@ class MessageService : Service(), NetworkCallback {
                 return START_NOT_STICKY
             }
         }
+        val identityReady = intent?.action == ACTION_IDENTITY_READY
+        serviceScope.launch {
+            val wasUp = networkStarted
+            val up = ensureNetworkStarted()
+            if (up && wasUp && identityReady) announceIdentity()
+        }
         return START_STICKY
     }
 
-    private fun startP2PNetwork() {
-        serviceScope.launch {
-            if (qubeeManager.initialize()) {
-                // Bring up the native call subsystem BEFORE we register the
-                // callback and start the node. An inbound call signal
-                // decrypts exactly once (the ratchet frame is consumed and
-                // can't be replayed), so the CallManager must already exist
-                // when the node begins delivering frames — otherwise the
-                // first signal of a call is lost. No-op when the .so was
-                // built without the calling feature.
-                if (!callRepository.start()) {
-                    Timber.d("Calling subsystem not started (feature off or no identity)")
-                }
-                qubeeManager.setNetworkCallback(this@MessageService)
-                if (qubeeManager.startNetworkNode()) {
-                    Timber.d("P2P Network Node started successfully")
-                    // Announce our signed prekey bundle so peers can
-                    // open forward-secret sessions with us (Ratchet
-                    // Stage 5). Best-effort: peers who miss it get it
-                    // on our next service start; without it they
-                    // simply can't initiate v3 and their sends fail
-                    // closed on their side.
-                    if (!qubeeManager.publishLocalPrekeyBundle()) {
-                        Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
-                    }
-                } else {
-                    Timber.e("Failed to start P2P Network Node")
-                }
+    /**
+     * Idempotent node bring-up; every start command funnels through
+     * here. Returns false without latching when the core can't
+     * initialise yet (Screen Lock binding before the unlock ceremony,
+     * or a sticky restart with an empty key holder) so the next start
+     * — MainActivity fires one after unlock — tries again.
+     */
+    private suspend fun ensureNetworkStarted(): Boolean = startLock.withLock {
+        if (networkStarted) return@withLock true
+        if (!qubeeManager.initialize()) {
+            Timber.d("Core not initialised yet; node start deferred to the next start command")
+            return@withLock false
+        }
+        // Bring up the native call subsystem BEFORE we register the
+        // callback and start the node. An inbound call signal decrypts
+        // exactly once (the ratchet frame is consumed and can't be
+        // replayed), so the CallManager must already exist when the node
+        // begins delivering frames. No-op without the calling feature or
+        // before onboarding (retried by announceIdentity).
+        if (!callRepository.start()) {
+            Timber.d("Calling subsystem not started (feature off or no identity)")
+        }
+        qubeeManager.setNetworkCallback(this@MessageService)
+        val localDiscovery = preferenceRepository.localDiscoveryEnabled()
+        if (localDiscovery) acquireMulticastLock()
+        val started = qubeeManager.startNetworkNode(
+            bootstrapNodes = preferenceRepository.bootstrapPeers(),
+            localDiscovery = localDiscovery,
+        )
+        if (!started) {
+            Timber.e("Failed to start P2P Network Node")
+            return@withLock false
+        }
+        networkStarted = true
+        Timber.d("P2P Network Node started (localDiscovery=%s)", localDiscovery)
+        announceIdentity()
+        true
+    }
+
+    /**
+     * Identity-dependent bring-up, safe to repeat: the call manager
+     * (idempotent natively) and the signed prekey bundle broadcast that
+     * lets peers open forward-secret sessions with us. Runs at node
+     * start, again when onboarding creates the identity afterwards, and
+     * on a debounced timer whenever a new peer shows up.
+     */
+    private suspend fun announceIdentity() {
+        if (!callRepository.start()) {
+            Timber.d("Calling subsystem not started (feature off or no identity)")
+        }
+        publishPrekeyBundle()
+    }
+
+    private suspend fun publishPrekeyBundle(): Boolean {
+        val ok = qubeeManager.publishLocalPrekeyBundle()
+        if (ok) {
+            lastPrekeyPublishAt = System.currentTimeMillis()
+        } else {
+            Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
+        }
+        return ok
+    }
+
+    /**
+     * A newly connected peer never saw our bundle (gossipsub has no
+     * history), so re-announce it once the mesh has formed. Coalesces a
+     * burst of discoveries into one publish and respects gossipsub's
+     * duplicate window.
+     */
+    private fun scheduleDiscoveryRepublish() {
+        if (discoveryRepublishJob?.isActive == true) return
+        discoveryRepublishJob = serviceScope.launch {
+            kotlinx.coroutines.delay(DISCOVERY_REPUBLISH_DELAY_MS)
+            val sinceLast = System.currentTimeMillis() - lastPrekeyPublishAt
+            if (sinceLast < MIN_PREKEY_REPUBLISH_INTERVAL_MS) {
+                kotlinx.coroutines.delay(MIN_PREKEY_REPUBLISH_INTERVAL_MS - sinceLast)
             }
+            if (networkStarted) publishPrekeyBundle()
         }
     }
 
@@ -290,9 +383,7 @@ class MessageService : Service(), NetworkCallback {
             while (isActive) {
                 kotlinx.coroutines.delay(PREKEY_REPUBLISH_INTERVAL_MS)
                 try {
-                    if (!qubeeManager.publishLocalPrekeyBundle()) {
-                        Timber.w("Periodic prekey bundle republish failed")
-                    }
+                    if (networkStarted) publishPrekeyBundle()
                 } catch (e: Exception) {
                     Timber.w(e, "prekey republish tick failed")
                 }
@@ -360,6 +451,11 @@ class MessageService : Service(), NetworkCallback {
                 null // budget exhausted; stop retrying
             }
             messageRepository.scheduleNextRetry(row.id, nextAttempt, nextRetry)
+            // A row that failed its first publish but left the device on
+            // this retry is now in the same state as a first-time SENT row.
+            if (ok && row.status == MessageStatus.FAILED) {
+                messageRepository.updateMessageStatus(row.id, MessageStatus.SENT)
+            }
             Timber.d(
                 "retried %s (attempt %d, ok=%s, next=%s)",
                 row.id, nextAttempt, ok, nextRetry,
@@ -376,10 +472,34 @@ class MessageService : Service(), NetworkCallback {
         else -> 2L * 3_600_000L  // 2h thereafter (caller bounds to budget)
     }
 
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE)
+                as? android.net.wifi.WifiManager ?: return
+            multicastLock = wifi.createMulticastLock("qubee-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Timber.d("Multicast lock acquired for local discovery")
+        } catch (e: Exception) {
+            Timber.w(e, "Could not acquire multicast lock; mDNS may not see peers")
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.takeIf { it.isHeld }?.release()
+        } catch (e: Exception) {
+            Timber.w(e, "Multicast lock release failed")
+        }
+        multicastLock = null
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        isRunning = false
         serviceScope.cancel()
+        releaseMulticastLock()
         Timber.d("MessageService destroyed")
     }
 
@@ -885,6 +1005,7 @@ class MessageService : Service(), NetworkCallback {
 
     override fun onPeerDiscovered(peerId: String) {
         Timber.d("Discovered new peer: %s", peerId)
+        scheduleDiscoveryRepublish()
     }
 
     override fun onMessageAcked(

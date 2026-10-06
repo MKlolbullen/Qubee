@@ -18,7 +18,7 @@ def prepare_source_tree(workspace: Path, stage: Path) -> None:
     gradle = (workspace / "app/build.gradle").read_text()
     levels = {}
     for name in ("minSdk", "targetSdk"):
-        matches = re.findall(r"^\\s*" + name + r"\\s+(\\d+)\\s*$", gradle, re.MULTILINE)
+        matches = re.findall(r"^\s*" + name + r"\s+(\d+)\s*$", gradle, re.MULTILINE)
         if len(matches) != 1:
             raise ValueError(f"Expected one literal {name}; update scanner SDK extraction")
         levels[name] = matches[0]

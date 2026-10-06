@@ -36,7 +36,10 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
 
       - name: Set up Rust + Android targets
         uses: dtolnay/rust-toolchain@stable
@@ -107,15 +110,24 @@ jobs:
         # visibility but don't gate the PR on it.
         run: ./gradlew :app:lintDebug --no-daemon || true
 
+      - name: Verify APK signatures and checksums
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/debug/*.apk out/qubee-debug.apk
+          cp app/build/outputs/apk/release/*.apk out/qubee-release-debugsigned.apk
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          for apk in out/*.apk; do
+            "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$apk"
+          done
+          (cd out && sha256sum *.apk > SHA256SUMS)
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: qubee-apks-${{ github.sha }}
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
-          retention-days: 7
-          if-no-files-found: warn
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
 
   verify-screenshots:
     name: Paparazzi screenshot baselines
@@ -134,7 +146,10 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
 
       - name: Cache Gradle
         uses: actions/cache@v4

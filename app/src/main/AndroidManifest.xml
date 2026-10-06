@@ -46,7 +46,8 @@
             android:name=".ui.main.MainActivity"
             android:exported="true"
             android:theme="@style/Theme.Qubee"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:taskAffinity="">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

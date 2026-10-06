@@ -30,7 +30,7 @@ jobs:
         run: python -m pip install 'mobsfscan==1.0.1'
 
       - name: Scan Android source
-        run: mobsfscan app/src/main --type android --sarif --output results.sarif
+        run: python scripts/run_mobsfscan.py
 
       # Preserve findings even when the scan exits nonzero. A failed
       # installation does not masquerade as a completed clean scan.

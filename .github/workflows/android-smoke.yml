@@ -107,15 +107,24 @@ jobs:
         # visibility but don't gate the PR on it.
         run: ./gradlew :app:lintDebug --no-daemon || true
 
+      - name: Verify APK signatures and checksums
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/debug/*.apk out/qubee-debug.apk
+          cp app/build/outputs/apk/release/*.apk out/qubee-release-debugsigned.apk
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          for apk in out/*.apk; do
+            "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$apk"
+          done
+          (cd out && sha256sum *.apk > SHA256SUMS)
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: qubee-apks-${{ github.sha }}
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
-          retention-days: 7
-          if-no-files-found: warn
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
 
   verify-screenshots:
     name: Paparazzi screenshot baselines

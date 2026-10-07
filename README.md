@@ -313,6 +313,8 @@ This is **not** a separate contributory DH exchange for the media root; secrecy 
 
 WebRTC negotiates **DTLS-SRTP**. The Rust tree also contains a `MediaKey` / `MediaEncryption` abstraction, but the current Android encoded-sample pipeline does **not** apply an additional Qubee frame-encryption layer before handing Opus frames to WebRTC. The project should either keep DTLS-SRTP as the explicit media-security boundary or deliberately add and test an application-layer frame encryption scheme; documentation should not imply both are active when they are not.
 
+That boundary, the ICE/STUN/TURN metadata exposure, and the frame and queue limits are written in [`docs/architecture/calling-threat-model.md`](docs/architecture/calling-threat-model.md). Inbound signaling is bound to the authenticated 1:1 peer: a frame cannot name a different caller, substitute a call id, or re-ring a call that already ended. Those checks are host-tested. They are not a physical-device validation.
+
 ### Why calling is still marked gated
 
 The default Android native build runs Cargo **without** `--features calling`, so the normal release `.so` does not expose the calling JNI symbols. The Kotlin layer fails closed when those symbols are unavailable.
@@ -323,13 +325,12 @@ Before calling should be considered shippable, it needs at least:
 - API 34+ microphone foreground-service validation;
 - runtime permission validation;
 - codec compatibility across OEMs;
-- bounded media queues/backpressure across every hop;
-- mono/stereo capability normalization;
 - echo cancellation / noise suppression / gain behavior;
 - Wi-Fi ↔ cellular transitions and reconnect behavior;
 - long-call memory/thermal/battery testing;
-- explicit ICE/STUN/TURN metadata documentation;
 - video capture/rendering only after the voice path is stable.
+
+Host tests now cover bounded queues, mono Opus advertisement, and the authenticated-sender checks. The items above still need a physical device.
 
 ## 📱 UI previews
 

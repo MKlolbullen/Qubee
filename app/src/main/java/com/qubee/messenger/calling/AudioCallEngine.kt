@@ -283,7 +283,9 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
         const val DEQUEUE_TIMEOUT_US = 10_000L
         const val TEARDOWN_JOIN_MS = 500L
         const val REMOTE_QUEUE_CAPACITY = 12
-        const val MAX_REMOTE_FRAME_BYTES = 64 * 1024
+        // Matches `media_policy::MAX_AUDIO_FRAME_BYTES`. Opus frames are
+        // at most 1275 bytes; anything larger is dropped before decode.
+        const val MAX_REMOTE_FRAME_BYTES = 2048
         val POISON = ByteArray(0)
     }
 }

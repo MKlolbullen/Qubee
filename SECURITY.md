@@ -178,6 +178,8 @@ Actual encoded media is currently handed to WebRTC, which negotiates DTLS-SRTP. 
 
 The Android audio pipeline is compile-verified scaffolding and still requires physical-device validation for codec availability, foreground-service rules, permission timing, audio routing and teardown behavior.
 
+The media-security boundary is DTLS-SRTP only. `MediaEncryption` is not applied to the sample path. ICE/STUN/TURN metadata exposure, authenticated-sender binding, and the frame/queue limits are specified in [`docs/architecture/calling-threat-model.md`](docs/architecture/calling-threat-model.md).
+
 ### 7. Database migrations are still pre-stable
 
 Room has an explicit migration chain, but the project has not yet treated every schema snapshot as a stable release contract. Cross-version data survival before the first stable schema should be considered best-effort.

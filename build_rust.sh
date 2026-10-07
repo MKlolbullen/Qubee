@@ -38,9 +38,15 @@ export RUSTFLAGS="${RUSTFLAGS:-} \
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 
 echo "Building Rust shared library for Android (release, --locked) ..."
+CARGO_ARGS=(--release --locked)
+if [[ "${QUBEE_CALLING:-0}" == "1" ]]; then
+    echo "Calling feature requested. Gradle must also be invoked with -PqubeeCalling=true"
+    echo "or the chat UI will keep the call control hidden."
+    CARGO_ARGS+=(--features calling)
+fi
 for abi in arm64-v8a armeabi-v7a x86_64 x86; do
     echo "  → $abi"
-    cargo ndk -t "$abi" -o "$ANDROID_JNI_DIR" build --release --locked
+    cargo ndk -t "$abi" -o "$ANDROID_JNI_DIR" build "${CARGO_ARGS[@]}"
 done
 
 echo

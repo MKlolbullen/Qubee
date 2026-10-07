@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 once it leaves the `0.x` line. Until then, expect breaking changes
 between minor versions.
 
+## [Unreleased]
+
+### Security
+
+- Calling signaling is bound to the authenticated 1:1 peer. A frame
+  whose embedded caller or sender does not match that peer is rejected,
+  and ICE or SDP for a call that peer is not in cannot be applied to
+  another call.
+- Replayed invitations no longer re-ring a call that has ended, been
+  rejected, or timed out, and an all-zero media root is refused.
+- Remote media uses a 12-frame drop-oldest queue. Audio frames above
+  2048 bytes, video RTP payloads above 16 KiB, and oversized SDP or ICE
+  text are rejected before they are queued.
+- The negotiated Opus profile is 48 kHz mono, matching Android capture.
+  The default codec registration (stereo Opus) is not used.
+- The chat call control is hidden unless the APK was built with
+  `-PqubeeCalling=true` and `nativeStartCalling` linked. Calling remains
+  gated; this is not a release claim. See
+  `docs/architecture/calling-threat-model.md`.
+
 ## [0.1.0-alpha] — 2026-08-06
 
 ### Added

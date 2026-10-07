@@ -14,12 +14,14 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::calling::call_manager::{CallId, CallSettings, CallType};
+use crate::calling::media_policy::MAX_SIGNALING_FRAME_BYTES;
 use crate::calling::peer_connection::ICECandidate;
 use crate::identity::identity_key::IdentityId;
 
@@ -234,8 +236,26 @@ impl SignalingMessage {
     }
 
     /// Tries to parse bytes into a `SignalingMessage`.
+    ///
+    /// Payloads larger than [`MAX_SIGNALING_FRAME_BYTES`] are rejected
+    /// before deserialize, and bincode itself is capped at the same limit
+    /// so a length prefix inside an otherwise-small buffer cannot allocate
+    /// an unbounded string.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+        if bytes.len() > MAX_SIGNALING_FRAME_BYTES {
+            return Err(Box::new(bincode::ErrorKind::Custom(
+                "signaling frame exceeds size limit".into(),
+            )));
+        }
+        // `bincode::serialize` is fixint + trailing-bytes allowed. The
+        // Options struct defaults are different; match the function so
+        // existing frames still decode, while `with_limit` refuses an
+        // internal length that would allocate past the cap.
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_SIGNALING_FRAME_BYTES as u64)
+            .deserialize(bytes)
     }
 }
 
@@ -315,5 +335,17 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[test]
+    fn oversized_signaling_frame_is_rejected_before_decode() {
+        use crate::calling::media_policy::MAX_SIGNALING_FRAME_BYTES;
+        let mut blob = vec![0u8; MAX_SIGNALING_FRAME_BYTES + 1];
+        blob[0] = 1;
+        assert!(SignalingMessage::from_bytes(&blob).is_err());
+        let hangup = sample_hangup(IdentityId::from([1u8; 32]));
+        let bytes = hangup.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_SIGNALING_FRAME_BYTES);
+        SignalingMessage::from_bytes(&bytes).unwrap();
     }
 }

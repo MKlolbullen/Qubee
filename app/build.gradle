@@ -54,6 +54,13 @@ android {
         // whole expression as the argument.
         versionCode Integer.parseInt((project.findProperty('qubeeVersionCode') ?: '100').toString())
 
+        // Default false. `build_rust.sh` does not pass `--features calling`,
+        // so a normal .so has no calling JNI symbols. A calling-enabled
+        // native build must also pass `-PqubeeCalling=true` or the chat
+        // control stays hidden. Do not flip this without the cargo feature.
+        def callingNativeEnabled = (project.findProperty('qubeeCalling') ?: 'false').toString() == 'true'
+        buildConfigField 'boolean', 'CALLING_NATIVE_ENABLED', callingNativeEnabled ? 'true' : 'false'
+
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
         ndk {

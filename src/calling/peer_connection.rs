@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::calling::call_manager::CallId;
 use crate::calling::media_encryption::MediaKey;
+use crate::calling::media_policy::{self, OPUS_CHANNELS, OPUS_CLOCK_RATE, OPUS_FMTP};
+use crate::calling::realtime_queue::RealtimeSender;
 use crate::calling::webrtc_manager::MediaStats;
 use crate::calling::webrtc_manager::WebRTCConfig;
 use crate::calling::webrtc_manager::{MediaKind, OutboundIce, RemoteMedia};
@@ -10,7 +12,9 @@ use crate::identity::identity_key::IdentityId;
 use bytes::Bytes;
 use std::time::{Duration, SystemTime};
 use webrtc::media::Sample;
-use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
 
 // Imports updated for webrtc 0.14:
 //   * `peer_connection::peer_connection::RTCPeerConnection` was
@@ -21,7 +25,7 @@ use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 //     directly under `webrtc::track::`.
 use std::sync::Arc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -30,13 +34,57 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 use tokio::sync::{mpsc, Mutex};
+
+/// Opus capability matching Android's 48 kHz mono capture. Shared by the
+/// outbound track and the media-engine registration so SDP cannot advertise
+/// stereo unless this function changes.
+pub(crate) fn local_opus_capability() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_OPUS.to_string(),
+        clock_rate: OPUS_CLOCK_RATE,
+        channels: OPUS_CHANNELS,
+        sdp_fmtp_line: OPUS_FMTP.to_string(),
+        rtcp_feedback: vec![],
+    }
+}
+
+fn register_qubee_codecs(media_engine: &mut MediaEngine) -> Result<()> {
+    // Do not call `register_default_codecs`: its Opus entry is 48 kHz
+    // stereo (payload 111), and a second registration does not replace it.
+    media_engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                capability: local_opus_capability(),
+                payload_type: 111,
+                ..Default::default()
+            },
+            RTPCodecType::Audio,
+        )
+        .context("Failed to register mono Opus")?;
+    media_engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_VP8.to_string(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: String::new(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: 96,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )
+        .context("Failed to register VP8")?;
+    Ok(())
+}
 
 /// Represents the state of a peer connection. Mirrors the variants
 /// exposed by webrtc-rs's `RTCPeerConnectionState` so `state()` can
@@ -135,7 +183,7 @@ impl PeerConnection {
         call_id: CallId,
         participant: IdentityId,
         ice_out: mpsc::UnboundedSender<OutboundIce>,
-        remote_media_out: mpsc::UnboundedSender<RemoteMedia>,
+        remote_media_out: RealtimeSender<RemoteMedia>,
     ) -> Result<Self> {
         // Convert CallManager's WebRTCConfig into the lower-level RTCConfiguration
         // used by webrtc-rs. Each STUN/TURN server becomes an RTCIceServer.
@@ -164,9 +212,7 @@ impl PeerConnection {
         // added track has no negotiable format and offer creation fails
         // with "RTPSender created with no codecs".
         let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .context("Failed to register default codecs")?;
+        register_qubee_codecs(&mut media_engine)?;
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)
             .context("Failed to register default interceptors")?;
@@ -214,18 +260,21 @@ impl PeerConnection {
                 };
                 // Reads end (Err) when the track closes.
                 while let Ok((packet, _)) = track.read_rtp().await {
-                    if packet.payload.is_empty() {
+                    let payload = packet.payload.as_ref();
+                    let allowed = match kind {
+                        MediaKind::Audio => media_policy::check_audio_frame(payload).is_ok(),
+                        MediaKind::Video => media_policy::check_video_frame(payload).is_ok(),
+                    };
+                    if !allowed {
                         continue;
                     }
-                    if remote_media_out
-                        .send(RemoteMedia {
-                            call_id,
-                            participant,
-                            kind,
-                            payload: packet.payload.to_vec(),
-                        })
-                        .is_err()
-                    {
+                    let queued = remote_media_out.push_freshest(RemoteMedia {
+                        call_id,
+                        participant,
+                        kind,
+                        payload: payload.to_vec(),
+                    });
+                    if !queued {
                         break; // CallManager dropped the receiver
                     }
                 }
@@ -284,15 +333,7 @@ impl PeerConnection {
             // application. For now we rely on the media subsystem to
             // handle silence frames.
             if sender_opt.is_none() {
-                // Define the codec capability for Opus audio. We use
-                // stereo at 48 kHz, which is widely supported.
-                let audio_cap = RTCRtpCodecCapability {
-                    mime_type: "audio/opus".to_string(),
-                    clock_rate: 48000,
-                    channels: 2,
-                    sdp_fmtp_line: String::new(),
-                    rtcp_feedback: vec![],
-                };
+                let audio_cap = local_opus_capability();
                 let track = Arc::new(TrackLocalStaticSample::new(
                     audio_cap.clone(),
                     "audio".to_string(),
@@ -316,13 +357,7 @@ impl PeerConnection {
                 let track = if let Some(track) = track_opt.as_ref() {
                     track.clone()
                 } else {
-                    let audio_cap = RTCRtpCodecCapability {
-                        mime_type: "audio/opus".to_string(),
-                        clock_rate: 48000,
-                        channels: 2,
-                        sdp_fmtp_line: String::new(),
-                        rtcp_feedback: vec![],
-                    };
+                    let audio_cap = local_opus_capability();
                     let t = Arc::new(TrackLocalStaticSample::new(
                         audio_cap,
                         "audio".to_string(),
@@ -586,6 +621,7 @@ impl PeerConnection {
     /// packetizes and sends. Requires the audio track to exist (enable
     /// audio first).
     pub async fn write_audio_sample(&self, data: &[u8], duration: Duration) -> Result<()> {
+        media_policy::check_audio_frame(data)?;
         let track_guard = self.audio_track.lock().await;
         let track = track_guard
             .as_ref()
@@ -603,6 +639,7 @@ impl PeerConnection {
 
     /// Write one encoded video frame to the local video track.
     pub async fn write_video_sample(&self, data: &[u8], duration: Duration) -> Result<()> {
+        media_policy::check_video_frame(data)?;
         let track_guard = self.video_track.lock().await;
         let track = track_guard
             .as_ref()

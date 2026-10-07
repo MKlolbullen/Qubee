@@ -70,9 +70,15 @@ use crate::calling::call_manager::{
     CallEvent, CallId, CallManager, CallManagerConfig, CallSettings, CallType,
 };
 #[cfg(feature = "calling")]
+use crate::calling::media_policy;
+#[cfg(feature = "calling")]
+use crate::calling::realtime_queue::RealtimeReceiver;
+#[cfg(feature = "calling")]
 use crate::calling::signaling::{ChannelSignalingTransport, OutboundSignal};
 #[cfg(feature = "calling")]
 use crate::calling::webrtc_manager::MediaKind;
+#[cfg(feature = "calling")]
+use crate::calling::webrtc_manager::RemoteMedia;
 
 // --- Global State ---
 
@@ -4246,6 +4252,29 @@ async fn drain_call_events(mut rx: tokio::sync::mpsc::UnboundedReceiver<CallEven
     }
 }
 
+/// Play remote frames from the bounded queue. One frame is in the JNI
+/// callback at a time; if this task falls behind, the queue drops the
+/// oldest frame rather than copying into the unbounded event channel.
+#[cfg(feature = "calling")]
+async fn drain_remote_media(mut rx: RealtimeReceiver<RemoteMedia>) {
+    while let Some(media) = rx.recv().await {
+        dispatch_call_event_to_kotlin(CallEvent::RemoteMedia {
+            call_id: media.call_id,
+            participant: media.participant,
+            kind: media.kind,
+            payload: media.payload,
+        });
+    }
+}
+
+#[cfg(feature = "calling")]
+fn jni_bytes_within(env: &JNIEnv, array: &JByteArray, max: usize) -> bool {
+    matches!(
+        env.get_array_length(array),
+        Ok(len) if len > 0 && (len as usize) <= max
+    )
+}
+
 /// Start the calling subsystem for the active identity. Idempotent-ish:
 /// a second call replaces the manager. Returns false if no identity is
 /// active or the manager can't be built.
@@ -4274,9 +4303,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
                 )
                 .await
             })?;
+            let media_rx = CALL_RUNTIME.block_on(manager.take_remote_media());
 
             CALL_RUNTIME.spawn(drain_outbound_call_signals(signal_rx));
             CALL_RUNTIME.spawn(drain_call_events(event_rx));
+            if let Some(media_rx) = media_rx {
+                CALL_RUNTIME.spawn(drain_remote_media(media_rx));
+            }
             *CALL_MANAGER.lock().unwrap() = Some(Arc::new(manager));
             Ok(())
         })();
@@ -4398,6 +4431,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandle
     catch_unwind_result(|| {
         let result: anyhow::Result<()> = (|| {
             let sender_hex: String = env.get_string(&sender)?.into();
+            if !jni_bytes_within(&env, &payload, media_policy::MAX_SIGNALING_FRAME_BYTES) {
+                return Err(anyhow::anyhow!("call signal exceeds size limit"));
+            }
             let payload = env.convert_byte_array(&payload)?;
             let sender_id = IdentityId::from(parse_hex32(Some(&sender_hex))?);
             let cm = call_manager()?;
@@ -4493,6 +4529,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteA
         let result: anyhow::Result<()> = (|| {
             let call_id_hex: String = env.get_string(&call_id)?.into();
             let participant_hex: String = env.get_string(&participant)?.into();
+            if !jni_bytes_within(&env, &frame, media_policy::MAX_AUDIO_FRAME_BYTES) {
+                return Err(anyhow::anyhow!("audio frame exceeds size limit"));
+            }
             let frame = env.convert_byte_array(&frame)?;
             let cid = parse_call_id(&call_id_hex)?;
             let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);
@@ -4526,6 +4565,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteV
         let result: anyhow::Result<()> = (|| {
             let call_id_hex: String = env.get_string(&call_id)?.into();
             let participant_hex: String = env.get_string(&participant)?.into();
+            if !jni_bytes_within(&env, &frame, media_policy::MAX_VIDEO_FRAME_BYTES) {
+                return Err(anyhow::anyhow!("video frame exceeds size limit"));
+            }
             let frame = env.convert_byte_array(&frame)?;
             let cid = parse_call_id(&call_id_hex)?;
             let pid = IdentityId::from(parse_hex32(Some(&participant_hex))?);

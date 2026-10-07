@@ -52,8 +52,12 @@ class CallMediaService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val callIdHex = intent?.getStringExtra(EXTRA_CALL_ID)
         val peerIdHex = intent?.getStringExtra(EXTRA_PEER_ID)
-        if (callIdHex.isNullOrEmpty() || peerIdHex.isNullOrEmpty()) {
-            Timber.w("CallMediaService started without call/peer id; stopping")
+        // stop() clears desiredCallId before stopService returns. A start
+        // that was already queued must not bring the microphone back up
+        // after the call has ended.
+        if (callIdHex.isNullOrEmpty() || peerIdHex.isNullOrEmpty() || desiredCallId != callIdHex) {
+            Timber.w("CallMediaService start ignored; no live call")
+            releaseEngine()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -74,6 +78,7 @@ class CallMediaService : Service() {
             // or from a disallowed state. Fail closed — no call audio —
             // rather than crash the process.
             Timber.e(e, "startForeground(microphone) rejected; stopping call media")
+            releaseEngine()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -91,15 +96,20 @@ class CallMediaService : Service() {
     }
 
     override fun onDestroy() {
+        releaseEngine()
         super.onDestroy()
-        engine?.stop()
-        engine = null
-        activeCallIdHex = ""
         if (active === this) active = null
         Timber.d("CallMediaService destroyed")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /** Stop capture and drop the engine. Safe to call more than once. */
+    private fun releaseEngine() {
+        engine?.stop()
+        engine = null
+        activeCallIdHex = ""
+    }
 
     /** Route one remote Opus frame to the running engine, if it's this call. */
     private fun onRemoteAudio(callIdHex: String, payload: ByteArray) {
@@ -144,7 +154,11 @@ class CallMediaService : Service() {
         private var active: CallMediaService? = null
 
         /** Bring up mic capture + playback for [callIdHex] ↔ [peerIdHex]. */
+        @Volatile
+        private var desiredCallId: String? = null
+
         fun start(context: Context, callIdHex: String, peerIdHex: String) {
+            desiredCallId = callIdHex
             val intent = Intent(context, CallMediaService::class.java).apply {
                 putExtra(EXTRA_CALL_ID, callIdHex)
                 putExtra(EXTRA_PEER_ID, peerIdHex)
@@ -157,6 +171,8 @@ class CallMediaService : Service() {
         }
 
         fun stop(context: Context) {
+            desiredCallId = null
+            active?.releaseEngine()
             context.stopService(Intent(context, CallMediaService::class.java))
         }
 

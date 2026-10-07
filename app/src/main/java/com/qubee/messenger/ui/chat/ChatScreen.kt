@@ -139,6 +139,7 @@ fun ChatScreen(
                     securityState = uiState.securityState,
                     onBackClick = onBackClick,
                     onSecureCallClick = viewModel::requestSecureCall,
+                    callingAvailable = uiState.callingAvailable && !uiState.isGroup,
                     onDetailsClick = { showDetails = true },
                 )
             },
@@ -294,6 +295,7 @@ private fun SecureChatTopBar(
     securityState: ConversationSecurityState,
     onBackClick: () -> Unit,
     onSecureCallClick: () -> Unit,
+    callingAvailable: Boolean,
     onDetailsClick: () -> Unit,
 ) {
     Surface(
@@ -337,8 +339,18 @@ private fun SecureChatTopBar(
                     )
                 }
             }
-            IconButton(onClick = onSecureCallClick) {
-                Icon(Icons.Default.Lock, contentDescription = "Secure call", tint = QubeePalette.Cyan)
+            // Absent unless this build's native library was compiled with
+            // `--features calling` AND `startCalling()` linked the symbols.
+            // A lock icon on the default .so would imply a capability that
+            // fails closed.
+            if (callingAvailable) {
+                IconButton(onClick = onSecureCallClick) {
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = "Secure voice call",
+                        tint = QubeePalette.Cyan,
+                    )
+                }
             }
             IconButton(onClick = onDetailsClick) {
                 Icon(Icons.Default.MoreVert, contentDescription = "Conversation details", tint = QubeePalette.MutedText)

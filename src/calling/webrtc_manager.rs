@@ -6,7 +6,9 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::calling::call_manager::{CallId, TurnServer};
 use crate::calling::media_encryption::MediaKey;
+use crate::calling::media_policy::{self, OPUS_CHANNELS, OPUS_CLOCK_RATE, OPUS_FMTP};
 use crate::calling::peer_connection::{ICECandidate, PeerConnection};
+use crate::calling::realtime_queue::RealtimeSender;
 use crate::identity::identity_key::IdentityId;
 
 /// A locally-gathered ICE candidate to be trickled to the remote. The
@@ -52,8 +54,9 @@ pub struct WebRTCManager {
     /// `CallManager` and trickled to the remote over signaling.
     ice_out: mpsc::UnboundedSender<OutboundIce>,
     /// Sink for encoded frames received on remote tracks, drained by
-    /// `CallManager` and surfaced to the app for decode + playback.
-    remote_media_out: mpsc::UnboundedSender<RemoteMedia>,
+    /// the call runtime and surfaced to the app for decode + playback.
+    /// A slow consumer drops the oldest frame instead of growing memory.
+    remote_media_out: RealtimeSender<RemoteMedia>,
 }
 
 /// Per-(call, participant) ICE candidate buffer.
@@ -191,7 +194,7 @@ impl WebRTCManager {
     pub async fn new(
         config: WebRTCConfig,
         ice_out: mpsc::UnboundedSender<OutboundIce>,
-        remote_media_out: mpsc::UnboundedSender<RemoteMedia>,
+        remote_media_out: RealtimeSender<RemoteMedia>,
     ) -> Result<Self> {
         let media_devices = MediaDevicesManager::new().await?;
 
@@ -239,6 +242,7 @@ impl WebRTCManager {
         data: &[u8],
         duration: std::time::Duration,
     ) -> Result<()> {
+        media_policy::check_audio_frame(data)?;
         let connections = self.peer_connections.read().await;
         let connection = connections
             .get(&(call_id, participant))
@@ -254,6 +258,7 @@ impl WebRTCManager {
         data: &[u8],
         duration: std::time::Duration,
     ) -> Result<()> {
+        media_policy::check_video_frame(data)?;
         let connections = self.peer_connections.read().await;
         let connection = connections
             .get(&(call_id, participant))
@@ -369,12 +374,25 @@ impl WebRTCManager {
         } else {
             // Store candidate for later if connection doesn't exist yet
             let mut ice_candidates = self.ice_candidates.write().await;
-            ice_candidates
+            let cached = ice_candidates
                 .entry((call_id, participant))
-                .or_insert_with(Vec::new)
-                .push(candidate);
+                .or_insert_with(Vec::new);
+            if cached.len() >= media_policy::MAX_CACHED_ICE_PER_PEER {
+                cached.remove(0);
+            }
+            cached.push(candidate);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cached_ice_len(&self) -> usize {
+        self.ice_candidates
+            .read()
+            .await
+            .values()
+            .map(|candidates| candidates.len())
+            .sum()
     }
 
     /// Create offer for initiating connection
@@ -441,9 +459,13 @@ impl WebRTCManager {
             CodecConfig {
                 name: "opus".to_string(),
                 payload_type: 111,
-                clock_rate: 48000,
-                channels: Some(2),
-                parameters: HashMap::new(),
+                clock_rate: OPUS_CLOCK_RATE,
+                channels: Some(u32::from(OPUS_CHANNELS)),
+                parameters: {
+                    let mut params = HashMap::new();
+                    params.insert("fmtp".to_string(), OPUS_FMTP.to_string());
+                    params
+                },
             },
             CodecConfig {
                 name: "PCMU".to_string(),

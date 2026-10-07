@@ -70,6 +70,11 @@ class ChatViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
+            callRepository.callingAvailable.collect { available ->
+                _uiState.value = _uiState.value.copy(callingAvailable = available)
+            }
+        }
+        viewModelScope.launch {
             // Resolve the conversation row + contact metadata first
             // so subsequent sendMessage calls have a target to write
             // to, then start streaming messages.
@@ -862,6 +867,10 @@ data class ChatUiState(
     /// matches this against `GroupMemberInfo.identityIdHex` to put
     /// a "You" badge on the row representing the local user.
     val myIdentityIdHex: String? = null,
+    /// True only after [CallRepository.start] confirms this build's native
+    /// library exported calling symbols. Defaults false so a default .so
+    /// never shows a call control.
+    val callingAvailable: Boolean = false,
 )
 
 data class ConversationDetailsUi(

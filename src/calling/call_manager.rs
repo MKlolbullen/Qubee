@@ -1,11 +1,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::calling::media_encryption::MediaEncryption;
+use crate::calling::media_policy::{self, REMOTE_MEDIA_QUEUE_CAPACITY};
+use crate::calling::realtime_queue::{self, RealtimeReceiver};
 use crate::calling::signaling::{SignalingMessage, SignalingTransport};
 use crate::calling::webrtc_manager::{
     MediaKind, OutboundIce, RemoteMedia, WebRTCConfig, WebRTCManager,
@@ -37,6 +39,57 @@ pub struct CallManager {
     config: CallManagerConfig,
     /// Contact manager for resolving identity keys and display names
     contact_manager: Arc<ContactManager>,
+    /// Call ids that already ended, were rejected, or timed out. A replayed
+    /// invitation for one of these must not ring again, even after the live
+    /// entry is gone.
+    ended_invites: Arc<RwLock<EndedCallIds>>,
+    /// Serializes mute/video toggles so overlapping updates cannot lose a flip.
+    media_toggle: Arc<Mutex<()>>,
+    /// Bounded remote-media consumer. Taken once by the runtime that plays
+    /// frames; never forwarded into an unbounded event channel.
+    remote_media_rx: Mutex<Option<RealtimeReceiver<RemoteMedia>>>,
+}
+
+const MAX_ENDED_CALL_IDS: usize = 64;
+
+struct EndedCallIds {
+    order: VecDeque<CallId>,
+    set: HashSet<CallId>,
+}
+
+impl EndedCallIds {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            set: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, id: CallId) {
+        if self.set.insert(id) {
+            self.order.push_back(id);
+            while self.order.len() > MAX_ENDED_CALL_IDS {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, id: &CallId) -> bool {
+        self.set.contains(id)
+    }
+}
+
+fn is_terminal(state: &CallState) -> bool {
+    matches!(
+        state,
+        CallState::Ended
+            | CallState::Cancelled
+            | CallState::Failed { .. }
+            | CallState::Rejected
+            | CallState::TimedOut
+    )
 }
 
 /// Individual call instance
@@ -215,8 +268,8 @@ pub enum VideoQuality {
 pub enum AudioQuality {
     Low,    // 8kHz, mono
     Medium, // 16kHz, mono
-    High,   // 48kHz, stereo
-    Studio, // 96kHz, stereo
+    High,   // preference only; capture is 48 kHz mono
+    Studio, // preference only; capture is 48 kHz mono
     Auto,   // Adaptive based on connection
 }
 
@@ -336,8 +389,10 @@ impl CallManager {
         // to the remote over signaling.
         let (ice_out, ice_in) = mpsc::unbounded_channel();
         // Encoded frames from remote tracks flow out on this channel; a
-        // background task republishes them as CallEvents for the app.
-        let (remote_media_out, remote_media_in) = mpsc::unbounded_channel();
+        // background drain plays them. The queue drops the oldest frame when
+        // the consumer falls behind, so a hostile producer cannot grow it.
+        let (remote_media_out, remote_media_in) =
+            realtime_queue::realtime_channel(REMOTE_MEDIA_QUEUE_CAPACITY);
         let webrtc_manager = WebRTCManager::new(webrtc_config, ice_out, remote_media_out).await?;
         let contact_manager = Arc::new(ContactManager::new());
 
@@ -345,10 +400,6 @@ impl CallManager {
             ice_in,
             signaling.clone(),
             local_identity,
-        ));
-        tokio::spawn(Self::forward_remote_media(
-            remote_media_in,
-            event_sender.clone(),
         ));
 
         Ok(CallManager {
@@ -360,7 +411,17 @@ impl CallManager {
             event_sender,
             config,
             contact_manager,
+            ended_invites: Arc::new(RwLock::new(EndedCallIds::new())),
+            media_toggle: Arc::new(Mutex::new(())),
+            remote_media_rx: Mutex::new(Some(remote_media_in)),
         })
+    }
+
+    /// Take the remote-media consumer. The runtime that plays frames must
+    /// call this once; a second call returns `None`. Frames are not copied
+    /// into the unbounded [`CallEvent`] channel.
+    pub async fn take_remote_media(&self) -> Option<RealtimeReceiver<RemoteMedia>> {
+        self.remote_media_rx.lock().await.take()
     }
 
     /// Provision the shared media root for a call. Both endpoints call
@@ -395,27 +456,6 @@ impl CallManager {
         }
     }
 
-    /// Drain encoded frames from remote tracks and republish them as
-    /// [`CallEvent::RemoteMedia`] so the app can decode and play them.
-    async fn forward_remote_media(
-        mut remote_media_in: mpsc::UnboundedReceiver<RemoteMedia>,
-        event_sender: mpsc::UnboundedSender<CallEvent>,
-    ) {
-        while let Some(media) = remote_media_in.recv().await {
-            if event_sender
-                .send(CallEvent::RemoteMedia {
-                    call_id: media.call_id,
-                    participant: media.participant,
-                    kind: media.kind,
-                    payload: media.payload,
-                })
-                .is_err()
-            {
-                break; // no event consumer left
-            }
-        }
-    }
-
     /// Write one encoded audio frame captured by the app to the call's
     /// outbound track.
     pub async fn write_audio_sample(
@@ -425,6 +465,7 @@ impl CallManager {
         data: &[u8],
         duration: Duration,
     ) -> Result<()> {
+        media_policy::check_audio_frame(data)?;
         self.webrtc_manager
             .write_audio_sample(call_id, participant, data, duration)
             .await
@@ -439,6 +480,7 @@ impl CallManager {
         data: &[u8],
         duration: Duration,
     ) -> Result<()> {
+        media_policy::check_video_frame(data)?;
         self.webrtc_manager
             .write_video_sample(call_id, participant, data, duration)
             .await
@@ -552,9 +594,10 @@ impl CallManager {
     }
 
     /// Route a decoded [`SignalingMessage`] to its handler. The
-    /// `sender` fields carried in the message identify the remote
-    /// endpoint the state applies to.
-    async fn dispatch_signaling(&self, _from: IdentityId, message: SignalingMessage) -> Result<()> {
+    /// embedded sender must match `from`, the identity of the authenticated
+    /// 1:1 session that carried the frame. A peer cannot name another
+    /// participant or another call.
+    async fn dispatch_signaling(&self, from: IdentityId, message: SignalingMessage) -> Result<()> {
         match message {
             SignalingMessage::CallInvitation {
                 call_id,
@@ -563,10 +606,15 @@ impl CallManager {
                 settings,
                 media_root,
             } => {
+                self.require_claimed_sender(from, caller)?;
                 self.on_call_invitation(call_id, caller, call_type, settings, media_root)
                     .await
             }
             SignalingMessage::HangUp { call_id, sender } => {
+                self.require_claimed_sender(from, sender)?;
+                if !self.is_live_participant(call_id, sender).await {
+                    return Ok(());
+                }
                 self.on_remote_hangup(call_id, sender).await
             }
             SignalingMessage::IceCandidate {
@@ -574,6 +622,10 @@ impl CallManager {
                 candidate,
                 sender,
             } => {
+                self.require_claimed_sender(from, sender)?;
+                self.require_live_participant(call_id, sender).await?;
+                media_policy::check_ice_text("sdp_mid", &candidate.sdp_mid)?;
+                media_policy::check_ice_text("candidate", &candidate.candidate)?;
                 self.webrtc_manager
                     .add_ice_candidate(call_id, sender, candidate)
                     .await
@@ -584,17 +636,52 @@ impl CallManager {
                 call_id,
                 sdp,
                 sender,
-            } => self.on_sdp_offer(call_id, sender, sdp).await,
+            } => {
+                self.require_claimed_sender(from, sender)?;
+                self.require_live_participant(call_id, sender).await?;
+                media_policy::check_sdp(&sdp)?;
+                self.on_sdp_offer(call_id, sender, sdp).await
+            }
             // Offerer side: install the remote answer to our earlier offer.
             SignalingMessage::SdpAnswer {
                 call_id,
                 sdp,
                 sender,
             } => {
+                self.require_claimed_sender(from, sender)?;
+                self.require_live_participant(call_id, sender).await?;
+                media_policy::check_sdp(&sdp)?;
                 self.webrtc_manager
                     .set_remote_description(call_id, sender, &sdp)
                     .await
             }
+        }
+    }
+
+    fn require_claimed_sender(&self, from: IdentityId, claimed: IdentityId) -> Result<()> {
+        if from != claimed {
+            return Err(anyhow::anyhow!(
+                "signaling sender does not match the authenticated peer"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn is_live_participant(&self, call_id: CallId, sender: IdentityId) -> bool {
+        let calls = self.calls.read().await;
+        matches!(
+            calls.get(&call_id),
+            Some(call) if !is_terminal(&call.state) && call.participants.contains_key(&sender)
+        )
+    }
+
+    async fn require_live_participant(&self, call_id: CallId, sender: IdentityId) -> Result<()> {
+        if self.is_live_participant(call_id, sender).await {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "signaling is not for a live call with this peer"
+            ))
         }
     }
 
@@ -687,9 +774,24 @@ impl CallManager {
         settings: CallSettings,
         media_root: [u8; 32],
     ) -> Result<()> {
+        if media_root == [0u8; 32] {
+            return Err(anyhow::anyhow!("refusing an all-zero call media root"));
+        }
+        if caller == self.local_identity {
+            return Err(anyhow::anyhow!(
+                "refusing a call invitation from the local identity"
+            ));
+        }
+        if self.ended_invites.read().await.contains(&call_id) {
+            return Err(anyhow::anyhow!("stale call invitation"));
+        }
         {
             let calls = self.calls.read().await;
-            if calls.contains_key(&call_id) {
+            if let Some(existing) = calls.get(&call_id) {
+                if is_terminal(&existing.state) {
+                    return Err(anyhow::anyhow!("stale call invitation"));
+                }
+                // A live duplicate must not replace the media root or re-ring.
                 return Ok(());
             }
             let active_calls = calls
@@ -737,8 +839,18 @@ impl CallManager {
             let mut calls = self.calls.write().await;
             // Re-check under the write lock: another inbound frame may
             // have registered this call between the read and the write.
-            if calls.contains_key(&call_id) {
+            if let Some(existing) = calls.get(&call_id) {
+                if is_terminal(&existing.state) {
+                    return Err(anyhow::anyhow!("stale call invitation"));
+                }
                 return Ok(());
+            }
+            let active_calls = calls
+                .values()
+                .filter(|call| matches!(call.state, CallState::Active | CallState::Ringing))
+                .count();
+            if active_calls >= self.config.max_concurrent_calls {
+                return Err(anyhow::anyhow!("Maximum concurrent calls reached"));
             }
             calls.insert(call_id, call);
         }
@@ -781,6 +893,7 @@ impl CallManager {
         // Best-effort teardown; a missing connection is not an error.
         let _ = self.close_peer_connection(call_id, sender).await;
         self.clear_call_media_root(call_id).await;
+        self.note_terminal(call_id).await;
 
         self.event_sender
             .send(CallEvent::ParticipantLeft {
@@ -899,8 +1012,13 @@ impl CallManager {
             call.state = CallState::Rejected;
             call.ended_at = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
         }
+        let terminal = is_terminal(&call.state);
 
         drop(calls);
+        if terminal {
+            self.clear_call_media_root(call_id).await;
+            self.note_terminal(call_id).await;
+        }
 
         // Send event
         self.event_sender
@@ -960,6 +1078,7 @@ impl CallManager {
         // Close peer connections
         self.close_peer_connection(call_id, participant).await?;
         self.clear_call_media_root(call_id).await;
+        self.note_terminal(call_id).await;
 
         // Send event
         self.event_sender
@@ -977,9 +1096,11 @@ impl CallManager {
     ///
     /// The WebRTC track is switched *before* the participant's state is
     /// committed, so a failed media update leaves the stored state and
-    /// the actual track in agreement rather than diverging. Full
-    /// serialisation of overlapping toggles is tracked in issue #67.
+    /// the actual track in agreement rather than diverging. Overlapping
+    /// toggles for every participant share one lock so two flips cannot
+    /// both read the old bit and write the same new bit.
     pub async fn toggle_mute(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
+        let _guard = self.media_toggle.lock().await;
         let target_muted = {
             let calls = self.calls.read().await;
             let participant_info = calls
@@ -1026,6 +1147,7 @@ impl CallManager {
     /// Same ordering discipline as [`toggle_mute`](Self::toggle_mute):
     /// the track is switched before the state is committed.
     pub async fn toggle_video(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
+        let _guard = self.media_toggle.lock().await;
         let target_enabled = {
             let calls = self.calls.read().await;
             let participant_info = calls
@@ -1205,29 +1327,45 @@ impl CallManager {
         let calls = self.calls.clone();
         let timeout = self.config.ring_timeout;
         let event_sender = self.event_sender.clone();
+        let ended_invites = self.ended_invites.clone();
+        let call_media = self.call_media.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
 
-            let mut calls = calls.write().await;
-            if let Some(call) = calls.get_mut(&call_id) {
-                if call.state == CallState::Ringing {
-                    call.state = CallState::TimedOut;
-                    call.ended_at = Some(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    );
-
-                    let _ = event_sender.send(CallEvent::CallStateChanged {
-                        call_id,
-                        old_state: CallState::Ringing,
-                        new_state: CallState::TimedOut,
-                    });
+            let timed_out = {
+                let mut calls = calls.write().await;
+                if let Some(call) = calls.get_mut(&call_id) {
+                    if call.state == CallState::Ringing {
+                        call.state = CallState::TimedOut;
+                        call.ended_at = Some(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
                 }
+            };
+            if timed_out {
+                ended_invites.write().await.insert(call_id);
+                call_media.write().await.remove(&call_id);
+                let _ = event_sender.send(CallEvent::CallStateChanged {
+                    call_id,
+                    old_state: CallState::Ringing,
+                    new_state: CallState::TimedOut,
+                });
             }
         });
+    }
+
+    async fn note_terminal(&self, call_id: CallId) {
+        self.ended_invites.write().await.insert(call_id);
     }
 
     /// Establish peer connection for a participant
@@ -1551,23 +1689,39 @@ mod tests {
     #[tokio::test]
     async fn inbound_ice_candidate_before_connection_is_buffered() {
         let (manager, _events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let call_id = CallId::from([9u8; 16]);
+        let invite = SignalingMessage::CallInvitation {
+            call_id,
+            caller,
+            call_type: CallType::VoiceCall,
+            settings: CallSettings::default(),
+            media_root: [7u8; 32],
+        }
+        .to_bytes()
+        .unwrap();
+        manager
+            .handle_inbound_signaling(caller, &invite)
+            .await
+            .unwrap();
         let payload = SignalingMessage::IceCandidate {
-            call_id: CallId::from([9u8; 16]),
+            call_id,
             candidate: ICECandidate {
                 sdp_mid: "audio".to_string(),
                 sdp_mline_index: 0,
                 candidate: "candidate:1 1 UDP 2130706431 192.0.2.1 3478 typ host".to_string(),
             },
-            sender: IdentityId::from([1u8; 32]),
+            sender: caller,
         }
         .to_bytes()
         .unwrap();
         // No peer connection exists yet; the candidate is cached rather
         // than rejected.
         manager
-            .handle_inbound_signaling(IdentityId::from([1u8; 32]), &payload)
+            .handle_inbound_signaling(caller, &payload)
             .await
             .expect("early ICE candidate buffered");
+        assert_eq!(manager.webrtc_manager.cached_ice_len().await, 1);
     }
 
     #[tokio::test]
@@ -1741,10 +1895,19 @@ mod tests {
         callee_mgr.accept_call(call_id, caller).await.unwrap();
         let offer = callee_rx.recv().await.expect("offer sent");
         assert_eq!(offer.recipient, caller);
-        assert!(matches!(
-            SignalingMessage::from_bytes(&offer.payload).unwrap(),
-            SignalingMessage::SdpOffer { .. }
-        ));
+        match SignalingMessage::from_bytes(&offer.payload).unwrap() {
+            SignalingMessage::SdpOffer { sdp, .. } => {
+                assert!(
+                    sdp.contains("opus/48000/1"),
+                    "offer must advertise the mono capture rate, got {sdp}"
+                );
+                assert!(
+                    !sdp.contains("opus/48000/2"),
+                    "offer must not advertise stereo Opus"
+                );
+            }
+            other => panic!("expected an SDP offer, got {other:?}"),
+        }
 
         // 3. Caller answers the offer → SDP answer goes to the callee,
         //    stamped with the caller's own identity.
@@ -1778,5 +1941,221 @@ mod tests {
                 .has_connection(call_id, caller)
                 .await
         );
+    }
+
+    fn invite(call_id: CallId, caller: IdentityId, root: u8) -> Vec<u8> {
+        SignalingMessage::CallInvitation {
+            call_id,
+            caller,
+            call_type: CallType::VoiceCall,
+            settings: CallSettings::default(),
+            media_root: [root; 32],
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invitation_with_substituted_caller_is_rejected() {
+        let (manager, mut events) = manager_with_events().await;
+        let authenticated = IdentityId::from([1u8; 32]);
+        let claimed = IdentityId::from([9u8; 32]);
+        let call_id = CallId::from([4u8; 16]);
+        let err = manager
+            .handle_inbound_signaling(authenticated, &invite(call_id, claimed, 7))
+            .await
+            .expect_err("substituted caller");
+        assert!(err.to_string().contains("authenticated peer"));
+        assert!(manager.get_call(call_id).await.is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ice_for_another_call_is_not_cached() {
+        let (manager, _events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let stranger = IdentityId::from([9u8; 32]);
+        let call_id = CallId::from([4u8; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+
+        let foreign = SignalingMessage::IceCandidate {
+            call_id,
+            candidate: ICECandidate {
+                sdp_mid: "audio".into(),
+                sdp_mline_index: 0,
+                candidate: "candidate:9 1 UDP 1 203.0.113.5 9 typ host".into(),
+            },
+            sender: stranger,
+        }
+        .to_bytes()
+        .unwrap();
+        assert!(manager
+            .handle_inbound_signaling(stranger, &foreign)
+            .await
+            .is_err());
+        assert_eq!(manager.webrtc_manager.cached_ice_len().await, 0);
+        assert_eq!(
+            manager.get_call(call_id).await.unwrap().state,
+            CallState::Ringing
+        );
+    }
+
+    #[tokio::test]
+    async fn hangup_for_a_different_call_does_not_end_ours() {
+        let (manager, _events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let stranger = IdentityId::from([9u8; 32]);
+        let call_id = CallId::from([4u8; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+
+        let spoofed = SignalingMessage::HangUp {
+            call_id,
+            sender: caller,
+        }
+        .to_bytes()
+        .unwrap();
+        assert!(manager
+            .handle_inbound_signaling(stranger, &spoofed)
+            .await
+            .is_err());
+
+        let unrelated = SignalingMessage::HangUp {
+            call_id,
+            sender: stranger,
+        }
+        .to_bytes()
+        .unwrap();
+        manager
+            .handle_inbound_signaling(stranger, &unrelated)
+            .await
+            .expect("hang-up for a call we do not share is a no-op");
+        assert_eq!(
+            manager.get_call(call_id).await.unwrap().state,
+            CallState::Ringing
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_invitation_after_hangup_does_not_rering() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let call_id = CallId::from([4u8; 16]);
+        let payload = invite(call_id, caller, 7);
+        manager
+            .handle_inbound_signaling(caller, &payload)
+            .await
+            .unwrap();
+        let _incoming = events.try_recv();
+
+        let hangup = SignalingMessage::HangUp {
+            call_id,
+            sender: caller,
+        }
+        .to_bytes()
+        .unwrap();
+        manager
+            .handle_inbound_signaling(caller, &hangup)
+            .await
+            .unwrap();
+        let _left = events.try_recv();
+
+        let err = manager
+            .handle_inbound_signaling(caller, &payload)
+            .await
+            .expect_err("replay");
+        assert!(err.to_string().contains("stale"));
+        assert_eq!(
+            manager.get_call(call_id).await.unwrap().state,
+            CallState::Ended
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn second_live_call_is_rejected_when_the_cap_is_one() {
+        let (event_sender, _events) = mpsc::unbounded_channel();
+        let server = Arc::new(SignalingServer::new().await.unwrap());
+        let manager = CallManager::new(
+            CallManagerConfig {
+                max_concurrent_calls: 1,
+                ..CallManagerConfig::default()
+            },
+            event_sender,
+            IdentityId::from([2u8; 32]),
+            server,
+        )
+        .await
+        .unwrap();
+        let first = IdentityId::from([1u8; 32]);
+        let second = IdentityId::from([3u8; 32]);
+        let first_id = CallId::from([4u8; 16]);
+        let second_id = CallId::from([5u8; 16]);
+        manager
+            .handle_inbound_signaling(first, &invite(first_id, first, 7))
+            .await
+            .unwrap();
+        let err = manager
+            .handle_inbound_signaling(second, &invite(second_id, second, 8))
+            .await
+            .expect_err("over capacity");
+        assert!(err.to_string().contains("Maximum concurrent"));
+        assert!(manager.get_call(second_id).await.is_none());
+        assert_eq!(
+            manager.get_call(first_id).await.unwrap().state,
+            CallState::Ringing
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_audio_sample_is_rejected_before_a_connection_exists() {
+        let (manager, _events) = manager_with_events().await;
+        let huge = vec![0u8; crate::calling::media_policy::MAX_AUDIO_FRAME_BYTES + 1];
+        let err = manager
+            .write_audio_sample(
+                CallId::from([1u8; 16]),
+                IdentityId::from([1u8; 32]),
+                &huge,
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("oversized");
+        assert!(err.to_string().contains("audio frame"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_mute_toggles_preserve_parity() {
+        let (manager, _events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let call_id = CallId::from([4u8; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+        let manager = Arc::new(manager);
+        let mut tasks = Vec::new();
+        for _ in 0..33 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager.toggle_mute(call_id, caller).await.unwrap()
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let muted = manager
+            .get_call(call_id)
+            .await
+            .unwrap()
+            .participants
+            .get(&caller)
+            .unwrap()
+            .is_muted;
+        assert!(muted, "33 flips from unmuted must end muted");
     }
 }

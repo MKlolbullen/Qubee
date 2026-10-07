@@ -132,9 +132,10 @@ default = []
 # Pull in the WebRTC stack and the `calling` module (voice/video).
 # Compiles clean on webrtc 0.14 and is clippy-/test-covered in CI
 # (see .github/workflows/calling.yml), but it is NOT wired into the
-# JNI surface or the Android app yet — signaling-over-P2P, the call
-# UI, and ratchet-derived media keys are still to come. Off by default
-# so the shipped .so stays lean; enable it for calling development.
+# default native library. Signaling, JNI, and the call UI exist behind
+# this flag; video capture is not shipped, and the physical-device
+# matrix is still open (issue #79). Off by default so the shipped .so
+# stays lean. A calling build must also pass -PqubeeCalling=true.
 calling = ["dep:webrtc", "dep:bytes"]
 # Compile the legacy prototype modules (`hybrid_ratchet`,
 # `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).

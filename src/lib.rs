@@ -32,10 +32,9 @@ pub mod sas;
 #[cfg(feature = "legacy")]
 pub mod secure_message;
 
-// WebRTC-backed calling. Behind a feature flag because the in-tree
-// implementation hasn't been ported to webrtc 0.14 yet — see
-// `src/calling/mod.rs` for the audit notes. `cargo build --features
-// calling` is the only way to even attempt it.
+// WebRTC-backed calling. Off by default: the shipped JNI library is
+// built without this feature, and video capture is not implemented.
+// `cargo test --features calling` covers the gated voice path.
 #[cfg(feature = "calling")]
 pub mod calling;
 

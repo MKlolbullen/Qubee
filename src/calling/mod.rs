@@ -36,34 +36,18 @@
 //!
 //! ## Still outstanding
 //!
-//! 1. **Unverified at compile time.** Round 8c was edits-by-reading
-//!    against a known webrtc 0.14 API; nothing was actually checked
-//!    with `cargo check --features calling` because the sandbox has no
-//!    cargo. There are likely a handful of follow-on type/signature
-//!    mismatches (the `add_track` trait-object bound, codec-capability
-//!    field reshuffling) that only show up when you run the build.
-//! 2. **`call_manager.rs` is ~900 lines** of orchestration leaning on
-//!    `peer_connection`'s newly-updated surface. Treat the first
-//!    `--features calling` build as a starting point, not the end of
-//!    the audit.
-//! 3. **The `CallSignal` compatibility shim** at the bottom of
-//!    `signaling.rs` has no callers. If it stays unused, drop it; if
-//!    you intended to revive it for the message pipeline, write the
-//!    test that drives it before bringing it back.
-//!
-//! ## Things that look right
-//!
-//! * `media_encryption.rs` — small, self-contained ChaCha20-Poly1305
-//!   over HKDF-derived per-stream keys. The closest piece to "ready"
-//!   in this module.
-//! * `signaling.rs` — pure-Rust message types and an in-memory router,
-//!   no I/O. The wire types are reasonable.
-//! * `MediaDevicesManager` — earlier audit notes claimed this type was
-//!   missing; it actually lives at `webrtc_manager.rs:38`. False alarm.
+//! Calling is host-tested under `--features calling`, but it is still
+//! not a shipped capability: the default native library is built without
+//! the feature, video capture is not implemented, and the physical-device
+//! matrix in issue #79 is unrecorded. See
+//! `docs/architecture/calling-threat-model.md` for the media-security
+//! boundary and the ICE metadata leak.
 
 pub mod call_manager;
 pub mod media_encryption;
+pub mod media_policy;
 pub mod peer_connection;
+pub mod realtime_queue;
 pub mod signaling;
 pub mod webrtc_manager;
 

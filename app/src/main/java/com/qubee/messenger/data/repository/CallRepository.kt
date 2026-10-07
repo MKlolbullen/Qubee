@@ -48,8 +48,25 @@ class CallRepository @Inject constructor(
     private val _state = MutableStateFlow<CallUiState>(CallUiState.Idle)
     val state: StateFlow<CallUiState> = _state.asStateFlow()
 
+    /**
+     * True only when this APK was built with `-PqubeeCalling=true` and the
+     * loaded `libqubee_crypto.so` actually exported the calling symbols.
+     * The default release leaves both false so the UI cannot imply a call
+     * button that the native library does not contain.
+     */
+    private val _callingAvailable = MutableStateFlow(false)
+    val callingAvailable: StateFlow<Boolean> = _callingAvailable.asStateFlow()
+
     /** Bring up the native call subsystem for the active identity. */
-    suspend fun start(): Boolean = qubeeManager.startCalling()
+    suspend fun start(): Boolean {
+        if (!com.qubee.messenger.BuildConfig.CALLING_NATIVE_ENABLED) {
+            _callingAvailable.value = false
+            return false
+        }
+        val started = qubeeManager.startCalling()
+        _callingAvailable.value = started
+        return started
+    }
 
     /**
      * Place a call. The media root is minted natively and shipped in

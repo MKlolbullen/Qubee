@@ -18,12 +18,10 @@ import kotlinx.coroutines.flow.asStateFlow
  * tapping a shared link, granting a permission) from forcing a
  * re-auth, while a genuine "put the phone down" locks.
  *
- * Scope: this gates the **UI only**. The SQLCipher key is still
- * unwrapped without user auth (`setUserAuthenticationRequired(false)`
- * — see SECURITY.md); binding the database key to the lock is the
- * deeper, separately-tracked change. Treat this as defense against a
- * casual "someone picked up my unlocked phone", not against a
- * forensic attacker with the device.
+ * The persisted auth binding is authoritative even if the UI preference
+ * was not saved (for example, a process death between the two writes).
+ * Unreadable key state keeps the UI locked. MainActivity clears the key
+ * holder on lock; existing Room/core sessions are not revoked by this class.
  *
  * State is process-scoped (a `@Singleton`), deliberately NOT persisted:
  * a fresh process always starts [locked] when the feature is on, and
@@ -33,8 +31,9 @@ import kotlinx.coroutines.flow.asStateFlow
 @Singleton
 class AppLockManager @Inject constructor(
     private val preferences: PreferenceRepository,
+    private val keyProvider: SqlCipherKeyProvider,
 ) {
-    private val _locked = MutableStateFlow(preferences.appLockEnabled())
+    private val _locked = MutableStateFlow(isEnabled())
 
     /** True while the unlock gate should be shown over the app UI. */
     val locked: StateFlow<Boolean> = _locked.asStateFlow()
@@ -44,7 +43,8 @@ class AppLockManager @Inject constructor(
     private var backgroundedAtMillis: Long? = null
 
     /** Whether the lock feature is currently switched on. */
-    fun isEnabled(): Boolean = preferences.appLockEnabled()
+    fun isEnabled(): Boolean = preferences.appLockEnabled() ||
+        runCatching { keyProvider.isAuthBindingEnabled() }.getOrDefault(true)
 
     /**
      * Called when the app's last activity stops. Records the time so

@@ -19,6 +19,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 
 /**
@@ -36,6 +40,8 @@ class SettingsViewModel @Inject constructor(
     private val keyProvider: SqlCipherKeyProvider,
     private val keyHolder: DatabaseKeyHolder,
 ) : ViewModel() {
+
+    private val appLockChangeMutex = Mutex()
 
     private val _state = MutableStateFlow<SettingsResetState>(SettingsResetState.Idle)
     val state: StateFlow<SettingsResetState> = _state.asStateFlow()
@@ -62,28 +68,33 @@ class SettingsViewModel @Inject constructor(
      * lock the user out of their own database.
      */
     fun setAppLockEnabled(enabled: Boolean) {
-        if (enabled) {
-            if (!deviceCanAuthenticate()) {
-                _appLockNotice.tryEmit(
-                    "Set a screen lock (PIN, pattern, password, or biometric) on your device first.",
-                )
-                _appLockEnabled.value = false
-                return
+        viewModelScope.launch {
+            appLockChangeMutex.withLock {
+                if (enabled && !deviceCanAuthenticate()) {
+                    _appLockNotice.tryEmit(
+                        "Set a screen lock (PIN, pattern, password, or biometric) on your device first.",
+                    )
+                    return@withLock
+                }
+                try {
+                    withContext(Dispatchers.IO) {
+                        if (enabled) keyProvider.enableAuthBinding(keyHolder)
+                        else keyProvider.disableAuthBinding(keyHolder)
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to change Screen Lock binding")
+                    _appLockNotice.tryEmit("Couldn't change Screen Lock. Restart the app before retrying.")
+                    return@withLock
+                }
+                // Publish the setting only after the secret transition commits.
+                // A failed disable must never advertise an unlocked datastore.
+                preferences.setAppLockEnabled(enabled)
+                _appLockEnabled.value = enabled
+                appLockManager.onPreferenceChanged()
             }
-            val bound = runCatching { keyProvider.enableAuthBinding(keyHolder) }
-            if (bound.isFailure) {
-                Timber.e(bound.exceptionOrNull(), "Failed to bind DB key to unlock")
-                _appLockNotice.tryEmit("Couldn't enable Screen Lock. Try again.")
-                _appLockEnabled.value = false
-                return
-            }
-        } else {
-            runCatching { keyProvider.disableAuthBinding(keyHolder) }
-                .onFailure { Timber.e(it, "Failed to unbind DB key; leaving binding in place") }
         }
-        preferences.setAppLockEnabled(enabled)
-        _appLockEnabled.value = enabled
-        appLockManager.onPreferenceChanged()
     }
 
     private fun deviceCanAuthenticate(): Boolean {

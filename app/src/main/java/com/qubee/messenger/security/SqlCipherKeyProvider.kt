@@ -134,7 +134,6 @@ class SqlCipherKeyProvider internal constructor(
         }
     }
 
-
     /**
      * Returns the 32-byte database key, generating and persisting it
      * on first call. Subsequent calls return the same bytes. Creation uses
@@ -169,8 +168,9 @@ class SqlCipherKeyProvider internal constructor(
      *
      * Before this existed, the Rust keystore wrapped its master key
      * under a hardcoded `"default_password"`, meaning the private keys
-     * at rest were recoverable by anyone with the files. This binds the wrapping key to Android Keystore. Hardware backing
-     * depends on the device/provider and is not assumed by this class.
+     * at rest were recoverable by anyone with the files. This binds the
+     * wrapping key to Android Keystore. Hardware backing depends on the
+     * device/provider and is not assumed by this class.
      *
      * Throws [SecurityException] if the Keystore is unavailable —
      * fail closed, same policy as [getOrCreate].

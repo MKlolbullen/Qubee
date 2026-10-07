@@ -85,7 +85,7 @@ class SettingsViewModel @Inject constructor(
                     throw e
                 } catch (e: Exception) {
                     Timber.e(e, "Failed to change Screen Lock binding")
-                    _appLockNotice.tryEmit("Couldn't change Screen Lock. Existing protection is retained; try again.")
+                    _appLockNotice.tryEmit("Couldn't change Screen Lock. Restart the app before retrying.")
                     return@withLock
                 }
                 // Publish the setting only after the secret transition commits.

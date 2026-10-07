@@ -119,9 +119,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** True when Screen Lock is on AND the DB key is stored auth-bound. */
+    /** Persisted key custody wins over a stale UI preference; errors stay locked. */
     private fun dbBindingActive(): Boolean =
-        appLockManager.isEnabled() && keyProvider.isAuthBindingEnabled()
+        runCatching { keyProvider.isAuthBindingEnabled() }.getOrDefault(true)
 
     /**
      * One-time, DB-touching startup: observers, permissions, and the
@@ -364,14 +364,14 @@ class MainActivity : AppCompatActivity() {
      * Launch the biometric / device-credential prompt. Guards against
      * re-entrancy (the state collector and the on-screen button can
      * both call this). If the device has no biometric AND no device
-     * credential set up, there is nothing to authenticate against —
-     * fail open rather than trap the user out of their own app.
+     * credential is unavailable, keep the gate closed. Authentication
+     * or key-store failures must never become a successful unlock.
      */
     private fun showUnlockPrompt() {
         if (promptInFlight) return
         if (!biometricAuthenticator.canAuthenticate()) {
-            Timber.w("No biometric or device credential enrolled — unlocking without a gate")
-            onUnlocked()
+            Timber.w("Authentication unavailable; keeping app locked")
+            lockError = getString(R.string.app_lock_error_auth_unavailable)
             return
         }
         promptInFlight = true
@@ -387,6 +387,11 @@ class MainActivity : AppCompatActivity() {
             }
         } else {
             null
+        }
+        if (challenge == null && dbBindingActive()) {
+            promptInFlight = false
+            lockError = getString(R.string.app_lock_error_unwrap)
+            return
         }
         val cryptoObject = challenge?.let {
             androidx.biometric.BiometricPrompt.CryptoObject(it.cipher)
@@ -408,10 +413,13 @@ class MainActivity : AppCompatActivity() {
                         val secrets = keyProvider.completeUnlock(
                             SqlCipherKeyProvider.UnlockChallenge(authedCipher, challenge.ciphertext),
                         )
-                        keyHolder.install(secrets.dbKey, secrets.corePassphraseHex)
-                        secrets.dbKey.fill(0)
-                        secrets.coreRaw.fill(0)
-                        secrets.corePassphraseHex.fill(0)
+                        try {
+                            keyHolder.install(secrets.dbKey, secrets.corePassphraseHex)
+                        } finally {
+                            secrets.dbKey.fill(0)
+                            secrets.coreRaw.fill(0)
+                            secrets.corePassphraseHex.fill(0)
+                        }
                     }.isSuccess
                     if (!ok) {
                         lockError = getString(R.string.app_lock_error_unwrap)
@@ -433,6 +441,10 @@ class MainActivity : AppCompatActivity() {
      * app init on the first unlock.
      */
     private fun onUnlocked() {
+        if (dbBindingActive() && !keyHolder.isUnlocked) {
+            lockError = getString(R.string.app_lock_error_unwrap)
+            return
+        }
         appLockManager.unlock()
         lifecycleScope.launch {
             runCatching { qubeeManager.initialize() }

@@ -33,7 +33,7 @@
   <a href="#-feature-status">Features</a> ·
   <a href="#-architecture">Architecture</a> ·
   <a href="#-security-model">Security</a> ·
-  <a href="#-voice--video-calling">Calling</a> ·
+  <a href="#-voice-and-video-sessions">Calling</a> ·
   <a href="#-build-from-source">Build</a> ·
   <a href="#-roadmap">Roadmap</a>
 </p>
@@ -285,7 +285,14 @@ Security-sensitive changes should preserve these rules:
 11. **Privacy-mode failure never silently falls back to a less-private transport.**
 12. **Retries reuse durable ciphertext instead of advancing a ratchet twice.**
 
-## 📞 Voice & video calling
+## 🎙 Voice and video sessions
+
+This is not a phone call. There is no dialer, no PSTN, and no phone
+number. A session is an encrypted media path between two Qubee
+identities, the same kind of thing as a Signal or Threema call. The
+only peer identifier is the 32-byte identity id already used for 1:1
+messages. A phone number, email address, or device phone-book entry is
+not an address and is not accepted.
 
 Calling has moved from a dormant module to a real, but still gated, integration surface.
 

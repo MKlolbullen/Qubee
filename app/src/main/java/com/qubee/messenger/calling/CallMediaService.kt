@@ -133,7 +133,7 @@ class CallMediaService : Service() {
         }
         return NotificationCompat.Builder(this, QubeeApplication.NOTIFICATION_CHANNEL_SERVICE)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Qubee call in progress")
+            .setContentText("Encrypted voice session")
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .setSilent(true)

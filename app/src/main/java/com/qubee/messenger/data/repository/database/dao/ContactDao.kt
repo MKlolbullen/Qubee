@@ -38,12 +38,6 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE peerId = :peerId LIMIT 1")
     suspend fun getContactByPeerId(peerId: String): Contact?
 
-    @Query("SELECT * FROM contacts WHERE phoneNumber = :phoneNumber")
-    suspend fun getContactByPhoneNumber(phoneNumber: String): Contact?
-
-    @Query("SELECT * FROM contacts WHERE email = :email")
-    suspend fun getContactByEmail(email: String): Contact?
-
     // Aggregate read for the conversations list. Joins the latest
     // message per `senderId == contact.id` and counts unread inbound
     // messages. The unread-count subquery filters on `status != 3`
@@ -69,7 +63,7 @@ interface ContactDao {
     )
     fun getContactsWithLastMessage(): Flow<List<ContactWithLastMessage>>
 
-    @Query("SELECT * FROM contacts WHERE displayName LIKE '%' || :query || '%' OR phoneNumber LIKE '%' || :query || '%'")
+    @Query("SELECT * FROM contacts WHERE displayName LIKE '%' || :query || '%' OR identityId LIKE '%' || :query || '%'")
     suspend fun searchContacts(query: String): List<Contact>
 
     @Query("SELECT * FROM contacts WHERE trustLevel = :trustLevel")

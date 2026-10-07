@@ -6,6 +6,22 @@ is false unless Gradle is invoked with `-PqubeeCalling=true`. A default
 APK must not present a call control. Video capture and rendering are
 not implemented. Nothing in this document is a ship claim.
 
+## Addressing
+
+A Qubee call is an encrypted media session between cryptographic
+identities, in the same sense as a Signal or Threema call. It is not a
+PSTN, cellular, or SIP phone call.
+
+The only peer identifier on this path is a 32-byte `IdentityId`. There
+is no phone number, MSISDN, IMSI, IMEI, SIP URI, or carrier caller-ID
+in the invitation, the SDP, the ICE exchange, or the JNI methods. A
+string that is not 32 bytes of hex is not a peer and must be rejected
+before a session is created. The app does not read the device phone
+book to decide who can be reached.
+
+STUN and TURN, when configured, learn network addresses. Those are IP
+metadata, not telephone identifiers. See the metadata section below.
+
 ## Media-security boundary
 
 For a 1:1 call the caller mints a fresh 32-byte media root and sends it

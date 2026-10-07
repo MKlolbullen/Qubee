@@ -27,6 +27,10 @@ between minor versions.
   gated; this is not a release claim. See
   `docs/architecture/calling-threat-model.md`.
 
+- A session is not a phone call. The only accepted peer identifier is a
+  32-byte identity id. Phone-book lookup is not requested, and stored
+  phone numbers and emails are cleared on database open.
+
 ## [0.1.0-alpha] — 2026-08-06
 
 ### Added

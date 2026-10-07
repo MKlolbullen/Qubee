@@ -138,6 +138,9 @@ abstract class QubeeDatabase : RoomDatabase() {
                             " (want $EXPECTED_PAGE_SIZE)",
                     )
                 }
+                // A peer is an identity id. Clear any phone number or email
+                // left in an older row so it cannot be used as an address.
+                db.execSQL("UPDATE contacts SET phoneNumber = NULL, email = NULL")
                 Timber.d(
                     "SQLCipher params OK: compat=%d page_size=%d",
                     compat,

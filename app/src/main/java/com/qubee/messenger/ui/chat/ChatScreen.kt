@@ -347,7 +347,7 @@ private fun SecureChatTopBar(
                 IconButton(onClick = onSecureCallClick) {
                     Icon(
                         Icons.Default.Lock,
-                        contentDescription = "Secure voice call",
+                        contentDescription = "Encrypted voice session",
                         tint = QubeePalette.Cyan,
                     )
                 }

@@ -185,6 +185,7 @@ internal fun ActiveCallBody(
     }
 }
 
+/** Hosts the decoder's output surface; publishes/clears it in [VideoSurfaces] as the view is created/destroyed. */
 @Composable
 private fun RemoteVideoSurface(modifier: Modifier = Modifier) {
     AndroidView(

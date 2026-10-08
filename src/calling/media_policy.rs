@@ -53,18 +53,22 @@ pub const MAX_ICE_TEXT_BYTES: usize = 1024;
 /// Trickle candidates cached before the peer connection exists.
 pub const MAX_CACHED_ICE_PER_PEER: usize = 16;
 
+/// Rejects an outbound/inbound audio payload that is empty or over `MAX_AUDIO_FRAME_BYTES`.
 pub fn check_audio_frame(data: &[u8]) -> Result<()> {
     check_bounded("audio frame", data, MAX_AUDIO_FRAME_BYTES)
 }
 
+/// Rejects a single RTP video packet that is empty or over `MAX_VIDEO_FRAME_BYTES`.
 pub fn check_video_frame(data: &[u8]) -> Result<()> {
     check_bounded("video frame", data, MAX_VIDEO_FRAME_BYTES)
 }
 
+/// Rejects a reassembled VP8 access unit that is empty or over `MAX_VIDEO_ACCESS_UNIT_BYTES`.
 pub fn check_video_access_unit(data: &[u8]) -> Result<()> {
     check_bounded("video access unit", data, MAX_VIDEO_ACCESS_UNIT_BYTES)
 }
 
+/// Shared empty/over-`max` length check used by the frame- and access-unit-specific wrappers.
 fn check_bounded(label: &str, data: &[u8], max: usize) -> Result<()> {
     if data.is_empty() || data.len() > max {
         bail!("{label} length {} is outside 1..={max}", data.len());
@@ -72,6 +76,7 @@ fn check_bounded(label: &str, data: &[u8], max: usize) -> Result<()> {
     Ok(())
 }
 
+/// Rejects an SDP offer/answer that is empty or over `MAX_SDP_BYTES` before it is installed.
 pub fn check_sdp(sdp: &str) -> Result<()> {
     if sdp.is_empty() || sdp.len() > MAX_SDP_BYTES {
         bail!("sdp length {} is outside 1..={MAX_SDP_BYTES}", sdp.len());
@@ -79,6 +84,7 @@ pub fn check_sdp(sdp: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rejects an ICE candidate/mid string over `MAX_ICE_TEXT_BYTES` before it is cached or applied.
 pub fn check_ice_text(field: &str, value: &str) -> Result<()> {
     if value.len() > MAX_ICE_TEXT_BYTES {
         bail!(

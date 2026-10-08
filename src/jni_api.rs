@@ -567,7 +567,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
                 if send_direct(route, data_vec) {
                     return 1;
                 }
-                tracing::debug!("direct frame could not be enqueued; caller will retry same wire");
+                tracing::debug!(recipient = %recipient_hex, "direct frame could not be enqueued; caller will retry same wire");
                 return 0;
             }
 
@@ -575,12 +575,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
             // recipient's rotating blinded inbox, never on qubee-global. The
             // frame is still end-to-end ratchet encrypted and recipient-bound.
             if publish_direct_inbox(recipient_hex.clone(), data_vec) {
-                tracing::debug!("queued direct frame on blinded recipient inbox");
+                tracing::debug!(recipient = %recipient_hex, "queued direct frame on blinded recipient inbox");
                 return 1;
             }
-            tracing::debug!(
-                "direct recipient route/inbox unavailable; caller will retry same wire"
-            );
+            tracing::debug!(recipient = %recipient_hex, "direct recipient route/inbox unavailable; caller will retry same wire");
             return 0;
         }
 
@@ -4269,6 +4267,8 @@ async fn drain_remote_media(mut rx: RealtimeReceiver<RemoteMedia>) {
     }
 }
 
+/// Whether `array` is non-empty and at most `max` bytes, checked by JVM array
+/// length before the bytes are copied into a Rust `Vec`.
 #[cfg(feature = "calling")]
 fn jni_bytes_within(env: &JNIEnv, array: &JByteArray, max: usize) -> bool {
     matches!(
@@ -4291,14 +4291,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
             let identity = active_identity()?
                 .ok_or_else(|| anyhow::anyhow!("onboarding required before calling"))?;
             let local_identity = identity.identity_id();
-
-            // MessageService currently sends call frames through the direct
-            // libp2p message path. A TURN-only media connection would still
-            // expose addresses there. Keep Android calling unavailable until
-            // a relay-only signaling transport is wired and verified.
-            if !relay_call_signaling_available() {
-                anyhow::bail!("calling requires a verified relay-only signaling transport");
-            }
 
             let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundSignal>();
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CallEvent>();
@@ -4325,19 +4317,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
         })();
         match result {
             Ok(()) => 1,
-            Err(_) => {
-                tracing::error!("nativeStartCalling failed");
+            Err(e) => {
+                tracing::error!(error = %e, "nativeStartCalling failed");
                 0
             }
         }
     })
-}
-
-#[cfg(feature = "calling")]
-fn relay_call_signaling_available() -> bool {
-    // This must become a real assertion supplied by the transport that
-    // carries the entire 1:1 session over relays, not a build flag.
-    false
 }
 
 /// Initiate a 1:1 call to `participant`. The call's media root is minted
@@ -4398,8 +4383,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
         })();
         match result {
             Ok(()) => 1,
-            Err(_) => {
-                tracing::warn!("nativeAcceptCall failed");
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeAcceptCall failed");
                 0
             }
         }
@@ -4427,8 +4412,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEndCal
         })();
         match result {
             Ok(()) => 1,
-            Err(_) => {
-                tracing::warn!("nativeEndCall failed");
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeEndCall failed");
                 0
             }
         }
@@ -4459,8 +4444,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandle
         })();
         match result {
             Ok(()) => 1,
-            Err(_) => {
-                tracing::warn!("nativeHandleCallSignal failed");
+            Err(e) => {
+                tracing::warn!(error = %e, "nativeHandleCallSignal failed");
                 0
             }
         }

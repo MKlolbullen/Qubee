@@ -43,12 +43,14 @@ class VideoCallEngine(
     private var decoder: MediaCodec? = null
     private var decoderSurface: Surface? = null
 
+    /** Binds this engine to a call/peer pair. Capture and decode stay off until explicitly enabled. */
     fun start(callId: String, peerId: String) {
         callIdHex = callId
         peerIdHex = peerId
         running.set(true)
     }
 
+    /** Toggles the local camera. A missing permission or encoder fails closed and leaves audio running. */
     fun setCaptureEnabled(enabled: Boolean) {
         if (!running.get()) return
         if (!enabled) {
@@ -65,6 +67,7 @@ class VideoCallEngine(
         startCapture()
     }
 
+    /** Feeds one already-reassembled VP8 access unit to the decoder bound to the active remote surface. */
     fun onRemoteAccessUnit(frame: ByteArray) {
         if (!running.get() || frame.isEmpty() || frame.size > MAX_ACCESS_UNIT) return
         val surface = VideoSurfaces.remote ?: return
@@ -96,12 +99,14 @@ class VideoCallEngine(
         }
     }
 
+    /** Tears down capture and decode; safe to call even if video was never started. */
     fun stop() {
         running.set(false)
         stopCapture()
         synchronized(lock) { releaseDecoderLocked() }
     }
 
+    /** Spins up the VP8 encoder and its camera source; falls back to audio-only on any failure. */
     private fun startCapture() {
         val thread = HandlerThread("qubee-camera").also { it.start() }
         val handler = Handler(thread.looper)
@@ -136,6 +141,7 @@ class VideoCallEngine(
         openCamera(started, handler)
     }
 
+    /** Opens the front-facing camera (or the first available) and streams it into the encoder surface. */
     private fun openCamera(target: Surface, handler: Handler) {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val id = runCatching {
@@ -201,6 +207,7 @@ class VideoCallEngine(
             }
     }
 
+    /** Pulls encoded access units off the encoder and ships each to the peer, dropping any over `MAX_ACCESS_UNIT`. */
     private fun drainEncoder() {
         val info = MediaCodec.BufferInfo()
         while (captureRunning.get() && encoder != null) {
@@ -220,6 +227,7 @@ class VideoCallEngine(
         }
     }
 
+    /** Builds a fresh VP8 decoder bound to `surface`, or null if the device has none. */
     private fun startDecoder(surface: Surface): MediaCodec? {
         return runCatching {
             val codec = MediaCodec.createDecoderByType(MIME)
@@ -233,6 +241,7 @@ class VideoCallEngine(
         }
     }
 
+    /** Releases the camera, encoder, and drain thread so capture can be restarted cleanly. */
     private fun stopCapture() {
         captureRunning.set(false)
         runCatching { session?.close() }
@@ -251,6 +260,7 @@ class VideoCallEngine(
         cameraHandler = null
     }
 
+    /** Releases the current decoder. Caller must hold `lock`. */
     private fun releaseDecoderLocked() {
         runCatching { decoder?.stop() }
         runCatching { decoder?.release() }

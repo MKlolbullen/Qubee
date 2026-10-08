@@ -30,6 +30,7 @@ pub struct RealtimeReceiver<T> {
     inner: Arc<Inner<T>>,
 }
 
+/// Builds a sender/receiver pair sharing a ring buffer of at least size 1.
 pub fn realtime_channel<T>(capacity: usize) -> (RealtimeSender<T>, RealtimeReceiver<T>) {
     let capacity = capacity.max(1);
     let inner = Arc::new(Inner {
@@ -49,6 +50,7 @@ pub fn realtime_channel<T>(capacity: usize) -> (RealtimeSender<T>, RealtimeRecei
 }
 
 impl<T> Clone for RealtimeSender<T> {
+    /// Registers another live sender so the queue doesn't close until all clones drop.
     fn clone(&self) -> Self {
         self.inner.senders.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -58,6 +60,7 @@ impl<T> Clone for RealtimeSender<T> {
 }
 
 impl<T> Drop for RealtimeSender<T> {
+    /// Closes the queue and wakes the receiver once the last sender clone is gone.
     fn drop(&mut self) {
         if self.inner.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.inner.closed.store(true, Ordering::Release);
@@ -67,12 +70,14 @@ impl<T> Drop for RealtimeSender<T> {
 }
 
 impl<T> Drop for RealtimeReceiver<T> {
+    /// Closes the queue so any remaining sender stops pushing into a dead consumer.
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::Release);
         self.inner.notify.notify_waiters();
     }
 }
 
+/// Locks `mutex`, recovering the guard on poison instead of propagating the panic.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -101,16 +106,19 @@ impl<T> RealtimeSender<T> {
         true
     }
 
+    /// Total number of items evicted so far because the queue was full.
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     }
 }
 
 impl<T> RealtimeReceiver<T> {
+    /// Pops the oldest queued item without waiting, if one is present.
     pub fn try_recv(&mut self) -> Option<T> {
         lock(&self.inner.items).pop_front()
     }
 
+    /// Waits for the next item, returning `None` once the queue is closed and drained.
     pub async fn recv(&mut self) -> Option<T> {
         loop {
             let notified = self.inner.notify.notified();

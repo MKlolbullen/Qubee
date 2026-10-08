@@ -603,13 +603,10 @@ class MessageService : Service(), NetworkCallback {
     }
 
     /**
-     * Recognise + process the Stage 5 ratchet wire formats. Returns
-     * true when the frame was a ratchet frame (handled or dropped),
-     * false to fall through to the legacy path.
-     *
-     * Decrypt failures return true with a log — a frame carrying a
-     * ratchet magic must never fall into the legacy decrypt, where a
-     * misleading failure would surface.
+     * Decode an inbound body that may carry a [FileTransfer] envelope and
+     * persist any attachment to disk. Returns the stored text/filename
+     * plus its [MessageType], or null if a detected attachment could not
+     * be written.
      */
     private fun storeInbound(messageId: String, text: String): Pair<String, MessageType>? {
         val decoded = FileTransfer.decode(text) ?: return text to MessageType.TEXT
@@ -620,6 +617,15 @@ class MessageService : Service(), NetworkCallback {
         }
     }
 
+    /**
+     * Recognise + process the Stage 5 ratchet wire formats. Returns
+     * true when the frame was a ratchet frame (handled or dropped),
+     * false to fall through to the legacy path.
+     *
+     * Decrypt failures return true with a log — a frame carrying a
+     * ratchet magic must never fall into the legacy decrypt, where a
+     * misleading failure would surface.
+     */
     private suspend fun handleRatchetFrame(peerId: String, data: ByteArray): Boolean {
         // 1:1 PQXDH + Double Ratchet frame (QUBEE_DMS). Detect by magic,
         // not by sender resolution: an unknown/tampered selector is still a
@@ -763,7 +769,7 @@ class MessageService : Service(), NetworkCallback {
                         // authenticated sender (never a self-claimed field).
                         val frame = hexToBytesOrNull(result.optString("callSignalHex"))
                         if (frame == null) {
-                            Timber.w("Malformed call signal")
+                            Timber.w("Malformed call signal from %s", senderIdentityHex)
                         } else {
                             if (peerId.isNotEmpty()) {
                                 contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
@@ -983,25 +989,25 @@ class MessageService : Service(), NetworkCallback {
             try {
                 val wire = qubeeManager.encryptDirectCallSignal(recipientIdHex, payload)
                 if (wire == null) {
-                    Timber.w("Failed to encrypt call signal")
+                    Timber.w("Failed to encrypt call signal for %s", recipientIdHex)
                     return@launch
                 }
                 if (!qubeeManager.sendP2PMessage("", wire)) {
-                    Timber.w("Failed to send call signal")
+                    Timber.w("Failed to send call signal to %s", recipientIdHex)
                 }
             } catch (e: Exception) {
-                Timber.e("onCallSignal failed (%s)", e.javaClass.simpleName)
+                Timber.e(e, "onCallSignal failed for %s", recipientIdHex)
             }
         }
     }
 
     override fun onIncomingCall(callIdHex: String, callerIdHex: String, callType: Int) {
-        Timber.i("Incoming call (type %d)", callType)
+        Timber.i("Incoming call %s from %s (type %d)", callIdHex, callerIdHex, callType)
         callRepository.onIncoming(callIdHex, callerIdHex, callType)
     }
 
     override fun onCallStateChanged(callIdHex: String, state: String) {
-        Timber.d("Call state: %s", state)
+        Timber.d("Call %s state: %s", callIdHex, state)
         callRepository.onStateChanged(callIdHex, state)
     }
 

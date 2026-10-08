@@ -15,11 +15,9 @@ import javax.inject.Inject
 /**
  * Drives [CallOverlay] from the durable call state in [CallRepository].
  *
- * `reject` and `hangUp` are fully wired (they only need the call id and
- * peer). `accept` and the in-call mute/video toggles depend on two
- * pieces still tracked in issue #67 — deriving the per-call media root
- * from the 1:1 session, and native mute/video toggles — so they update
- * local UI state and log rather than fabricate anything.
+ * Accept/reject/hang-up and the native mute/video controls operate on
+ * the active identity session. The camera remains off until the user
+ * grants permission and enables it from the in-session controls.
  */
 @HiltViewModel
 class CallViewModel @Inject constructor(

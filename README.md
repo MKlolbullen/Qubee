@@ -106,13 +106,13 @@ Legend: **Active** = on the normal application path; **Gated** = integrated but 
 | Durable outbound FSM | ✅ Active / soaking | `PREPARED → SENDING → SENT/DELIVERED|FAILED` avoids re-encrypting a retry and protects ratchet state from silent reuse. |
 | SQLCipher-backed Room storage | ✅ Active | Local conversations/messages use SQLCipher; key material is wrapped through Android Keystore. |
 | Screen lock + auth-bound key path | ✅ Active / device-sensitive | Biometric/device-credential gate and auth-bound storage path exist; exact behavior remains OEM/API-sensitive. |
-| Voice call signaling + UI | 🟡 Gated | Rust call manager, ratchet-carried signaling, JNI surface, Compose call overlay and call controls are wired. |
-| Android voice media pipeline | 🟡 Gated / unvalidated | `AudioRecord → Opus → WebRTC` and remote `Opus → AudioTrack` exist, but physical-device codec/FGS/permission validation is still required. |
-| Video capture/rendering | ❌ Not shipped | WebRTC video track seams exist; Android camera capture/render pipeline is not complete. |
+| Voice session signaling + UI | 🟡 Gated | Identity-to-identity signaling, JNI surface, Compose overlay and controls are wired; builds must opt in with `-PqubeeCalling=true`. |
+| Android voice media pipeline | 🟡 Integrated / unvalidated | `AudioRecord → Opus → WebRTC` and remote `Opus → AudioTrack` are wired with runtime microphone permission; physical-device and peer interop testing remains. |
+| Video capture/rendering | 🟡 Integrated / unvalidated | Optional Camera2 VP8 capture and VP8 remote decode/rendering are wired; permission, codec and physical-device interop testing remains. |
 | Tor transport | 🟠 Foundation | Fail-closed transport posture/config exists; no working Tor transport is shipped. |
 | Nym mixnet transport | 🟠 Foundation | Experimental posture only; no working Nym transport is shipped. |
 | Multi-device identity sync | ❌ Not shipped | Identity remains device-local. |
-| File transfer | ❌ Not shipped | Legacy code is not production-ready and is excluded from the default surface. |
+| File transfer | 🟡 Integrated / size-limited | Direct and group encrypted messages carry files up to 256 KiB; attachment copies at rest use Android Keystore-backed encryption. Physical-device and multi-peer testing remains. |
 
 ## 🏗 Architecture
 
@@ -304,11 +304,19 @@ Calling has moved from a dormant module to a real, but still gated, integration 
 - JNI methods for initiate/accept/end, mute/video toggles and media samples;
 - Compose incoming/active call UI;
 - a microphone foreground service;
+- Camera2 VP8 capture and a remote VP8 decode/render surface (video is
+  opt-in and the camera stays off until permission is granted);
 - Android `AudioRecord` capture at 48 kHz PCM16;
 - Android Opus encode/decode through `MediaCodec`;
 - `AudioTrack` playback;
 - remote-media callbacks back through JNI/Kotlin;
 - dedicated `calling.yml` CI that compiles, lints and tests the feature.
+
+To build a local calling-enabled debug APK, build the Rust libraries with
+`QUBEE_CALLING=1 ./build_rust.sh`, then run
+`./gradlew assembleDebug -PqubeeCalling=true`. Both opt-ins are required;
+the normal release build continues to omit calling. The resulting APK is
+development-signed and not suitable for publishing as a release.
 
 ### Keying model
 

@@ -1,5 +1,6 @@
 package com.qubee.messenger.ui.call
 
+import com.qubee.messenger.calling.CallMediaService
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.data.repository.CallRepository
@@ -108,6 +109,7 @@ class CallViewModel @Inject constructor(
             val now = state.value
             if (now is CallUiState.Active && now.callIdHex == callId) {
                 _videoOn.value = result
+                CallMediaService.setCaptureEnabled(result)
             }
         }
     }

@@ -49,6 +49,7 @@ pub mod media_policy;
 pub mod peer_connection;
 pub mod realtime_queue;
 pub mod signaling;
+pub mod vp8_reassembly;
 pub mod webrtc_manager;
 
 pub use call_manager::{Call, CallManager, CallState, CallType};

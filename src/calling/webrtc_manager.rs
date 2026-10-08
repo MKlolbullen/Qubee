@@ -258,7 +258,7 @@ impl WebRTCManager {
         data: &[u8],
         duration: std::time::Duration,
     ) -> Result<()> {
-        media_policy::check_video_frame(data)?;
+        media_policy::check_video_access_unit(data)?;
         let connections = self.peer_connections.read().await;
         let connection = connections
             .get(&(call_id, participant))

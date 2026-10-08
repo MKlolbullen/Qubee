@@ -63,6 +63,7 @@ hex = "0.4"
 # `cargo build` works out of the box; pass `--features calling` to
 # pull WebRTC in.
 webrtc = { version = "0.14", optional = true }
+rtp = { version = "0.14.0", optional = true }
 # `bytes::Bytes` is the payload type of `webrtc::media::Sample` (the
 # capture-sample write API). Already in the tree via webrtc; declared
 # here so the calling media path can name it. Calling-only.
@@ -136,7 +137,7 @@ default = []
 # this flag; video capture is not shipped, and the physical-device
 # matrix is still open (issue #79). Off by default so the shipped .so
 # stays lean. A calling build must also pass -PqubeeCalling=true.
-calling = ["dep:webrtc", "dep:bytes"]
+calling = ["dep:webrtc", "dep:bytes", "dep:rtp"]
 # Compile the legacy prototype modules (`hybrid_ratchet`,
 # `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
 # They reference dependency APIs that have since drifted; enabling

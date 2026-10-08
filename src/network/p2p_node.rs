@@ -524,6 +524,10 @@ impl P2PNode {
                         hasher.update(&message.data);
                         gossipsub::MessageId::from(hasher.finalize().as_bytes()[..20].to_vec())
                     })
+                    // A sealed file envelope can be a few hundred kilobytes.
+                    // The default 64 KiB would drop it on the blinded inbox
+                    // and on group topics. Still bounded.
+                    .max_transmit_size(512 * 1024)
                     .build()
                     .map_err(std::io::Error::other)?;
                 // Anonymous authorship: group frames are already

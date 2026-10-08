@@ -9,6 +9,17 @@ between minor versions.
 
 ## [Unreleased]
 
+### Added
+
+- Android camera capture using VP8 and remote VP8 decode/rendering for
+  optional identity-to-identity video sessions. Camera capture remains
+  off until the user grants permission and enables it. On-device codec
+  and peer interoperability validation is still required.
+- File attachment sending and receiving over the existing encrypted
+  direct/group message paths, capped at 256 KiB per file. Attachment
+  copies are encrypted at rest with Android Keystore-backed storage;
+  opening uses a short-lived decrypted cache copy.
+
 ### Security
 
 - Calling signaling is bound to the authenticated 1:1 peer. A frame

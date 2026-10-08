@@ -480,7 +480,7 @@ impl CallManager {
         data: &[u8],
         duration: Duration,
     ) -> Result<()> {
-        media_policy::check_video_frame(data)?;
+        media_policy::check_video_access_unit(data)?;
         self.webrtc_manager
             .write_video_sample(call_id, participant, data, duration)
             .await
@@ -539,10 +539,9 @@ impl CallManager {
                 joined_at: None,
                 left_at: None,
                 is_muted: settings.auto_mute_on_join,
-                is_video_enabled: matches!(
-                    call_type,
-                    CallType::VideoCall | CallType::GroupVideoCall
-                ),
+                // Selecting a video session does not implicitly activate a
+                // camera. The local user must explicitly toggle capture on.
+                is_video_enabled: false,
                 is_screen_sharing: false,
             };
             call_participants.insert(participant_id, participant);
@@ -729,14 +728,18 @@ impl CallManager {
         self.webrtc_manager
             .set_audio_enabled(call_id, participant, true)
             .await?;
-        if matches!(
-            call_type,
-            CallType::VideoCall | CallType::GroupVideoCall | CallType::Conference
-        ) {
-            self.webrtc_manager
-                .set_video_enabled(call_id, participant, true)
-                .await?;
+        // Always negotiate a video m-line. There is no later renegotiation
+        // step, so a voice-only offer could not grow a video track when the
+        // user turns the camera on. The camera stays off until the app
+        // writes samples. A track-add failure must not kill the voice path.
+        if let Err(error) = self
+            .webrtc_manager
+            .set_video_enabled(call_id, participant, true)
+            .await
+        {
+            tracing::warn!(%error, "video track was not attached; voice session continues");
         }
+        let _ = call_type;
         Ok(())
     }
 
@@ -814,7 +817,8 @@ impl CallManager {
             joined_at: None,
             left_at: None,
             is_muted: settings.auto_mute_on_join,
-            is_video_enabled: matches!(call_type, CallType::VideoCall | CallType::GroupVideoCall),
+            // Receiving a video invitation is not camera consent.
+            is_video_enabled: false,
             is_screen_sharing: false,
         };
 

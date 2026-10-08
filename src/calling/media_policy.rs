@@ -31,6 +31,12 @@ pub const MAX_AUDIO_FRAME_BYTES: usize = 2048;
 /// this is a packet bound, not a keyframe bound.
 pub const MAX_VIDEO_FRAME_BYTES: usize = 16 * 1024;
 
+/// Hard cap for one complete VP8 access unit, either outbound from the
+/// camera encoder or inbound after RTP reassembly. Larger than one RTP
+/// packet so a keyframe can span packets, still small enough that a
+/// missing marker cannot retain an unbounded buffer.
+pub const MAX_VIDEO_ACCESS_UNIT_BYTES: usize = 128 * 1024;
+
 /// Real-time playback window: 12 × 20 ms = 240 ms. Matches the Android
 /// playback queue. A slower consumer drops the oldest frame.
 pub const REMOTE_MEDIA_QUEUE_CAPACITY: usize = 12;
@@ -53,6 +59,10 @@ pub fn check_audio_frame(data: &[u8]) -> Result<()> {
 
 pub fn check_video_frame(data: &[u8]) -> Result<()> {
     check_bounded("video frame", data, MAX_VIDEO_FRAME_BYTES)
+}
+
+pub fn check_video_access_unit(data: &[u8]) -> Result<()> {
+    check_bounded("video access unit", data, MAX_VIDEO_ACCESS_UNIT_BYTES)
 }
 
 fn check_bounded(label: &str, data: &[u8], max: usize) -> Result<()> {

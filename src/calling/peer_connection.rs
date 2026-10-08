@@ -5,6 +5,7 @@ use crate::calling::call_manager::CallId;
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::media_policy::{self, OPUS_CHANNELS, OPUS_CLOCK_RATE, OPUS_FMTP};
 use crate::calling::realtime_queue::RealtimeSender;
+use crate::calling::vp8_reassembly::Vp8Assembler;
 use crate::calling::webrtc_manager::MediaStats;
 use crate::calling::webrtc_manager::WebRTCConfig;
 use crate::calling::webrtc_manager::{MediaKind, OutboundIce, RemoteMedia};
@@ -258,24 +259,35 @@ impl PeerConnection {
                     RTPCodecType::Video => MediaKind::Video,
                     _ => return,
                 };
+                let mut video = Vp8Assembler::default();
                 // Reads end (Err) when the track closes.
                 while let Ok((packet, _)) = track.read_rtp().await {
-                    let payload = packet.payload.as_ref();
-                    let allowed = match kind {
-                        MediaKind::Audio => media_policy::check_audio_frame(payload).is_ok(),
-                        MediaKind::Video => media_policy::check_video_frame(payload).is_ok(),
+                    let payload = match kind {
+                        MediaKind::Audio => {
+                            let raw = packet.payload.as_ref();
+                            if media_policy::check_audio_frame(raw).is_err() {
+                                continue;
+                            }
+                            raw.to_vec()
+                        }
+                        MediaKind::Video => {
+                            let raw = packet.payload.as_ref();
+                            if media_policy::check_video_frame(raw).is_err() {
+                                continue;
+                            }
+                            match video.push(raw, packet.header.marker) {
+                                Some(frame) => frame,
+                                None => continue,
+                            }
+                        }
                     };
-                    if !allowed {
-                        continue;
-                    }
-                    let queued = remote_media_out.push_freshest(RemoteMedia {
+                    if !remote_media_out.push_freshest(RemoteMedia {
                         call_id,
                         participant,
                         kind,
-                        payload: payload.to_vec(),
-                    });
-                    if !queued {
-                        break; // CallManager dropped the receiver
+                        payload,
+                    }) {
+                        break;
                     }
                 }
             })
@@ -639,7 +651,7 @@ impl PeerConnection {
 
     /// Write one encoded video frame to the local video track.
     pub async fn write_video_sample(&self, data: &[u8], duration: Duration) -> Result<()> {
-        media_policy::check_video_frame(data)?;
+        media_policy::check_video_access_unit(data)?;
         let track_guard = self.video_track.lock().await;
         let track = track_guard
             .as_ref()

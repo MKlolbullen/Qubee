@@ -4565,7 +4565,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeWriteV
         let result: anyhow::Result<()> = (|| {
             let call_id_hex: String = env.get_string(&call_id)?.into();
             let participant_hex: String = env.get_string(&participant)?.into();
-            if !jni_bytes_within(&env, &frame, media_policy::MAX_VIDEO_FRAME_BYTES) {
+            if !jni_bytes_within(&env, &frame, media_policy::MAX_VIDEO_ACCESS_UNIT_BYTES) {
                 return Err(anyhow::anyhow!("video frame exceeds size limit"));
             }
             let frame = env.convert_byte_array(&frame)?;

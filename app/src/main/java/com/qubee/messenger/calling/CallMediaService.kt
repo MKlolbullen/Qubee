@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -41,6 +43,7 @@ class CallMediaService : Service() {
     @Inject lateinit var qubeeManager: QubeeManager
 
     private var engine: AudioCallEngine? = null
+    private var video: VideoCallEngine? = null
 
     @Volatile private var activeCallIdHex: String = ""
 
@@ -91,6 +94,8 @@ class CallMediaService : Service() {
         engine?.stop()
         activeCallIdHex = callIdHex
         engine = AudioCallEngine(qubeeManager).apply { start(callIdHex, peerIdHex) }
+        video?.stop()
+        video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
         Timber.d("CallMediaService audio engine started for call %s", callIdHex)
         return START_STICKY
     }
@@ -108,6 +113,8 @@ class CallMediaService : Service() {
     private fun releaseEngine() {
         engine?.stop()
         engine = null
+        video?.stop()
+        video = null
         activeCallIdHex = ""
     }
 
@@ -116,6 +123,42 @@ class CallMediaService : Service() {
         if (callIdHex == activeCallIdHex) {
             engine?.onRemoteAudioFrame(payload)
         }
+    }
+
+    private fun onRemoteVideo(callIdHex: String, payload: ByteArray) {
+        if (callIdHex == activeCallIdHex) {
+            video?.onRemoteAccessUnit(payload)
+        }
+    }
+
+    private fun applyCapture(enabled: Boolean) {
+        if (activeCallIdHex.isEmpty()) return
+        if (!enabled) {
+            video?.setCaptureEnabled(false)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                createNotification(),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                } else {
+                    0
+                },
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "camera foreground type rejected")
+            return
+        }
+        video?.setCaptureEnabled(true)
     }
 
     private fun createNotification(): Notification {
@@ -183,6 +226,14 @@ class CallMediaService : Service() {
          */
         fun deliverRemoteAudio(callIdHex: String, payload: ByteArray) {
             active?.onRemoteAudio(callIdHex, payload)
+        }
+
+        fun deliverRemoteVideo(callIdHex: String, payload: ByteArray) {
+            active?.onRemoteVideo(callIdHex, payload)
+        }
+
+        fun setCaptureEnabled(enabled: Boolean) {
+            active?.applyCapture(enabled)
         }
     }
 }

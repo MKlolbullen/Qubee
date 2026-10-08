@@ -13,6 +13,11 @@ import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.MessageRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import com.qubee.messenger.transfer.FileTransfer
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -40,6 +45,7 @@ class ChatViewModel @Inject constructor(
     private val qubeeManager: QubeeManager,
     private val ratchetSender: com.qubee.messenger.crypto.RatchetSender,
     private val callRepository: com.qubee.messenger.data.repository.CallRepository,
+    @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
     private val contactId: String = savedStateHandle["contactId"] ?: ""
@@ -143,8 +149,70 @@ class ChatViewModel @Inject constructor(
     fun sendMessage(text: String) {
         val payload = text.trim()
         if (payload.isEmpty() || conversationId.isEmpty()) return
-        viewModelScope.launch {
+        sendEncrypted(payload, payload, com.qubee.messenger.data.model.MessageType.TEXT, null)
+    }
+
+    fun sendSelectedFile(uri: Uri) {
+        if (conversationId.isEmpty()) return
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val name = displayName(uri)
+            val bytes = runCatching {
+                appContext.contentResolver.openInputStream(uri)?.use { input ->
+                    val out = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (out.size() + count > FileTransfer.MAX_BYTES) {
+                            notice("File is larger than 256 KB")
+                            return@launch
+                        }
+                        out.write(buffer, 0, count)
+                    }
+                    out.toByteArray()
+                }
+            }.getOrNull()
+            if (bytes == null) {
+                notice("Could not read that file")
+                return@launch
+            }
+            if (bytes.size > FileTransfer.MAX_BYTES) {
+                notice("File is larger than 256 KB")
+                return@launch
+            }
+            val envelope = FileTransfer.encode(name, bytes)
+            if (envelope == null) {
+                notice("Could not prepare that file")
+                return@launch
+            }
             val messageId = UUID.randomUUID().toString()
+            if (!FileTransfer.store(appContext, messageId, FileTransfer.Decoded(name, bytes))) {
+                notice("Could not keep a local copy of that file")
+                return@launch
+            }
+            sendEncrypted(name, envelope, com.qubee.messenger.data.model.MessageType.FILE, messageId)
+        }
+    }
+
+    private fun displayName(uri: Uri): String {
+        val cursor = appContext.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val index = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) return it.getString(index) ?: "file"
+            }
+        }
+        return "file"
+    }
+
+    private fun sendEncrypted(
+        display: String,
+        plaintext: String,
+        type: com.qubee.messenger.data.model.MessageType,
+        existingId: String?,
+    ) {
+        viewModelScope.launch {
+            val messageId = existingId ?: UUID.randomUUID().toString()
             val now = System.currentTimeMillis()
             val fromId = selfSenderId ?: SELF_SENDER_ID_FALLBACK
 
@@ -161,8 +229,8 @@ class ChatViewModel @Inject constructor(
                     id = messageId,
                     conversationId = conversationId,
                     senderId = fromId,
-                    content = payload,
-                    contentType = MessageType.TEXT,
+                    content = display,
+                    contentType = type,
                     timestamp = now,
                     status = MessageStatus.PREPARED,
                     isFromMe = true,
@@ -178,12 +246,12 @@ class ChatViewModel @Inject constructor(
             val wire = runCatching {
                 if (ratchetSender.enabled()) {
                     if (isGroup) {
-                        ratchetSender.encryptGroupText(conversationId, selfSenderId, payload)
+                        ratchetSender.encryptGroupText(conversationId, selfSenderId, plaintext)
                     } else {
-                        peerIdentityIdHex?.let { ratchetSender.encryptDirectText(it, payload) }
+                        peerIdentityIdHex?.let { ratchetSender.encryptDirectText(it, plaintext) }
                     }
                 } else {
-                    qubeeManager.encryptMessage(conversationId, payload)?.toBytes()
+                    qubeeManager.encryptMessage(conversationId, plaintext)?.toBytes()
                 }
             }.getOrNull()
             if (wire == null) {
@@ -221,8 +289,8 @@ class ChatViewModel @Inject constructor(
                 id = messageId,
                 conversationId = conversationId,
                 senderId = fromId,
-                content = payload,
-                contentType = MessageType.TEXT,
+                content = display,
+                contentType = type,
                 timestamp = now,
                 status = MessageStatus.SENDING,
                 isFromMe = true,
@@ -260,28 +328,8 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Queue a file attachment. Placeholder — writes a [Message] of
-     * [MessageType.FILE] with empty content, so the row appears in
-     * the chat. Real selection / encryption / upload lands later.
-     */
     fun onAttachFile() {
-        if (conversationId.isEmpty()) return
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val msg = Message(
-                id = UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
-                content = "",
-                contentType = MessageType.FILE,
-                timestamp = now,
-                status = MessageStatus.SENDING,
-                isFromMe = true,
-            )
-            messageRepository.saveMessage(msg)
-            _events.emit(ChatUiEvent.Notice("File attachment queued (encryption not yet implemented)"))
-        }
+        notice("Select a file using the attachment picker")
     }
 
     /**
@@ -335,17 +383,14 @@ class ChatViewModel @Inject constructor(
      * Secure calling — gated on the Rust `calling` feature flag and
      * a yet-unbuilt signalling layer. Surfaces a notice for now.
      */
-    fun requestSecureCall() {
+    fun requestSecureCall(isVideo: Boolean = false) {
         val peerIdHex = peerIdentityIdHex
         if (peerIdHex == null) {
             notice("Can't call yet — no verified peer identity for this contact")
             return
         }
         viewModelScope.launch {
-            // Voice call for now; the CallOverlay drives accept/answer.
-            // A null id means the native .so was built without the
-            // calling feature, or startup hasn't provisioned it.
-            if (callRepository.initiateCall(peerIdHex, isVideo = false) == null) {
+            if (callRepository.initiateCall(peerIdHex, isVideo) == null) {
                 notice("Calling is unavailable in this build")
             }
         }

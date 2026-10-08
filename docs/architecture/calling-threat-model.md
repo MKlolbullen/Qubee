@@ -3,8 +3,10 @@
 Status: **gated research surface.** The default native library is built
 without `--features calling`, and `BuildConfig.CALLING_NATIVE_ENABLED`
 is false unless Gradle is invoked with `-PqubeeCalling=true`. A default
-APK must not present a call control. Video capture and rendering are
-not implemented. Nothing in this document is a ship claim.
+APK must not present a call control. Video capture/rendering are integrated
+behind the build gate but remain unvalidated on physical devices. Calling
+startup also remains blocked by the relay-only signaling gate below.
+Nothing in this document is a ship claim.
 
 ## Addressing
 
@@ -67,7 +69,7 @@ call, and ICE for an unknown call is not cached.
 | SDP offer/answer | Reject empty or above 32 KiB |
 | ICE candidate text | Reject above 1 KiB; cache at most 16 per peer |
 | Audio frame (RTP or app sample) | 1..=2048 bytes. Opus itself is at most 1275 |
-| Video RTP payload | 1..=16 KiB. Video capture is not shipped |
+| Video RTP payload | 1..=16 KiB. Video hardware validation is pending |
 | Remote media queue | 12 frames, drop oldest. Same window as Android playback |
 | Live calls | `max_concurrent_calls`, rechecked under the write lock |
 
@@ -88,27 +90,57 @@ advertised until an encoder that emits stereo is actually wired.
 
 Calling does not hide network location.
 
-- The default configuration lists public STUN servers
-  (`stun.l.google.com`, `stun1.l.google.com`). A STUN binding request
-  tells that server the reflexive address of this device.
-- ICE candidates exchanged with the peer include host and server-reflexive
-  addresses. The peer, and anyone who can read the signaling session,
-  learns those addresses. Signaling is encrypted, so a passive network
-  observer of the Qubee session does not see the candidate strings, but
-  the STUN/TURN servers and the eventual media path do see IP traffic.
-- TURN is supported as configuration and is empty by default. If a TURN
-  server is configured, that relay sees the client's allocations and the
-  media it forwards. TURN credentials in `TurnServer` are call-setup
-  configuration, not a substitute for the media key.
+- The calling configuration now defaults to `RelayOnly` with no public
+  STUN servers. It rejects a missing TURN allocation/credentials instead
+  of silently trying direct ICE. `RTCIceTransportPolicy::Relay` is set in
+  webrtc-rs; trickle and inline SDP candidates are checked as a second
+  boundary. Related-address attributes are removed from relay candidates.
+- `DirectDevelopment` is an explicit test-only policy. It exposes host and
+  server-reflexive addresses; it must not be wired into an Android release.
+- TURN is not provisioned by default. Its operator still sees the client's
+  IP, allocations, timing, and traffic volume. It cannot read DTLS-SRTP
+  media content. Credentials should be short-lived and identity-opaque;
+  credential provisioning is not yet implemented.
+- **Call signaling still uses the direct libp2p message path.** A media-only
+  TURN policy cannot hide the peer IP while that path exists. Android
+  `nativeStartCalling` therefore fails closed until the signaling transport
+  is relay-only and tested. Existing ordinary chat traffic retains its
+  documented direct-network metadata behavior.
 - DTLS-SRTP protects media contents from the path. It does not hide that
   a media flow exists, its timing, or its volume.
+- A relay operator sees the client IP and allocation times. A peer receiving
+  relay ICE candidates learns the relay's address, but any simultaneously
+  connected direct Qubee chat/libp2p session still reveals the client's IP.
+- A direct inbox topic rotates but is derivable from the public IdentityId
+  and epoch. A party knowing that ID can monitor topic activity. Neither
+  topic blinding nor signaling encryption hides that party's traffic timing.
+- Android logcat previously included call IDs and peer IdentityIds on the
+  call path. The calling diagnostics now log only event classes and call
+  state; other network and chat diagnostics still require a separate audit.
 - Tor and Nym are not transports for this path. Enabling calling does
   not anonymise the peer.
 
-Treat a call as a direct network exposure to the peer and to whatever
-STUN/TURN infrastructure the build was configured with. That is a
-stronger metadata leak than an ordinary direct message, which already
-exposes the peer's libp2p address.
+No end-to-end IP-anonymity claim follows from relay-only ICE. The relay
+and traffic observer still see timing and volume, and the direct message
+transport must be redesigned before calling can be enabled.
+
+Decentralisation is a deployment and trust choice, not a guarantee of IP
+anonymity. Two endpoints can keep their existing end-to-end encryption and
+session keys while routing via independently operated relays. A direct
+peer-to-peer mode can be offered later only as an explicit IP-sharing choice
+for *both* endpoints; it must never be a silent fallback from a private
+mode. A single mandatory Coturn host would concentrate metadata even if it
+cannot decrypt media. Federation or user-selected relays require separate
+discovery, authentication, abuse limits, and cross-relay interoperability
+work; none are implemented yet.
+
+Release gates for metadata: provision TURN at runtime, relay the complete
+1:1 signaling session without direct libp2p dialing/address advertisement,
+prove packet-capture absence of direct peer traffic including reconnection
+and ICE restart, then run the physical device matrix. Do not merely flip
+the Android guard or add TURN credentials to the APK.
+The observer-by-observer risks, exact physical cases and first Samsung run
+are in [calling-metadata-matrix.md](calling-metadata-matrix.md).
 
 ## Teardown
 
@@ -128,5 +160,5 @@ still unproven on API 34+ foreground-service and permission races.
   thermal, and battery.
 - Echo cancellation, noise suppression, and gain. The settings flags
   exist; the peer-connection methods are stubs.
-- Video capture and rendering only after the voice path is stable on
-  hardware.
+- Video capture and rendering must remain gated until voice is stable on
+  hardware, then be validated on physical devices.

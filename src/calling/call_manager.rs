@@ -10,7 +10,7 @@ use crate::calling::media_policy::{self, REMOTE_MEDIA_QUEUE_CAPACITY};
 use crate::calling::realtime_queue::{self, RealtimeReceiver};
 use crate::calling::signaling::{SignalingMessage, SignalingTransport};
 use crate::calling::webrtc_manager::{
-    MediaKind, OutboundIce, RemoteMedia, WebRTCConfig, WebRTCManager,
+    IceTransportMode, MediaKind, OutboundIce, RemoteMedia, WebRTCConfig, WebRTCManager,
 };
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
@@ -347,6 +347,7 @@ pub struct CallManagerConfig {
     pub enable_p2p_optimization: bool,
     pub stun_servers: Vec<String>,
     pub turn_servers: Vec<TurnServer>,
+    pub ice_mode: IceTransportMode,
 }
 
 /// TURN server configuration
@@ -380,6 +381,7 @@ impl CallManager {
         let webrtc_config = WebRTCConfig {
             stun_servers: config.stun_servers.clone(),
             turn_servers: config.turn_servers.clone(),
+            ice_mode: config.ice_mode,
             enable_dtls: true,
             enable_srtp: true,
         };
@@ -1512,12 +1514,10 @@ impl Default for CallManagerConfig {
             call_timeout: Duration::from_secs(300), // 5 minutes
             ring_timeout: Duration::from_secs(60),  // 1 minute
             reconnection_attempts: 3,
-            enable_p2p_optimization: true,
-            stun_servers: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-            ],
+            enable_p2p_optimization: false,
+            stun_servers: Vec::new(),
             turn_servers: Vec::new(),
+            ice_mode: IceTransportMode::RelayOnly,
         }
     }
 }
@@ -1541,10 +1541,36 @@ mod tests {
     use crate::calling::signaling::SignalingServer;
     use tokio::sync::mpsc;
 
+    // Host signaling tests do not provision a TURN server. Explicitly opt
+    // them into direct development mode; the application default stays relay.
+    fn development_config() -> CallManagerConfig {
+        CallManagerConfig {
+            ice_mode: IceTransportMode::DirectDevelopment,
+            stun_servers: vec![
+                "stun:stun.l.google.com:19302".to_string(),
+                "stun:stun1.l.google.com:19302".to_string(),
+            ],
+            ..CallManagerConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_only_default_refuses_to_start_without_turn() {
+        let (event_sender, _events) = mpsc::unbounded_channel();
+        let result = CallManager::new(
+            CallManagerConfig::default(),
+            event_sender,
+            IdentityId::from([1u8; 32]),
+            Arc::new(SignalingServer::new().await.unwrap()),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn test_call_creation() {
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
-        let config = CallManagerConfig::default();
+        let config = development_config();
 
         // The invite rides the in-process signaling server; an
         // unregistered recipient makes initiate_call fail (correctly —
@@ -1586,7 +1612,7 @@ mod tests {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let server = Arc::new(SignalingServer::new().await.unwrap());
         let manager = CallManager::new(
-            CallManagerConfig::default(),
+            development_config(),
             event_sender,
             IdentityId::from([2u8; 32]),
             server,
@@ -1776,7 +1802,7 @@ mod tests {
         let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<OutboundSignal>();
         let (callee_ev, _callee_ev_rx) = mpsc::unbounded_channel();
         let callee_mgr = CallManager::new(
-            CallManagerConfig::default(),
+            development_config(),
             callee_ev,
             callee,
             Arc::new(ChannelSignalingTransport::new(callee_tx)),
@@ -1859,7 +1885,7 @@ mod tests {
         let (callee_ev, _callee_ev_rx) = mpsc::unbounded_channel();
 
         let caller_mgr = CallManager::new(
-            CallManagerConfig::default(),
+            development_config(),
             caller_ev,
             caller,
             Arc::new(ChannelSignalingTransport::new(caller_tx)),
@@ -1867,7 +1893,7 @@ mod tests {
         .await
         .unwrap();
         let callee_mgr = CallManager::new(
-            CallManagerConfig::default(),
+            development_config(),
             callee_ev,
             callee,
             Arc::new(ChannelSignalingTransport::new(callee_tx)),
@@ -2088,7 +2114,7 @@ mod tests {
         let manager = CallManager::new(
             CallManagerConfig {
                 max_concurrent_calls: 1,
-                ..CallManagerConfig::default()
+                ..development_config()
             },
             event_sender,
             IdentityId::from([2u8; 32]),

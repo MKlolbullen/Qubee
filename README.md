@@ -322,6 +322,10 @@ provisioning or relay-only signaling carrier is wired yet. This build
 compiles the research surface but does not enable a private call. See
 [`calling-threat-model.md`](docs/architecture/calling-threat-model.md).
 
+A self-hosted Coturn deployment and server-side ephemeral credential issuer
+are staged under [`deploy/calling/`](deploy/calling/README.md). They do not
+remove the signaling or physical-device release gates.
+
 ### Keying model
 
 For a 1:1 call, the caller currently generates a fresh random 32-byte media root and sends it inside the already authenticated + E2E-encrypted call invitation. Both endpoints then derive the same per-call media key using the call id and a canonical sorted pair of participant identities.

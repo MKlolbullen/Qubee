@@ -1,0 +1,44 @@
+services:
+  turn:
+    image: coturn/coturn:4.18.0-r0
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run/qubee-turn:mode=0700,size=16m
+    environment:
+      TURN_REALM: ${TURN_REALM:?Set TURN_REALM to the DNS name on the certificate}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+    secrets:
+      - turn_shared_secret
+      - tls_cert
+      - tls_key
+    volumes:
+      - ./turnserver.conf:/etc/qubee/turnserver.conf:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command: |
+      umask 077
+      test -s /run/secrets/turn_shared_secret
+      test -s /run/secrets/tls_cert
+      test -s /run/secrets/tls_key
+      case "$${TURN_REALM}" in *[!a-zA-Z0-9.-]*|"" ) exit 1 ;; esac
+      turn_secret="$$(cat /run/secrets/turn_shared_secret)"
+      case "$${turn_secret}" in *[!0-9a-fA-F]*|"" ) exit 1 ;; esac
+      test "$${#turn_secret}" -ge 64
+      cp /etc/qubee/turnserver.conf /run/qubee-turn/turnserver.conf
+      printf 'realm=%s\n' "$${TURN_REALM}" >> /run/qubee-turn/turnserver.conf
+      printf 'static-auth-secret=%s\n' "$${turn_secret}" >> /run/qubee-turn/turnserver.conf
+      unset turn_secret
+      if [ -n "$${TURN_EXTERNAL_IP}" ]; then
+        case "$${TURN_EXTERNAL_IP}" in *[!0-9.]* ) exit 1 ;; esac
+        printf 'external-ip=%s\n' "$${TURN_EXTERNAL_IP}" >> /run/qubee-turn/turnserver.conf
+      fi
+      exec turnserver -c /run/qubee-turn/turnserver.conf
+
+secrets:
+  turn_shared_secret:
+    file: ./secrets/turn-shared-secret
+  tls_cert:
+    file: ./secrets/tls.crt
+  tls_key:
+    file: ./secrets/tls.key

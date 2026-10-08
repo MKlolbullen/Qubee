@@ -316,7 +316,11 @@ To build a local calling-enabled debug APK, build the Rust libraries with
 `QUBEE_CALLING=1 ./build_rust.sh`, then run
 `./gradlew assembleDebug -PqubeeCalling=true`. Both opt-ins are required;
 the normal release build continues to omit calling. The resulting APK is
-development-signed and not suitable for publishing as a release.
+development-signed and not suitable for publishing as a release. Calling
+currently fails closed at startup even in this opt-in APK: no TURN
+provisioning or relay-only signaling carrier is wired yet. This build
+compiles the research surface but does not enable a private call. See
+[`calling-threat-model.md`](docs/architecture/calling-threat-model.md).
 
 ### Keying model
 

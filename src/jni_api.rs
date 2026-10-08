@@ -4290,6 +4290,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
                 .ok_or_else(|| anyhow::anyhow!("onboarding required before calling"))?;
             let local_identity = identity.identity_id();
 
+            // MessageService currently sends call frames through the direct
+            // libp2p message path. A TURN-only media connection would still
+            // expose addresses there. Keep Android calling unavailable until
+            // a relay-only signaling transport is wired and verified.
+            if !relay_call_signaling_available() {
+                anyhow::bail!("calling requires a verified relay-only signaling transport");
+            }
+
             let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundSignal>();
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CallEvent>();
             let signaling = Arc::new(ChannelSignalingTransport::new(signal_tx));
@@ -4321,6 +4329,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
             }
         }
     })
+}
+
+#[cfg(feature = "calling")]
+fn relay_call_signaling_available() -> bool {
+    // This must become a real assertion supplied by the transport that
+    // carries the entire 1:1 session over relays, not a build flag.
+    false
 }
 
 /// Initiate a 1:1 call to `participant`. The call's media root is minted

@@ -44,6 +44,7 @@
 //! boundary and the ICE metadata leak.
 
 pub mod call_manager;
+pub mod ice_privacy;
 pub mod media_encryption;
 pub mod media_policy;
 pub mod peer_connection;
@@ -56,4 +57,4 @@ pub use call_manager::{Call, CallManager, CallState, CallType};
 pub use media_encryption::{MediaEncryption, MediaKey, StreamEncryption};
 pub use peer_connection::{ICECandidate, PeerConnection, PeerConnectionState};
 pub use signaling::{SignalingClient, SignalingMessage, SignalingServer};
-pub use webrtc_manager::{WebRTCConfig, WebRTCManager};
+pub use webrtc_manager::{IceTransportMode, WebRTCConfig, WebRTCManager};

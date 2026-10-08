@@ -25,6 +25,7 @@ import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.ConversationRepository
 import com.qubee.messenger.data.repository.MessageRepository
 import com.qubee.messenger.network.NetworkCallback
+import com.qubee.messenger.transfer.FileTransfer
 import com.qubee.messenger.ui.main.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
@@ -102,6 +103,7 @@ class MessageService : Service(), NetworkCallback {
         /// onRemoteMedia kind discriminant: 0=audio (Opus), 1=video.
         /// Mirrors MediaKind in src/calling/webrtc_manager.rs.
         private const val MEDIA_KIND_AUDIO: Int = 0
+        private const val MEDIA_KIND_VIDEO: Int = 1
 
         /// Prekey bundles ride gossipsub, so peers offline at publish
         /// time miss them and can never initiate v3 toward us. A
@@ -579,12 +581,17 @@ class MessageService : Service(), NetworkCallback {
         }
         val matched = contactRepository.getContactByIdentityId(senderIdHex)
         val resolvedSenderId = matched?.id ?: senderIdHex
+        val messageId = UUID.randomUUID().toString()
+        val stored = storeInbound(messageId, content) ?: run {
+            Timber.w("Could not securely store inbound group attachment")
+            return
+        }
         val msg = Message(
-            id = UUID.randomUUID().toString(),
+            id = messageId,
             conversationId = groupIdHex,
             senderId = resolvedSenderId,
-            content = content,
-            contentType = MessageType.TEXT,
+            content = stored.first,
+            contentType = stored.second,
             timestamp = timestampMillis,
             status = MessageStatus.DELIVERED,
             isFromMe = false,
@@ -604,6 +611,15 @@ class MessageService : Service(), NetworkCallback {
      * ratchet magic must never fall into the legacy decrypt, where a
      * misleading failure would surface.
      */
+    private fun storeInbound(messageId: String, text: String): Pair<String, MessageType>? {
+        val decoded = FileTransfer.decode(text) ?: return text to MessageType.TEXT
+        return if (FileTransfer.store(this, messageId, decoded)) {
+            decoded.name to MessageType.FILE
+        } else {
+            null
+        }
+    }
+
     private suspend fun handleRatchetFrame(peerId: String, data: ByteArray): Boolean {
         // 1:1 PQXDH + Double Ratchet frame (QUBEE_DMS). Detect by magic,
         // not by sender resolution: an unknown/tampered selector is still a
@@ -666,12 +682,17 @@ class MessageService : Service(), NetworkCallback {
                             Timber.w("Cannot route ratchet 1:1 from %s", senderIdentityHex)
                             return@withLock true
                         }
+                        val messageId = UUID.randomUUID().toString()
+                        val stored = storeInbound(messageId, result.optString("text")) ?: run {
+                            Timber.w("Could not securely store inbound direct attachment")
+                            return@withLock true
+                        }
                         val inboundMessage = Message(
-                            id = UUID.randomUUID().toString(),
+                            id = messageId,
                             conversationId = conversationId,
                             senderId = routedSenderId,
-                            content = result.optString("text"),
-                            contentType = MessageType.TEXT,
+                            content = stored.first,
+                            contentType = stored.second,
                             timestamp = System.currentTimeMillis(),
                             status = MessageStatus.DELIVERED,
                             isFromMe = false,
@@ -987,13 +1008,15 @@ class MessageService : Service(), NetworkCallback {
     /**
      * Encoded remote media from a call track. Audio (kind 0) is Opus and
      * goes to the [CallMediaService] engine for decode + playback; video
-     * (kind 1) has no renderer yet and is dropped. Fires at media rate, so
+     * (kind 1) is a reassembled VP8 access unit routed to the decoder. Fires at media rate, so
      * this stays cheap — a queue offer inside the engine, no allocation
      * beyond the payload we were handed.
      */
     override fun onRemoteMedia(callIdHex: String, senderIdHex: String, kind: Int, payload: ByteArray) {
         if (kind == MEDIA_KIND_AUDIO) {
             CallMediaService.deliverRemoteAudio(callIdHex, payload)
+        } else if (kind == MEDIA_KIND_VIDEO) {
+            CallMediaService.deliverRemoteVideo(callIdHex, payload)
         }
     }
 

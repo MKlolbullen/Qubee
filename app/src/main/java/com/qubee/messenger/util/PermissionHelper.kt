@@ -25,7 +25,9 @@ object PermissionHelper {
         // permissions the manifest doesn't declare; requesting an
         // undeclared permission is a silent no-op. Prune to the
         // declared set in a follow-up.)
-        permissions.add(Manifest.permission.READ_CONTACTS)
+        // READ_CONTACTS is intentionally not requested. Contacts are
+        // cryptographic identities, not the device phone book. A phone
+        // number is not a way to reach someone.
         permissions.add(Manifest.permission.VIBRATE)
         
         // Storage permissions based on API level
@@ -97,9 +99,7 @@ object PermissionHelper {
             Manifest.permission.CAMERA -> 
                 "Camera permission is needed to take photos and videos for sharing."
             Manifest.permission.RECORD_AUDIO -> 
-                "Microphone permission is needed to record voice messages and make calls."
-            Manifest.permission.READ_CONTACTS -> 
-                "Contacts permission is needed to find friends who are using the app."
+                "Microphone permission is needed for an encrypted voice session with a verified identity."
             Manifest.permission.READ_EXTERNAL_STORAGE,
             Manifest.permission.READ_MEDIA_IMAGES,
             Manifest.permission.READ_MEDIA_VIDEO,
@@ -147,4 +147,3 @@ object PermissionHelper {
         )
     }
 }
-

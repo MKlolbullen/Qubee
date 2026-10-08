@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -41,6 +43,7 @@ class CallMediaService : Service() {
     @Inject lateinit var qubeeManager: QubeeManager
 
     private var engine: AudioCallEngine? = null
+    private var video: VideoCallEngine? = null
 
     @Volatile private var activeCallIdHex: String = ""
 
@@ -52,8 +55,12 @@ class CallMediaService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val callIdHex = intent?.getStringExtra(EXTRA_CALL_ID)
         val peerIdHex = intent?.getStringExtra(EXTRA_PEER_ID)
-        if (callIdHex.isNullOrEmpty() || peerIdHex.isNullOrEmpty()) {
-            Timber.w("CallMediaService started without call/peer id; stopping")
+        // stop() clears desiredCallId before stopService returns. A start
+        // that was already queued must not bring the microphone back up
+        // after the call has ended.
+        if (callIdHex.isNullOrEmpty() || peerIdHex.isNullOrEmpty() || desiredCallId != callIdHex) {
+            Timber.w("CallMediaService start ignored; no live call")
+            releaseEngine()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -74,6 +81,7 @@ class CallMediaService : Service() {
             // or from a disallowed state. Fail closed — no call audio —
             // rather than crash the process.
             Timber.e(e, "startForeground(microphone) rejected; stopping call media")
+            releaseEngine()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -86,26 +94,71 @@ class CallMediaService : Service() {
         engine?.stop()
         activeCallIdHex = callIdHex
         engine = AudioCallEngine(qubeeManager).apply { start(callIdHex, peerIdHex) }
+        video?.stop()
+        video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
         Timber.d("CallMediaService audio engine started for call %s", callIdHex)
         return START_STICKY
     }
 
     override fun onDestroy() {
+        releaseEngine()
         super.onDestroy()
-        engine?.stop()
-        engine = null
-        activeCallIdHex = ""
         if (active === this) active = null
         Timber.d("CallMediaService destroyed")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** Stop capture and drop the engine. Safe to call more than once. */
+    private fun releaseEngine() {
+        engine?.stop()
+        engine = null
+        video?.stop()
+        video = null
+        activeCallIdHex = ""
+    }
+
     /** Route one remote Opus frame to the running engine, if it's this call. */
     private fun onRemoteAudio(callIdHex: String, payload: ByteArray) {
         if (callIdHex == activeCallIdHex) {
             engine?.onRemoteAudioFrame(payload)
         }
+    }
+
+    private fun onRemoteVideo(callIdHex: String, payload: ByteArray) {
+        if (callIdHex == activeCallIdHex) {
+            video?.onRemoteAccessUnit(payload)
+        }
+    }
+
+    private fun applyCapture(enabled: Boolean) {
+        if (activeCallIdHex.isEmpty()) return
+        if (!enabled) {
+            video?.setCaptureEnabled(false)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                createNotification(),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                } else {
+                    0
+                },
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "camera foreground type rejected")
+            return
+        }
+        video?.setCaptureEnabled(true)
     }
 
     private fun createNotification(): Notification {
@@ -123,7 +176,7 @@ class CallMediaService : Service() {
         }
         return NotificationCompat.Builder(this, QubeeApplication.NOTIFICATION_CHANNEL_SERVICE)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Qubee call in progress")
+            .setContentText("Encrypted voice session")
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .setSilent(true)
@@ -144,7 +197,11 @@ class CallMediaService : Service() {
         private var active: CallMediaService? = null
 
         /** Bring up mic capture + playback for [callIdHex] ↔ [peerIdHex]. */
+        @Volatile
+        private var desiredCallId: String? = null
+
         fun start(context: Context, callIdHex: String, peerIdHex: String) {
+            desiredCallId = callIdHex
             val intent = Intent(context, CallMediaService::class.java).apply {
                 putExtra(EXTRA_CALL_ID, callIdHex)
                 putExtra(EXTRA_PEER_ID, peerIdHex)
@@ -157,6 +214,8 @@ class CallMediaService : Service() {
         }
 
         fun stop(context: Context) {
+            desiredCallId = null
+            active?.releaseEngine()
             context.stopService(Intent(context, CallMediaService::class.java))
         }
 
@@ -167,6 +226,14 @@ class CallMediaService : Service() {
          */
         fun deliverRemoteAudio(callIdHex: String, payload: ByteArray) {
             active?.onRemoteAudio(callIdHex, payload)
+        }
+
+        fun deliverRemoteVideo(callIdHex: String, payload: ByteArray) {
+            active?.onRemoteVideo(callIdHex, payload)
+        }
+
+        fun setCaptureEnabled(enabled: Boolean) {
+            active?.applyCapture(enabled)
         }
     }
 }

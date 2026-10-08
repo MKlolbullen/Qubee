@@ -48,22 +48,51 @@ class CallRepository @Inject constructor(
     private val _state = MutableStateFlow<CallUiState>(CallUiState.Idle)
     val state: StateFlow<CallUiState> = _state.asStateFlow()
 
+    /**
+     * True only when this APK was built with `-PqubeeCalling=true` and the
+     * loaded `libqubee_crypto.so` actually exported the calling symbols.
+     * The default release leaves both false so the UI cannot imply a call
+     * button that the native library does not contain.
+     */
+    private val _callingAvailable = MutableStateFlow(false)
+    val callingAvailable: StateFlow<Boolean> = _callingAvailable.asStateFlow()
+
     /** Bring up the native call subsystem for the active identity. */
-    suspend fun start(): Boolean = qubeeManager.startCalling()
+    suspend fun start(): Boolean {
+        if (!com.qubee.messenger.BuildConfig.CALLING_NATIVE_ENABLED) {
+            _callingAvailable.value = false
+            return false
+        }
+        val started = qubeeManager.startCalling()
+        _callingAvailable.value = started
+        return started
+    }
 
     /**
      * Place a call. The media root is minted natively and shipped in
      * the encrypted invitation. Returns the new call id (hex) or null.
      */
     suspend fun initiateCall(peerIdHex: String, isVideo: Boolean): String? {
+        val peer = identityHexOrNull(peerIdHex) ?: return null
         val callType = if (isVideo) 1 else 0
-        val callIdHex = qubeeManager.initiateCall(peerIdHex, callType) ?: return null
-        _state.value = CallUiState.Active(callIdHex, peerIdHex, callType)
+        val callIdHex = qubeeManager.initiateCall(peer, callType) ?: return null
+        _state.value = CallUiState.Active(callIdHex, peer, callType)
         return callIdHex
+    }
+
+    /**
+     * A session peer is a 32-byte identity id, hex-encoded. A phone
+     * number, email, or other dial string is not an address.
+     */
+    private fun identityHexOrNull(value: String): String? {
+        if (value.length != 64) return null
+        if (value.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) return null
+        return value
     }
 
     /** Accept the currently-ringing call (media root came from the invite). */
     suspend fun acceptCall(callIdHex: String, peerIdHex: String): Boolean {
+        val peer = identityHexOrNull(peerIdHex) ?: return false
         // Snapshot the ringing state before suspending: a terminal
         // lifecycle callback (hang-up, timeout) can land while
         // acceptCall() awaits, and we must not clobber it.
@@ -71,12 +100,12 @@ class CallRepository @Inject constructor(
             ?.takeIf { it.callIdHex == callIdHex }
             ?.callType
             ?: return false
-        val accepted = qubeeManager.acceptCall(callIdHex, peerIdHex)
+        val accepted = qubeeManager.acceptCall(callIdHex, peer)
         if (accepted) {
             // Only transition if this call is still the one ringing.
             val current = _state.value
             if (current is CallUiState.Incoming && current.callIdHex == callIdHex) {
-                _state.value = CallUiState.Active(callIdHex, peerIdHex, callType)
+                _state.value = CallUiState.Active(callIdHex, peer, callType)
             }
         }
         return accepted

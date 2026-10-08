@@ -63,6 +63,7 @@ hex = "0.4"
 # `cargo build` works out of the box; pass `--features calling` to
 # pull WebRTC in.
 webrtc = { version = "0.14", optional = true }
+rtp = { version = "0.14.0", optional = true }
 # `bytes::Bytes` is the payload type of `webrtc::media::Sample` (the
 # capture-sample write API). Already in the tree via webrtc; declared
 # here so the calling media path can name it. Calling-only.
@@ -132,10 +133,11 @@ default = []
 # Pull in the WebRTC stack and the `calling` module (voice/video).
 # Compiles clean on webrtc 0.14 and is clippy-/test-covered in CI
 # (see .github/workflows/calling.yml), but it is NOT wired into the
-# JNI surface or the Android app yet — signaling-over-P2P, the call
-# UI, and ratchet-derived media keys are still to come. Off by default
-# so the shipped .so stays lean; enable it for calling development.
-calling = ["dep:webrtc", "dep:bytes"]
+# default native library. Signaling, JNI, and the call UI exist behind
+# this flag; video capture is not shipped, and the physical-device
+# matrix is still open (issue #79). Off by default so the shipped .so
+# stays lean. A calling build must also pass -PqubeeCalling=true.
+calling = ["dep:webrtc", "dep:bytes", "dep:rtp"]
 # Compile the legacy prototype modules (`hybrid_ratchet`,
 # `secure_message`, `file_transfer`, `audio`, `sas`, `oob_secrets`).
 # They reference dependency APIs that have since drifted; enabling

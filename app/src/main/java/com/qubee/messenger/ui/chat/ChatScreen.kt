@@ -1,5 +1,7 @@
 package com.qubee.messenger.ui.chat
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -38,6 +40,7 @@ import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -77,8 +80,10 @@ import com.qubee.messenger.ui.theme.QubeeSecondaryButton
 import com.qubee.messenger.ui.theme.QubeeStatusPill
 import com.qubee.messenger.ui.theme.QubeeTheme
 import com.qubee.messenger.ui.invite.QrScannerActivity
+import com.qubee.messenger.transfer.FileTransfer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -95,6 +100,18 @@ fun ChatScreen(
         var inputText by remember { mutableStateOf("") }
         var showDetails by remember { mutableStateOf(false) }
         val context = LocalContext.current
+        var pendingVideoSession by remember { mutableStateOf(false) }
+        val microphonePermission = rememberLauncherForActivityResult(
+            androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+        ) { granted -> if (granted) viewModel.requestSecureCall(pendingVideoSession) }
+        val startSession = { video: Boolean ->
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                viewModel.requestSecureCall(video)
+            } else {
+                pendingVideoSession = video
+                microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
 
         // Embedded ZXing scanner for the verification dialog. The
         // scanned text is fed straight into the existing
@@ -105,6 +122,9 @@ fun ChatScreen(
                 viewModel.confirmContactVerification(scanned)
             }
         }
+        val filePicker = rememberLauncherForActivityResult(
+            androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+        ) { uri -> uri?.let(viewModel::sendSelectedFile) }
 
         LaunchedEffect(viewModel) {
             viewModel.events.collect { event ->
@@ -138,7 +158,9 @@ fun ChatScreen(
                     contactName = uiState.contactName,
                     securityState = uiState.securityState,
                     onBackClick = onBackClick,
-                    onSecureCallClick = viewModel::requestSecureCall,
+                    onSecureCallClick = { startSession(false) },
+                    onSecureVideoClick = { startSession(true) },
+                    callingAvailable = uiState.callingAvailable && !uiState.isGroup,
                     onDetailsClick = { showDetails = true },
                 )
             },
@@ -150,7 +172,7 @@ fun ChatScreen(
                         viewModel.sendMessage(inputText)
                         inputText = ""
                     },
-                    onAttach = viewModel::onAttachFile,
+                    onAttach = { filePicker.launch(arrayOf("*/*")) },
                     onCamera = viewModel::onTakePhoto,
                     onMic = viewModel::onRecordAudio,
                 )
@@ -294,6 +316,8 @@ private fun SecureChatTopBar(
     securityState: ConversationSecurityState,
     onBackClick: () -> Unit,
     onSecureCallClick: () -> Unit,
+    onSecureVideoClick: () -> Unit,
+    callingAvailable: Boolean,
     onDetailsClick: () -> Unit,
 ) {
     Surface(
@@ -337,8 +361,25 @@ private fun SecureChatTopBar(
                     )
                 }
             }
-            IconButton(onClick = onSecureCallClick) {
-                Icon(Icons.Default.Lock, contentDescription = "Secure call", tint = QubeePalette.Cyan)
+            // Absent unless this build's native library was compiled with
+            // `--features calling` AND `startCalling()` linked the symbols.
+            // A lock icon on the default .so would imply a capability that
+            // fails closed.
+            if (callingAvailable) {
+                IconButton(onClick = onSecureCallClick) {
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = "Encrypted voice session",
+                        tint = QubeePalette.Cyan,
+                    )
+                }
+                IconButton(onClick = onSecureVideoClick) {
+                    Icon(
+                        Icons.Default.Videocam,
+                        contentDescription = "Encrypted video session",
+                        tint = QubeePalette.Cyan,
+                    )
+                }
             }
             IconButton(onClick = onDetailsClick) {
                 Icon(Icons.Default.MoreVert, contentDescription = "Conversation details", tint = QubeePalette.MutedText)
@@ -443,6 +484,7 @@ private fun EmptyChatState(contactName: String) {
 
 @Composable
 private fun MessageItem(msg: UiMessage, isGroup: Boolean) {
+    val context = LocalContext.current
     // Only incoming group messages get a sender line: a 1:1 chat
     // already names the peer in the top bar, and our own bubbles
     // sit on the other edge of the screen.
@@ -450,7 +492,13 @@ private fun MessageItem(msg: UiMessage, isGroup: Boolean) {
     when (msg.type) {
         UiMessageType.TEXT -> MessageBubble(msg, showSender)
         UiMessageType.IMAGE -> MediaMessageCard(msg, Icons.Default.PhotoCamera, "Encrypted image", showSender)
-        UiMessageType.FILE -> MediaMessageCard(msg, Icons.Default.InsertDriveFile, "Encrypted file", showSender)
+        UiMessageType.FILE -> MediaMessageCard(
+            msg,
+            Icons.Default.InsertDriveFile,
+            "Encrypted file",
+            showSender,
+            onClick = { FileTransfer.open(context, msg.id, msg.text) },
+        )
         UiMessageType.AUDIO -> AudioMessageCard(msg, showSender)
     }
 }
@@ -510,7 +558,13 @@ fun MessageBubble(msg: UiMessage, showSender: Boolean = false) {
 }
 
 @Composable
-private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String, showSender: Boolean = false) {
+private fun MediaMessageCard(
+    msg: UiMessage,
+    icon: ImageVector,
+    title: String,
+    showSender: Boolean = false,
+    onClick: (() -> Unit)? = null,
+) {
     val align = if (msg.isFromMe) Alignment.End else Alignment.Start
     Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
         Surface(
@@ -518,6 +572,8 @@ private fun MediaMessageCard(msg: UiMessage, icon: ImageVector, title: String, s
             shape = RoundedCornerShape(24.dp),
             color = Color(0xFF222725).copy(alpha = 0.96f),
             border = BorderStroke(1.dp, QubeePalette.Cyan.copy(alpha = 0.22f)),
+            onClick = onClick ?: {},
+            enabled = onClick != null,
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 if (showSender) {

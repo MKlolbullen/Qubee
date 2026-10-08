@@ -1,5 +1,11 @@
 package com.qubee.messenger.ui.call
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -8,6 +14,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -22,9 +29,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
@@ -34,6 +44,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
+import com.qubee.messenger.calling.VideoSurfaces
 import com.qubee.messenger.data.repository.CallRepository.CallUiState
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeeTheme
@@ -48,13 +60,26 @@ fun CallOverlay(viewModel: CallViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val muted by viewModel.muted.collectAsStateWithLifecycle()
     val videoOn by viewModel.videoOn.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) viewModel.accept()
+    }
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) viewModel.toggleVideo()
+    }
 
     when (val call = state) {
         is CallUiState.Idle -> Unit
         is CallUiState.Incoming -> IncomingCallBody(
             callerLabel = shortId(call.peerIdHex),
             isVideo = call.callType == CALL_TYPE_VIDEO,
-            onAccept = viewModel::accept,
+            onAccept = {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                    viewModel.accept()
+                } else {
+                    microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            },
             onReject = viewModel::reject,
         )
         is CallUiState.Active -> ActiveCallBody(
@@ -63,7 +88,15 @@ fun CallOverlay(viewModel: CallViewModel = hiltViewModel()) {
             muted = muted,
             videoOn = videoOn,
             onToggleMute = viewModel::toggleMute,
-            onToggleVideo = viewModel::toggleVideo,
+            onToggleVideo = {
+                if (videoOn) {
+                    viewModel.toggleVideo()
+                } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                    viewModel.toggleVideo()
+                } else {
+                    cameraPermission.launch(Manifest.permission.CAMERA)
+                }
+            },
             onHangUp = viewModel::hangUp,
         )
     }
@@ -121,6 +154,10 @@ internal fun ActiveCallBody(
             title = peerLabel,
             subtitle = if (isVideo) "Video call" else "Voice call",
         )
+        if (isVideo || videoOn) {
+            RemoteVideoSurface(Modifier.fillMaxWidth().height(260.dp))
+            Spacer(Modifier.size(20.dp))
+        }
         Spacer(Modifier.size(48.dp))
         Row(
             Modifier.fillMaxWidth(),
@@ -145,6 +182,33 @@ internal fun ActiveCallBody(
                 onClick = onToggleVideo,
             )
         }
+    }
+}
+
+@Composable
+private fun RemoteVideoSurface(modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            SurfaceView(context).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) {
+                        VideoSurfaces.remote = holder.surface
+                    }
+
+                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                        VideoSurfaces.remote = holder.surface
+                    }
+
+                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                        if (VideoSurfaces.remote === holder.surface) VideoSurfaces.remote = null
+                    }
+                })
+            }
+        },
+    )
+    DisposableEffect(Unit) {
+        onDispose { VideoSurfaces.remote = null }
     }
 }
 

@@ -73,7 +73,12 @@ data class Contact(
     @PrimaryKey val id: String = "",
     val identityId: String = "",
     val displayName: String = "",
+    /// Vestigial column. Not a contact address and not a session
+    /// address. Cleared on database open. Do not populate it.
+    @Deprecated("Qubee does not address peers by phone number")
     val phoneNumber: String? = null,
+    /// Vestigial column. Not a contact address. Cleared on database open.
+    @Deprecated("Qubee does not address peers by email")
     val email: String? = null,
     val publicKey: ByteArray? = null,
     val identityKey: ByteArray? = null,

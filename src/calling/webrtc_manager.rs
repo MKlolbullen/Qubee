@@ -69,10 +69,72 @@ pub struct WebRTCConfig {
     pub stun_servers: Vec<String>,
     /// TURN servers for relay
     pub turn_servers: Vec<TurnServer>,
+    /// The ICE policy enforced by the engine, including after network changes.
+    pub ice_mode: IceTransportMode,
     /// Enable DTLS for secure transport
     pub enable_dtls: bool,
     /// Enable SRTP for media encryption
     pub enable_srtp: bool,
+}
+
+/// Direct candidates are only for explicit development/testing. RelayOnly
+/// requires TURN and never falls back to host or server-reflexive media.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IceTransportMode {
+    DirectDevelopment,
+    RelayOnly,
+}
+
+impl WebRTCConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.ice_mode == IceTransportMode::RelayOnly {
+            anyhow::ensure!(
+                self.stun_servers.is_empty(),
+                "relay-only must not contact STUN servers"
+            );
+            anyhow::ensure!(
+                !self.turn_servers.is_empty(),
+                "relay-only requires a TURN server"
+            );
+            for turn in &self.turn_servers {
+                anyhow::ensure!(
+                    (turn.url.starts_with("turn:") || turn.url.starts_with("turns:"))
+                        && !turn.username.is_empty()
+                        && !turn.credential.is_empty(),
+                    "relay-only requires a TURN URL and credentials"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ice_policy_tests {
+    use super::*;
+
+    #[test]
+    fn relay_policy_needs_turn_and_forbids_stun() {
+        let mut config = WebRTCConfig {
+            stun_servers: vec![],
+            turn_servers: vec![],
+            ice_mode: IceTransportMode::RelayOnly,
+            enable_dtls: true,
+            enable_srtp: true,
+        };
+        assert!(config.validate().is_err());
+        config.turn_servers.push(TurnServer {
+            url: "turns:relay.example:5349".into(),
+            username: "ephemeral".into(),
+            credential: "secret".into(),
+        });
+        assert!(config.validate().is_ok());
+        config.stun_servers.push("stun:public.example".into());
+        assert!(config.validate().is_err());
+        config.stun_servers.clear();
+        config.turn_servers[0].credential.clear();
+        assert!(config.validate().is_err());
+    }
 }
 
 /// Media devices manager
@@ -196,6 +258,7 @@ impl WebRTCManager {
         ice_out: mpsc::UnboundedSender<OutboundIce>,
         remote_media_out: RealtimeSender<RemoteMedia>,
     ) -> Result<Self> {
+        config.validate()?;
         let media_devices = MediaDevicesManager::new().await?;
 
         Ok(WebRTCManager {
@@ -368,6 +431,9 @@ impl WebRTCManager {
         participant: IdentityId,
         candidate: ICECandidate,
     ) -> Result<()> {
+        if self.config.ice_mode == IceTransportMode::RelayOnly {
+            crate::calling::ice_privacy::relay_candidate(&candidate.candidate)?;
+        }
         let connections = self.peer_connections.read().await;
         if let Some(connection) = connections.get(&(call_id, participant)) {
             connection.add_ice_candidate(candidate).await?;
@@ -385,7 +451,6 @@ impl WebRTCManager {
         Ok(())
     }
 
-    /// Total number of trickled ICE candidates buffered across all pending peers (test-only).
     #[cfg(test)]
     pub(crate) async fn cached_ice_len(&self) -> usize {
         self.ice_candidates

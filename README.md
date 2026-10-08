@@ -343,9 +343,13 @@ Before calling should be considered shippable, it needs at least:
 - echo cancellation / noise suppression / gain behavior;
 - Wi-Fi ↔ cellular transitions and reconnect behavior;
 - long-call memory/thermal/battery testing;
-- video capture/rendering only after the voice path is stable.
+- video codec compatibility, camera lifecycle, and remote rendering;
+- direct and group attachment round-trips, including large/invalid files
+  and low-storage behavior.
 
-Host tests now cover bounded queues, mono Opus advertisement, and the authenticated-sender checks. The items above still need a physical device.
+Host tests cover bounded queues, mono Opus advertisement, and the
+authenticated-sender checks. Android integration compiles and its unit
+tests pass, but the end-to-end items above still need physical devices.
 
 ## 📱 UI previews
 

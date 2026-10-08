@@ -567,7 +567,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
                 if send_direct(route, data_vec) {
                     return 1;
                 }
-                tracing::debug!(recipient = %recipient_hex, "direct frame could not be enqueued; caller will retry same wire");
+                tracing::debug!("direct frame could not be enqueued; caller will retry same wire");
                 return 0;
             }
 
@@ -575,10 +575,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
             // recipient's rotating blinded inbox, never on qubee-global. The
             // frame is still end-to-end ratchet encrypted and recipient-bound.
             if publish_direct_inbox(recipient_hex.clone(), data_vec) {
-                tracing::debug!(recipient = %recipient_hex, "queued direct frame on blinded recipient inbox");
+                tracing::debug!("queued direct frame on blinded recipient inbox");
                 return 1;
             }
-            tracing::debug!(recipient = %recipient_hex, "direct recipient route/inbox unavailable; caller will retry same wire");
+            tracing::debug!(
+                "direct recipient route/inbox unavailable; caller will retry same wire"
+            );
             return 0;
         }
 
@@ -4196,9 +4198,7 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
         CallEvent::ParticipantLeft {
             call_id, reason, ..
         } => emit_state(&mut env, call_id, &format!("left: {reason}")),
-        CallEvent::CallError { call_id, error } => {
-            emit_state(&mut env, call_id, &format!("error: {error}"))
-        }
+        CallEvent::CallError { call_id, .. } => emit_state(&mut env, call_id, "error"),
         CallEvent::RemoteMedia {
             call_id,
             participant,
@@ -4292,6 +4292,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
                 .ok_or_else(|| anyhow::anyhow!("onboarding required before calling"))?;
             let local_identity = identity.identity_id();
 
+            // Direct libp2p signaling still exposes the peer IP even with TURN media.
+            // A private call must never start until its complete 1:1 session
+            // has a verified relay route with no direct fallback.
+            if !relay_call_signaling_available() {
+                anyhow::bail!("calling requires a verified relay-only signaling transport");
+            }
+
             let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundSignal>();
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CallEvent>();
             let signaling = Arc::new(ChannelSignalingTransport::new(signal_tx));
@@ -4317,12 +4324,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::error!(error = %e, "nativeStartCalling failed");
+            Err(_) => {
+                tracing::error!("nativeStartCalling failed");
                 0
             }
         }
     })
+}
+
+#[cfg(feature = "calling")]
+fn relay_call_signaling_available() -> bool {
+    // Replace only with an assertion supplied by a real relayed 1:1
+    // transport. A build flag, TURN availability or user toggle is insufficient.
+    false
 }
 
 /// Initiate a 1:1 call to `participant`. The call's media root is minted
@@ -4383,8 +4397,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::warn!(error = %e, "nativeAcceptCall failed");
+            Err(_) => {
+                tracing::warn!("nativeAcceptCall failed");
                 0
             }
         }
@@ -4412,8 +4426,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEndCal
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::warn!(error = %e, "nativeEndCall failed");
+            Err(_) => {
+                tracing::warn!("nativeEndCall failed");
                 0
             }
         }
@@ -4444,8 +4458,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandle
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::warn!(error = %e, "nativeHandleCallSignal failed");
+            Err(_) => {
+                tracing::warn!("nativeHandleCallSignal failed");
                 0
             }
         }

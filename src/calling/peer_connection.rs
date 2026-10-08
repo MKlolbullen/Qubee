@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::calling::call_manager::CallId;
+use crate::calling::ice_privacy;
 use crate::calling::media_encryption::MediaKey;
 use crate::calling::media_policy::{self, OPUS_CHANNELS, OPUS_CLOCK_RATE, OPUS_FMTP};
 use crate::calling::realtime_queue::RealtimeSender;
 use crate::calling::vp8_reassembly::Vp8Assembler;
 use crate::calling::webrtc_manager::MediaStats;
-use crate::calling::webrtc_manager::WebRTCConfig;
+use crate::calling::webrtc_manager::{IceTransportMode, WebRTCConfig};
 use crate::calling::webrtc_manager::{MediaKind, OutboundIce, RemoteMedia};
 use crate::identity::identity_key::IdentityId;
 use bytes::Bytes;
@@ -33,6 +34,7 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
@@ -55,8 +57,6 @@ pub(crate) fn local_opus_capability() -> RTCRtpCodecCapability {
     }
 }
 
-/// Registers the mono-Opus and VP8 codecs this stack actually emits, instead
-/// of webrtc-rs's stereo-Opus defaults which a second registration can't replace.
 fn register_qubee_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     // Do not call `register_default_codecs`: its Opus entry is 48 kHz
     // stereo (payload 111), and a second registration does not replace it.
@@ -161,6 +161,7 @@ pub struct PeerConnection {
     /// SCTP transports. We wrap it in an `Arc` so it can be cloned to
     /// attach event handlers if needed.
     webrtc_pc: Arc<RTCPeerConnection>,
+    ice_mode: IceTransportMode,
 
     /// Optional audio track and sender. Wrapped in a mutex to allow
     /// mutation through an immutable reference to the peer connection.
@@ -188,6 +189,7 @@ impl PeerConnection {
         ice_out: mpsc::UnboundedSender<OutboundIce>,
         remote_media_out: RealtimeSender<RemoteMedia>,
     ) -> Result<Self> {
+        config.validate()?;
         // Convert CallManager's WebRTCConfig into the lower-level RTCConfiguration
         // used by webrtc-rs. Each STUN/TURN server becomes an RTCIceServer.
         let mut ice_servers: Vec<RTCIceServer> = Vec::new();
@@ -208,6 +210,10 @@ impl PeerConnection {
         }
         let rtc_config = RTCConfiguration {
             ice_servers,
+            ice_transport_policy: match config.ice_mode {
+                IceTransportMode::DirectDevelopment => RTCIceTransportPolicy::All,
+                IceTransportMode::RelayOnly => RTCIceTransportPolicy::Relay,
+            },
             ..Default::default()
         };
         // Build the WebRTC API with the standard codec set and default
@@ -231,18 +237,27 @@ impl PeerConnection {
         // Trickle locally-gathered ICE candidates out to the call layer.
         // The handler fires once per candidate as gathering proceeds and
         // a final time with `None`, which we ignore.
+        let ice_mode = config.ice_mode;
         pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
             let ice_out = ice_out.clone();
             Box::pin(async move {
                 if let Some(candidate) = candidate {
                     if let Ok(init) = candidate.to_json() {
+                        let candidate_text = if ice_mode == IceTransportMode::RelayOnly {
+                            match ice_privacy::relay_candidate(&init.candidate) {
+                                Ok(candidate) => candidate,
+                                Err(_) => return,
+                            }
+                        } else {
+                            init.candidate
+                        };
                         let _ = ice_out.send(OutboundIce {
                             call_id,
                             participant,
                             candidate: ICECandidate {
                                 sdp_mid: init.sdp_mid.unwrap_or_default(),
                                 sdp_mline_index: init.sdp_mline_index.unwrap_or(0) as u32,
-                                candidate: init.candidate,
+                                candidate: candidate_text,
                             },
                         });
                     }
@@ -301,6 +316,7 @@ impl PeerConnection {
             media_key,
             state: PeerConnectionState::New,
             webrtc_pc: Arc::new(pc),
+            ice_mode,
             audio_track: Arc::new(Mutex::new(None)),
             audio_sender: Arc::new(Mutex::new(None)),
             video_track: Arc::new(Mutex::new(None)),
@@ -566,8 +582,13 @@ impl PeerConnection {
     /// can be paired against local candidates during connectivity
     /// checks.
     pub async fn add_ice_candidate(&self, candidate: ICECandidate) -> Result<()> {
+        let candidate_text = if self.ice_mode == IceTransportMode::RelayOnly {
+            ice_privacy::relay_candidate(&candidate.candidate)?
+        } else {
+            candidate.candidate
+        };
         let init = RTCIceCandidateInit {
-            candidate: candidate.candidate,
+            candidate: candidate_text,
             sdp_mid: Some(candidate.sdp_mid),
             sdp_mline_index: Some(candidate.sdp_mline_index as u16),
             username_fragment: None,
@@ -593,11 +614,18 @@ impl PeerConnection {
             .set_local_description(offer.clone())
             .await
             .context("Failed to set local description for offer")?;
-        Ok(offer.sdp)
+        if self.ice_mode == IceTransportMode::RelayOnly {
+            ice_privacy::relay_sdp(&offer.sdp)
+        } else {
+            Ok(offer.sdp)
+        }
     }
 
     /// Create an answer SDP in response to an offer.
     pub async fn create_answer(&self, offer: &str) -> Result<String> {
+        if self.ice_mode == IceTransportMode::RelayOnly {
+            ice_privacy::relay_sdp(offer)?;
+        }
         // webrtc 0.14 doesn't allow direct struct-literal construction
         // of RTCSessionDescription — use the typed constructors instead.
         let remote_desc =
@@ -615,12 +643,19 @@ impl PeerConnection {
             .set_local_description(answer.clone())
             .await
             .context("Failed to set local description for answer")?;
-        Ok(answer.sdp)
+        if self.ice_mode == IceTransportMode::RelayOnly {
+            ice_privacy::relay_sdp(&answer.sdp)
+        } else {
+            Ok(answer.sdp)
+        }
     }
 
     /// Set the remote SDP description, expected to be an answer to a
     /// previously generated local offer.
     pub async fn set_remote_description(&self, description: &str) -> Result<()> {
+        if self.ice_mode == IceTransportMode::RelayOnly {
+            ice_privacy::relay_sdp(description)?;
+        }
         let remote_desc =
             RTCSessionDescription::answer(description.to_string()).context("Invalid SDP answer")?;
         self.webrtc_pc

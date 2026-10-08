@@ -108,6 +108,15 @@ Calling does not hide network location.
   documented direct-network metadata behavior.
 - DTLS-SRTP protects media contents from the path. It does not hide that
   a media flow exists, its timing, or its volume.
+- A relay operator sees the client IP and allocation times. A peer receiving
+  relay ICE candidates learns the relay's address, but any simultaneously
+  connected direct Qubee chat/libp2p session still reveals the client's IP.
+- A direct inbox topic rotates but is derivable from the public IdentityId
+  and epoch. A party knowing that ID can monitor topic activity. Neither
+  topic blinding nor signaling encryption hides that party's traffic timing.
+- Android logcat previously included call IDs and peer IdentityIds on the
+  call path. The calling diagnostics now log only event classes and call
+  state; other network and chat diagnostics still require a separate audit.
 - Tor and Nym are not transports for this path. Enabling calling does
   not anonymise the peer.
 
@@ -115,11 +124,23 @@ No end-to-end IP-anonymity claim follows from relay-only ICE. The relay
 and traffic observer still see timing and volume, and the direct message
 transport must be redesigned before calling can be enabled.
 
+Decentralisation is a deployment and trust choice, not a guarantee of IP
+anonymity. Two endpoints can keep their existing end-to-end encryption and
+session keys while routing via independently operated relays. A direct
+peer-to-peer mode can be offered later only as an explicit IP-sharing choice
+for *both* endpoints; it must never be a silent fallback from a private
+mode. A single mandatory Coturn host would concentrate metadata even if it
+cannot decrypt media. Federation or user-selected relays require separate
+discovery, authentication, abuse limits, and cross-relay interoperability
+work; none are implemented yet.
+
 Release gates for metadata: provision TURN at runtime, relay the complete
 1:1 signaling session without direct libp2p dialing/address advertisement,
 prove packet-capture absence of direct peer traffic including reconnection
 and ICE restart, then run the physical device matrix. Do not merely flip
 the Android guard or add TURN credentials to the APK.
+The observer-by-observer risks, exact physical cases and first Samsung run
+are in [calling-metadata-matrix.md](calling-metadata-matrix.md).
 
 ## Teardown
 

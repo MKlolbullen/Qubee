@@ -763,7 +763,7 @@ class MessageService : Service(), NetworkCallback {
                         // authenticated sender (never a self-claimed field).
                         val frame = hexToBytesOrNull(result.optString("callSignalHex"))
                         if (frame == null) {
-                            Timber.w("Malformed call signal from %s", senderIdentityHex)
+                            Timber.w("Malformed call signal")
                         } else {
                             if (peerId.isNotEmpty()) {
                                 contactRepository.observePeerIdentityLink(peerId, senderIdentityHex)
@@ -983,25 +983,25 @@ class MessageService : Service(), NetworkCallback {
             try {
                 val wire = qubeeManager.encryptDirectCallSignal(recipientIdHex, payload)
                 if (wire == null) {
-                    Timber.w("Failed to encrypt call signal for %s", recipientIdHex)
+                    Timber.w("Failed to encrypt call signal")
                     return@launch
                 }
                 if (!qubeeManager.sendP2PMessage("", wire)) {
-                    Timber.w("Failed to send call signal to %s", recipientIdHex)
+                    Timber.w("Failed to send call signal")
                 }
             } catch (e: Exception) {
-                Timber.e(e, "onCallSignal failed for %s", recipientIdHex)
+                Timber.e("onCallSignal failed (%s)", e.javaClass.simpleName)
             }
         }
     }
 
     override fun onIncomingCall(callIdHex: String, callerIdHex: String, callType: Int) {
-        Timber.i("Incoming call %s from %s (type %d)", callIdHex, callerIdHex, callType)
+        Timber.i("Incoming call (type %d)", callType)
         callRepository.onIncoming(callIdHex, callerIdHex, callType)
     }
 
     override fun onCallStateChanged(callIdHex: String, state: String) {
-        Timber.d("Call %s state: %s", callIdHex, state)
+        Timber.d("Call state: %s", state)
         callRepository.onStateChanged(callIdHex, state)
     }
 

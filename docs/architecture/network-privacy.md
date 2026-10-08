@@ -25,10 +25,11 @@ a `/qubee/direct/1` request-response channel. Concretely:
 | Leak | Mechanism | Who sees it |
 |---|---|---|
 | **Your IP address** | Direct TCP/QUIC dials; no relay or onion layer | Every peer you connect to or gossip with; any on-path network observer |
-| **LAN IP / presence** | mDNS (`enable_mdns`, default **on**) | Anyone on the same local network |
+| **LAN IP / presence** | mDNS only when explicitly enabled (default **off**); local TCP/QUIC listeners and direct LAN connections remain visible | Local peers and LAN observers, depending on their network position |
 | **Address propagation** | Kademlia runs in `Mode::Server` — advertises its addresses and answers DHT queries | The whole DHT, transitively |
-| ~~**Social graph + authorship**~~ | ✅ *Closed.* Group publishing is now `MessageAuthenticity::Anonymous` (`ValidationMode::None` + content-based message-id): no author PeerId rides on gossip. App-layer signatures still authenticate; the PeerId↔IdentityId linkage comes only from the in-band member directory + the authenticated direct channel | ~~Every member of a group topic~~ — authorship no longer on the wire |
-| ~~**Group identity**~~ | ✅ *Closed.* The topic is a blinded rotating hash, and `QUBEE_GMS\x04` replaced the envelope's plaintext `group_id` with a per-message keyed selector | ~~Anyone who observes the topic string~~ — neither the topic nor the payload names the group, and neither is stable across messages |
+| **Social graph + authorship** | Anonymous gossipsub removes the author field, but a directly connected peer sees the libp2p PeerId/IP of its neighbors; signed member directories and traffic correlation can reveal relationships | Connected peers, group members, and network observers with sufficient vantage |
+| **Group identity** | Rotating topics and keyed envelope selectors remove the raw group ID; observers can still correlate subscribers and activity within an epoch | Topic subscribers and connected peers |
+| **Direct inbox targeting** | The rotating inbox topic is a deterministic hash of a *public* IdentityId and epoch. Anyone with that ID can compute its topics and monitor activity or send frames; the ratchet protects contents | Contacts or anyone who obtained the identity ID |
 | **Timing & size** | No batching, no cover traffic, envelope padding is "at the envelope" only | Any on-path observer |
 
 What is **not** leaked: message content (sealed), and — usefully —
@@ -38,10 +39,11 @@ common accidental IP/agent leakers in libp2p stacks.
 The two headline problems were **(A) IP exposure** (any peer learns your
 network location) and **(B) the gossipsub social graph** (any topic
 subscriber learns which PeerId authored which message in which group).
-**(B) is now closed** by anonymous gossip authorship (Tier 1, landed —
-see §2); a topic subscriber still sees *that* a group topic has traffic,
-but no longer *who* authored it. **(A) remains** and is Tier 2 (Tor)
-work.
+**(B) is reduced** by anonymous gossip authorship (Tier 1, landed —
+see §2); a topic subscriber cannot read an author field, but connected
+peers and traffic observers can still correlate participation. **(A)
+remains** and requires an overlay or relay transport to hide from the
+other endpoint.
 
 ## 2. The spectrum of mitigations
 

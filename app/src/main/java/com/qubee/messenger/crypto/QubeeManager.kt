@@ -192,7 +192,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Rust call-signal-encrypt JNI is not linked")
                 null
             } catch (e: Exception) {
-                Timber.e(e, "Call signal encryption failed")
+                Timber.e("Call signal encryption failed (%s)", e.javaClass.simpleName)
                 null
             }
         }
@@ -227,7 +227,7 @@ class QubeeManager @Inject constructor(
             Timber.e(e, "Calling JNI is not linked (calling feature off?)")
             false
         } catch (e: Exception) {
-            Timber.e(e, "startCalling failed")
+            Timber.e("startCalling failed (%s)", e.javaClass.simpleName)
             false
         }
     }
@@ -246,7 +246,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Calling JNI is not linked")
                 null
             } catch (e: Exception) {
-                Timber.e(e, "initiateCall failed")
+                Timber.e("initiateCall failed (%s)", e.javaClass.simpleName)
                 null
             }
         }
@@ -264,7 +264,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Calling JNI is not linked")
                 false
             } catch (e: Exception) {
-                Timber.e(e, "acceptCall failed")
+                Timber.e("acceptCall failed (%s)", e.javaClass.simpleName)
                 false
             }
         }
@@ -279,7 +279,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Calling JNI is not linked")
                 false
             } catch (e: Exception) {
-                Timber.e(e, "endCall failed")
+                Timber.e("endCall failed (%s)", e.javaClass.simpleName)
                 false
             }
         }
@@ -297,7 +297,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Calling JNI is not linked")
                 false
             } catch (e: Exception) {
-                Timber.e(e, "handleCallSignal failed")
+                Timber.e("handleCallSignal failed (%s)", e.javaClass.simpleName)
                 false
             }
         }
@@ -313,7 +313,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Calling JNI is not linked")
                 null
             } catch (e: Exception) {
-                Timber.e(e, "toggleMute failed")
+                Timber.e("toggleMute failed (%s)", e.javaClass.simpleName)
                 null
             }
         }
@@ -329,7 +329,7 @@ class QubeeManager @Inject constructor(
                 Timber.e(e, "Calling JNI is not linked")
                 null
             } catch (e: Exception) {
-                Timber.e(e, "toggleVideo failed")
+                Timber.e("toggleVideo failed (%s)", e.javaClass.simpleName)
                 null
             }
         }

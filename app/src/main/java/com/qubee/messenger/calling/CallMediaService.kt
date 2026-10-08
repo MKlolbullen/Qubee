@@ -96,7 +96,7 @@ class CallMediaService : Service() {
         engine = AudioCallEngine(qubeeManager).apply { start(callIdHex, peerIdHex) }
         video?.stop()
         video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
-        Timber.d("CallMediaService audio engine started for call %s", callIdHex)
+        Timber.d("CallMediaService audio engine started")
         return START_STICKY
     }
 

@@ -567,7 +567,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
                 if send_direct(route, data_vec) {
                     return 1;
                 }
-                tracing::debug!(recipient = %recipient_hex, "direct frame could not be enqueued; caller will retry same wire");
+                tracing::debug!("direct frame could not be enqueued; caller will retry same wire");
                 return 0;
             }
 
@@ -575,10 +575,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeSendP2
             // recipient's rotating blinded inbox, never on qubee-global. The
             // frame is still end-to-end ratchet encrypted and recipient-bound.
             if publish_direct_inbox(recipient_hex.clone(), data_vec) {
-                tracing::debug!(recipient = %recipient_hex, "queued direct frame on blinded recipient inbox");
+                tracing::debug!("queued direct frame on blinded recipient inbox");
                 return 1;
             }
-            tracing::debug!(recipient = %recipient_hex, "direct recipient route/inbox unavailable; caller will retry same wire");
+            tracing::debug!(
+                "direct recipient route/inbox unavailable; caller will retry same wire"
+            );
             return 0;
         }
 
@@ -4323,8 +4325,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::error!(error = %e, "nativeStartCalling failed");
+            Err(_) => {
+                tracing::error!("nativeStartCalling failed");
                 0
             }
         }
@@ -4396,8 +4398,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeAccept
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::warn!(error = %e, "nativeAcceptCall failed");
+            Err(_) => {
+                tracing::warn!("nativeAcceptCall failed");
                 0
             }
         }
@@ -4425,8 +4427,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEndCal
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::warn!(error = %e, "nativeEndCall failed");
+            Err(_) => {
+                tracing::warn!("nativeEndCall failed");
                 0
             }
         }
@@ -4457,8 +4459,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeHandle
         })();
         match result {
             Ok(()) => 1,
-            Err(e) => {
-                tracing::warn!(error = %e, "nativeHandleCallSignal failed");
+            Err(_) => {
+                tracing::warn!("nativeHandleCallSignal failed");
                 0
             }
         }

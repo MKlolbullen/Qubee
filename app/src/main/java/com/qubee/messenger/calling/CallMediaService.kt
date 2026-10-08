@@ -96,7 +96,7 @@ class CallMediaService : Service() {
         engine = AudioCallEngine(qubeeManager).apply { start(callIdHex, peerIdHex) }
         video?.stop()
         video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
-        Timber.d("CallMediaService audio engine started")
+        Timber.d("CallMediaService audio engine started for call %s", callIdHex)
         return START_STICKY
     }
 
@@ -125,12 +125,14 @@ class CallMediaService : Service() {
         }
     }
 
+    /** Route one remote VP8 access unit to the running engine, if it's this call. */
     private fun onRemoteVideo(callIdHex: String, payload: ByteArray) {
         if (callIdHex == activeCallIdHex) {
             video?.onRemoteAccessUnit(payload)
         }
     }
 
+    /** Starts/stops the camera, upgrading the foreground service type to include camera on enable. */
     private fun applyCapture(enabled: Boolean) {
         if (activeCallIdHex.isEmpty()) return
         if (!enabled) {
@@ -196,10 +198,11 @@ class CallMediaService : Service() {
         @Volatile
         private var active: CallMediaService? = null
 
-        /** Bring up mic capture + playback for [callIdHex] ↔ [peerIdHex]. */
+        /** The call id the caller most recently asked to start, so a queued start intent after [stop] is ignored. */
         @Volatile
         private var desiredCallId: String? = null
 
+        /** Bring up mic capture + playback for [callIdHex] ↔ [peerIdHex]. */
         fun start(context: Context, callIdHex: String, peerIdHex: String) {
             desiredCallId = callIdHex
             val intent = Intent(context, CallMediaService::class.java).apply {
@@ -213,6 +216,7 @@ class CallMediaService : Service() {
             }
         }
 
+        /** Tear down the live call's media and stop the foreground service. */
         fun stop(context: Context) {
             desiredCallId = null
             active?.releaseEngine()
@@ -228,10 +232,12 @@ class CallMediaService : Service() {
             active?.onRemoteAudio(callIdHex, payload)
         }
 
+        /** Forward a remote VP8 access unit to the live engine, if the call id matches. */
         fun deliverRemoteVideo(callIdHex: String, payload: ByteArray) {
             active?.onRemoteVideo(callIdHex, payload)
         }
 
+        /** Toggle local camera capture on the running service, if any. */
         fun setCaptureEnabled(enabled: Boolean) {
             active?.applyCapture(enabled)
         }

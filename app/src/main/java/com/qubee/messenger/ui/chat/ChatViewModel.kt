@@ -146,12 +146,14 @@ class ChatViewModel @Inject constructor(
 
     // ---- Send / actions -------------------------------------------
 
+    /** Send plain chat text; no-op on an empty trimmed body or before the conversation resolves. */
     fun sendMessage(text: String) {
         val payload = text.trim()
         if (payload.isEmpty() || conversationId.isEmpty()) return
         sendEncrypted(payload, payload, com.qubee.messenger.data.model.MessageType.TEXT, null)
     }
 
+    /** Reads `uri` on an IO dispatcher, wraps it as a [FileTransfer] envelope, and sends it like a text message. */
     fun sendSelectedFile(uri: Uri) {
         if (conversationId.isEmpty()) return
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -194,6 +196,7 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /** Looks up the content resolver's display name for `uri`, falling back to "file". */
     private fun displayName(uri: Uri): String {
         val cursor = appContext.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
         cursor?.use {
@@ -205,6 +208,11 @@ class ChatViewModel @Inject constructor(
         return "file"
     }
 
+    /**
+     * Shared send path for text and file messages: persists the local row
+     * optimistically, encrypts `plaintext` (ratchet when enabled, else the
+     * legacy path), and transmits it under `display` as the stored content.
+     */
     private fun sendEncrypted(
         display: String,
         plaintext: String,
@@ -328,6 +336,7 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /** Legacy attach entry point; the screen now launches the system file picker directly into [sendSelectedFile]. */
     fun onAttachFile() {
         notice("Select a file using the attachment picker")
     }

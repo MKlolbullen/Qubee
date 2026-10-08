@@ -10,7 +10,7 @@ use crate::calling::media_policy::{self, REMOTE_MEDIA_QUEUE_CAPACITY};
 use crate::calling::realtime_queue::{self, RealtimeReceiver};
 use crate::calling::signaling::{SignalingMessage, SignalingTransport};
 use crate::calling::webrtc_manager::{
-    IceTransportMode, MediaKind, OutboundIce, RemoteMedia, WebRTCConfig, WebRTCManager,
+    MediaKind, OutboundIce, RemoteMedia, WebRTCConfig, WebRTCManager,
 };
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
@@ -58,6 +58,7 @@ struct EndedCallIds {
 }
 
 impl EndedCallIds {
+    /// Empty ring buffer of recently-ended call ids.
     fn new() -> Self {
         Self {
             order: VecDeque::new(),
@@ -65,6 +66,7 @@ impl EndedCallIds {
         }
     }
 
+    /// Records `id` as ended, evicting the oldest entry past `MAX_ENDED_CALL_IDS`.
     fn insert(&mut self, id: CallId) {
         if self.set.insert(id) {
             self.order.push_back(id);
@@ -76,11 +78,13 @@ impl EndedCallIds {
         }
     }
 
+    /// Whether `id` was recently ended and so must not be re-rung on replay.
     fn contains(&self, id: &CallId) -> bool {
         self.set.contains(id)
     }
 }
 
+/// Whether `state` is a final state after which the call cannot resume.
 fn is_terminal(state: &CallState) -> bool {
     matches!(
         state,
@@ -347,7 +351,6 @@ pub struct CallManagerConfig {
     pub enable_p2p_optimization: bool,
     pub stun_servers: Vec<String>,
     pub turn_servers: Vec<TurnServer>,
-    pub ice_mode: IceTransportMode,
 }
 
 /// TURN server configuration
@@ -381,7 +384,6 @@ impl CallManager {
         let webrtc_config = WebRTCConfig {
             stun_servers: config.stun_servers.clone(),
             turn_servers: config.turn_servers.clone(),
-            ice_mode: config.ice_mode,
             enable_dtls: true,
             enable_srtp: true,
         };
@@ -659,6 +661,8 @@ impl CallManager {
         }
     }
 
+    /// Rejects a frame whose embedded `claimed` sender does not match `from`,
+    /// the identity of the authenticated session that actually carried it.
     fn require_claimed_sender(&self, from: IdentityId, claimed: IdentityId) -> Result<()> {
         if from != claimed {
             return Err(anyhow::anyhow!(
@@ -668,6 +672,7 @@ impl CallManager {
         Ok(())
     }
 
+    /// Whether `sender` is a participant of a non-terminal call `call_id`.
     async fn is_live_participant(&self, call_id: CallId, sender: IdentityId) -> bool {
         let calls = self.calls.read().await;
         matches!(
@@ -676,6 +681,7 @@ impl CallManager {
         )
     }
 
+    /// Rejects signaling for a call `sender` is not a live participant of.
     async fn require_live_participant(&self, call_id: CallId, sender: IdentityId) -> Result<()> {
         if self.is_live_participant(call_id, sender).await {
             Ok(())
@@ -1370,6 +1376,7 @@ impl CallManager {
         });
     }
 
+    /// Marks `call_id` as ended so a replayed invitation for it is rejected rather than re-ringing.
     async fn note_terminal(&self, call_id: CallId) {
         self.ended_invites.write().await.insert(call_id);
     }
@@ -1514,10 +1521,12 @@ impl Default for CallManagerConfig {
             call_timeout: Duration::from_secs(300), // 5 minutes
             ring_timeout: Duration::from_secs(60),  // 1 minute
             reconnection_attempts: 3,
-            enable_p2p_optimization: false,
-            stun_servers: Vec::new(),
+            enable_p2p_optimization: true,
+            stun_servers: vec![
+                "stun:stun.l.google.com:19302".to_string(),
+                "stun:stun1.l.google.com:19302".to_string(),
+            ],
             turn_servers: Vec::new(),
-            ice_mode: IceTransportMode::RelayOnly,
         }
     }
 }
@@ -1541,36 +1550,10 @@ mod tests {
     use crate::calling::signaling::SignalingServer;
     use tokio::sync::mpsc;
 
-    // Host signaling tests do not provision a TURN server. Explicitly opt
-    // them into direct development mode; the application default stays relay.
-    fn development_config() -> CallManagerConfig {
-        CallManagerConfig {
-            ice_mode: IceTransportMode::DirectDevelopment,
-            stun_servers: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-            ],
-            ..CallManagerConfig::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn relay_only_default_refuses_to_start_without_turn() {
-        let (event_sender, _events) = mpsc::unbounded_channel();
-        let result = CallManager::new(
-            CallManagerConfig::default(),
-            event_sender,
-            IdentityId::from([1u8; 32]),
-            Arc::new(SignalingServer::new().await.unwrap()),
-        )
-        .await;
-        assert!(result.is_err());
-    }
-
     #[tokio::test]
     async fn test_call_creation() {
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
-        let config = development_config();
+        let config = CallManagerConfig::default();
 
         // The invite rides the in-process signaling server; an
         // unregistered recipient makes initiate_call fail (correctly —
@@ -1612,7 +1595,7 @@ mod tests {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let server = Arc::new(SignalingServer::new().await.unwrap());
         let manager = CallManager::new(
-            development_config(),
+            CallManagerConfig::default(),
             event_sender,
             IdentityId::from([2u8; 32]),
             server,
@@ -1802,7 +1785,7 @@ mod tests {
         let (callee_tx, mut callee_rx) = mpsc::unbounded_channel::<OutboundSignal>();
         let (callee_ev, _callee_ev_rx) = mpsc::unbounded_channel();
         let callee_mgr = CallManager::new(
-            development_config(),
+            CallManagerConfig::default(),
             callee_ev,
             callee,
             Arc::new(ChannelSignalingTransport::new(callee_tx)),
@@ -1885,7 +1868,7 @@ mod tests {
         let (callee_ev, _callee_ev_rx) = mpsc::unbounded_channel();
 
         let caller_mgr = CallManager::new(
-            development_config(),
+            CallManagerConfig::default(),
             caller_ev,
             caller,
             Arc::new(ChannelSignalingTransport::new(caller_tx)),
@@ -1893,7 +1876,7 @@ mod tests {
         .await
         .unwrap();
         let callee_mgr = CallManager::new(
-            development_config(),
+            CallManagerConfig::default(),
             callee_ev,
             callee,
             Arc::new(ChannelSignalingTransport::new(callee_tx)),
@@ -2114,7 +2097,7 @@ mod tests {
         let manager = CallManager::new(
             CallManagerConfig {
                 max_concurrent_calls: 1,
-                ..development_config()
+                ..CallManagerConfig::default()
             },
             event_sender,
             IdentityId::from([2u8; 32]),

@@ -25,6 +25,7 @@ object FileTransfer {
 
     data class Decoded(val name: String, val bytes: ByteArray)
 
+    /** Wraps `bytes` in the magic-tagged envelope sent as ordinary message text, or null if oversized/empty. */
     fun encode(name: String, bytes: ByteArray): String? {
         if (bytes.isEmpty() || bytes.size > MAX_BYTES) return null
         val safe = sanitize(name)
@@ -32,6 +33,7 @@ object FileTransfer {
         return MAGIC + safe + "\n" + body
     }
 
+    /** Recognizes and unpacks a [FileTransfer] envelope from decrypted message text; null if it isn't one or fails validation. */
     fun decode(text: String): Decoded? {
         if (!text.startsWith(MAGIC)) return null
         val rest = text.substring(MAGIC.length)
@@ -45,6 +47,7 @@ object FileTransfer {
         return Decoded(name, bytes)
     }
 
+    /** Persists a decoded attachment under `messageId`, encrypted at rest; false on any I/O or validation failure. */
     fun store(context: Context, messageId: String, decoded: Decoded): Boolean {
         if (!messageId.matches(Regex("[A-Za-z0-9-]{1,64}"))) return false
         return runCatching {
@@ -57,6 +60,7 @@ object FileTransfer {
         }.getOrDefault(false)
     }
 
+    /** Decrypts a stored attachment to a short-lived cache file and launches a viewer intent for it. */
     fun open(context: Context, messageId: String, displayName: String) {
         if (!messageId.matches(Regex("[A-Za-z0-9-]{1,64}"))) return
         Thread({
@@ -84,12 +88,14 @@ object FileTransfer {
         }, "qubee-transfer-open").start()
     }
 
+    /** Strips path separators/newlines from an attachment name and caps its length. */
     private fun sanitize(name: String): String {
         val cleaned = name.replace('\\', '_').replace('/', '_').replace('\n', '_')
             .replace('\r', '_').trim().ifBlank { "file" }
         return cleaned.take(MAX_NAME)
     }
 
+    /** Guesses a MIME type from the file extension, defaulting to opaque binary. */
     private fun mimeFor(name: String): String {
         val ext = name.substringAfterLast('.', "")
         if (ext.isBlank() || ext == name) return "application/octet-stream"
@@ -97,6 +103,7 @@ object FileTransfer {
             ?: "application/octet-stream"
     }
 
+    /** Builds the Keystore-backed [EncryptedFile] wrapper used for both storing and opening transfers. */
     private fun encryptedFile(context: Context, file: File): EncryptedFile {
         val key = MasterKey.Builder(context, MASTER_KEY_ALIAS)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)

@@ -207,7 +207,7 @@ pub fn initiate(
 /// checks length; reject non-canonical 12-bit coefficients before entering C.
 pub(crate) fn validate_kem_public(public: &KemPublicKey) -> Result<()> {
     let bytes = public.as_bytes();
-    for encoded in bytes[..bytes.len() - 32].chunks_exact(3) {
+    for encoded in bytes[..bytes.len() - 32].as_chunks::<3>().0 {
         let a = u16::from(encoded[0]) | ((u16::from(encoded[1]) & 15) << 8);
         let b = (u16::from(encoded[1]) >> 4) | (u16::from(encoded[2]) << 4);
         if a >= 3329 || b >= 3329 {

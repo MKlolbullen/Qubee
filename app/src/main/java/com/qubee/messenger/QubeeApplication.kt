@@ -19,6 +19,7 @@ class QubeeApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        com.qubee.messenger.transfer.FileTransfer.clearOpenCache(this)
 
         // Initialize logging
         if (BuildConfig.DEBUG) {
@@ -35,7 +36,7 @@ class QubeeApplication : Application() {
         // initialization runs once inside `MainViewModel.init` (and
         // again inside `MessageService.startP2PNetwork` when the
         // foreground service spins up), so Application.onCreate
-        // doesn't need to do anything beyond logging + channels.
+        // remains separate from startup logging, channels and export cleanup.
 
         Timber.d("QubeeApplication initialized")
     }

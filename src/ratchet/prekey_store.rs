@@ -20,6 +20,7 @@ use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::groups::group_handshake::PrekeyBundleBody;
 use crate::identity::identity_key::{IdentityId, IdentityKey};
@@ -61,7 +62,7 @@ pub fn list_peer_bundle_ids(ks: &SecureKeyStore) -> Result<Vec<IdentityId>> {
 
 /// On-disk serialisation of a secret prekey bundle. The KEM secret
 /// can't reproduce its public, so we persist the public alongside it.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredLocalBundle {
     identity: [u8; 32],
     signed_prekey: [u8; 32],
@@ -104,7 +105,9 @@ pub fn get_or_create_local_bundle(
         kem_public: kem_public.as_bytes().to_vec(),
         created_at: now,
     };
-    let bytes = bincode::serialize(&stored).map_err(|e| anyhow!("encode prekey bundle: {e}"))?;
+    let bytes = Zeroizing::new(
+        bincode::serialize(&stored).map_err(|e| anyhow!("encode prekey bundle: {e}"))?,
+    );
     ks.store_key(
         LOCAL_BUNDLE_KEY_ID,
         &bytes,
@@ -152,7 +155,9 @@ pub fn consume_one_time_prekey(ks: &mut SecureKeyStore) -> Result<bool> {
     // Replace the consumed OTP with a fresh random scalar seed so the
     // mechanism stays alive for the next published bundle.
     stored.one_time_prekey = Some(crate::security::secure_rng::random::array::<32>()?);
-    let bytes = bincode::serialize(&stored).map_err(|e| anyhow!("encode local bundle: {e}"))?;
+    let bytes = Zeroizing::new(
+        bincode::serialize(&stored).map_err(|e| anyhow!("encode local bundle: {e}"))?,
+    );
     ks.store_key(
         LOCAL_BUNDLE_KEY_ID,
         &bytes,
@@ -201,8 +206,10 @@ pub fn build_body(
 /// Convert a received public bundle body into the PQXDH-facing
 /// [`PrekeyBundlePublic`] so it can drive `pqxdh::initiate`.
 pub fn body_to_public(body: &PrekeyBundleBody) -> Result<PrekeyBundlePublic> {
+    body.publisher.validate()?;
     let kem_public = KemPublicKey::from_bytes(&body.kem_public)
         .map_err(|e| anyhow!("invalid bundle KEM public: {e}"))?;
+    super::pqxdh::validate_kem_public(&kem_public)?;
     Ok(PrekeyBundlePublic {
         identity: PublicKey::from(body.identity_x25519),
         signed_prekey: PublicKey::from(body.signed_prekey),
@@ -215,7 +222,13 @@ pub fn body_to_public(body: &PrekeyBundleBody) -> Result<PrekeyBundlePublic> {
 /// The caller must have already checked the signature
 /// (`verify_prekey_bundle`) — this only persists.
 pub fn store_peer_bundle(ks: &mut SecureKeyStore, body: &PrekeyBundleBody) -> Result<()> {
+    body_to_public(body)?;
     let id = body.publisher.identity_id;
+    if let Some(previous) = get_peer_bundle(ks, &id)? {
+        if body.timestamp < previous.timestamp {
+            return Err(anyhow!("prekey bundle timestamp rollback"));
+        }
+    }
     let bytes = bincode::serialize(body).map_err(|e| anyhow!("encode peer bundle: {e}"))?;
     ks.store_key(
         &peer_key_id(&id),
@@ -234,6 +247,9 @@ pub fn get_peer_bundle(
         Some(secret) => {
             let body: PrekeyBundleBody = bincode::deserialize(secret.expose_secret())
                 .map_err(|e| anyhow!("decode peer bundle: {e}"))?;
+            if body.publisher.identity_id != *id {
+                return Err(anyhow!("cached prekey identity mismatch"));
+            }
             Ok(Some(body))
         }
         None => Ok(None),
@@ -371,5 +387,25 @@ mod tests {
             bob.decrypt(&h, &c, b"cid").unwrap(),
             b"cached-bundle handshake"
         );
+    }
+    #[test]
+    fn cached_peer_bundle_cannot_roll_back_timestamp() {
+        let (mut ks, _dir) = fresh_ks();
+        let publisher = IdentityKeyPair::generate().unwrap();
+        let (secret, kem_public) = get_or_create_local_bundle(&mut ks, 200).unwrap();
+        let body = build_body(&secret, &kem_public, publisher.public_key(), 200);
+        store_peer_bundle(&mut ks, &body).unwrap();
+        let mut old = body.clone();
+        old.timestamp = 199;
+        assert!(store_peer_bundle(&mut ks, &old).is_err());
+        assert_eq!(
+            get_peer_bundle(&mut ks, &body.publisher.identity_id)
+                .unwrap()
+                .unwrap()
+                .timestamp,
+            200
+        );
+        // Equal timestamps are allowed: multiple bundles can be signed in one second.
+        assert!(store_peer_bundle(&mut ks, &body).is_ok());
     }
 }

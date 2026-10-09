@@ -124,10 +124,11 @@ impl WrappedGroupKey {
     pub fn wrap(group_key: &[u8; 32], joiner_kyber_pub: &[u8]) -> Result<Self> {
         let pk = KyberPublicKey::from_bytes(joiner_kyber_pub)
             .map_err(|e| anyhow!("invalid joiner Kyber pubkey: {e}"))?;
+        crate::ratchet::pqxdh::validate_kem_public(&pk)?;
         let (shared_secret, ciphertext) = kyber_encapsulate(&pk);
 
-        let wrap_key = derive_wrap_key(shared_secret.as_bytes())?;
-        let cipher = ChaCha20Poly1305::new((&wrap_key).into());
+        let wrap_key = zeroize::Zeroizing::new(derive_wrap_key(shared_secret.as_bytes())?);
+        let cipher = ChaCha20Poly1305::new((&*wrap_key).into());
         let nonce_bytes = secure_rng::random::array::<12>()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let wrapped_key = cipher
@@ -141,9 +142,9 @@ impl WrappedGroupKey {
         })
     }
 
-    /// Inverse of [`wrap`]. The Kyber secret is consumed (and zeroised
-    /// when the slice is dropped by the caller) so accidental reuse is
-    /// harder.
+    /// Inverse of [`wrap`]. The caller owns and must wipe the secret buffer.
+    /// The upstream opaque KEM secret also makes a transient copy that does
+    /// not implement wiping Drop; see the crypto-boundary review.
     pub fn unwrap(&self, joiner_kyber_secret: &[u8]) -> Result<[u8; 32]> {
         let sk = KyberSecretKey::from_bytes(joiner_kyber_secret)
             .map_err(|e| anyhow!("invalid joiner Kyber secret: {e}"))?;
@@ -151,12 +152,14 @@ impl WrappedGroupKey {
             .map_err(|e| anyhow!("invalid KEM ciphertext: {e}"))?;
         let shared_secret = kyber_decapsulate(&ct, &sk);
 
-        let wrap_key = derive_wrap_key(shared_secret.as_bytes())?;
-        let cipher = ChaCha20Poly1305::new((&wrap_key).into());
+        let wrap_key = zeroize::Zeroizing::new(derive_wrap_key(shared_secret.as_bytes())?);
+        let cipher = ChaCha20Poly1305::new((&*wrap_key).into());
         let nonce = Nonce::from_slice(&self.nonce);
-        let plaintext = cipher
-            .decrypt(nonce, self.wrapped_key.as_ref())
-            .map_err(|e| anyhow!("group key unwrap failed: {e}"))?;
+        let plaintext = zeroize::Zeroizing::new(
+            cipher
+                .decrypt(nonce, self.wrapped_key.as_ref())
+                .map_err(|e| anyhow!("group key unwrap failed: {e}"))?,
+        );
         if plaintext.len() != 32 {
             return Err(anyhow!("unwrapped group key has wrong length"));
         }
@@ -1080,6 +1083,12 @@ pub fn sign_prekey_bundle(
     keypair: &IdentityKeyPair,
     body: PrekeyBundleBody,
 ) -> Result<GroupHandshake> {
+    body.publisher.validate()?;
+    if body.publisher != keypair.public_key() {
+        return Err(anyhow::anyhow!(
+            "prekey publisher does not match signing identity"
+        ));
+    }
     let payload = canonical_prekey_bundle(&body);
     let signature = keypair.sign(&payload)?;
     Ok(GroupHandshake::PrekeyBundle { body, signature })

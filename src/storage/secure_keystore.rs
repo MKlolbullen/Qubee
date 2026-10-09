@@ -51,12 +51,8 @@ const ARGON2_P_COST: u32 = 1;
 
 /// Secure key storage with encryption and integrity protection.
 ///
-/// Drop behaviour: we use a manual `impl Drop` (further down) that
-/// best-effort flushes the keystore to disk. The `master_key` field
-/// is wrapped in `SecretBox<[u8; 32]>` which already zeroises on drop,
-/// so we don't need `#[derive(ZeroizeOnDrop)]` — combining that
-/// derive with the manual impl produced two `Drop` impls and an
-/// E0119 conflict.
+/// Mutations are persisted explicitly; dropping a store never writes. After an
+/// uncertain write failure the handle must be reopened before further use.
 pub struct SecureKeyStore {
     storage_path: PathBuf,
     /// Data-encryption key: every stored key entry is sealed under
@@ -72,6 +68,8 @@ pub struct SecureKeyStore {
     /// re-running the KDF.
     wrap_salt: [u8; WRAP_SALT_LEN],
     keys: HashMap<String, EncryptedKeyEntry>,
+    write_failed: bool,
+    transaction_active: bool,
 }
 
 /// Everything `load_master_key` recovers in one pass, so `new()` never
@@ -140,37 +138,47 @@ pub enum KeyUsage {
 /// keystore or master-key file would destroy all local key state.
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp_os = path.as_os_str().to_owned();
-    tmp_os.push(".tmp");
+    tmp_os.push(format!(
+        ".{}.tmp",
+        hex::encode(secure_rng::random::array::<8>()?)
+    ));
     let tmp = PathBuf::from(tmp_os);
-
-    // Stage the bytes; on any failure remove the temp so a partial
-    // `.tmp` can't be left behind (and preserve the original error).
-    let staged = (|| -> Result<()> {
-        let mut f = fs::File::create(&tmp)
-            .with_context(|| format!("create temp file {}", tmp.display()))?;
-        f.write_all(data).context("write temp file")?;
-        // Durability: the bytes must hit disk before the rename, or a
-        // crash could leave the renamed file pointing at empty content.
-        f.sync_all().context("fsync temp file")
-    })();
-    if staged.is_err() {
-        let _ = fs::remove_file(&tmp);
-        return staged;
-    }
-
-    fs::rename(&tmp, path).context("atomic rename over target")?;
-
-    // The rename is only durable once the containing directory entry is
-    // flushed; without this a power loss can resurrect the pre-rename
-    // directory state. Best-effort — not all platforms allow fsync on a
-    // directory handle, and a failure here doesn't corrupt anything.
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = fs::File::open(dir) {
-            let _ = d.sync_all();
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut file = options
+            .open(&tmp)
+            .context("create private temporary file")?;
+        file.write_all(data).context("write temporary file")?;
+        file.sync_all().context("fsync temporary file")?;
+        fs::rename(&tmp, path).context("atomic rename over target")?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            fs::File::open(parent)
+                .context("open parent directory")?
+                .sync_all()
+                .context("fsync parent directory")?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
+
+const SNAPSHOT_MAGIC: &[u8; 4] = b"QKS1";
+const SNAPSHOT_AAD: &[u8] = b"qubee_keystore_snapshot_v1";
 
 /// Domain-separation tag for the per-entry AEAD associated data.
 const ENTRY_AAD_TAG: &[u8] = b"qubee_keystore_entry_v1";
@@ -246,16 +254,21 @@ impl SecureKeyStore {
             wrap_key: unwrapped.wrap_key,
             wrap_salt: unwrapped.wrap_salt,
             keys: HashMap::new(),
+            write_failed: false,
+            transaction_active: false,
         };
 
-        // Load existing keys
-        keystore.load_keys()?;
-
-        // If the `.master` was a transient dual-key layout, the process
-        // crashed mid-rotation: decide which key the `.db` is actually
-        // under and collapse back to a single-key `.master`.
+        let (used_alt, migrate) = keystore.load_keys(unwrapped.alt_master_key.as_ref())?;
         if let Some(alt) = unwrapped.alt_master_key {
-            keystore.resolve_pending_rotation(alt)?;
+            if used_alt {
+                keystore.master_key = alt;
+                keystore.save_master_key()?;
+            } else {
+                keystore.resolve_pending_rotation(alt)?;
+            }
+        }
+        if migrate {
+            keystore.save_keys()?;
         }
 
         Ok(keystore)
@@ -270,33 +283,35 @@ impl SecureKeyStore {
         if !self.keys_open_under(self.master_key.expose_secret()) {
             // The `.db` was not rewritten under the new key before the
             // crash — the entries are still under the old (alt) key.
+            anyhow::ensure!(
+                self.keys_open_under(alt.expose_secret()),
+                "neither rotation key opens keystore"
+            );
             self.master_key = alt;
         }
         self.save_master_key()
     }
 
-    /// Whether the stored entries decrypt under `candidate`. Checks a
-    /// single entry (they all share the master key) via the AAD path
+    /// Whether the stored entries decrypt under `candidate`. Checks
+    /// all entries via the AAD path
     /// then the legacy no-AAD path; an empty keystore trivially matches.
     fn keys_open_under(&self, candidate: &[u8; 32]) -> bool {
-        // One entry decides — they all share the master key. An empty
-        // keystore trivially matches (adopt the intended new key).
-        let Some((key_id, entry)) = self.keys.iter().next() else {
-            return true;
-        };
         let cipher = ChaCha20Poly1305::new(candidate.into());
-        let nonce = Nonce::from_slice(&entry.nonce);
-        let aad = entry_aad(key_id, &entry.key_type);
-        cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: &entry.encrypted_data,
-                    aad: &aad,
-                },
-            )
-            .is_ok()
-            || cipher.decrypt(nonce, entry.encrypted_data.as_ref()).is_ok()
+        self.keys.iter().all(|(key_id, entry)| {
+            let nonce = Nonce::from_slice(&entry.nonce);
+            let aad = entry_aad(key_id, &entry.key_type);
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: &entry.encrypted_data,
+                        aad: &aad,
+                    },
+                )
+                .or_else(|_| cipher.decrypt(nonce, entry.encrypted_data.as_ref()))
+                .map(Zeroizing::new)
+                .is_ok()
+        })
     }
 
     /// Store a key in the secure keystore
@@ -307,6 +322,7 @@ impl SecureKeyStore {
         key_type: KeyType,
         metadata: KeyMetadata,
     ) -> Result<()> {
+        self.ensure_healthy()?;
         // Validate key ID
         if key_id.is_empty() || key_id.len() > 256 {
             return Err(anyhow::anyhow!("Invalid key ID"));
@@ -351,6 +367,7 @@ impl SecureKeyStore {
 
     /// Retrieve a key from the secure keystore
     pub fn retrieve_key(&mut self, key_id: &str) -> Result<Option<SecretBox<Vec<u8>>>> {
+        self.ensure_healthy()?;
         // Snapshot the fields we need without holding a mutable borrow
         // across the possible re-seal + save below.
         let (nonce_bytes, ciphertext, key_type) = match self.keys.get_mut(key_id) {
@@ -387,9 +404,11 @@ impl SecureKeyStore {
         // transparently re-seal it *with* AAD (fresh nonce) so the next
         // read is on the hardened path. If it doesn't open either way,
         // it's a wrong key or tampering.
-        let legacy_pt = cipher
-            .decrypt(nonce, ciphertext.as_ref())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?;
+        let mut legacy_pt = Zeroizing::new(
+            cipher
+                .decrypt(nonce, ciphertext.as_ref())
+                .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?,
+        );
 
         let new_nonce_bytes = secure_rng::random::array::<12>()?;
         let new_ciphertext = cipher
@@ -407,11 +426,14 @@ impl SecureKeyStore {
         }
         self.save_keys()?;
 
-        Ok(Some(SecretBox::new(Box::new(legacy_pt))))
+        Ok(Some(SecretBox::new(Box::new(std::mem::take(
+            &mut *legacy_pt,
+        )))))
     }
 
     /// Delete a key from the keystore
     pub fn delete_key(&mut self, key_id: &str) -> Result<bool> {
+        self.ensure_healthy()?;
         let removed = self.keys.remove(key_id).is_some();
         if removed {
             self.save_keys()?;
@@ -436,6 +458,8 @@ impl SecureKeyStore {
 
     /// Rotate the master key (re-encrypt all stored keys)
     pub fn rotate_master_key(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
+        anyhow::ensure!(!self.transaction_active, "rotation inside transaction");
         // Generate new master key; keep a copy of the old one so the
         // `.master` can carry both across the `.db` write below.
         let old_master = Zeroizing::new(*self.master_key.expose_secret());
@@ -445,7 +469,8 @@ impl SecureKeyStore {
         let old_cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
         let new_cipher = ChaCha20Poly1305::new(new_master_key.expose_secret().into());
 
-        for (key_id, entry) in self.keys.iter_mut() {
+        let mut rotated = self.keys.clone();
+        for (key_id, entry) in rotated.iter_mut() {
             let aad = entry_aad(key_id, &entry.key_type);
             // Decrypt with old key + the entry's AAD, falling back to the
             // legacy (no-AAD) form for any entry not yet migrated. The
@@ -485,8 +510,8 @@ impl SecureKeyStore {
             entry.nonce = new_nonce_bytes;
         }
 
-        // Crash-safe two-file commit. `self.keys` now holds new-key
-        // ciphertexts but `self.master_key` is still the old key. The
+        // Crash-safe two-file commit. `rotated` holds new-key ciphertexts;
+        // the live map and `self.master_key` still use the old key. The
         // `.master` and `.db` are separate files, so we can't write both
         // in one atomic step; instead we keep *both* master keys
         // recoverable across the window:
@@ -500,24 +525,31 @@ impl SecureKeyStore {
         // under and adopts it — so no crash point can strand entries
         // under an unrecoverable master key.
         let master_path = self.storage_path.with_extension("master");
-        Self::seal_master_dual(
-            new_master_key.expose_secret(),
-            Some(&old_master),
-            &master_path,
-            self.wrap_key.expose_secret(),
-            &self.wrap_salt,
-        )?;
+        let commit = (|| -> Result<()> {
+            Self::seal_master_dual(
+                new_master_key.expose_secret(),
+                Some(&old_master),
+                &master_path,
+                self.wrap_key.expose_secret(),
+                &self.wrap_salt,
+            )?;
 
-        self.master_key = new_master_key;
-        self.save_keys()?;
-        // Collapse the dual `.master` back to a single (new) key.
-        self.save_master_key()?;
-
-        Ok(())
+            self.master_key = new_master_key;
+            self.keys = rotated;
+            self.save_keys()?;
+            // Collapse the dual `.master` back to a single (new) key.
+            self.save_master_key()?;
+            Ok(())
+        })();
+        if commit.is_err() {
+            self.write_failed = true;
+        }
+        commit
     }
 
     /// Clean up expired keys
     pub fn cleanup_expired_keys(&mut self) -> Result<usize> {
+        self.ensure_healthy()?;
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -550,6 +582,10 @@ impl SecureKeyStore {
         if master_key_path.exists() {
             Self::load_master_key(&master_key_path, passphrase)
         } else {
+            anyhow::ensure!(
+                !storage_path.exists(),
+                "keystore exists but master key is missing"
+            );
             let master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
             Self::rewrap_as_v2(master_key, &master_key_path, passphrase)
         }
@@ -835,35 +871,113 @@ impl SecureKeyStore {
         key
     }
 
-    fn load_keys(&mut self) -> Result<()> {
+    fn ensure_healthy(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.write_failed,
+            "keystore write failed; reopen before use"
+        );
+        Ok(())
+    }
+
+    /// One durable snapshot for all mutations in an operation. Roll back
+    /// pre-commit errors (including unwinding); poison after uncertain I/O.
+    pub(crate) fn transaction<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.ensure_healthy()?;
+        anyhow::ensure!(!self.transaction_active, "nested keystore transaction");
+        let previous = self.keys.clone();
+        self.transaction_active = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        self.transaction_active = false;
+        match result {
+            Ok(Ok(value)) => {
+                self.save_keys()?;
+                Ok(value)
+            }
+            Ok(Err(error)) => {
+                self.keys = previous;
+                Err(error)
+            }
+            Err(panic) => {
+                self.keys = previous;
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    fn load_keys(&mut self, alt: Option<&SecretBox<[u8; 32]>>) -> Result<(bool, bool)> {
         if !self.storage_path.exists() {
-            return Ok(());
+            return Ok((false, false));
         }
-
-        let data = fs::read(&self.storage_path).context("Failed to read keystore file")?;
-
-        if data.is_empty() {
-            return Ok(());
+        let data = fs::read(&self.storage_path).context("read keystore")?;
+        anyhow::ensure!(!data.is_empty(), "empty keystore file");
+        if data.starts_with(SNAPSHOT_MAGIC) {
+            anyhow::ensure!(data.len() >= 4 + 12 + 16, "truncated keystore snapshot");
+            let nonce = Nonce::from_slice(&data[4..16]);
+            let open = |key: &[u8; 32]| {
+                ChaCha20Poly1305::new(key.into()).decrypt(
+                    nonce,
+                    Payload {
+                        msg: &data[16..],
+                        aad: SNAPSHOT_AAD,
+                    },
+                )
+            };
+            let (plaintext, used_alt) = match open(self.master_key.expose_secret()) {
+                Ok(value) => (value, false),
+                Err(_) => {
+                    let fallback = alt.ok_or_else(|| {
+                        anyhow::anyhow!("keystore snapshot authentication failed")
+                    })?;
+                    (
+                        open(fallback.expose_secret()).map_err(|_| {
+                            anyhow::anyhow!("keystore snapshot authentication failed")
+                        })?,
+                        true,
+                    )
+                }
+            };
+            let plaintext = Zeroizing::new(plaintext);
+            self.keys =
+                bincode::deserialize(&plaintext).context("deserialize authenticated keystore")?;
+            Ok((used_alt, false))
+        } else {
+            // Read-only compatibility with the old plaintext index; never write it.
+            self.keys = bincode::deserialize(&data).context("deserialize legacy keystore")?;
+            Ok((false, true))
         }
-
-        self.keys = bincode::deserialize(&data).context("Failed to deserialize keystore")?;
-
-        Ok(())
     }
 
-    fn save_keys(&self) -> Result<()> {
-        let data = bincode::serialize(&self.keys).context("Failed to serialize keystore")?;
-
-        atomic_write(&self.storage_path, &data).context("Failed to write keystore file")?;
-
-        Ok(())
-    }
-}
-
-impl Drop for SecureKeyStore {
-    fn drop(&mut self) {
-        // Attempt to save keys on drop
-        let _ = self.save_keys();
+    fn save_keys(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
+        if self.transaction_active {
+            return Ok(());
+        }
+        let result = (|| -> Result<()> {
+            let plaintext =
+                Zeroizing::new(bincode::serialize(&self.keys).context("serialize keystore")?);
+            let nonce = secure_rng::random::array::<12>()?;
+            let ciphertext = ChaCha20Poly1305::new(self.master_key.expose_secret().into())
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &plaintext,
+                        aad: SNAPSHOT_AAD,
+                    },
+                )
+                .map_err(|_| anyhow::anyhow!("encrypt keystore snapshot"))?;
+            let mut data = Vec::with_capacity(16 + ciphertext.len());
+            data.extend_from_slice(SNAPSHOT_MAGIC);
+            data.extend_from_slice(&nonce);
+            data.extend_from_slice(&ciphertext);
+            atomic_write(&self.storage_path, &data).context("commit keystore snapshot")
+        })();
+        if result.is_err() {
+            self.write_failed = true;
+        }
+        result
     }
 }
 
@@ -1172,12 +1286,11 @@ mod tests {
             plain_metadata(10),
         )
         .unwrap();
+        let mut keys = ks.keys.clone();
         drop(ks);
 
         // Attacker with .db write access moves slot_a's sealed bytes into
         // slot_b (same master key, so without AAD this would decrypt).
-        let mut keys: HashMap<String, EncryptedKeyEntry> =
-            bincode::deserialize(&fs::read(&path).unwrap()).unwrap();
         let a = keys.get("slot_a").unwrap().clone();
         let b = keys.get_mut("slot_b").unwrap();
         b.encrypted_data = a.encrypted_data.clone();
@@ -1210,11 +1323,10 @@ mod tests {
             plain_metadata(12),
         )
         .unwrap();
+        let mut keys = ks.keys.clone();
         drop(ks);
 
         // Flip the stored key_type; the AAD binds the type discriminant.
-        let mut keys: HashMap<String, EncryptedKeyEntry> =
-            bincode::deserialize(&fs::read(&path).unwrap()).unwrap();
         keys.get_mut("k").unwrap().key_type = KeyType::EncryptionKey;
         fs::write(&path, bincode::serialize(&keys).unwrap()).unwrap();
 
@@ -1434,6 +1546,7 @@ mod tests {
                 entry.encrypted_data = ct;
                 entry.nonce = nb;
             }
+            ks.master_key = SecretBox::new(Box::new(m_new));
             ks.save_keys().unwrap();
         }
         // Dual `.master`, not yet collapsed.
@@ -1490,5 +1603,184 @@ mod tests {
                 .as_slice(),
             b"data before rotation",
         );
+    }
+    #[test]
+    fn failed_open_never_overwrites_damaged_database() {
+        let (ks, _dir) = create_test_keystore();
+        let path = ks.storage_path.clone();
+        drop(ks);
+        for damaged in [vec![], b"QKS1truncated".to_vec(), vec![255; 40]] {
+            fs::write(&path, &damaged).unwrap();
+            assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+        }
+    }
+
+    #[test]
+    fn missing_master_does_not_replace_database_or_generate_key() {
+        let (mut ks, _dir) = create_test_keystore();
+        ks.store_key("k", b"secret", KeyType::RootKey, plain_metadata(6))
+            .unwrap();
+        let path = ks.storage_path.clone();
+        let saved = fs::read(&path).unwrap();
+        drop(ks);
+        fs::remove_file(path.with_extension("master")).unwrap();
+        assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert!(!path.with_extension("master").exists());
+    }
+
+    #[test]
+    fn snapshot_hides_index_and_authenticates_tampering() {
+        let (mut ks, _dir) = create_test_keystore();
+        let id = "ratchet_session_distinctive-contact-identifier";
+        let mut metadata = plain_metadata(6);
+        metadata
+            .tags
+            .insert("private tag".into(), "distinctive private metadata".into());
+        ks.store_key(id, b"secret", KeyType::RootKey, metadata)
+            .unwrap();
+        let path = ks.storage_path.clone();
+        let mut data = fs::read(&path).unwrap();
+        assert!(data.starts_with(SNAPSHOT_MAGIC));
+        for needle in [
+            id.as_bytes(),
+            b"distinctive private metadata".as_slice(),
+            b"secret".as_slice(),
+        ] {
+            assert!(!data.windows(needle.len()).any(|window| window == needle));
+        }
+        drop(ks);
+        *data.last_mut().unwrap() ^= 1;
+        fs::write(&path, &data).unwrap();
+        assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+        assert_eq!(fs::read(path).unwrap(), data);
+    }
+
+    #[test]
+    fn transaction_rolls_back_errors_and_panics_and_commits_together() {
+        let (mut ks, _dir) = create_test_keystore();
+        ks.store_key("session", b"old", KeyType::RootKey, plain_metadata(3))
+            .unwrap();
+        let before = fs::read(&ks.storage_path).unwrap();
+        let failed: Result<()> = ks.transaction(|ks| {
+            ks.store_key("session", b"new", KeyType::RootKey, plain_metadata(3))?;
+            ks.store_key(
+                "prekey-consumed",
+                b"yes",
+                KeyType::PreKey,
+                plain_metadata(3),
+            )?;
+            anyhow::bail!("operation rejected")
+        });
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&ks.storage_path).unwrap(), before);
+        assert!(!ks.has_key("prekey-consumed"));
+        assert_eq!(
+            ks.retrieve_key("session").unwrap().unwrap().expose_secret(),
+            b"old"
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = ks.transaction(|ks| {
+                ks.delete_key("session")?;
+                panic!("test interrupted operation")
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(!ks.transaction_active);
+        assert!(ks.has_key("session"));
+        ks.transaction(|ks| {
+            ks.store_key("session", b"new", KeyType::RootKey, plain_metadata(3))?;
+            ks.store_key(
+                "prekey-consumed",
+                b"yes",
+                KeyType::PreKey,
+                plain_metadata(3),
+            )
+        })
+        .unwrap();
+        let path = ks.storage_path.clone();
+        drop(ks);
+        let mut reopened = SecureKeyStore::new(path, b"test-keystore-passphrase").unwrap();
+        assert_eq!(
+            reopened
+                .retrieve_key("session")
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            b"new"
+        );
+        assert!(reopened.has_key("prekey-consumed"));
+    }
+
+    #[test]
+    fn uncertain_commit_blocks_further_secret_use_and_drop_does_not_retry() {
+        let (mut ks, dir) = create_test_keystore();
+        ks.store_key("k", b"old", KeyType::RootKey, plain_metadata(3))
+            .unwrap();
+        let path = ks.storage_path.clone();
+        let before = fs::read(&path).unwrap();
+        // Renaming a regular staged file over a directory must fail.
+        ks.storage_path = dir.path().to_path_buf();
+        assert!(ks
+            .store_key("k", b"new", KeyType::RootKey, plain_metadata(3))
+            .is_err());
+        ks.storage_path = path.clone();
+        assert!(ks.retrieve_key("k").is_err());
+        assert!(ks.delete_key("k").is_err());
+        assert!(ks.rotate_master_key().is_err());
+        drop(ks);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let mut reopened = SecureKeyStore::new(path, b"test-keystore-passphrase").unwrap();
+        assert_eq!(
+            reopened.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            b"old"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut ks, _dir) = create_test_keystore();
+        ks.store_key("k", b"secret", KeyType::RootKey, plain_metadata(6))
+            .unwrap();
+        for path in [&ks.storage_path, &ks.storage_path.with_extension("master")] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+    #[test]
+    fn interrupted_rotation_of_empty_snapshot_selects_authenticated_master() {
+        let (mut ks, _dir) = create_test_keystore();
+        ks.save_keys().unwrap();
+        let path = ks.storage_path.clone();
+        let old_master = Zeroizing::new(*ks.master_key.expose_secret());
+        let new_master = Zeroizing::new(secure_rng::random::array::<32>().unwrap());
+        SecureKeyStore::seal_master_dual(
+            &new_master,
+            Some(&old_master),
+            &path.with_extension("master"),
+            ks.wrap_key.expose_secret(),
+            &ks.wrap_salt,
+        )
+        .unwrap();
+        drop(ks);
+        let mut reopened = SecureKeyStore::new(&path, b"test-keystore-passphrase").unwrap();
+        assert_eq!(reopened.master_key.expose_secret(), &*old_master);
+        reopened
+            .store_key(
+                "after-recovery",
+                b"secret",
+                KeyType::RootKey,
+                plain_metadata(6),
+            )
+            .unwrap();
+        drop(reopened);
+        assert!(SecureKeyStore::new(path, b"test-keystore-passphrase")
+            .unwrap()
+            .has_key("after-recovery"));
     }
 }

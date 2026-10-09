@@ -42,6 +42,7 @@
 //! both directions. Same trade-off Signal makes for session racing.
 
 use anyhow::{anyhow, bail, Result};
+use zeroize::Zeroizing;
 
 use crate::groups::group_handshake::{verify_prekey_bundle, GroupHandshake};
 use crate::identity::identity_key::IdentityId;
@@ -114,6 +115,16 @@ pub fn encrypt_direct(
     plaintext: &[u8],
     now: u64,
 ) -> Result<Vec<u8>> {
+    ks.transaction(|ks| encrypt_direct_inner(ks, local_id, peer_id, plaintext, now))
+}
+
+fn encrypt_direct_inner(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    plaintext: &[u8],
+    now: u64,
+) -> Result<Vec<u8>> {
     // Generate routing metadata before advancing the ratchet. If secure RNG
     // fails, the send fails without consuming a message-key position.
     let route_nonce = crate::security::secure_rng::random::array::<DIRECT_ROUTE_NONCE_LEN>()?;
@@ -178,6 +189,19 @@ pub fn decrypt_direct(
     wire: &[u8],
     now: u64,
 ) -> Result<(IdentityId, Vec<u8>)> {
+    let (peer, mut plaintext) = ks.transaction(|ks| {
+        let (peer, plaintext) = decrypt_direct_inner(ks, local_id, wire, now)?;
+        Ok((peer, Zeroizing::new(plaintext)))
+    })?;
+    Ok((peer, std::mem::take(&mut *plaintext)))
+}
+
+fn decrypt_direct_inner(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    wire: &[u8],
+    now: u64,
+) -> Result<(IdentityId, Vec<u8>)> {
     let dm = DirectMessage::from_wire(wire).ok_or_else(|| anyhow!("not a direct message frame"))?;
     if direct_identity_selector(&local_id, &dm.route_nonce) != dm.recipient_selector {
         bail!("direct message addressed to a different recipient");
@@ -190,6 +214,7 @@ pub fn decrypt_direct(
     if let Some(mut session) = load_session(ks, &peer_id)? {
         match session.decrypt(&dm.header, &dm.ciphertext) {
             Ok(padded) => {
+                let padded = Zeroizing::new(padded);
                 store_session(ks, &session)?;
                 // Receiving on this session proves the peer holds it too:
                 // stop attaching our own initial (if we were initiator).
@@ -228,22 +253,16 @@ pub fn decrypt_direct(
     let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
     let mut session =
         Session::establish_responder(local_id, peer_id, &local_secret, &initial.to_message()?)?;
-    let padded = session.decrypt(&dm.header, &dm.ciphertext)?;
+    let padded = Zeroizing::new(session.decrypt(&dm.header, &dm.ciphertext)?);
     store_session(ks, &session)?;
     // The handshake is now AEAD-verified. If it consumed our one-time
     // prekey, rotate it so it's never reused (single-use forward
     // secrecy). Doing this only after a successful decrypt stops a
     // spoofed initial from burning OTPs.
     //
-    // Rotation failure must NOT discard the message: the ratchet already
-    // consumed this frame's message key (and we persisted the session),
-    // so the caller can never re-decrypt this exact frame on retry.
-    // Losing an authenticated message to a keystore-bookkeeping hiccup
-    // would be worse than a not-yet-rotated OTP — log and continue.
+    // Session advancement, OTP consumption and replay marker share one commit.
     if initial.used_one_time_prekey {
-        if let Err(e) = consume_one_time_prekey(ks) {
-            tracing::warn!(error = %e, "failed to rotate one-time prekey after handshake");
-        }
+        consume_one_time_prekey(ks)?;
     }
     ks.store_key(
         &accepted_initial_key(&peer_id),
@@ -300,6 +319,10 @@ pub fn inspect_direct_recipient(ks: &SecureKeyStore, wire: &[u8]) -> Option<Iden
 /// requires the peer's verified bundle identity), it's purely a
 /// liveness lever.
 pub fn reset_direct_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Result<usize> {
+    ks.transaction(|ks| reset_direct_session_inner(ks, peer))
+}
+
+fn reset_direct_session_inner(ks: &mut SecureKeyStore, peer: &IdentityId) -> Result<usize> {
     let mut deleted = 0;
     for key in [
         crate::ratchet::session::session_key_id(peer),
@@ -341,7 +364,7 @@ pub const DIRECT_PAYLOAD_ENVELOPE_VERSION: u8 = 0x01;
 const DIRECT_ROUTE_HINT_MAX_LEN: usize = 256;
 
 /// A decoded 1:1 plaintext.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum DirectPayload {
     /// A chat message.
     Text(String),
@@ -355,6 +378,18 @@ pub enum DirectPayload {
     Ack([u8; DIRECT_MESSAGE_ID_LEN]),
     /// An opaque call-signaling frame (see [`PAYLOAD_TAG_CALL_SIGNAL`]).
     CallSignal(Vec<u8>),
+}
+
+impl std::fmt::Debug for DirectPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Text(_) => "Text",
+            Self::SenderKeyDistribution(_) => "SenderKeyDistribution",
+            Self::Ack(_) => "Ack",
+            Self::CallSignal(_) => "CallSignal",
+        };
+        write!(f, "{kind}([REDACTED])")
+    }
 }
 
 fn encode_tagged_payload(payload: &DirectPayload) -> Result<Vec<u8>> {
@@ -1045,5 +1080,32 @@ mod tests {
             (gid, from, pt.as_slice()),
             (group, aid, b"group hello".as_slice())
         );
+    }
+    #[test]
+    fn authenticated_invalid_padding_does_not_commit_session_or_consume_prekey() {
+        let (mut alice, mut bob) = paired();
+        let (aid, bid) = (alice.kp.identity_id(), bob.kp.identity_id());
+        let valid =
+            encrypt_direct(&mut alice.ks, aid, bid, b"recoverable first message", 1).unwrap();
+        let mut frame = DirectMessage::from_wire(&valid).unwrap();
+        let mut session = load_session(&mut alice.ks, &bid).unwrap().unwrap();
+        // A legitimate sender can authenticate invalid application padding.
+        // This reaches the session/OTP/marker staging before unpad rejects it.
+        let (header, ciphertext) = session.encrypt(&[255; 4]).unwrap();
+        frame.header = header;
+        frame.ciphertext = ciphertext;
+        let path = bob._dir.path().join("ks.db");
+        let before = std::fs::read(&path).unwrap();
+        assert!(decrypt_direct(&mut bob.ks, bid, &frame.to_wire().unwrap(), 1).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(load_session(&mut bob.ks, &aid).unwrap().is_none());
+        // The original first frame still opens after rollback and restart.
+        bob.ks = SecureKeyStore::new(&path, b"test-direct").unwrap();
+        assert_eq!(
+            decrypt_direct(&mut bob.ks, bid, &valid, 1).unwrap().1,
+            b"recoverable first message"
+        );
+        bob.ks = SecureKeyStore::new(path, b"test-direct").unwrap();
+        assert!(decrypt_direct(&mut bob.ks, bid, &valid, 1).is_err());
     }
 }

@@ -1,376 +1,150 @@
+//! Fallible operating-system randomness. No application PRNG state, clock,
+//! filesystem scanning, timing measurements, or fallback entropy sources.
+//! PQClean's C primitives have their own OS-randomness boundary; see the audit
+//! notes in docs/security/crypto-boundary-hardening.md.
+
 use anyhow::{Context, Result};
-use blake3::Hasher;
-use getrandom::getrandom;
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-/// Enhanced secure random number generator with multiple entropy sources
-/// and protection against various attacks. ChaCha20Rng doesn't impl
-/// `Zeroize` so we drop the derive and zero the entropy_pool field
-/// manually in `Drop`.
-pub struct SecureRng {
-    rng: ChaCha20Rng,
-    entropy_pool: [u8; 64],
-    reseed_counter: u64,
-    last_reseed: u64,
+fn fill_with(dest: &mut [u8], source: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<()> {
+    if dest.is_empty() {
+        return Ok(());
+    }
+    if let Err(error) = source(dest) {
+        // A failed OS request may have partially filled the destination.
+        dest.zeroize();
+        return Err(error);
+    }
+    Ok(())
 }
 
-impl Drop for SecureRng {
-    fn drop(&mut self) {
-        self.entropy_pool.zeroize();
-        self.reseed_counter.zeroize();
-        self.last_reseed.zeroize();
-    }
+fn fill_from_os(dest: &mut [u8]) -> Result<()> {
+    fill_with(dest, |bytes| {
+        getrandom::getrandom(bytes).context("operating-system randomness unavailable")
+    })
 }
+
+/// Compatibility handle: every request goes directly to the OS CSPRNG.
+pub struct SecureRng;
 
 impl SecureRng {
-    const RESEED_THRESHOLD: u64 = 1_000_000; // Reseed after 1M bytes
-    const RESEED_TIME_THRESHOLD: u64 = 3600; // Reseed after 1 hour
-
-    /// Create a new secure RNG with enhanced entropy collection
     pub fn new() -> Result<Self> {
-        let mut seed = [0u8; 32];
-        Self::collect_high_quality_entropy(&mut seed)?;
-
-        let mut entropy_pool = [0u8; 64];
-        Self::collect_additional_entropy(&mut entropy_pool)?;
-
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-        Ok(SecureRng {
-            rng: ChaCha20Rng::from_seed(seed),
-            entropy_pool,
-            reseed_counter: 0,
-            last_reseed: current_time,
-        })
+        let mut rng = Self;
+        rng.reseed()?;
+        Ok(rng)
     }
 
-    /// Generate random bytes with automatic reseeding
     pub fn fill_bytes(&mut self, dest: &mut [u8]) -> Result<()> {
-        // Check if reseeding is needed
-        if self.should_reseed()? {
-            self.reseed()?;
-        }
-
-        self.rng.fill_bytes(dest);
-        self.reseed_counter += dest.len() as u64;
-
-        Ok(())
+        fill_from_os(dest)
     }
 
-    /// Generate a random u64
     pub fn next_u64(&mut self) -> Result<u64> {
-        if self.should_reseed()? {
-            self.reseed()?;
-        }
-
-        self.reseed_counter += 8;
-        Ok(self.rng.next_u64())
+        random::u64()
     }
 
-    /// Generate a random u32
     pub fn next_u32(&mut self) -> Result<u32> {
-        if self.should_reseed()? {
-            self.reseed()?;
-        }
-
-        self.reseed_counter += 4;
-        Ok(self.rng.next_u32())
+        random::u32()
     }
 
-    /// Force a reseed operation
+    /// Availability check only. Reseeding is owned by the OS; there is no
+    /// application seed or cached output to continue using on error.
     pub fn reseed(&mut self) -> Result<()> {
-        let mut new_seed = [0u8; 32];
-        Self::collect_high_quality_entropy(&mut new_seed)?;
-
-        // Mix with current state for forward security
-        let mut hasher = Hasher::new();
-        hasher.update(&new_seed);
-        hasher.update(&self.entropy_pool);
-        hasher.update(&self.reseed_counter.to_le_bytes());
-
-        let hash = hasher.finalize();
-        new_seed.copy_from_slice(&hash.as_bytes()[..32]);
-
-        self.rng = ChaCha20Rng::from_seed(new_seed);
-        Self::collect_additional_entropy(&mut self.entropy_pool)?;
-
-        self.reseed_counter = 0;
-        self.last_reseed = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-        // Zeroize the seed
-        new_seed.zeroize();
-
-        Ok(())
-    }
-
-    /// Check if reseeding is needed based on usage or time
-    fn should_reseed(&self) -> Result<bool> {
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-        // `saturating_sub`: if the wall clock steps backward
-        // (`current_time < last_reseed`), a plain subtraction would
-        // underflow (panic in debug). Saturate to 0 — a backward clock
-        // just means "not time-based due yet", and the counter path
-        // still forces a reseed.
-        Ok(self.reseed_counter >= Self::RESEED_THRESHOLD
-            || current_time.saturating_sub(self.last_reseed) >= Self::RESEED_TIME_THRESHOLD)
-    }
-
-    /// Collect high-quality entropy from multiple sources
-    fn collect_high_quality_entropy(buffer: &mut [u8; 32]) -> Result<()> {
-        // Primary entropy from OS
-        getrandom(buffer).context("Failed to get entropy from OS")?;
-
-        // Additional entropy mixing
-        let mut hasher = Hasher::new();
-        hasher.update(buffer);
-
-        // Add timing entropy
-        let start = std::time::Instant::now();
-        for _ in 0..1000 {
-            std::hint::black_box(std::time::Instant::now());
-        }
-        let timing = start.elapsed().as_nanos();
-        hasher.update(&timing.to_le_bytes());
-
-        // Add process-specific entropy
-        hasher.update(&std::process::id().to_le_bytes());
-
-        // Thread-id entropy removed — ThreadId::as_u64 is still
-        // unstable. The other sources below are plenty.
-
-        // Add memory address entropy (ASLR)
-        let stack_addr = &buffer as *const _ as usize;
-        hasher.update(&stack_addr.to_le_bytes());
-
-        #[cfg(unix)]
-        {
-            // std::process::id is portable and matches libc::getpid on
-            // Unix; using it dodges an extra libc round-trip.
-            let pid = std::process::id();
-            hasher.update(&pid.to_le_bytes());
-        }
-
-        #[cfg(windows)]
-        {
-            // Add Windows-specific entropy
-            use winapi::um::processthreadsapi::GetCurrentProcessId;
-            let pid = unsafe { GetCurrentProcessId() };
-            hasher.update(&pid.to_le_bytes());
-        }
-
-        let hash = hasher.finalize();
-        buffer.copy_from_slice(&hash.as_bytes()[..32]);
-
-        Ok(())
-    }
-
-    /// Collect additional entropy for the entropy pool
-    fn collect_additional_entropy(buffer: &mut [u8; 64]) -> Result<()> {
-        let mut hasher = Hasher::new();
-
-        // System time with high precision
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        hasher.update(&now.as_nanos().to_le_bytes());
-
-        // CPU cycle counter (if available)
-        #[cfg(target_arch = "x86_64")]
-        {
-            let cycles = unsafe { std::arch::x86_64::_rdtsc() };
-            hasher.update(&cycles.to_le_bytes());
-        }
-
-        // Memory allocation patterns
-        for _ in 0..10 {
-            let vec: Vec<u8> = Vec::with_capacity(1024);
-            let addr = vec.as_ptr() as usize;
-            hasher.update(&addr.to_le_bytes());
-        }
-
-        // File system entropy (if available)
-        if let Ok(temp_dir) = std::env::temp_dir().read_dir() {
-            for entry in temp_dir.take(5).flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    hasher.update(&metadata.len().to_le_bytes());
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                            hasher.update(&duration.as_nanos().to_le_bytes());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Stretch the BLAKE3 output to 64 bytes via its XOF mode
-        // — `finalize().as_bytes()` only gives us 32. Without this
-        // the original code panicked on copy_from_slice (length
-        // mismatch 32 vs 64).
-        let mut xof = hasher.finalize_xof();
-        let mut filled = [0u8; 64];
-        xof.fill(&mut filled);
-        buffer.copy_from_slice(&filled);
-
-        Ok(())
+        let mut probe = zeroize::Zeroizing::new([0u8; 32]);
+        fill_from_os(probe.as_mut())
     }
 }
 
 impl Default for SecureRng {
     fn default() -> Self {
-        Self::new().expect("Failed to initialize secure RNG")
+        // Stateless construction; requests remain fallible.
+        Self
     }
 }
 
-/// Thread-safe global secure RNG instance
-pub struct GlobalSecureRng {
-    rng: Arc<Mutex<SecureRng>>,
-}
+/// Global facade whose initialization cannot panic on entropy failure.
+pub struct GlobalSecureRng;
 
 impl GlobalSecureRng {
-    /// Get the global secure RNG instance
-    pub fn instance() -> &'static GlobalSecureRng {
-        static INSTANCE: std::sync::OnceLock<GlobalSecureRng> = std::sync::OnceLock::new();
-        INSTANCE.get_or_init(|| GlobalSecureRng {
-            rng: Arc::new(Mutex::new(
-                SecureRng::new().expect("Failed to initialize global RNG"),
-            )),
-        })
+    pub fn instance() -> &'static Self {
+        static INSTANCE: GlobalSecureRng = GlobalSecureRng;
+        &INSTANCE
     }
 
-    /// Generate random bytes using the global RNG
     pub fn fill_bytes(&self, dest: &mut [u8]) -> Result<()> {
-        let mut rng = self
-            .rng
-            .lock()
-            .map_err(|_| anyhow::anyhow!("RNG mutex poisoned"))?;
-        rng.fill_bytes(dest)
+        fill_from_os(dest)
     }
 
-    /// Generate a random u64 using the global RNG
     pub fn next_u64(&self) -> Result<u64> {
-        let mut rng = self
-            .rng
-            .lock()
-            .map_err(|_| anyhow::anyhow!("RNG mutex poisoned"))?;
-        rng.next_u64()
+        random::u64()
     }
 
-    /// Force a reseed of the global RNG
     pub fn reseed(&self) -> Result<()> {
-        let mut rng = self
-            .rng
-            .lock()
-            .map_err(|_| anyhow::anyhow!("RNG mutex poisoned"))?;
-        rng.reseed()
+        SecureRng.reseed()
     }
 }
 
-/// Convenience functions for common random operations
 pub mod random {
     use super::*;
 
-    /// Generate random bytes
     pub fn bytes(len: usize) -> Result<Vec<u8>> {
-        let mut buffer = vec![0u8; len];
-        GlobalSecureRng::instance().fill_bytes(&mut buffer)?;
-        Ok(buffer)
+        let mut bytes = vec![0u8; len];
+        fill_from_os(&mut bytes)?;
+        Ok(bytes)
     }
 
-    /// Generate a random array of specified size
     pub fn array<const N: usize>() -> Result<[u8; N]> {
-        let mut array = [0u8; N];
-        GlobalSecureRng::instance().fill_bytes(&mut array)?;
-        Ok(array)
+        let mut bytes = [0u8; N];
+        fill_from_os(&mut bytes)?;
+        Ok(bytes)
     }
 
-    /// Generate a random u64
     pub fn u64() -> Result<u64> {
-        GlobalSecureRng::instance().next_u64()
+        Ok(u64::from_le_bytes(array()?))
     }
 
-    /// Generate a random u32
     pub fn u32() -> Result<u32> {
-        Ok((GlobalSecureRng::instance().next_u64()? >> 32) as u32)
+        Ok(u32::from_le_bytes(array()?))
     }
 
-    /// Generate a random boolean
     pub fn bool() -> Result<bool> {
-        Ok(GlobalSecureRng::instance().next_u64()? & 1 == 1)
+        Ok(array::<1>()?[0] & 1 == 1)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
-    fn test_secure_rng_creation() {
-        let _rng = SecureRng::new().expect("Should create RNG");
+    fn partial_entropy_failure_erases_output_and_propagates() {
+        let mut dest = [0x55; 32];
+        let result = fill_with(&mut dest, |bytes| {
+            bytes[..16].fill(0xAA);
+            anyhow::bail!("injected entropy failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(dest, [0; 32]);
     }
 
     #[test]
-    fn test_random_bytes_generation() {
-        let mut rng = SecureRng::new().expect("Should create RNG");
-        let mut buffer = [0u8; 32];
-        rng.fill_bytes(&mut buffer).expect("Should generate bytes");
-
-        // Check that not all bytes are zero (extremely unlikely)
-        assert!(buffer.iter().any(|&b| b != 0));
+    fn request_after_failure_uses_a_fresh_source_call() {
+        let mut dest = [0; 8];
+        assert!(fill_with(&mut dest, |_| anyhow::bail!("unavailable")).is_err());
+        fill_with(&mut dest, |bytes| {
+            bytes.copy_from_slice(&42u64.to_le_bytes());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(dest), 42);
     }
 
     #[test]
-    fn test_random_uniqueness() {
-        let mut rng = SecureRng::new().expect("Should create RNG");
-        let mut values = HashSet::new();
-
-        // Generate 1000 random u64 values
-        for _ in 0..1000 {
-            let value = rng.next_u64().expect("Should generate u64");
-            values.insert(value);
-        }
-
-        // Should have close to 1000 unique values
-        assert!(values.len() > 990);
-    }
-
-    #[test]
-    fn test_reseed_functionality() {
-        let mut rng = SecureRng::new().expect("Should create RNG");
-
-        // Force a reseed
-        rng.reseed().expect("Should reseed successfully");
-
-        // Should still generate random numbers
-        let value = rng.next_u64().expect("Should generate after reseed");
-        assert!(value != 0); // Extremely unlikely to be zero
-    }
-
-    #[test]
-    fn test_global_rng() {
-        let global_rng = GlobalSecureRng::instance();
-
-        let mut buffer = [0u8; 16];
-        global_rng
-            .fill_bytes(&mut buffer)
-            .expect("Should generate bytes");
-
-        assert!(buffer.iter().any(|&b| b != 0));
-    }
-
-    #[test]
-    fn test_convenience_functions() {
-        let bytes = random::bytes(32).expect("Should generate bytes");
-        assert_eq!(bytes.len(), 32);
-
-        let array = random::array::<16>().expect("Should generate array");
-        assert_eq!(array.len(), 16);
-
-        let _value = random::u64().expect("Should generate u64");
-        let _value = random::u32().expect("Should generate u32");
-        let _value = random::bool().expect("Should generate bool");
+    fn facade_supports_os_requests_and_empty_buffers() {
+        let mut rng = SecureRng::new().unwrap();
+        rng.fill_bytes(&mut []).unwrap();
+        rng.next_u32().unwrap();
+        GlobalSecureRng::instance().next_u64().unwrap();
+        assert_eq!(random::bytes(24).unwrap().len(), 24);
+        random::bool().unwrap();
     }
 }

@@ -41,12 +41,13 @@ use pqcrypto_mlkem::mlkem768::{
     decapsulate as kem_decapsulate, encapsulate as kem_encapsulate, keypair as kem_keypair,
     Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
 };
-use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
+use crate::security::key_agreement::checked_x25519;
 use crate::security::secure_rng;
 
 const PQXDH_KDF_INFO: &[u8] = b"qubee_pqxdh_v1";
@@ -170,25 +171,25 @@ pub fn initiate(
     alice_identity: &StaticSecret,
     bundle: &PrekeyBundlePublic,
 ) -> Result<PqxdhInitiatorResult> {
+    validate_kem_public(&bundle.kem_public)?;
     let ephemeral = random_secret()?;
     let ephemeral_public = PublicKey::from(&ephemeral);
 
     // DH1 = DH(IK_A, SPK_B); DH2 = DH(EK_A, IK_B); DH3 = DH(EK_A, SPK_B)
-    let dh1 = alice_identity
-        .diffie_hellman(&bundle.signed_prekey)
-        .to_bytes();
-    let dh2 = ephemeral.diffie_hellman(&bundle.identity).to_bytes();
-    let dh3 = ephemeral.diffie_hellman(&bundle.signed_prekey).to_bytes();
+    let dh1 = checked_x25519(alice_identity, &bundle.signed_prekey)?;
+    let dh2 = checked_x25519(&ephemeral, &bundle.identity)?;
+    let dh3 = checked_x25519(&ephemeral, &bundle.signed_prekey)?;
     // DH4 = DH(EK_A, OPK_B) if a one-time prekey is present.
     let dh4 = bundle
         .one_time_prekey
         .as_ref()
-        .map(|opk| ephemeral.diffie_hellman(opk).to_bytes());
+        .map(|opk| checked_x25519(&ephemeral, opk))
+        .transpose()?;
 
     // KEM: encapsulate to Bob's ML-KEM prekey.
     let (kem_ss, kem_ct) = kem_encapsulate(&bundle.kem_public);
 
-    let shared_secret = derive_sk(&dh1, &dh2, &dh3, dh4.as_ref(), kem_ss.as_bytes())?;
+    let shared_secret = derive_sk(&dh1, &dh2, &dh3, dh4.as_deref(), kem_ss.as_bytes())?;
 
     Ok(PqxdhInitiatorResult {
         shared_secret,
@@ -202,6 +203,20 @@ pub fn initiate(
     })
 }
 
+/// FIPS 203 encapsulation-key modulus check. The wrapper's from_bytes only
+/// checks length; reject non-canonical 12-bit coefficients before entering C.
+pub(crate) fn validate_kem_public(public: &KemPublicKey) -> Result<()> {
+    let bytes = public.as_bytes();
+    for encoded in bytes[..bytes.len() - 32].chunks_exact(3) {
+        let a = u16::from(encoded[0]) | ((u16::from(encoded[1]) & 15) << 8);
+        let b = (u16::from(encoded[1]) >> 4) | (u16::from(encoded[2]) << 4);
+        if a >= 3329 || b >= 3329 {
+            return Err(anyhow!("non-canonical ML-KEM encapsulation key"));
+        }
+    }
+    Ok(())
+}
+
 /// Run the responder (Bob) side. Reproduces the shared secret from
 /// Bob's private bundle + Alice's initial message. Returns `sk` and the
 /// ratchet secret (Bob's signed-prekey secret) to feed to
@@ -211,31 +226,22 @@ pub fn respond(
     initial: &InitialMessage,
 ) -> Result<([u8; 32], StaticSecret)> {
     // Mirror Alice's DHs with the private key of each pair swapped in.
-    let dh1 = bundle
-        .signed_prekey
-        .diffie_hellman(&initial.identity)
-        .to_bytes();
-    let dh2 = bundle
-        .identity
-        .diffie_hellman(&initial.ephemeral)
-        .to_bytes();
-    let dh3 = bundle
-        .signed_prekey
-        .diffie_hellman(&initial.ephemeral)
-        .to_bytes();
+    let dh1 = checked_x25519(&bundle.signed_prekey, &initial.identity)?;
+    let dh2 = checked_x25519(&bundle.identity, &initial.ephemeral)?;
+    let dh3 = checked_x25519(&bundle.signed_prekey, &initial.ephemeral)?;
     let dh4 = if initial.used_one_time_prekey {
         let opk = bundle
             .one_time_prekey
             .as_ref()
             .ok_or_else(|| anyhow!("initiator used a one-time prekey we don't have"))?;
-        Some(opk.diffie_hellman(&initial.ephemeral).to_bytes())
+        Some(checked_x25519(opk, &initial.ephemeral)?)
     } else {
         None
     };
 
     let kem_ss = kem_decapsulate(&initial.kem_ciphertext, &bundle.kem_secret);
 
-    let shared_secret = derive_sk(&dh1, &dh2, &dh3, dh4.as_ref(), kem_ss.as_bytes())?;
+    let shared_secret = derive_sk(&dh1, &dh2, &dh3, dh4.as_deref(), kem_ss.as_bytes())?;
     // Clone the signed-prekey secret for the ratchet init. (StaticSecret
     // is Clone; the original stays in the bundle for any concurrent
     // handshakes still in flight, though production should rotate it.)
@@ -250,7 +256,7 @@ fn derive_sk(
     dh4: Option<&[u8; 32]>,
     kem_ss: &[u8],
 ) -> Result<[u8; 32]> {
-    let mut ikm = Vec::with_capacity(32 * 4 + kem_ss.len());
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 * 4 + kem_ss.len()));
     ikm.extend_from_slice(dh1);
     ikm.extend_from_slice(dh2);
     ikm.extend_from_slice(dh3);
@@ -263,7 +269,6 @@ fn derive_sk(
     let mut sk = [0u8; 32];
     hk.expand(PQXDH_KDF_INFO, &mut sk)
         .map_err(|e| anyhow!("PQXDH KDF expand: {e}"))?;
-    ikm.zeroize();
     Ok(sk)
 }
 
@@ -362,5 +367,46 @@ mod tests {
         if let Ok((other_sk, _)) = result {
             assert_ne!(init.shared_secret, other_sk);
         }
+    }
+    #[test]
+    fn rejects_non_contributory_prekeys_and_initial_keys() {
+        let (secret, kem_public) = generate_bundle().unwrap();
+        let public = secret.public_with_kem(kem_public);
+        let alice = random_secret().unwrap();
+        let initial = initiate(&alice, &public).unwrap().initial_message;
+        for first_byte in [0, 1] {
+            let mut low = [0; 32];
+            low[0] = first_byte;
+            for field in 0..3 {
+                let mut bad = public.clone();
+                match field {
+                    0 => bad.identity = PublicKey::from(low),
+                    1 => bad.signed_prekey = PublicKey::from(low),
+                    _ => bad.one_time_prekey = Some(PublicKey::from(low)),
+                }
+                assert!(initiate(&alice, &bad).is_err());
+            }
+            for field in 0..2 {
+                let mut bad = initial.clone();
+                if field == 0 {
+                    bad.identity = PublicKey::from(low);
+                } else {
+                    bad.ephemeral = PublicKey::from(low);
+                }
+                assert!(respond(&secret, &bad).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_mlkem_public_before_encapsulation() {
+        let (secret, kem_public) = generate_bundle().unwrap();
+        assert!(validate_kem_public(&kem_public).is_ok());
+        let mut public = secret.public_with_kem(kem_public);
+        let mut bytes = kem_public.as_bytes().to_vec();
+        // A 12-bit polynomial coefficient must be less than q=3329.
+        bytes[..3].fill(255);
+        public.kem_public = KemPublicKey::from_bytes(&bytes).unwrap();
+        assert!(initiate(&random_secret().unwrap(), &public).is_err());
     }
 }

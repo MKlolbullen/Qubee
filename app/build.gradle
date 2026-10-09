@@ -35,7 +35,7 @@ android {
 
     defaultConfig {
         applicationId 'com.qubee.messenger'
-        minSdk 24
+        minSdk 32
         targetSdk 34
 
         // versionName / versionCode default to a "0.1.0-alpha" pre-release

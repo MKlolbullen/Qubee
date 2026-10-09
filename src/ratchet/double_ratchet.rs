@@ -43,8 +43,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::security::key_agreement::checked_x25519;
 use crate::security::secure_rng;
 
 /// Max message keys we will skip within a single receiving chain before
@@ -153,7 +154,7 @@ impl Drop for DoubleRatchet {
 /// recomputed from `dhs_secret` on load. Holds live message-key material
 /// (chain keys + skipped keys), so its bytes must only ever live inside
 /// the encrypted keystore, never on the wire.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct WireRatchetState {
     dhs_secret: [u8; 32],
     dhr: Option<[u8; 32]>,
@@ -203,13 +204,22 @@ impl DoubleRatchet {
             bincode::deserialize(bytes).map_err(|e| anyhow!("deserialize ratchet state: {e}"))?;
         let dhs_secret = StaticSecret::from(wire.dhs_secret);
         let dhs_public = PublicKey::from(&dhs_secret);
+
+        if wire.skipped.len() > MAX_SKIPPED_STORE {
+            return Err(anyhow!("persisted skipped-key store exceeds maximum"));
+        }
+        let mut unique = std::collections::HashSet::new();
+        for &(dh, n, _) in &wire.skipped {
+            if !unique.insert((dh, n)) {
+                return Err(anyhow!("duplicate persisted skipped message key"));
+            }
+        }
         let mut skipped = HashMap::with_capacity(wire.skipped.len());
         let mut skipped_order = Vec::with_capacity(wire.skipped.len());
-        for (dh, n, mk) in wire.skipped {
+        for &(dh, n, mk) in &wire.skipped {
             let key = (dh, n);
-            if skipped.insert(key, mk).is_none() {
-                skipped_order.push(key);
-            }
+            skipped.insert(key, mk);
+            skipped_order.push(key);
         }
         Ok(DoubleRatchet {
             dhs_secret,
@@ -232,7 +242,7 @@ impl DoubleRatchet {
     pub fn init_alice(sk: [u8; 32], bob_dh_public: PublicKey) -> Result<Self> {
         let dhs_secret = random_secret()?;
         let dhs_public = PublicKey::from(&dhs_secret);
-        let dh_out = dhs_secret.diffie_hellman(&bob_dh_public).to_bytes();
+        let dh_out = checked_x25519(&dhs_secret, &bob_dh_public)?;
         let (rk, cks) = kdf_rk(&sk, &dh_out)?;
         Ok(DoubleRatchet {
             dhs_secret,
@@ -284,6 +294,10 @@ impl DoubleRatchet {
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<(MessageHeader, Vec<u8>)> {
+        let next_ns = self
+            .ns
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("sending chain exhausted"))?;
         let cks = self
             .cks
             .as_mut()
@@ -296,9 +310,10 @@ impl DoubleRatchet {
             pn: self.pn,
             n: self.ns,
         };
-        self.ns += 1;
+        self.ns = next_ns;
 
         let aad = concat_aad(associated_data, &header);
+        let mk = Zeroizing::new(mk);
         let ciphertext = aead_encrypt(&mk, plaintext, &aad)?;
         Ok((header, ciphertext))
     }
@@ -400,8 +415,12 @@ impl DoubleRatchet {
             .as_mut()
             .ok_or_else(|| anyhow!("no receiving chain"))?;
         let (next_ck, mk) = kdf_ck(ckr);
+        let mk = Zeroizing::new(mk);
         *ckr = next_ck;
-        self.nr += 1;
+        self.nr = self
+            .nr
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("receiving chain exhausted"))?;
 
         let aad = concat_aad(associated_data, header);
         aead_decrypt(&mk, ciphertext, &aad)
@@ -415,7 +434,7 @@ impl DoubleRatchet {
         associated_data: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         let key = (header.dh, header.n);
-        if let Some(mk) = self.skipped.get(&key).copied() {
+        if let Some(mk) = self.skipped.get(&key).copied().map(Zeroizing::new) {
             let aad = concat_aad(associated_data, header);
             match aead_decrypt(&mk, ciphertext, &aad) {
                 Some(pt) => {
@@ -485,7 +504,7 @@ impl DoubleRatchet {
         self.nr = 0;
         self.dhr = Some(*their_dh);
 
-        let dh1 = self.dhs_secret.diffie_hellman(their_dh).to_bytes();
+        let dh1 = checked_x25519(&self.dhs_secret, their_dh)?;
         let (rk1, ckr) = kdf_rk(&self.rk, &dh1)?;
         self.rk = rk1;
         self.ckr = Some(ckr);
@@ -493,7 +512,7 @@ impl DoubleRatchet {
         // Fresh sending ratchet keypair, then the sending chain.
         let new_secret = random_secret()?;
         let new_public = PublicKey::from(&new_secret);
-        let dh2 = new_secret.diffie_hellman(their_dh).to_bytes();
+        let dh2 = checked_x25519(&new_secret, their_dh)?;
         let (rk2, cks) = kdf_rk(&self.rk, &dh2)?;
         self.rk = rk2;
         self.cks = Some(cks);
@@ -832,5 +851,37 @@ mod tests {
         let (_alice2, mut bob2) = pair();
         let (h, c) = alice1.encrypt(b"hi", AD).unwrap();
         assert!(bob2.decrypt(&h, &c, AD).is_err());
+    }
+    #[test]
+    fn low_order_ratchet_header_does_not_mutate_session() {
+        let (mut alice, mut bob) = pair();
+        let (header, ciphertext) = alice.encrypt(b"valid", AD).unwrap();
+        let before = bob.serialize_state().unwrap();
+        let mut invalid = header.clone();
+        invalid.dh = [0; 32];
+        assert!(bob.decrypt(&invalid, &ciphertext, AD).is_err());
+        assert_eq!(bob.serialize_state().unwrap(), before);
+        assert_eq!(bob.decrypt(&header, &ciphertext, AD).unwrap(), b"valid");
+        assert!(DoubleRatchet::init_alice([42; 32], PublicKey::from([0; 32])).is_err());
+    }
+
+    #[test]
+    fn exhausted_sending_counter_does_not_advance_key() {
+        let (mut alice, _) = pair();
+        alice.ns = u32::MAX;
+        let before = alice.serialize_state().unwrap();
+        assert!(alice.encrypt(b"must fail", AD).is_err());
+        assert_eq!(alice.serialize_state().unwrap(), before);
+    }
+
+    #[test]
+    fn duplicate_or_oversized_persisted_skipped_keys_are_rejected() {
+        let (alice, _) = pair();
+        let mut state: WireRatchetState =
+            bincode::deserialize(&alice.serialize_state().unwrap()).unwrap();
+        state.skipped = vec![([1; 32], 0, [2; 32]); 2];
+        assert!(DoubleRatchet::deserialize_state(&bincode::serialize(&state).unwrap()).is_err());
+        state.skipped = vec![([1; 32], 0, [2; 32]); MAX_SKIPPED_STORE + 1];
+        assert!(DoubleRatchet::deserialize_state(&bincode::serialize(&state).unwrap()).is_err());
     }
 }

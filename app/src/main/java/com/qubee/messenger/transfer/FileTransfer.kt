@@ -21,6 +21,7 @@ import java.io.File
 object FileTransfer {
     const val MAX_BYTES: Int = 256 * 1024
     private const val MAX_NAME: Int = 120
+    private const val MAX_BASE64: Int = ((MAX_BYTES + 2) / 3) * 4
     private const val MAGIC = "QUBEEFILE1\n"
 
     data class Decoded(val name: String, val bytes: ByteArray)
@@ -35,13 +36,15 @@ object FileTransfer {
 
     /** Recognizes and unpacks a [FileTransfer] envelope from decrypted message text; null if it isn't one or fails validation. */
     fun decode(text: String): Decoded? {
+        if (text.length > MAGIC.length + MAX_NAME + 1 + MAX_BASE64) return null
         if (!text.startsWith(MAGIC)) return null
         val rest = text.substring(MAGIC.length)
         val split = rest.indexOf('\n')
         if (split <= 0 || split > MAX_NAME) return null
         val name = rest.substring(0, split)
-        if (name.any { it == '/' || it == '\\' || it == '\r' }) return null
+        if (name.any { it == '/' || it == '\\' || it.isISOControl() }) return null
         val body = rest.substring(split + 1)
+        if (body.length > MAX_BASE64) return null
         val bytes = runCatching { Base64.decode(body, Base64.NO_WRAP) }.getOrNull() ?: return null
         if (bytes.isEmpty() || bytes.size > MAX_BYTES) return null
         return Decoded(name, bytes)
@@ -50,6 +53,7 @@ object FileTransfer {
     /** Persists a decoded attachment under `messageId`, encrypted at rest; false on any I/O or validation failure. */
     fun store(context: Context, messageId: String, decoded: Decoded): Boolean {
         if (!messageId.matches(Regex("[A-Za-z0-9-]{1,64}"))) return false
+        if (decoded.bytes.isEmpty() || decoded.bytes.size > MAX_BYTES) return false
         return runCatching {
             val dir = File(context.filesDir, "transfers")
             if (!dir.exists() && !dir.mkdirs()) return false
@@ -70,28 +74,42 @@ object FileTransfer {
                 val dir = File(context.cacheDir, "transfer-open")
                 if (!dir.exists() && !dir.mkdirs()) return@runCatching
                 val safeName = sanitize(displayName)
-                val plaintext = File(dir, "${messageId}_${System.currentTimeMillis()}_$safeName")
-                encryptedFile(context, encrypted).openFileInput().use { input ->
-                    plaintext.outputStream().use { output -> input.copyTo(output) }
-                }
-                val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", plaintext)
-                val intent = Intent(Intent.ACTION_VIEW)
-                    .setDataAndType(uri, mimeFor(safeName))
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(intent)
+                val plaintext = File(dir, java.util.UUID.randomUUID().toString())
+                // Schedule cleanup before decryption/viewer startup so their failures
+                // cannot leave a partial plaintext export without a deletion task.
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
                     { plaintext.delete() },
                     PLAINTEXT_CACHE_TTL_MS,
                 )
+                try {
+                    encryptedFile(context, encrypted).openFileInput().use { input ->
+                        plaintext.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", plaintext)
+                    val intent = Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, mimeFor(safeName))
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                } catch (error: Exception) {
+                    plaintext.delete()
+                    throw error
+                }
             }.onFailure { timber.log.Timber.w(it, "Could not open encrypted transfer") }
         }, "qubee-transfer-open").start()
+    }
+
+    /** Remove prior viewer exports on process restart, including interrupted decrypts. */
+    fun clearOpenCache(context: Context) {
+        runCatching { File(context.cacheDir, "transfer-open").listFiles()?.forEach { it.delete() } }
     }
 
     /** Strips path separators/newlines from an attachment name and caps its length. */
     private fun sanitize(name: String): String {
         val cleaned = name.replace('\\', '_').replace('/', '_').replace('\n', '_')
-            .replace('\r', '_').trim().ifBlank { "file" }
+            .replace('\r', '_')
+            .map { if (it.isISOControl()) '_' else it }.joinToString("")
+            .trim().ifBlank { "file" }
         return cleaned.take(MAX_NAME)
     }
 

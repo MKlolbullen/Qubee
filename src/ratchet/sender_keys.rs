@@ -48,12 +48,12 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::groups::group_handshake::bounded_bincode_deserialize;
 use crate::groups::group_manager::GroupId;
@@ -103,9 +103,11 @@ fn state_metadata() -> KeyMetadata {
 /// One member's sender-key announcement for one group. **Contains the
 /// live chain key** — never put this on the wire in plaintext; deliver
 /// it through the Stage 3 encrypted 1:1 sessions only.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKeyDistribution {
+    #[zeroize(skip)]
     pub group_id: GroupId,
+    #[zeroize(skip)]
     pub sender_id: IdentityId,
     /// Chain iteration this distribution starts at. Receivers can
     /// decrypt from here forward, never backward — late joiners get no
@@ -115,6 +117,15 @@ pub struct SenderKeyDistribution {
     /// Per-group ephemeral Ed25519 verification key. Authenticates the
     /// sender *inside* the group without touching the identity keys.
     pub signing_pub: [u8; 32],
+}
+
+impl std::fmt::Debug for SenderKeyDistribution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderKeyDistribution")
+            .field("iteration", &self.iteration)
+            .field("chain_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SenderKeyDistribution {
@@ -127,14 +138,14 @@ impl SenderKeyDistribution {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredOwnState {
     chain_key: [u8; 32],
     iteration: u32,
     signing_secret: [u8; 32],
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredRecvState {
     chain_key: [u8; 32],
     iteration: u32,
@@ -209,7 +220,9 @@ fn load_own_state(ks: &mut SecureKeyStore, group: &GroupId) -> Result<Option<Sto
 }
 
 fn store_own_state(ks: &mut SecureKeyStore, group: &GroupId, state: &StoredOwnState) -> Result<()> {
-    let bytes = bincode::serialize(state).map_err(|e| anyhow!("encode own sender state: {e}"))?;
+    let bytes = Zeroizing::new(
+        bincode::serialize(state).map_err(|e| anyhow!("encode own sender state: {e}"))?,
+    );
     ks.store_key(
         &own_key_id(group),
         &bytes,
@@ -238,7 +251,9 @@ fn store_recv_state(
     sender: &IdentityId,
     state: &StoredRecvState,
 ) -> Result<()> {
-    let bytes = bincode::serialize(state).map_err(|e| anyhow!("encode recv sender state: {e}"))?;
+    let bytes = Zeroizing::new(
+        bincode::serialize(state).map_err(|e| anyhow!("encode recv sender state: {e}"))?,
+    );
     ks.store_key(
         &recv_key_id(group, sender),
         &bytes,
@@ -320,8 +335,10 @@ pub fn encrypt_sender_key_message(
     local_id: IdentityId,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let inner = build_signed_inner(ks, group, local_id, plaintext)?;
-    seal_outer_v3(group, group_key, &inner)
+    ks.transaction(|ks| {
+        let inner = build_signed_inner(ks, group, local_id, plaintext)?;
+        seal_outer_v3(group, group_key, &inner)
+    })
 }
 
 /// v5 variant of [`encrypt_sender_key_message`]: identical chain
@@ -335,8 +352,10 @@ pub fn encrypt_sender_key_message_v5(
     local_id: IdentityId,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let inner = build_signed_inner(ks, group, local_id, plaintext)?;
-    seal_outer_v5(group_key, &inner)
+    ks.transaction(|ks| {
+        let inner = build_signed_inner(ks, group, local_id, plaintext)?;
+        seal_outer_v5(group_key, &inner)
+    })
 }
 
 fn build_signed_inner(
@@ -349,7 +368,8 @@ fn build_signed_inner(
     let mut state = load_own_state(ks, group)?.expect("own state just ensured");
 
     let iteration = state.iteration;
-    let (next_ck, mut mk) = kdf_chain(&state.chain_key);
+    let (next_ck, mk) = kdf_chain(&state.chain_key);
+    let mk = Zeroizing::new(mk);
     state.chain_key = next_ck;
     state.iteration = iteration
         .checked_add(1)
@@ -357,11 +377,11 @@ fn build_signed_inner(
     store_own_state(ks, group, &state)?;
 
     let (key, nonce) = derive_msg_aead(&mk)?;
-    mk.zeroize();
-    let cipher = ChaCha20Poly1305::new(&key.into());
+    let key = Zeroizing::new(key);
+    let cipher = ChaCha20Poly1305::new((&*key).into());
     // Length-hiding: pad the plaintext to a size class before sealing so
     // the on-wire ciphertext length no longer fingerprints the message.
-    let padded = crate::security::padding::pad(plaintext);
+    let padded = Zeroizing::new(crate::security::padding::pad(plaintext));
     let payload = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -431,29 +451,31 @@ fn open_signed_inner(
         .try_into()
         .map_err(|_| anyhow!("malformed signature length"))?;
     verifying
-        .verify(
+        .verify_strict(
             &signature_digest(&group, &msg.sender_id, msg.iteration, &msg.payload),
             &Signature::from_bytes(&sig_bytes),
         )
         .map_err(|_| anyhow!("sender key signature verification failed"))?;
 
-    let mut mk = take_message_key(&mut state, msg.iteration)?;
+    let mk = Zeroizing::new(take_message_key(&mut state, msg.iteration)?);
     let (key, nonce) = derive_msg_aead(&mk)?;
-    mk.zeroize();
-    let cipher = ChaCha20Poly1305::new(&key.into());
-    let padded = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &msg.payload,
-                aad: &inner_aad(&group, &msg.sender_id, msg.iteration),
-            },
-        )
-        .map_err(|_| anyhow!("sender message decrypt failed (tamper)"))?;
-    let plaintext = crate::security::padding::unpad(&padded)?;
+    let key = Zeroizing::new(key);
+    let cipher = ChaCha20Poly1305::new((&*key).into());
+    let padded = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &msg.payload,
+                    aad: &inner_aad(&group, &msg.sender_id, msg.iteration),
+                },
+            )
+            .map_err(|_| anyhow!("sender message decrypt failed (tamper)"))?,
+    );
+    let mut plaintext = Zeroizing::new(crate::security::padding::unpad(&padded)?);
 
     store_recv_state(ks, &group, &msg.sender_id, &state)?;
-    Ok((group, msg.sender_id, plaintext))
+    Ok((group, msg.sender_id, std::mem::take(&mut *plaintext)))
 }
 
 /// Advance (or reach back into the skipped store of) a receive chain to
@@ -466,6 +488,9 @@ fn take_message_key(state: &mut StoredRecvState, iteration: u32) -> Result<[u8; 
             return Ok(mk);
         }
         bail!("message key already consumed (replay?)");
+    }
+    if iteration == u32::MAX {
+        bail!("sender receive chain exhausted");
     }
     if iteration - state.iteration > SENDER_MAX_SKIP {
         bail!(
@@ -505,6 +530,10 @@ pub fn own_chain_iteration(ks: &mut SecureKeyStore, group: &GroupId) -> Result<O
 /// everyone's chain keys, so all of them must be re-generated and
 /// re-distributed. Returns how many states were deleted.
 pub fn reset_group_sender_state(ks: &mut SecureKeyStore, group: &GroupId) -> Result<usize> {
+    ks.transaction(|ks| reset_group_sender_state_inner(ks, group))
+}
+
+fn reset_group_sender_state_inner(ks: &mut SecureKeyStore, group: &GroupId) -> Result<usize> {
     let own = own_key_id(group);
     let prefix = recv_key_prefix(group);
     let doomed: Vec<String> = ks

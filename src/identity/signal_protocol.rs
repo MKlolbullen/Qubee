@@ -276,13 +276,13 @@ impl SignalProtocol {
         let remote_device = &remote_bundle.signed_prekey.device_public_key;
 
         // DH1: Our identity key with their signed pre-key
-        let dh1_classical = self.device_key.x25519_agree(&remote_device.x25519_public);
+        let dh1_classical = self.device_key.x25519_agree(&remote_device.x25519_public)?;
         let (dh1_pq_ct, dh1_pq_ss) = self
             .device_key
             .kyber_encapsulate(&remote_device.kyber_public)?;
 
         // DH2: Our ephemeral key with their identity key (via device key)
-        let dh2_classical = self.device_key.x25519_agree(&remote_device.x25519_public);
+        let dh2_classical = self.device_key.x25519_agree(&remote_device.x25519_public)?;
         let (dh2_pq_ct, dh2_pq_ss) = self
             .device_key
             .kyber_encapsulate(&remote_device.kyber_public)?;
@@ -291,7 +291,7 @@ impl SignalProtocol {
         let (dh3_classical, dh3_pq_ss, dh3_pq_ct) = if let Some(otk) =
             &remote_bundle.one_time_prekey
         {
-            let dh3_classical = self.device_key.x25519_agree(&otk.x25519_public);
+            let dh3_classical = self.device_key.x25519_agree(&otk.x25519_public)?;
             let (dh3_pq_ct, dh3_pq_ss) = self.device_key.kyber_encapsulate(&otk.kyber_public)?;
             (Some(dh3_classical), Some(dh3_pq_ss), Some(dh3_pq_ct))
         } else {
@@ -320,7 +320,7 @@ impl SignalProtocol {
         // DH1: Their identity key with our signed pre-key
         let dh1_classical = self
             .device_key
-            .x25519_agree(&initiator_device.x25519_public);
+            .x25519_agree(&initiator_device.x25519_public)?;
         // Note: For PQ, we need the ciphertext from the initiator to decapsulate
         // This is simplified - in practice, the ciphertext would be transmitted
         let dh1_pq_ss = [0u8; 32]; // Placeholder
@@ -329,7 +329,7 @@ impl SignalProtocol {
         // DH2: Their ephemeral key with our identity key
         let dh2_classical = self
             .device_key
-            .x25519_agree(&initiator_device.x25519_public);
+            .x25519_agree(&initiator_device.x25519_public)?;
         let dh2_pq_ss = [0u8; 32]; // Placeholder
         let dh2_pq_ct = Vec::new(); // Placeholder
 
@@ -339,7 +339,7 @@ impl SignalProtocol {
                 // In practice, we would use the one-time pre-key private key
                 let dh3_classical = self
                     .device_key
-                    .x25519_agree(&initiator_device.x25519_public);
+                    .x25519_agree(&initiator_device.x25519_public)?;
                 let dh3_pq_ss = [0u8; 32]; // Placeholder
                 let dh3_pq_ct = Vec::new(); // Placeholder
                 (Some(dh3_classical), Some(dh3_pq_ss), Some(dh3_pq_ct))

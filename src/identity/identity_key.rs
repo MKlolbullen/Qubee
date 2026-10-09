@@ -14,12 +14,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use blake3::Hasher;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use pqcrypto_mldsa::mldsa44::{self};
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::security::secure_rng;
 
@@ -124,7 +124,7 @@ impl Drop for IdentityKeyPair {
 
 /// Encrypted-at-rest representation of an [`IdentityKeyPair`]. Lives
 /// in the secure keystore only; bytes are never exposed to Kotlin / JNI.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct PersistedIdentitySecrets {
     classical_private: [u8; 32],
     pq_private: Vec<u8>,
@@ -324,6 +324,20 @@ impl IdentityKeyPair {
 }
 
 impl IdentityKey {
+    /// An IdentityId commits to BOTH public keys. A self-signed replacement
+    /// key must not be allowed to claim an existing contact's identifier.
+    pub fn validate(&self) -> Result<()> {
+        if self.classical_public.is_weak() {
+            return Err(anyhow!("weak Ed25519 identity public key"));
+        }
+        if self.identity_id
+            != IdentityKeyPair::derive_identity_id(&self.classical_public, &self.pq_public)
+        {
+            return Err(anyhow!("identity id does not bind both public keys"));
+        }
+        Ok(())
+    }
+
     /// Default acceptable signature age (5 minutes) for ratcheted
     /// message flows. Use [`verify_with_max_age`] for QR / onboarding
     /// flows that need a longer window.
@@ -347,7 +361,7 @@ impl IdentityKey {
         signature: &HybridSignature,
         max_age_secs: u64,
     ) -> Result<bool> {
-        if signature.signer_identity != self.identity_id {
+        if self.validate().is_err() || signature.signer_identity != self.identity_id {
             return Ok(false);
         }
         let current_time = std::time::SystemTime::now()
@@ -374,7 +388,7 @@ impl IdentityKey {
 
         let classical_valid = self
             .classical_public
-            .verify(&message, &signature.classical_signature)
+            .verify_strict(&message, &signature.classical_signature)
             .is_ok();
         let pq_valid =
             mldsa44::verify_detached_signature(&signature.pq_signature, &message, &self.pq_public)
@@ -442,12 +456,14 @@ impl TryFrom<WireIdentityKey> for IdentityKey {
             .map_err(|e| anyhow!("invalid Ed25519 pub: {e}"))?;
         let pq_public = mldsa44::PublicKey::from_bytes(&w.pq_public)
             .map_err(|e| anyhow!("invalid PQ pub: {e}"))?;
-        Ok(IdentityKey {
+        let key = IdentityKey {
             classical_public,
             pq_public,
             identity_id: w.identity_id,
             created_at: w.created_at,
-        })
+        };
+        key.validate()?;
+        Ok(key)
     }
 }
 
@@ -541,9 +557,12 @@ impl DeviceKey {
         }
     }
 
-    pub fn x25519_agree(&self, other_public: &x25519_dalek::PublicKey) -> [u8; 32] {
+    pub fn x25519_agree(&self, other_public: &x25519_dalek::PublicKey) -> Result<[u8; 32]> {
         let sk = x25519_dalek::StaticSecret::from(self.x25519_private_bytes);
-        sk.diffie_hellman(other_public).to_bytes()
+        Ok(*crate::security::key_agreement::checked_x25519(
+            &sk,
+            other_public,
+        )?)
     }
 
     pub fn kyber_encapsulate(
@@ -551,6 +570,7 @@ impl DeviceKey {
         other_public: &pqcrypto_mlkem::mlkem768::PublicKey,
     ) -> Result<(Vec<u8>, [u8; 32])> {
         use pqcrypto_traits::kem::{Ciphertext as _, SharedSecret as _};
+        crate::ratchet::pqxdh::validate_kem_public(other_public)?;
         let (shared_secret, ciphertext) = pqcrypto_mlkem::mlkem768::encapsulate(other_public);
         let mut ss = [0u8; 32];
         ss.copy_from_slice(&shared_secret.as_bytes()[..32]);
@@ -699,5 +719,46 @@ mod tests {
             pk.verify(msg, &within_skew).unwrap(),
             "a within-skew future timestamp should still verify",
         );
+    }
+    #[test]
+    fn replacement_keys_cannot_claim_existing_identity() {
+        let victim = IdentityKeyPair::generate().unwrap();
+        let attacker = IdentityKeyPair::generate().unwrap();
+        let mut public = attacker.public_key();
+        let mut signature = attacker.sign(b"prekey bundle").unwrap();
+        public.identity_id = victim.identity_id();
+        signature.signer_identity = victim.identity_id();
+        assert!(public.validate().is_err());
+        assert!(!public.verify(b"prekey bundle", &signature).unwrap());
+        assert!(IdentityKey::from_bytes(&public.to_bytes()).is_err());
+        let mut public = victim.public_key();
+        public.pq_public = attacker.public_key().pq_public;
+        assert!(IdentityKey::from_bytes(&public.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn hybrid_verification_requires_both_components() {
+        let kp = IdentityKeyPair::generate().unwrap();
+        let pk = kp.public_key();
+        let correct = kp.sign(b"message").unwrap();
+        let other = kp.sign(b"other message").unwrap();
+        let mut mixed = correct.clone();
+        mixed.classical_signature = other.classical_signature;
+        assert!(!pk.verify(b"message", &mixed).unwrap());
+        let mut mixed = correct;
+        mixed.pq_signature = other.pq_signature;
+        assert!(!pk.verify(b"message", &mixed).unwrap());
+    }
+
+    #[test]
+    fn low_order_ed25519_identity_is_rejected_even_with_matching_id() {
+        let mut public = IdentityKeyPair::generate().unwrap().public_key();
+        let mut encoded_identity = [0; 32];
+        encoded_identity[0] = 1;
+        public.classical_public = VerifyingKey::from_bytes(&encoded_identity).unwrap();
+        public.identity_id =
+            IdentityKeyPair::derive_identity_id(&public.classical_public, &public.pq_public);
+        assert!(public.validate().is_err());
+        assert!(IdentityKey::from_bytes(&public.to_bytes()).is_err());
     }
 }

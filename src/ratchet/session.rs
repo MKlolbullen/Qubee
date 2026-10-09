@@ -31,6 +31,7 @@ use crate::ratchet::pqxdh::{
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const SESSION_AD_TAG: &[u8] = b"qubee_session_ad_v1";
 
@@ -57,8 +58,9 @@ fn conversation_ad(a: &IdentityId, b: &IdentityId) -> [u8; 32] {
 /// On-disk form of a session: the peer id, the conversation AD, and the
 /// serialised ratchet state. Contains live key material — keystore only,
 /// never the wire.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredSession {
+    #[zeroize(skip)]
     peer_id: IdentityId,
     conversation_ad: [u8; 32],
     ratchet: Vec<u8>,
@@ -169,7 +171,7 @@ fn session_metadata() -> KeyMetadata {
 /// Overwrites any prior state for that peer — always store the latest
 /// state after an encrypt/decrypt so no message key is ever reused.
 pub fn store_session(ks: &mut SecureKeyStore, session: &Session) -> Result<()> {
-    let bytes = session.serialize()?;
+    let bytes = Zeroizing::new(session.serialize()?);
     ks.store_key(
         &session_key_id(&session.peer_id),
         &bytes,
@@ -181,7 +183,13 @@ pub fn store_session(ks: &mut SecureKeyStore, session: &Session) -> Result<()> {
 /// Load a peer's session from the keystore, if one exists.
 pub fn load_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Result<Option<Session>> {
     match ks.retrieve_key(&session_key_id(peer))? {
-        Some(secret) => Ok(Some(Session::deserialize(secret.expose_secret())?)),
+        Some(secret) => {
+            let session = Session::deserialize(secret.expose_secret())?;
+            if session.peer_id != *peer {
+                return Err(anyhow!("stored session peer identity mismatch"));
+            }
+            Ok(Some(session))
+        }
         None => Ok(None),
     }
 }

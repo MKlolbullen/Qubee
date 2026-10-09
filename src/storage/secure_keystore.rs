@@ -510,8 +510,8 @@ impl SecureKeyStore {
             entry.nonce = new_nonce_bytes;
         }
 
-        // Crash-safe two-file commit. `self.keys` now holds new-key
-        // ciphertexts but `self.master_key` is still the old key. The
+        // Crash-safe two-file commit. `rotated` holds new-key ciphertexts;
+        // the live map and `self.master_key` still use the old key. The
         // `.master` and `.db` are separate files, so we can't write both
         // in one atomic step; instead we keep *both* master keys
         // recoverable across the window:

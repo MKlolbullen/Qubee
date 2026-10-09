@@ -176,10 +176,37 @@ process-death, locked-key, upgrade/migration, low-storage, attachment-viewer and
 two-peer tests before release. Host fault injection is not a physical power-loss
 test. Measure whole-snapshot persistence cost with realistic peer/session counts.
 
+## Verification snapshot — 9 October 2026
+
+Default all-target tests passed (246 tests plus benchmark smoke checks), then
+the final core run passed 160 tests after two further regression cases were
+added. Strict Clippy passed across all targets with `_typecheck_jni,calling`;
+JNI symbols, reverse callbacks, bridge contracts and formatting also passed.
+Calling core tests passed 199/200: the live ICE-gathering case also fails on
+unchanged main `a6dd3b9` in this environment. This is not a green calling-runtime
+result, and CI/device networking still needs validation.
+
+Local Android verification could not download Gradle because the connection
+failed. PR CI is running the Android build and five attachment instrumentation
+tests. RustSec's vulnerability gate passed, but OSV reported two existing,
+non-allowlisted `hickory-resolver` 0.25.2 advisories:
+`GHSA-5j98-2g5x-46v6` and `GHSA-6f2x-v7q7-m7m5`. The upstream patched resolver
+line is 0.26.2+; libp2p-dns 0.44.0 requires 0.25.2, so this needs a compatible
+DNS/libp2p integration update. No advisory suppression was added. This is a
+merge/release blocker, not a regression introduced by this pass.
+
+The scan also reports the PQ crates as unmaintained following PQClean archival
+(RustSec informational advisories dated 4 June 2026). These warnings are not
+primitive breaks, but reinforce the need to select a maintained implementation
+with reviewed entropy, secret-key validation and erasure boundaries before
+claiming production readiness.
+
 ## Primary references
 
 - [FIPS 203, 13 August 2024, section 7.2](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf).
 - [x25519-dalek 2.0.1 SharedSecret / was_contributory](https://docs.rs/x25519-dalek/2.0.1/x25519_dalek/struct.SharedSecret.html).
 - [pqcrypto-internals 0.2.11 source](https://docs.rs/crate/pqcrypto-internals/0.2.11/source/src/lib.rs).
+- [Hickory resolver advisories](https://github.com/hickory-dns/hickory-dns/security/advisories).
+- [RustSec PQ maintenance advisory](https://rustsec.org/advisories/RUSTSEC-2026-0161.html).
 - [Qubee Double Ratchet design](../double-ratchet-design.md).
 - [Network privacy](../architecture/network-privacy.md) and [calling threat model](../architecture/calling-threat-model.md).

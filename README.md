@@ -164,7 +164,8 @@ Useful runbooks:
 
 ## Next priorities
 
-1. Finish native entropy/secret-lifetime review and Android ABI validation.
+1. Resolve the existing DNS dependency advisory gate; select maintained PQ
+   implementations and finish native entropy/secret-lifetime and ABI review.
 2. Retire legacy emission/receive paths after interop testing; strengthen key
    publication epochs, expiry and authenticated identity changes.
 3. Add ID-addressed prekey pooling and rotation; test cross-store crash recovery

@@ -29,17 +29,16 @@ use crate::identity::identity_key::IdentityId;
 /// variant carries the metadata necessary for the recipient to act
 /// upon the message. Messages are addressed to a specific identity
 /// and routed by the [`SignalingServer`].
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum SignalingMessage {
     /// Invitation to join a call. Sent from the initiator to each
     /// participant. The recipient can either accept the invitation,
     /// triggering a WebRTC negotiation, or reject it.
     ///
-    /// `media_root` is the 32-byte secret the caller mints for this
-    /// call; both endpoints derive their media keys from it. It is only
-    /// as confidential as the channel this frame rides — in Qubee that
-    /// is the E2E-encrypted, authenticated 1:1 session, so no third
-    /// party ever sees it.
+    /// `media_root` is a zero placeholder in the v2 signaling frame. The session
+    /// boundary exports the root from this invitation's message key and
+    /// substitutes it locally after authentication, never trusting the
+    /// peer-supplied field. The loopback transport is test-only.
     CallInvitation {
         call_id: CallId,
         caller: IdentityId,
@@ -72,6 +71,21 @@ pub enum SignalingMessage {
     /// Signal that a participant has hung up. The recipient should
     /// close its local peer connection and mark the call as ended.
     HangUp { call_id: CallId, sender: IdentityId },
+}
+
+pub const SIGNALING_MAGIC_V2: &[u8] = b"qubee_call_signal_v2\0";
+
+impl std::fmt::Debug for SignalingMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::CallInvitation { .. } => "CallInvitation",
+            Self::SdpOffer { .. } => "SdpOffer",
+            Self::SdpAnswer { .. } => "SdpAnswer",
+            Self::IceCandidate { .. } => "IceCandidate",
+            Self::HangUp { .. } => "HangUp",
+        };
+        write!(f, "{kind}([REDACTED])")
+    }
 }
 
 /// In‑memory signaling server that routes messages between
@@ -225,14 +239,27 @@ impl SignalingClient {
     }
 }
 
-/// Backwards compatibility for the previous `CallSignal` type. The
-/// older implementation serialised signalling messages directly as
-/// bincode blobs. We retain the ability to serialise and
-/// deserialise messages for transport over the encrypted chat layer.
 impl SignalingMessage {
+    pub fn call_id(&self) -> CallId {
+        match self {
+            Self::CallInvitation { call_id, .. }
+            | Self::SdpOffer { call_id, .. }
+            | Self::SdpAnswer { call_id, .. }
+            | Self::IceCandidate { call_id, .. }
+            | Self::HangUp { call_id, .. } => *call_id,
+        }
+    }
+
     /// Serializes the signal to bytes for encryption.
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
+        let mut out = SIGNALING_MAGIC_V2.to_vec();
+        out.extend_from_slice(&bincode::serialize(self)?);
+        if out.len() > MAX_SIGNALING_FRAME_BYTES {
+            return Err(Box::new(bincode::ErrorKind::Custom(
+                "signaling frame exceeds size limit".into(),
+            )));
+        }
+        Ok(out)
     }
 
     /// Tries to parse bytes into a `SignalingMessage`.
@@ -247,15 +274,16 @@ impl SignalingMessage {
                 "signaling frame exceeds size limit".into(),
             )));
         }
-        // `bincode::serialize` is fixint + trailing-bytes allowed. The
-        // Options struct defaults are different; match the function so
-        // existing frames still decode, while `with_limit` refuses an
-        // internal length that would allocate past the cap.
+        let body = bytes.strip_prefix(SIGNALING_MAGIC_V2).ok_or_else(|| {
+            Box::new(bincode::ErrorKind::Custom(
+                "unsupported signaling version; ratchet exporter v2 required".into(),
+            ))
+        })?;
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
-            .allow_trailing_bytes()
+            .reject_trailing_bytes()
             .with_limit(MAX_SIGNALING_FRAME_BYTES as u64)
-            .deserialize(bytes)
+            .deserialize(body)
     }
 }
 
@@ -268,6 +296,18 @@ mod tests {
             call_id: CallId::from([3u8; 16]),
             sender,
         }
+    }
+
+    #[test]
+    fn invitation_debug_redacts_exported_root() {
+        let signal = SignalingMessage::CallInvitation {
+            call_id: CallId::from([1; 16]),
+            caller: IdentityId::from([2; 32]),
+            call_type: crate::calling::call_manager::CallType::VoiceCall,
+            settings: crate::calling::call_manager::CallSettings::default(),
+            media_root: [231; 32],
+        };
+        assert_eq!(format!("{signal:?}"), "CallInvitation([REDACTED])");
     }
 
     #[tokio::test]

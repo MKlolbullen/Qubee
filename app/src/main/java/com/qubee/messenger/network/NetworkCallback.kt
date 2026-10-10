@@ -87,12 +87,12 @@ interface NetworkCallback {
     /**
      * Outbound call signaling. The Rust call layer asks the app to
      * deliver `payload` to `recipientIdHex` over that peer's encrypted
-     * 1:1 session — the same authenticated, forward-secret path as chat
-     * messages. The peer feeds the bytes back via
+     * 1:1 session. Rust has already encrypted the wire bytes and provisioned
+     * the caller's media root. The peer decrypts them before
      * `nativeHandleCallSignal`. Default no-op.
      *
      * @param recipientIdHex hex-encoded recipient IdentityId.
-     * @param payload the opaque signaling frame to encrypt and send.
+     * @param payload already encrypted QUBEE_DMS wire bytes to send unchanged.
      */
     fun onCallSignal(recipientIdHex: String, payload: ByteArray) {
         // default no-op

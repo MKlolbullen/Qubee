@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -15,7 +15,6 @@ use crate::calling::webrtc_manager::{
 use crate::groups::group_manager::GroupId;
 use crate::identity::contact_manager::ContactManager;
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
-use crate::security::secure_rng;
 
 /// Comprehensive call management system
 pub struct CallManager {
@@ -44,11 +43,13 @@ pub struct CallManager {
     /// entry is gone.
     ended_invites: Arc<RwLock<EndedCallIds>>,
     /// Serializes mute/video toggles so overlapping updates cannot lose a flip.
-    media_toggle: Arc<Mutex<()>>,
+    media_toggle: Mutex<MediaToggleGuards>,
     /// Bounded remote-media consumer. Taken once by the runtime that plays
     /// frames; never forwarded into an unbounded event channel.
     remote_media_rx: Mutex<Option<RealtimeReceiver<RemoteMedia>>>,
 }
+
+type MediaToggleGuards = HashMap<(CallId, IdentityId), Weak<Mutex<()>>>;
 
 const MAX_ENDED_CALL_IDS: usize = 64;
 
@@ -414,7 +415,7 @@ impl CallManager {
             config,
             contact_manager,
             ended_invites: Arc::new(RwLock::new(EndedCallIds::new())),
-            media_toggle: Arc::new(Mutex::new(())),
+            media_toggle: Mutex::new(HashMap::new()),
             remote_media_rx: Mutex::new(Some(remote_media_in)),
         })
     }
@@ -434,6 +435,31 @@ impl CallManager {
             .write()
             .await
             .insert(call_id, MediaEncryption::from_shared_root(media_root));
+    }
+
+    pub async fn provision_call_media_root(
+        &self,
+        call_id: CallId,
+        media_root: [u8; 32],
+    ) -> Result<()> {
+        if media_root == [0; 32] {
+            return Err(anyhow::anyhow!("refusing an all-zero call media root"));
+        }
+        let calls = self.calls.read().await;
+        let call = calls
+            .get(&call_id)
+            .ok_or_else(|| anyhow::anyhow!("Call not found"))?;
+        if call.initiator != self.local_identity || is_terminal(&call.state) {
+            return Err(anyhow::anyhow!(
+                "call cannot provision an outbound media root"
+            ));
+        }
+        let mut media = self.call_media.write().await;
+        if media.contains_key(&call_id) {
+            return Err(anyhow::anyhow!("call media root already provisioned"));
+        }
+        media.insert(call_id, MediaEncryption::from_shared_root(media_root));
+        Ok(())
     }
 
     /// Drain locally-gathered ICE candidates and trickle each to its
@@ -488,10 +514,8 @@ impl CallManager {
             .await
     }
 
-    /// Initiate a new call. The caller mints a fresh random media root
-    /// for the call and ships it inside the (E2E-encrypted) invitation,
-    /// so the callee derives the same media keys without a separate key
-    /// exchange.
+    /// Initiate a 1:1 call. The session carrier provisions its media root
+    /// from the invitation's ratchet key before delivering the invitation.
     pub async fn initiate_call(
         &self,
         initiator: IdentityId,
@@ -500,8 +524,17 @@ impl CallManager {
         group_id: Option<GroupId>,
         settings: CallSettings,
     ) -> Result<CallId> {
+        if initiator != self.local_identity
+            || participants.len() != 1
+            || participants[0] == initiator
+            || group_id.is_some()
+            || !matches!(call_type, CallType::VoiceCall | CallType::VideoCall)
+        {
+            return Err(anyhow::anyhow!(
+                "only local 1:1 voice/video calls are supported"
+            ));
+        }
         let call_id = self.generate_call_id()?;
-        let media_root = secure_rng::random::array::<32>()?;
 
         // Validate participants
         if participants.is_empty() {
@@ -563,16 +596,11 @@ impl CallManager {
             quality_stats: CallQualityStats::default(),
         };
 
-        // Store the call, then its media root — only once validation and
-        // construction have succeeded, so a rejected request leaves no
-        // stray entry in `call_media`.
         let mut calls = self.calls.write().await;
         calls.insert(call_id, call);
         drop(calls);
-        self.set_call_media_root(call_id, media_root).await;
 
-        // Send invitations to participants, carrying the call's media root.
-        self.send_call_invitations(call_id, media_root).await?;
+        self.send_call_invitations(call_id, [0; 32]).await?;
 
         // Update call state to ringing
         self.update_call_state(call_id, CallState::Ringing).await?;
@@ -1103,10 +1131,11 @@ impl CallManager {
     /// The WebRTC track is switched *before* the participant's state is
     /// committed, so a failed media update leaves the stored state and
     /// the actual track in agreement rather than diverging. Overlapping
-    /// toggles for every participant share one lock so two flips cannot
+    /// toggles for the same participant share one lock so two flips cannot
     /// both read the old bit and write the same new bit.
     pub async fn toggle_mute(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
-        let _guard = self.media_toggle.lock().await;
+        let toggle = self.media_toggle_guard(call_id, participant).await;
+        let _guard = toggle.lock().await;
         let target_muted = {
             let calls = self.calls.read().await;
             let participant_info = calls
@@ -1153,7 +1182,8 @@ impl CallManager {
     /// Same ordering discipline as [`toggle_mute`](Self::toggle_mute):
     /// the track is switched before the state is committed.
     pub async fn toggle_video(&self, call_id: CallId, participant: IdentityId) -> Result<bool> {
-        let _guard = self.media_toggle.lock().await;
+        let toggle = self.media_toggle_guard(call_id, participant).await;
+        let _guard = toggle.lock().await;
         let target_enabled = {
             let calls = self.calls.read().await;
             let participant_info = calls
@@ -1191,6 +1221,18 @@ impl CallManager {
             .map_err(|_| anyhow::anyhow!("Failed to send event"))?;
 
         Ok(target_enabled)
+    }
+
+    async fn media_toggle_guard(&self, call_id: CallId, participant: IdentityId) -> Arc<Mutex<()>> {
+        let mut guards = self.media_toggle.lock().await;
+        guards.retain(|_, guard| guard.strong_count() > 0);
+        let key = (call_id, participant);
+        if let Some(guard) = guards.get(&key).and_then(Weak::upgrade) {
+            return guard;
+        }
+        let guard = Arc::new(Mutex::new(()));
+        guards.insert(key, Arc::downgrade(&guard));
+        guard
     }
 
     /// Start screen sharing
@@ -1275,8 +1317,7 @@ impl CallManager {
         Ok(CallId(bytes))
     }
 
-    /// Send call invitations to participants, each carrying the call's
-    /// media root so the callee can derive matching media keys.
+    /// Send invitations for the session carrier to provision and encrypt.
     async fn send_call_invitations(&self, call_id: CallId, media_root: [u8; 32]) -> Result<()> {
         let calls = self.calls.read().await;
         let call = calls
@@ -1604,6 +1645,33 @@ mod tests {
         assert_eq!(call.call_type, CallType::VoiceCall);
         assert_eq!(call.initiator, initiator);
         assert_eq!(call.participants.len(), 1);
+        assert!(!call_manager.call_media.read().await.contains_key(&call_id));
+        assert!(call_manager
+            .provision_call_media_root(call_id, [0; 32])
+            .await
+            .is_err());
+        call_manager
+            .provision_call_media_root(call_id, [7; 32])
+            .await
+            .unwrap();
+        assert!(call_manager
+            .provision_call_media_root(call_id, [8; 32])
+            .await
+            .is_err());
+        assert!(call_manager
+            .provision_call_media_root(CallId::from([0; 16]), [7; 32])
+            .await
+            .is_err());
+        assert!(call_manager
+            .initiate_call(
+                initiator,
+                vec![IdentityId::from([2; 32]), IdentityId::from([3; 32])],
+                CallType::GroupVoiceCall,
+                None,
+                CallSettings::default(),
+            )
+            .await
+            .is_err());
     }
 
     /// A manager whose own identity is `[2; 32]` (the "us" that
@@ -1916,10 +1984,19 @@ mod tests {
             .unwrap();
         let invite = caller_rx.recv().await.expect("invitation sent");
         assert_eq!(invite.recipient, callee);
+        caller_mgr
+            .provision_call_media_root(call_id, [7; 32])
+            .await
+            .unwrap();
+        let mut message = SignalingMessage::from_bytes(&invite.payload).unwrap();
+        if let SignalingMessage::CallInvitation { media_root, .. } = &mut message {
+            *media_root = [7; 32];
+        }
+        let invite_payload = message.to_bytes().unwrap();
 
         // 2. Callee rings, then accepts → SDP offer goes back to the caller.
         callee_mgr
-            .handle_inbound_signaling(caller, &invite.payload)
+            .handle_inbound_signaling(caller, &invite_payload)
             .await
             .unwrap();
         callee_mgr.accept_call(call_id, caller).await.unwrap();
@@ -2187,5 +2264,34 @@ mod tests {
             .unwrap()
             .is_muted;
         assert!(muted, "33 flips from unmuted must end muted");
+    }
+
+    #[tokio::test]
+    async fn media_toggle_guards_are_scoped_and_reclaimed() {
+        let (manager, _events) = manager_with_events().await;
+        let call_id = CallId::from([4u8; 16]);
+        let participant = IdentityId::from([1u8; 32]);
+        let guard = manager.media_toggle_guard(call_id, participant).await;
+        let held = guard.lock().await;
+        let same = manager.media_toggle_guard(call_id, participant).await;
+        assert!(Arc::ptr_eq(&guard, &same));
+        assert!(same.try_lock().is_err());
+
+        let other_peer = manager
+            .media_toggle_guard(call_id, IdentityId::from([2u8; 32]))
+            .await;
+        assert!(other_peer.try_lock().is_ok());
+        let other_call = manager
+            .media_toggle_guard(CallId::from([5u8; 16]), participant)
+            .await;
+        assert!(other_call.try_lock().is_ok());
+
+        drop(held);
+        drop(guard);
+        drop(same);
+        drop(other_peer);
+        drop(other_call);
+        let _new = manager.media_toggle_guard(call_id, participant).await;
+        assert_eq!(manager.media_toggle.lock().await.len(), 1);
     }
 }

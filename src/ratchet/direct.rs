@@ -59,6 +59,8 @@ use crate::ratchet::sender_keys::SenderKeyDistribution;
 use crate::ratchet::session::{load_session, store_session, Session};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
 
+pub type CallRootExport = ([u8; 16], [u8; 32]);
+
 fn pending_initial_key(peer: &IdentityId) -> String {
     format!("ratchet_pending_initial_{}", hex::encode(peer.as_ref()))
 }
@@ -115,7 +117,9 @@ pub fn encrypt_direct(
     plaintext: &[u8],
     now: u64,
 ) -> Result<Vec<u8>> {
-    ks.transaction(|ks| encrypt_direct_inner(ks, local_id, peer_id, plaintext, now))
+    ks.transaction(|ks| {
+        encrypt_direct_inner(ks, local_id, peer_id, plaintext, now, None).map(|(wire, _)| wire)
+    })
 }
 
 fn encrypt_direct_inner(
@@ -124,7 +128,8 @@ fn encrypt_direct_inner(
     peer_id: IdentityId,
     plaintext: &[u8],
     now: u64,
-) -> Result<Vec<u8>> {
+    call_id: Option<[u8; 16]>,
+) -> Result<(Vec<u8>, Option<[u8; 32]>)> {
     // Generate routing metadata before advancing the ratchet. If secure RNG
     // fails, the send fails without consuming a message-key position.
     let route_nonce = crate::security::secure_rng::random::array::<DIRECT_ROUTE_NONCE_LEN>()?;
@@ -167,9 +172,9 @@ fn encrypt_direct_inner(
     // messages (and the sender-key distributions that ride these
     // sessions) present one of a small set of on-wire lengths.
     let padded = crate::security::padding::pad(plaintext);
-    let (header, ciphertext) = session.encrypt(&padded)?;
+    let (header, ciphertext, root) = session.encrypt_with_call_root(&padded, call_id)?;
     store_session(ks, &session)?;
-    DirectMessage {
+    let wire = DirectMessage {
         route_nonce,
         sender_selector,
         recipient_selector,
@@ -177,7 +182,8 @@ fn encrypt_direct_inner(
         header,
         ciphertext,
     }
-    .to_wire()
+    .to_wire()?;
+    Ok((wire, root))
 }
 
 /// Decrypt an inbound `QUBEE_DMS\x02` frame, establishing the responder
@@ -212,14 +218,15 @@ fn decrypt_direct_inner(
     }
 
     if let Some(mut session) = load_session(ks, &peer_id)? {
-        match session.decrypt(&dm.header, &dm.ciphertext) {
-            Ok(padded) => {
+        match session.decrypt_with_call_root(&dm.header, &dm.ciphertext, select_call_invitation) {
+            Ok((padded, root)) => {
                 let padded = Zeroizing::new(padded);
                 store_session(ks, &session)?;
                 // Receiving on this session proves the peer holds it too:
                 // stop attaching our own initial (if we were initiator).
                 ks.delete_key(&pending_initial_key(&peer_id))?;
-                return Ok((peer_id, crate::security::padding::unpad(&padded)?));
+                let plaintext = crate::security::padding::unpad(&padded)?;
+                return Ok((peer_id, stamp_call_root(plaintext, root)?));
             }
             Err(e) => {
                 // Simultaneous-open: yield our initiator session only to
@@ -253,7 +260,9 @@ fn decrypt_direct_inner(
     let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
     let mut session =
         Session::establish_responder(local_id, peer_id, &local_secret, &initial.to_message()?)?;
-    let padded = Zeroizing::new(session.decrypt(&dm.header, &dm.ciphertext)?);
+    let (padded, root) =
+        session.decrypt_with_call_root(&dm.header, &dm.ciphertext, select_call_invitation)?;
+    let padded = Zeroizing::new(padded);
     store_session(ks, &session)?;
     // The handshake is now AEAD-verified. If it consumed our one-time
     // prekey, rotate it so it's never reused (single-use forward
@@ -270,7 +279,8 @@ fn decrypt_direct_inner(
         KeyType::EphemeralKey,
         marker_metadata(),
     )?;
-    Ok((peer_id, crate::security::padding::unpad(&padded)?))
+    let plaintext = crate::security::padding::unpad(&padded)?;
+    Ok((peer_id, stamp_call_root(plaintext, root)?))
 }
 
 fn resolve_direct_selector(
@@ -586,9 +596,86 @@ pub fn encrypt_direct_call_signal_with_route(
     sender_peer_id: Option<&str>,
     now: u64,
 ) -> Result<Vec<u8>> {
-    let payload =
-        encode_payload_with_route(&DirectPayload::CallSignal(frame.to_vec()), sender_peer_id)?;
-    encrypt_direct(ks, local_id, peer_id, &payload, now)
+    encrypt_direct_call_signal_with_root(ks, local_id, peer_id, frame, sender_peer_id, now)
+        .map(|(wire, _)| wire)
+}
+
+pub fn encrypt_direct_call_signal_with_root(
+    ks: &mut SecureKeyStore,
+    local_id: IdentityId,
+    peer_id: IdentityId,
+    frame: &[u8],
+    sender_peer_id: Option<&str>,
+    now: u64,
+) -> Result<(Vec<u8>, Option<CallRootExport>)> {
+    #[cfg(feature = "calling")]
+    let (frame, call_id) = {
+        use crate::calling::signaling::SignalingMessage;
+        let mut signal = SignalingMessage::from_bytes(frame)?;
+        let call_id = match &mut signal {
+            SignalingMessage::CallInvitation {
+                call_id,
+                caller,
+                media_root,
+                ..
+            } => {
+                if *caller != local_id {
+                    bail!("call invitation caller does not match local identity");
+                }
+                *media_root = [0; 32];
+                Some(*call_id.as_bytes())
+            }
+            _ => None,
+        };
+        (signal.to_bytes()?, call_id)
+    };
+    #[cfg(not(feature = "calling"))]
+    let (frame, call_id) = (frame.to_vec(), None);
+    let payload = encode_payload_with_route(&DirectPayload::CallSignal(frame), sender_peer_id)?;
+    ks.transaction(|ks| {
+        let (wire, root) = encrypt_direct_inner(ks, local_id, peer_id, &payload, now, call_id)?;
+        Ok((wire, call_id.zip(root)))
+    })
+}
+
+fn select_call_invitation(padded: &[u8]) -> Result<Option<[u8; 16]>> {
+    #[cfg(feature = "calling")]
+    {
+        use crate::calling::signaling::SignalingMessage;
+        let plaintext = Zeroizing::new(crate::security::padding::unpad(padded)?);
+        if let Ok((_, DirectPayload::CallSignal(frame))) = decode_payload_with_route(&plaintext) {
+            if let SignalingMessage::CallInvitation { call_id, .. } =
+                SignalingMessage::from_bytes(&frame)?
+            {
+                return Ok(Some(*call_id.as_bytes()));
+            }
+        }
+    }
+    #[cfg(not(feature = "calling"))]
+    let _ = padded;
+    Ok(None)
+}
+
+fn stamp_call_root(plaintext: Vec<u8>, root: Option<[u8; 32]>) -> Result<Vec<u8>> {
+    #[cfg(feature = "calling")]
+    if let Some(root) = root {
+        use crate::calling::signaling::SignalingMessage;
+        let (route, payload) = decode_payload_with_route(&plaintext)?;
+        if let DirectPayload::CallSignal(frame) = payload {
+            let mut signal = SignalingMessage::from_bytes(&frame)?;
+            if let SignalingMessage::CallInvitation { media_root, .. } = &mut signal {
+                *media_root = root;
+                return encode_payload_with_route(
+                    &DirectPayload::CallSignal(signal.to_bytes()?),
+                    route.as_deref(),
+                );
+            }
+        }
+        bail!("call exporter without invitation");
+    }
+    #[cfg(not(feature = "calling"))]
+    let _ = root;
+    Ok(plaintext)
 }
 
 /// Decrypt an inbound frame and decode its tagged payload. Returns the
@@ -917,12 +1004,125 @@ mod tests {
         let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
 
         // Opaque bytes standing in for a serialized SignalingMessage.
+        #[cfg(not(feature = "calling"))]
         let frame = vec![0xAB; 96];
+        #[cfg(feature = "calling")]
+        let frame = crate::calling::signaling::SignalingMessage::HangUp {
+            call_id: crate::calling::call_manager::CallId::from([1; 16]),
+            sender: aid,
+        }
+        .to_bytes()
+        .unwrap();
         let wire =
             encrypt_direct_call_signal_with_route(&mut a.ks, aid, bid, &frame, None, 1).unwrap();
         let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &wire, 1).unwrap();
         assert_eq!(sender, aid);
         assert_eq!(payload, DirectPayload::CallSignal(frame));
+    }
+    #[cfg(feature = "calling")]
+    #[test]
+    fn call_invitation_exports_authenticated_message_key_and_interoperable_media() {
+        use crate::calling::call_manager::{CallId, CallSettings, CallType};
+        use crate::calling::media_encryption::MediaEncryption;
+        use crate::calling::signaling::SignalingMessage;
+
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let invitation = |id| {
+            SignalingMessage::CallInvitation {
+                call_id: CallId::from([id; 16]),
+                caller: aid,
+                call_type: CallType::VoiceCall,
+                settings: CallSettings::default(),
+                media_root: [99; 32],
+            }
+            .to_bytes()
+            .unwrap()
+        };
+        let (first, first_export) =
+            encrypt_direct_call_signal_with_root(&mut a.ks, aid, bid, &invitation(1), None, 1)
+                .unwrap();
+        let (second, second_export) =
+            encrypt_direct_call_signal_with_root(&mut a.ks, aid, bid, &invitation(2), None, 2)
+                .unwrap();
+        let (_, first_root) = first_export.unwrap();
+        let (_, second_root) = second_export.unwrap();
+        assert_ne!(first_root, second_root);
+        assert_ne!(first_root, [99; 32]);
+        let mut tampered = DirectMessage::from_wire(&first).unwrap();
+        tampered.ciphertext[0] ^= 1;
+        assert!(decrypt_direct_payload(&mut b.ks, bid, &tampered.to_wire().unwrap(), 3).is_err());
+        for (wire, expected_root) in [(&second, second_root), (&first, first_root)] {
+            let (sender, route, payload) =
+                decrypt_direct_payload_with_route(&mut b.ks, bid, wire, 4).unwrap();
+            assert_eq!(sender, aid);
+            assert!(route.is_none());
+            let DirectPayload::CallSignal(frame) = payload else {
+                panic!("expected signaling");
+            };
+            let SignalingMessage::CallInvitation {
+                call_id,
+                media_root,
+                ..
+            } = SignalingMessage::from_bytes(&frame).unwrap()
+            else {
+                panic!("expected invitation");
+            };
+            assert_eq!(media_root, expected_root);
+            let mut pair = [0; 64];
+            let (lo, hi) = if aid.as_ref() < bid.as_ref() {
+                (aid, bid)
+            } else {
+                (bid, aid)
+            };
+            pair[..32].copy_from_slice(lo.as_ref());
+            pair[32..].copy_from_slice(hi.as_ref());
+            let caller_key = MediaEncryption::from_shared_root(expected_root)
+                .generate_media_key(call_id.as_bytes(), &pair);
+            let callee_key = MediaEncryption::from_shared_root(media_root)
+                .generate_media_key(call_id.as_bytes(), &pair);
+            for stream in [0, 1] {
+                let media = caller_key.encrypt_frame(stream, b"audio/video").unwrap();
+                assert_eq!(
+                    callee_key.decrypt_frame(stream, &media).unwrap(),
+                    b"audio/video"
+                );
+                let reply = callee_key.encrypt_frame(stream, b"reply").unwrap();
+                assert_eq!(caller_key.decrypt_frame(stream, &reply).unwrap(), b"reply");
+            }
+            assert!(decrypt_direct_payload(&mut b.ks, bid, wire, 5).is_err());
+        }
+
+        let reply = encrypt_direct_text(&mut b.ks, bid, aid, "DH step", 6).unwrap();
+        decrypt_direct_payload(&mut a.ks, aid, &reply, 6).unwrap();
+        let (next, exported) =
+            encrypt_direct_call_signal_with_root(&mut a.ks, aid, bid, &invitation(1), None, 7)
+                .unwrap();
+        let (_, root) = exported.unwrap();
+        assert_ne!(root, first_root);
+        let (_, DirectPayload::CallSignal(frame)) =
+            decrypt_direct_payload(&mut b.ks, bid, &next, 7).unwrap()
+        else {
+            panic!("expected invitation");
+        };
+        assert!(matches!(
+            SignalingMessage::from_bytes(&frame).unwrap(),
+            SignalingMessage::CallInvitation { media_root, .. } if media_root == root
+        ));
+
+        let untrusted =
+            encode_payload_with_route(&DirectPayload::CallSignal(invitation(3)), None).unwrap();
+        let wire = encrypt_direct(&mut a.ks, aid, bid, &untrusted, 8).unwrap();
+        let (_, DirectPayload::CallSignal(frame)) =
+            decrypt_direct_payload(&mut b.ks, bid, &wire, 8).unwrap()
+        else {
+            panic!("expected invitation");
+        };
+        assert!(matches!(
+            SignalingMessage::from_bytes(&frame).unwrap(),
+            SignalingMessage::CallInvitation { media_root, .. }
+                if media_root != [99; 32] && media_root != [0; 32]
+        ));
     }
 
     #[test]
@@ -934,6 +1134,100 @@ mod tests {
         let (sender, payload) = decrypt_direct_payload(&mut b.ks, bid, &w, 1).unwrap();
         assert_eq!(sender, aid);
         assert_eq!(payload, DirectPayload::Text("tagged hello".to_string()));
+    }
+
+    #[cfg(feature = "calling")]
+    #[tokio::test]
+    async fn encrypted_call_signaling_dispatches_to_real_call_managers() {
+        use crate::calling::call_manager::{
+            CallManager, CallManagerConfig, CallSettings, CallType,
+        };
+        use crate::calling::signaling::{ChannelSignalingTransport, SignalingMessage};
+        use crate::calling::webrtc_manager::IceTransportMode;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let config = || CallManagerConfig {
+            ice_mode: IceTransportMode::DirectDevelopment,
+            stun_servers: vec![],
+            ..CallManagerConfig::default()
+        };
+        let (a_tx, mut a_rx) = mpsc::unbounded_channel();
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+        let (a_events, _a_event_rx) = mpsc::unbounded_channel();
+        let (b_events, mut b_event_rx) = mpsc::unbounded_channel();
+        let caller = CallManager::new(
+            config(),
+            a_events,
+            aid,
+            Arc::new(ChannelSignalingTransport::new(a_tx)),
+        )
+        .await
+        .unwrap();
+        let callee = CallManager::new(
+            config(),
+            b_events,
+            bid,
+            Arc::new(ChannelSignalingTransport::new(b_tx)),
+        )
+        .await
+        .unwrap();
+        let call_id = caller
+            .initiate_call(
+                aid,
+                vec![bid],
+                CallType::VoiceCall,
+                None,
+                CallSettings::default(),
+            )
+            .await
+            .unwrap();
+        let invite = a_rx.recv().await.unwrap();
+        let (wire, exported) =
+            encrypt_direct_call_signal_with_root(&mut a.ks, aid, bid, &invite.payload, None, 1)
+                .unwrap();
+        caller
+            .provision_call_media_root(call_id, exported.unwrap().1)
+            .await
+            .unwrap();
+        let (from, DirectPayload::CallSignal(frame)) =
+            decrypt_direct_payload(&mut b.ks, bid, &wire, 1).unwrap()
+        else {
+            panic!("expected invitation");
+        };
+        callee.handle_inbound_signaling(from, &frame).await.unwrap();
+        assert!(callee.get_call(call_id).await.is_some());
+        assert!(b_event_rx.try_recv().is_ok());
+        callee.accept_call(call_id, aid).await.unwrap();
+        let offer = b_rx.recv().await.unwrap();
+        assert!(matches!(
+            SignalingMessage::from_bytes(&offer.payload).unwrap(),
+            SignalingMessage::SdpOffer { .. }
+        ));
+        let wire =
+            encrypt_direct_call_signal_with_route(&mut b.ks, bid, aid, &offer.payload, None, 2)
+                .unwrap();
+        let (from, DirectPayload::CallSignal(frame)) =
+            decrypt_direct_payload(&mut a.ks, aid, &wire, 2).unwrap()
+        else {
+            panic!("expected offer");
+        };
+        caller.handle_inbound_signaling(from, &frame).await.unwrap();
+        let answer = a_rx.recv().await.unwrap();
+        assert!(matches!(
+            SignalingMessage::from_bytes(&answer.payload).unwrap(),
+            SignalingMessage::SdpAnswer { .. }
+        ));
+        let wire =
+            encrypt_direct_call_signal_with_route(&mut a.ks, aid, bid, &answer.payload, None, 3)
+                .unwrap();
+        let (from, DirectPayload::CallSignal(frame)) =
+            decrypt_direct_payload(&mut b.ks, bid, &wire, 3).unwrap()
+        else {
+            panic!("expected answer");
+        };
+        callee.handle_inbound_signaling(from, &frame).await.unwrap();
     }
 
     #[test]

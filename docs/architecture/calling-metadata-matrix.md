@@ -1,9 +1,11 @@
 # Calling metadata and physical-device gates (#79)
 
 Status: calling is disabled in the standard APK and blocked at native startup
-in the opt-in build. Host tests do not prove the absence of address leaks on
-two physical phones. Keep the draft relay work in PR #86 separate from a
-release claim.
+until the complete signaling path is relayed and validated. PR #86's relay-only
+ICE policy and TURN staging, and PR #91's authenticated encrypted signaling and
+session-derived media roots, are merged; neither provides physical-device proof
+or removes the direct libp2p metadata exposure. Host tests do not prove the
+absence of address leaks on two physical phones.
 
 ## Observation points
 
@@ -59,6 +61,7 @@ credentials, SDP or device identifiers in an issue.
    release candidate. Video requires its own physical gate. Preserve #79
    open until the matrix is recorded, reviewed and green.
 
-Host-tested in PR #85: signaling state/replay checks, bounded media queues,
-payload caps, and mono 48 kHz Opus profile. PR #86 adds host-tested relay
-policy and stages Coturn, but has no deployed relay or two-phone proof.
+Host-tested: signaling state/replay checks, bounded media queues, payload caps,
+and the mono 48 kHz Opus profile. PR #86's relay policy and Coturn staging have
+no deployed credential service or two-phone proof. The device procedures above
+remain pending; keep #79 open until those results are recorded and reviewed.

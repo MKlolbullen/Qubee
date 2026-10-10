@@ -2078,7 +2078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ice_for_another_call_is_not_cached() {
+    async fn ice_from_uninvited_participant_is_not_cached() {
         let (manager, _events) = manager_with_events().await;
         let caller = IdentityId::from([1u8; 32]);
         let stranger = IdentityId::from([9u8; 32]);
@@ -2108,6 +2108,40 @@ mod tests {
             manager.get_call(call_id).await.unwrap().state,
             CallState::Ringing
         );
+    }
+
+    #[tokio::test]
+    async fn ice_with_substituted_call_id_is_rejected_without_mutation() {
+        let (manager, _events) = manager_with_events().await;
+        let caller = IdentityId::from([1u8; 32]);
+        let call_id = CallId::from([4u8; 16]);
+        let substituted_call_id = CallId::from([5u8; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+
+        let substituted = SignalingMessage::IceCandidate {
+            call_id: substituted_call_id,
+            candidate: ICECandidate {
+                sdp_mid: "audio".into(),
+                sdp_mline_index: 0,
+                candidate: "candidate:9 1 UDP 1 203.0.113.5 9 typ host".into(),
+            },
+            sender: caller,
+        }
+        .to_bytes()
+        .unwrap();
+        assert!(manager
+            .handle_inbound_signaling(caller, &substituted)
+            .await
+            .is_err());
+        assert_eq!(manager.webrtc_manager.cached_ice_len().await, 0);
+        assert_eq!(
+            manager.get_call(call_id).await.unwrap().state,
+            CallState::Ringing
+        );
+        assert!(manager.get_call(substituted_call_id).await.is_none());
     }
 
     #[tokio::test]
@@ -2233,6 +2267,22 @@ mod tests {
             .await
             .expect_err("oversized");
         assert!(err.to_string().contains("audio frame"));
+    }
+
+    #[tokio::test]
+    async fn oversized_video_access_unit_is_rejected_before_a_connection_exists() {
+        let (manager, _events) = manager_with_events().await;
+        let huge = vec![0u8; crate::calling::media_policy::MAX_VIDEO_ACCESS_UNIT_BYTES + 1];
+        let err = manager
+            .write_video_sample(
+                CallId::from([1u8; 16]),
+                IdentityId::from([1u8; 32]),
+                &huge,
+                Duration::from_millis(33),
+            )
+            .await
+            .expect_err("oversized");
+        assert!(err.to_string().contains("video access unit"));
     }
 
     #[tokio::test]

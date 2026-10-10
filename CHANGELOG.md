@@ -71,7 +71,12 @@ between minor versions.
   keys. The keystore master-file parser builds its salt straight from
   the file bytes, and the v5 selector golden vector lives only in
   `tests/wire_stability.rs` (the copy inside `sender_keys.rs` was a
-  duplicate).
+  duplicate). Two queries are excluded outright because every hit was
+  a false positive and neither can be suppressed inline:
+  `rust/hard-coded-cryptographic-value` (zero-init buffers filled by
+  the RNG or HKDF) and `py/weak-sensitive-data-hashing` (coturn's
+  mandatory HMAC-SHA1). `.github/codeql/codeql-config.yml` says how to
+  turn either back on.
 
 ## [0.1.0-alpha] — 2026-08-06
 

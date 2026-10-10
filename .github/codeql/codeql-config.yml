@@ -9,3 +9,19 @@ paths-ignore:
   - app/src/test
   - app/src/androidTest
   - deploy/calling/test_issue_turn_credentials.py
+
+# Two queries have produced only false positives here and cannot be
+# answered inline: CodeQL ships no alert-suppression query for Rust, and
+# the Python one is not part of the default code-scanning suite.
+#   rust/hard-coded-cryptographic-value flags `let mut b = [0u8; N]`
+#   buffers that the OS RNG or an HKDF fills before use; every real
+#   key and nonce in src/ is derived or random.
+#   py/weak-sensitive-data-hashing flags the HMAC-SHA1 that coturn's
+#   use-auth-secret scheme mandates in deploy/calling.
+# Re-enable either by deleting its entry; the alerts reappear on the
+# next analysis.
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
+  - exclude:
+      id: py/weak-sensitive-data-hashing

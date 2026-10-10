@@ -587,14 +587,11 @@ fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 /// Derive the AEAD key (32) + nonce (12) from a message key.
 fn derive_message_aead(mk: &[u8; 32]) -> Result<([u8; 32], [u8; 12])> {
     let hk = Hkdf::<Sha256>::new(None, mk);
-    let mut okm = [0u8; 44];
-    hk.expand(MSG_KDF_INFO, &mut okm)
+    let mut okm = Zeroizing::new([0u8; 44]);
+    hk.expand(MSG_KDF_INFO, &mut okm[..])
         .map_err(|e| anyhow!("message KDF expand: {e}"))?;
-    let mut key = [0u8; 32];
-    let mut nonce = [0u8; 12];
-    key.copy_from_slice(&okm[..32]);
-    nonce.copy_from_slice(&okm[32..]);
-    okm.zeroize();
+    let key: [u8; 32] = okm[..32].try_into()?;
+    let nonce: [u8; 12] = okm[32..].try_into()?;
     Ok((key, nonce))
 }
 

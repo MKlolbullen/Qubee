@@ -41,6 +41,30 @@ between minor versions.
 - A session is not a phone call. The only accepted peer identifier is a
   32-byte identity id. Phone-book lookup is not requested, and stored
   phone numbers and emails are cleared on database open.
+- Every activity declares an empty `taskAffinity`, not only the
+  launcher, so no Qubee screen can be pulled into a foreign app's task.
+- The unused libp2p `dns` and `websocket` features are gone: the swarm
+  only ever built TCP and QUIC. libp2p-websocket, soketto and
+  webpki-roots leave the build, and hickory-resolver is no longer
+  compiled. It stays listed in `Cargo.lock` through a weak feature
+  reference, so its two open advisories (`GHSA-5j98-2g5x-46v6`,
+  `GHSA-6f2x-v7q7-m7m5`) are allowlisted in `scripts/osv_scan.sh`,
+  bound to 0.25.2 exactly. The real fix is libp2p 0.57, which also
+  switches QUIC to aws-lc-rs and therefore needs an Android build
+  validation of its own.
+- Ratchet message-key derivation builds the AEAD key and nonce directly
+  from the HKDF output and zeroizes the scratch buffer on every exit
+  path, including the error path.
+
+### Changed
+
+- CI: CodeQL analyses Kotlin from source instead of autobuilding the
+  app, which the runner cannot do. MobSF findings are published to code
+  scanning again rather than only to a 30-day artifact. The clippy
+  code-scanning job uses the pinned 1.88 toolchain. The release build
+  also triggers on bare semver tags such as `0.1.0-alpha`. A manual
+  "Record Paparazzi baselines" workflow re-records the screenshot
+  baselines on a runner and pushes them to the dispatched branch.
 
 ## [0.1.0-alpha] — 2026-08-06
 

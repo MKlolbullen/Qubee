@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+      # Bare semver tags build too. 0.1.0-alpha was cut without the
+      # prefix and never triggered a release, leaving an asset-less
+      # GitHub release behind.
+      - '[0-9]*.[0-9]*.[0-9]*'
   # Allow manual dispatch from the Actions tab so a maintainer can
   # rebuild a release without re-tagging (e.g. to swap in a new
   # signing key).
@@ -37,6 +41,13 @@ jobs:
             tag="${{ inputs.tag }}"
           else
             tag="${GITHUB_REF#refs/tags/}"
+          fi
+          # The tag globs above are loose (`[0-9]*` matches `1foo`);
+          # this is the real gate. Semver with an optional v prefix and
+          # an optional pre-release suffix, nothing else.
+          if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' is not a semver release tag (expected v1.2.3 or 1.2.3, optional -prerelease suffix)."
+            exit 1
           fi
           version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"

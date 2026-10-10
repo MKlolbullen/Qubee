@@ -209,8 +209,7 @@ pub fn open_outer_envelope(
     }
     let mut offset = MAGIC_GROUP_MESSAGE.len();
 
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&wire[offset..offset + 12]);
+    let nonce_bytes: [u8; 12] = wire[offset..offset + 12].try_into()?;
     offset += 12;
 
     let wire_selector = &wire[offset..offset + GROUP_SELECTOR_LEN];

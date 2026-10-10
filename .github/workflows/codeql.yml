@@ -111,12 +111,17 @@ jobs:
     # to build your code.
     # ℹ️ Command-line programs to run using the OS shell.
     # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
+    # The extractor only sees code the compiler actually processes. With
+    # the Gradle build cache warm, compileDebugKotlin is restored
+    # FROM-CACHE, kotlinc never runs, and CodeQL ends with "could not
+    # process any code". --no-build-cache and --rerun-tasks force a real
+    # compile on every run.
     - name: Compile Kotlin sources under CodeQL tracing
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
         chmod +x ./gradlew
-        ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace
+        ./gradlew :app:compileDebugKotlin --no-build-cache --rerun-tasks --no-daemon --stacktrace
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4

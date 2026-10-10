@@ -1,13 +1,22 @@
 name: Record Paparazzi baselines
 
 # Re-records app/src/test/snapshots/ on a runner and pushes the PNGs
-# back to the branch this was dispatched on. Recording needs the
-# Android SDK, which not every contributor environment can fetch; the
-# verify job in android-smoke.yml stays the gate, this is the tool that
-# feeds it. Review the pushed PNGs like any other diff before merging.
+# back to the branch it ran on. Recording needs the Android SDK, which
+# not every contributor environment can fetch; the verify job in
+# android-smoke.yml stays the gate, this is the tool that feeds it.
+# Review the pushed PNGs like any other diff before merging.
+#
+# Two ways in: "Run workflow" on any branch, or push a branch named
+# paparazzi/record/<anything>. The push trigger exists because GitHub
+# only offers manual dispatch for workflows already on the default
+# branch. The bot's own push uses GITHUB_TOKEN, which never starts
+# another run, so there is no loop.
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - 'paparazzi/record/**'
 
 permissions:
   contents: write

@@ -109,6 +109,13 @@ mod tests {
     }
 
     #[test]
+    fn video_access_unit_cap_rejects_oversized_frames() {
+        assert!(check_video_access_unit(&[0u8; MAX_VIDEO_ACCESS_UNIT_BYTES]).is_ok());
+        assert!(check_video_access_unit(&[0u8; MAX_VIDEO_ACCESS_UNIT_BYTES + 1]).is_err());
+        assert!(check_video_access_unit(&[]).is_err());
+    }
+
+    #[test]
     fn shipped_opus_profile_is_android_mono() {
         assert_eq!(OPUS_CLOCK_RATE, 48_000);
         assert_eq!(OPUS_CHANNELS, 1);

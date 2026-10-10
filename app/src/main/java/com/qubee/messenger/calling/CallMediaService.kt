@@ -58,10 +58,28 @@ class CallMediaService : Service() {
         // stop() clears desiredCallId before stopService returns. A start
         // that was already queued must not bring the microphone back up
         // after the call has ended.
-        if (callIdHex.isNullOrEmpty() || peerIdHex.isNullOrEmpty() || desiredCallId != callIdHex) {
+        if (callIdHex.isNullOrEmpty() || desiredCallId != callIdHex) {
             Timber.w("CallMediaService start ignored; no live call")
+            if (desiredCallId == null) {
+                releaseEngine()
+                stopSelf(startId)
+            }
+            return START_NOT_STICKY
+        }
+        if (peerIdHex.isNullOrEmpty()) {
+            Timber.w("CallMediaService start ignored; no live call")
+            if (desiredCallId == callIdHex) desiredCallId = null
             releaseEngine()
-            stopSelf()
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            Timber.w("CallMediaService start ignored; microphone permission missing")
+            if (desiredCallId == callIdHex) desiredCallId = null
+            releaseEngine()
+            stopSelf(startId)
             return START_NOT_STICKY
         }
 
@@ -101,6 +119,7 @@ class CallMediaService : Service() {
     }
 
     override fun onDestroy() {
+        if (desiredCallId == activeCallIdHex) desiredCallId = null
         releaseEngine()
         super.onDestroy()
         if (active === this) active = null

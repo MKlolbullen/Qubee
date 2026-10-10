@@ -157,6 +157,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_consumer_does_not_accumulate_sustained_overproduction() {
+        const CAPACITY: usize = 12;
+        const FRAMES: u32 = 100_000;
+
+        let (tx, mut rx) = realtime_channel::<u32>(CAPACITY);
+        let producer = tokio::spawn(async move {
+            for frame in 0..FRAMES {
+                assert!(tx.push_freshest(frame));
+                if frame % 256 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tx.dropped()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let dropped = producer.await.unwrap();
+        let mut received = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            received.push(frame);
+            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+        }
+
+        assert!(dropped >= u64::from(FRAMES) - CAPACITY as u64);
+        assert_eq!(received.len(), CAPACITY);
+        assert_eq!(
+            received,
+            (FRAMES - CAPACITY as u32..FRAMES).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn recv_returns_none_after_the_last_sender_drops() {
         let (tx, mut rx) = realtime_channel::<u8>(2);
         tx.push_freshest(7);

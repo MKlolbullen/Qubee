@@ -63,11 +63,15 @@
         </activity>
 
         <!-- Embedded ZXing QR scanner. Declared so the camera capture
-             activity can run inside our task with our theme. -->
+             activity can run inside our task with our theme. Empty
+             taskAffinity on every activity, not just the launcher: a
+             foreign app declaring our package as its affinity must not
+             be able to pull any of our screens into its task. -->
         <activity
             android:name=".ui.invite.QrScannerActivity"
             android:screenOrientation="fullSensor"
             android:stateNotNeeded="true"
+            android:taskAffinity=""
             android:theme="@style/Theme.AppCompat"
             android:windowSoftInputMode="stateAlwaysHidden" />
 
@@ -76,6 +80,7 @@
         <activity
             android:name=".ui.contacts.verification.ContactVerificationActivity"
             android:exported="false"
+            android:taskAffinity=""
             android:theme="@style/Theme.Qubee" />
 
         <service

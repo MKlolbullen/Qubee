@@ -29,6 +29,42 @@ use qubee_crypto::groups::group_message::{
 use qubee_crypto::groups::group_permissions::Role;
 use qubee_crypto::identity::identity_key::{IdentityId, IdentityKeyPair};
 
+#[cfg(feature = "calling")]
+#[test]
+fn call_signaling_v2_vector_and_legacy_rejection_are_pinned() {
+    use qubee_crypto::calling::call_manager::{CallId, CallSettings, CallType};
+    use qubee_crypto::calling::signaling::{SignalingMessage, SIGNALING_MAGIC_V2};
+    assert_eq!(SIGNALING_MAGIC_V2, b"qubee_call_signal_v2\0");
+    let signal = SignalingMessage::CallInvitation {
+        call_id: CallId::from([1; 16]),
+        caller: IdentityId::from([2; 32]),
+        call_type: CallType::VoiceCall,
+        settings: CallSettings::default(),
+        media_root: [0; 32],
+    };
+    let wire = signal.to_bytes().unwrap();
+    let expected = concat!(
+        "71756265655f63616c6c5f7369676e616c5f763200",
+        "00000000",
+        "01010101010101010101010101010101",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "00000000",
+        "0108000000000000000100000101050000000400000000",
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    assert_eq!(hex::encode(&wire), expected);
+    assert!(
+        matches!(SignalingMessage::from_bytes(&wire).unwrap(), SignalingMessage::CallInvitation { media_root, .. } if media_root == [0; 32])
+    );
+    assert!(SignalingMessage::from_bytes(&bincode::serialize(&signal).unwrap()).is_err());
+    let mut wrong_version = wire.clone();
+    wrong_version[SIGNALING_MAGIC_V2.len() - 2] = b'1';
+    assert!(SignalingMessage::from_bytes(&wrong_version).is_err());
+    let mut trailing = wire;
+    trailing.push(0);
+    assert!(SignalingMessage::from_bytes(&trailing).is_err());
+}
+
 #[test]
 fn handshake_magic_is_pinned() {
     assert_eq!(HANDSHAKE_MAGIC, b"QUBEE_GHS\x01");

@@ -979,20 +979,15 @@ class MessageService : Service(), NetworkCallback {
 
     /**
      * Outbound call signaling: the native call layer asks us to deliver
-     * [payload] to [recipientIdHex] over that peer's 1:1 session. We
-     * encrypt it as a tagged call-signal frame and send it the same way
-     * as a chat message (Rust routes by the frame's opaque selector, so
+     * [payload] to [recipientIdHex]. Rust has already encrypted it and
+     * provisioned the per-call media root. Send it once, without another
+     * ratchet step (Rust routes by the frame's opaque selector, so
      * the peer hint is empty, as with delivery acks).
      */
     override fun onCallSignal(recipientIdHex: String, payload: ByteArray) {
         serviceScope.launch {
             try {
-                val wire = qubeeManager.encryptDirectCallSignal(recipientIdHex, payload)
-                if (wire == null) {
-                    Timber.w("Failed to encrypt call signal")
-                    return@launch
-                }
-                if (!qubeeManager.sendP2PMessage("", wire)) {
+                if (!qubeeManager.sendP2PMessage("", payload)) {
                     Timber.w("Failed to send call signal")
                 }
             } catch (e: Exception) {

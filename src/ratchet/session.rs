@@ -137,6 +137,25 @@ impl Session {
             .decrypt(header, ciphertext, &self.conversation_ad)
     }
 
+    pub fn encrypt_with_call_root(
+        &mut self,
+        plaintext: &[u8],
+        call_id: Option<[u8; 16]>,
+    ) -> Result<(MessageHeader, Vec<u8>, Option<[u8; 32]>)> {
+        self.ratchet
+            .encrypt_with_call_root(plaintext, &self.conversation_ad, call_id)
+    }
+
+    pub fn decrypt_with_call_root(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+        select_call: impl FnOnce(&[u8]) -> Result<Option<[u8; 16]>>,
+    ) -> Result<(Vec<u8>, Option<[u8; 32]>)> {
+        self.ratchet
+            .decrypt_with_call_root(header, ciphertext, &self.conversation_ad, select_call)
+    }
+
     fn serialize(&self) -> Result<Vec<u8>> {
         let stored = StoredSession {
             peer_id: self.peer_id,
@@ -234,6 +253,92 @@ mod tests {
         assert_eq!(alice.decrypt(&h2, &c2).unwrap(), b"hello back");
         assert_eq!(alice.peer_id(), bob_id);
         assert_eq!(bob.peer_id(), alice_id);
+    }
+
+    #[test]
+    fn call_exporter_authenticates_before_selection_and_preserves_skipped_keys() {
+        let (a, b) = ids();
+        let (mut alice, mut bob) = establish_pair(a, b);
+        let (h1, c1, r1) = alice
+            .encrypt_with_call_root(b"invite", Some([1; 16]))
+            .unwrap();
+        let (h2, c2, r2) = alice
+            .encrypt_with_call_root(b"invite", Some([2; 16]))
+            .unwrap();
+        let mut tampered = c1.clone();
+        tampered[0] ^= 1;
+        assert!(bob
+            .decrypt_with_call_root(&h1, &tampered, |_| {
+                panic!("exporter context selected before authentication")
+            })
+            .is_err());
+        assert_eq!(
+            bob.decrypt_with_call_root(&h2, &c2, |_| Ok(Some([2; 16])))
+                .unwrap()
+                .1,
+            r2
+        );
+        assert!(bob
+            .decrypt_with_call_root(&h1, &c1, |_| anyhow::bail!("invalid invitation"))
+            .is_err());
+        assert_eq!(
+            bob.decrypt_with_call_root(&h1, &c1, |_| Ok(Some([1; 16])))
+                .unwrap()
+                .1,
+            r1
+        );
+        assert_ne!(r1, r2);
+        assert!(bob
+            .decrypt_with_call_root(&h1, &c1, |_| Ok(Some([1; 16])))
+            .is_err());
+        let (h, c) = bob.encrypt(b"ordinary reply").unwrap();
+        assert_eq!(alice.decrypt(&h, &c).unwrap(), b"ordinary reply");
+    }
+
+    #[test]
+    fn call_exporter_survives_reload_and_exports_for_the_responder() {
+        let (a, b) = ids();
+        let (mut alice, mut bob) = establish_pair(a, b);
+        let (h, c) = alice.encrypt(b"establish receiving chain").unwrap();
+        bob.decrypt(&h, &c).unwrap();
+        let (h1, c1, r1) = bob
+            .encrypt_with_call_root(b"responder invite", Some([4; 16]))
+            .unwrap();
+        let (h2, c2, r2) = bob
+            .encrypt_with_call_root(b"later invite", Some([5; 16]))
+            .unwrap();
+        assert_eq!(
+            alice
+                .decrypt_with_call_root(&h2, &c2, |_| Ok(Some([5; 16])))
+                .unwrap()
+                .1,
+            r2,
+        );
+        let (mut ks, _dir) = fresh_ks();
+        store_session(&mut ks, &alice).unwrap();
+        let mut alice = load_session(&mut ks, &b).unwrap().unwrap();
+        assert_eq!(
+            alice
+                .decrypt_with_call_root(&h1, &c1, |_| Ok(Some([4; 16])))
+                .unwrap()
+                .1,
+            r1,
+        );
+        let (mut bob_ks, _bob_dir) = fresh_ks();
+        store_session(&mut bob_ks, &bob).unwrap();
+        let mut bob = load_session(&mut bob_ks, &a).unwrap().unwrap();
+        let (h, c, root) = bob
+            .encrypt_with_call_root(b"after reload", Some([6; 16]))
+            .unwrap();
+        assert_eq!(
+            alice
+                .decrypt_with_call_root(&h, &c, |_| Ok(Some([6; 16])))
+                .unwrap()
+                .1,
+            root,
+        );
+        assert_ne!(root, r1);
+        assert_ne!(root, r2);
     }
 
     #[test]

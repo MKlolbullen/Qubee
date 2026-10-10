@@ -169,6 +169,17 @@ struct WireRatchetState {
     skipped: Vec<([u8; 32], u32, [u8; 32])>,
 }
 
+type AuthenticatedMessage = (Vec<u8>, Zeroizing<[u8; 32]>);
+
+fn call_media_root(mk: &[u8; 32], call_id: &[u8; 16], associated_data: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_keyed(mk);
+    h.update(b"qubee_call_media_root_v1\0");
+    h.update(call_id);
+    h.update(&(associated_data.len() as u64).to_le_bytes());
+    h.update(associated_data);
+    *h.finalize().as_bytes()
+}
+
 impl DoubleRatchet {
     /// Serialise the full ratchet state for encrypted-at-rest
     /// persistence. The output contains live key material and must be
@@ -294,6 +305,17 @@ impl DoubleRatchet {
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<(MessageHeader, Vec<u8>)> {
+        let (header, ciphertext, _) =
+            self.encrypt_with_call_root(plaintext, associated_data, None)?;
+        Ok((header, ciphertext))
+    }
+
+    pub fn encrypt_with_call_root(
+        &mut self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+        call_id: Option<[u8; 16]>,
+    ) -> Result<(MessageHeader, Vec<u8>, Option<[u8; 32]>)> {
         let next_ns = self
             .ns
             .checked_add(1)
@@ -315,7 +337,8 @@ impl DoubleRatchet {
         let aad = concat_aad(associated_data, &header);
         let mk = Zeroizing::new(mk);
         let ciphertext = aead_encrypt(&mk, plaintext, &aad)?;
-        Ok((header, ciphertext))
+        let root = call_id.map(|id| call_media_root(&mk, &id, associated_data));
+        Ok((header, ciphertext, root))
     }
 
     /// Decrypt a message given its header + ciphertext + the same
@@ -327,6 +350,18 @@ impl DoubleRatchet {
         ciphertext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>> {
+        self.decrypt_with_call_root(header, ciphertext, associated_data, |_| Ok(None))
+            .map(|(plaintext, _)| plaintext)
+    }
+
+    /// Select an exporter context only from the authenticated plaintext.
+    pub fn decrypt_with_call_root(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+        select_call: impl FnOnce(&[u8]) -> Result<Option<[u8; 16]>>,
+    ) -> Result<(Vec<u8>, Option<[u8; 32]>)> {
         // Ratchet on a throwaway copy and commit it back only once the
         // AEAD verifies. Without this, the receive-side mutations
         // (DH-ratchet step, chain-key advance, nr/pn bumps) happen
@@ -342,9 +377,10 @@ impl DoubleRatchet {
         // no message key is ever *reused* (the point of `!Clone`), so
         // this doesn't reopen the fork hazard the type guards against.
         let mut staged = self.snapshot();
-        let plaintext = staged.decrypt_in_place(header, ciphertext, associated_data)?;
+        let (plaintext, mk) = staged.decrypt_in_place(header, ciphertext, associated_data)?;
+        let root = select_call(&plaintext)?.map(|id| call_media_root(&mk, &id, associated_data));
         *self = staged;
-        Ok(plaintext)
+        Ok((plaintext, root))
     }
 
     /// A private, transient duplicate of the ratchet for staged decrypt.
@@ -374,7 +410,7 @@ impl DoubleRatchet {
         header: &MessageHeader,
         ciphertext: &[u8],
         associated_data: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<AuthenticatedMessage> {
         // 1. A skipped key for exactly this (dh, n)? (single-use)
         if let Some(pt) = self.try_skipped(header, ciphertext, associated_data)? {
             return Ok(pt);
@@ -423,8 +459,9 @@ impl DoubleRatchet {
             .ok_or_else(|| anyhow!("receiving chain exhausted"))?;
 
         let aad = concat_aad(associated_data, header);
-        aead_decrypt(&mk, ciphertext, &aad)
-            .ok_or_else(|| anyhow!("ratchet decrypt failed (auth/tamper/replay)"))
+        let plaintext = aead_decrypt(&mk, ciphertext, &aad)
+            .ok_or_else(|| anyhow!("ratchet decrypt failed (auth/tamper/replay)"))?;
+        Ok((plaintext, mk))
     }
 
     fn try_skipped(
@@ -432,7 +469,7 @@ impl DoubleRatchet {
         header: &MessageHeader,
         ciphertext: &[u8],
         associated_data: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<AuthenticatedMessage>> {
         let key = (header.dh, header.n);
         if let Some(mk) = self.skipped.get(&key).copied().map(Zeroizing::new) {
             let aad = concat_aad(associated_data, header);
@@ -444,7 +481,7 @@ impl DoubleRatchet {
                         removed.zeroize();
                     }
                     self.skipped_order.retain(|k| k != &key);
-                    Ok(Some(pt))
+                    Ok(Some((pt, mk)))
                 }
                 None => Err(anyhow!("skipped-key decrypt failed (tamper)")),
             }
@@ -626,6 +663,34 @@ mod tests {
     }
 
     const AD: &[u8] = b"conversation-id";
+
+    #[test]
+    fn call_exporter_is_domain_separated_and_does_not_change_persisted_state() {
+        let mk = [7; 32];
+        let root = call_media_root(&mk, &[1; 16], AD);
+        assert_ne!(root, mk);
+        assert_ne!(root, call_media_root(&mk, &[2; 16], AD));
+        assert_ne!(root, call_media_root(&mk, &[1; 16], b"other conversation"));
+
+        let (mut alice, mut bob) = pair();
+        let mut ordinary =
+            DoubleRatchet::deserialize_state(&alice.serialize_state().unwrap()).unwrap();
+        let (h, c, root) = alice
+            .encrypt_with_call_root(b"invite", AD, Some([1; 16]))
+            .unwrap();
+        let (ordinary_h, _) = ordinary.encrypt(b"invite", AD).unwrap();
+        assert_eq!(h, ordinary_h);
+        assert_eq!(
+            alice.serialize_state().unwrap(),
+            ordinary.serialize_state().unwrap()
+        );
+        assert_eq!(
+            bob.decrypt_with_call_root(&h, &c, AD, |_| Ok(Some([1; 16])))
+                .unwrap()
+                .1,
+            root,
+        );
+    }
 
     #[test]
     fn full_duplex_ping_pong() {

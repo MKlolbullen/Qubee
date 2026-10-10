@@ -181,7 +181,9 @@ class QubeeManager @Inject constructor(
      * Encrypt an opaque call-signaling frame to [peerIdHex] over the
      * peer's 1:1 ratchet session (tagged as a call signal, not chat).
      * Returns the QUBEE_DMS wire bytes. The peer decrypts it and routes
-     * the frame to the native call state machine.
+     * the frame to the native call state machine. Invitations provision
+     * their media root in Rust before returning. The onCallSignal callback
+     * already supplies encrypted bytes and must not call this again.
      */
     suspend fun encryptDirectCallSignal(peerIdHex: String, frame: ByteArray): ByteArray? =
         withContext(Dispatchers.IO) {

@@ -34,7 +34,7 @@ use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload_with_route, encrypt_direct_ack_with_route,
-    encrypt_direct_call_signal_with_route, encrypt_direct_distribution_with_route,
+    encrypt_direct_call_signal_with_root, encrypt_direct_distribution_with_route,
     encrypt_direct_text_with_route, inspect_direct_recipient, inspect_direct_sender,
     install_peer_bundle, reset_direct_session, DirectPayload,
 };
@@ -2992,7 +2992,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let local_peer_id = LOCAL_PEER_ID.lock().unwrap().clone();
-            let wire = encrypt_direct_call_signal_with_route(
+            let (wire, root) = encrypt_direct_call_signal_with_root(
                 ks,
                 local_id,
                 peer_id,
@@ -3000,6 +3000,15 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
                 local_peer_id.as_deref(),
                 now_secs(),
             )?;
+            drop(ks_guard);
+            #[cfg(feature = "calling")]
+            if let Some((call_id, root)) = root {
+                CALL_RUNTIME.block_on(
+                    call_manager()?.provision_call_media_root(CallId::from(call_id), root),
+                )?;
+            }
+            #[cfg(not(feature = "calling"))]
+            let _ = root;
             let arr = env
                 .byte_array_from_slice(&wire)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
@@ -4030,11 +4039,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeListGr
 // Calling (voice/video) JNI surface — feature = "calling".
 //
 // Signaling rides the encrypted 1:1 message session: outbound frames
-// are handed to Kotlin via `onCallSignal` (Kotlin encrypts + sends them
-// like any message), and inbound frames come back through
-// `nativeHandleCallSignal`. The per-call media root is provided by
-// Kotlin (derived from the same 1:1 session) on initiate/accept. See
-// issue #67.
+// are encrypted and provisioned in Rust before `onCallSignal` sends the
+// wire bytes. Inbound invitations receive their locally exported media
+// root during direct-message decrypt, before `nativeHandleCallSignal`.
 // ---------------------------------------------------------------------
 
 #[cfg(feature = "calling")]
@@ -4238,10 +4245,55 @@ fn dispatch_call_event_to_kotlin(event: CallEvent) {
 }
 
 #[cfg(feature = "calling")]
-async fn drain_outbound_call_signals(mut rx: tokio::sync::mpsc::UnboundedReceiver<OutboundSignal>) {
+async fn drain_outbound_call_signals(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<OutboundSignal>,
+    manager: Arc<CallManager>,
+    local_identity: IdentityId,
+) {
     while let Some(signal) = rx.recv().await {
-        let recipient_hex = hex::encode(signal.recipient.as_ref() as &[u8]);
-        dispatch_call_signal_to_kotlin(&recipient_hex, &signal.payload);
+        let call_id = crate::calling::signaling::SignalingMessage::from_bytes(&signal.payload)
+            .map(|signal| signal.call_id())
+            .ok();
+        let result: anyhow::Result<()> = async {
+            let (wire, root) = {
+                let identity =
+                    active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
+                if identity.identity_id() != local_identity {
+                    anyhow::bail!("calling identity changed before signaling delivery");
+                }
+                let mut ks_guard = KEYSTORE.lock().unwrap();
+                let ks = ks_guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+                let local_peer_id = LOCAL_PEER_ID.lock().unwrap().clone();
+                encrypt_direct_call_signal_with_root(
+                    ks,
+                    local_identity,
+                    signal.recipient,
+                    &signal.payload,
+                    local_peer_id.as_deref(),
+                    now_secs(),
+                )?
+            };
+            if let Some((call_id, root)) = root {
+                manager
+                    .provision_call_media_root(CallId::from(call_id), root)
+                    .await?;
+            }
+            let recipient_hex = hex::encode(signal.recipient.as_ref() as &[u8]);
+            dispatch_call_signal_to_kotlin(&recipient_hex, &wire);
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            tracing::warn!("outbound call signaling encryption/provisioning failed");
+            if let Some(call_id) = call_id {
+                dispatch_call_event_to_kotlin(CallEvent::CallError {
+                    call_id,
+                    error: "outbound signaling encryption/provisioning failed".into(),
+                });
+            }
+        }
     }
 }
 
@@ -4303,7 +4355,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<CallEvent>();
             let signaling = Arc::new(ChannelSignalingTransport::new(signal_tx));
 
-            let manager = CALL_RUNTIME.block_on(async {
+            let manager = Arc::new(CALL_RUNTIME.block_on(async {
                 CallManager::new(
                     CallManagerConfig::default(),
                     event_tx,
@@ -4311,15 +4363,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
                     signaling,
                 )
                 .await
-            })?;
+            })?);
             let media_rx = CALL_RUNTIME.block_on(manager.take_remote_media());
 
-            CALL_RUNTIME.spawn(drain_outbound_call_signals(signal_rx));
+            CALL_RUNTIME.spawn(drain_outbound_call_signals(
+                signal_rx,
+                Arc::clone(&manager),
+                local_identity,
+            ));
             CALL_RUNTIME.spawn(drain_call_events(event_rx));
             if let Some(media_rx) = media_rx {
                 CALL_RUNTIME.spawn(drain_remote_media(media_rx));
             }
-            *CALL_MANAGER.lock().unwrap() = Some(Arc::new(manager));
+            *CALL_MANAGER.lock().unwrap() = Some(manager);
             Ok(())
         })();
         match result {

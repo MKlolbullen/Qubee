@@ -26,10 +26,30 @@ metadata, not telephone identifiers. See the metadata section below.
 
 ## Media-security boundary
 
-For a 1:1 call the caller mints a fresh 32-byte media root and sends it
-inside the authenticated, end-to-end encrypted call invitation. Both
+For a 1:1 call both endpoints export a fresh 32-byte media root from the
+exact Double Ratchet message key that encrypts the invitation. The exporter
+is BLAKE3 keyed by that message key over `qubee_call_media_root_v1\0`,
+the 16-byte call id, the little-endian u64 conversation-AD length, and
+the conversation AD. It does not retain the PQXDH initial secret or expose
+the current ratchet root, which need not agree across endpoints.
+
+All signaling frames use the `qubee_call_signal_v2\0` prefix followed by
+fixed-integer bincode. The unversioned legacy codec is rejected: its random-root
+semantics cannot interoperate with exporter-derived roots. The invitation
+retains the `media_root` field, but Rust sends zeros and ignores any peer-supplied
+value. Decrypt exports only
+after AEAD authentication, including when consuming a skipped message key,
+and substitutes the derived root locally before the call state machine runs.
+Rust provisions the caller's root before handing encrypted wire bytes to
+Android; Android sends those bytes unchanged, without encrypting them again. Both
 endpoints derive the same per-call media key from that root, the call
 id, and the canonical sorted participant pair.
+
+Retry delivery of the same encrypted invitation wire bytes only. Do not
+re-encrypt an invitation: that consumes another message key and exports a
+different root, while a live call deliberately rejects root replacement.
+Outbound encryption/provisioning failures emit the existing call-error event
+to Android rather than leaving the UI silently waiting.
 
 That derivation is **not** a second media encryption layer on the wire.
 
@@ -49,7 +69,8 @@ Secrecy of the media root reduces to the established 1:1 session. A
 separate contributory media handshake is future work, not current
 behavior.
 
-An all-zero media root is rejected. A replayed invitation does not
+An all-zero provisioned media root is rejected (the wire placeholder is
+replaced before this check). A replayed invitation does not
 replace a live root and does not re-ring a call that has ended,
 been rejected, or timed out.
 

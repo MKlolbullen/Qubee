@@ -31,10 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # No persisted token: Gradle runs third-party plugin code, and the
+      # write token must not be reachable from it. The push step below
+      # is handed the token on its own.
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+          persist-credentials: false
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -67,6 +71,8 @@ jobs:
         run: ./gradlew :app:verifyPaparazziDebug --no-daemon --stacktrace
 
       - name: Push updated baselines
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git add app/src/test/snapshots
           if git diff --cached --quiet; then
@@ -77,7 +83,8 @@ jobs:
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               commit -m "test: re-record Paparazzi baselines" \
                      -m "Recorded by the Record Paparazzi baselines workflow, run ${GITHUB_RUN_ID}."
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "HEAD:${GITHUB_REF_NAME}"
 
       - name: Upload baselines
         uses: actions/upload-artifact@v4

@@ -42,6 +42,13 @@ jobs:
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
+          # The tag globs above are loose (`[0-9]*` matches `1foo`);
+          # this is the real gate. Semver with an optional v prefix and
+          # an optional pre-release suffix, nothing else.
+          if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' is not a semver release tag (expected v1.2.3 or 1.2.3, optional -prerelease suffix)."
+            exit 1
+          fi
           version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"

@@ -45,8 +45,11 @@ jobs:
         include:
         - language: actions
           build-mode: none
+        # Autobuild needs the Android SDK, the NDK and the Rust .so,
+        # none of which the runner has; it failed on every run. Build
+        # mode none extracts Kotlin/Java straight from source.
         - language: java-kotlin
-          build-mode: autobuild
+          build-mode: none
         - language: python
           build-mode: none
         - language: rust

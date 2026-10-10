@@ -127,8 +127,11 @@ git tag -a v$version -m "v$version"
 git push origin v$version
 ```
 
-The push triggers `.github/workflows/release.yml`. It runs end-to-
-end in ~12-15 minutes:
+The push triggers `.github/workflows/release.yml`. A bare semver tag
+(`0.1.0-alpha`) triggers it as well, but keep the `v` prefix: it is
+what the changelog heading lookup, the docs, and the earlier tags
+agree on. Any other shape (`Qubee-beta-v.1.2`) builds nothing. The
+workflow runs end-to-end in ~12-15 minutes:
 
 1. Resolves `versionName` from the tag
 2. Computes `versionCode` from `git rev-list --count HEAD`

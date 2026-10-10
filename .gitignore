@@ -42,6 +42,14 @@ replay_pid*
 app/build/paparazzi/failures/
 
 # ─────────────────────────────────────────────────────────────
+# Scanner output
+# ─────────────────────────────────────────────────────────────
+# scripts/run_mobsfscan.py writes its SARIF to the repo root; CI
+# uploads it as an artifact and to code scanning.
+results.sarif
+__pycache__/
+
+# ─────────────────────────────────────────────────────────────
 # Signing material / local secrets
 # ─────────────────────────────────────────────────────────────
 *.jks

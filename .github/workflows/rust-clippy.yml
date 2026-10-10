@@ -30,13 +30,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af #@v1
+      # Same pinned compiler as ci.yml's blocking gate. The previous
+      # actions-rs step installed `stable` with override: true, which
+      # bypassed rust-toolchain.toml and linted a different compiler.
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
-          profile: minimal
-          toolchain: stable
           components: clippy
-          override: true
 
       - name: Install required cargo
         run: cargo install clippy-sarif sarif-fmt

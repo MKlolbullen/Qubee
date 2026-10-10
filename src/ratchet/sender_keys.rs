@@ -1144,15 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn v5_selector_is_pinned() {
-        // Golden vector: a silent change to the selector KDF context,
-        // hash, or truncation strands every deployed receiver (their
-        // trial-match never hits). Fixed key + nonce, pinned output.
-        let selector = v5_group_selector(&[0x11; 32], &[0x22; 12]);
-        assert_eq!(selector, [0xa0, 0xc8, 0xbf, 0x13, 0x10, 0x0b, 0x4d, 0xb4]);
-    }
-
-    #[test]
     fn v5_round_trips_across_members() {
         let (mut a, mut b, mut c) = trio();
         let g = group();

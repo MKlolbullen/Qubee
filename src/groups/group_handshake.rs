@@ -561,6 +561,10 @@ pub(crate) const MAX_WIRE_FRAME_BYTES: u64 = 512 * 1024;
 pub(crate) fn bounded_bincode_deserialize<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T> {
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_WIRE_FRAME_BYTES,
+        "wire frame exceeds size limit"
+    );
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()

@@ -237,12 +237,13 @@ wire frame (`src/ratchet/direct_message.rs`), and the live orchestration
 + JNI bridge (`src/ratchet/direct.rs`, four `nativeDirect*`/bundle
 symbols). Replay protection comes from consumed message keys plus an
 accepted-initial hash record — a dedicated `(chain_idx, msg_idx)` window
-proved unnecessary. Shipped dark; default 1:1 send path since the
-v0.2.0 cutover.
+proved unnecessary. Shipped dark; 1:1 emission requires explicit
+`ratchetSendEnabled` opt-in pending issue #47 device validation.
 
 **Stage 4 (LANDED):** sender-keys group messaging on top of DR —
-`src/ratchet/sender_keys.rs`, wire `QUBEE_GMS\x03`; default group send
-path since the v0.2.0 cutover.
+`src/ratchet/sender_keys.rs`, wire `QUBEE_GMS\x03`; group emission also
+requires explicit opt-in. The default remains OFF and legacy signed
+emission is retained until every required device exit criterion is green.
 Migration plan unchanged: existing groups keep the v2 symmetric key for
 one release; new groups (and any group after a member-add /
 member-remove) start on v3. Cleanup batch removes v2 support after a

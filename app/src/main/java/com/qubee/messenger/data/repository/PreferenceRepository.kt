@@ -117,17 +117,16 @@ class PreferenceRepository @Inject constructor(
     fun isOnboarded(): Boolean = prefs.getBoolean(KEY_ONBOARDED, false)
 
     /**
-     * Stage 5 rollout flag: when true (the default since the v0.2.0
-     * cutover), outbound 1:1 and group traffic uses the PQXDH + Double
+     * Stage 5 rollout flag: when explicitly enabled, outbound 1:1 and
+     * group traffic uses the PQXDH + Double
      * Ratchet / sender-keys wire formats instead of the legacy
      * envelope. Receive-side support is always on (MessageService
      * recognises the new frames unconditionally); this only gates what
-     * WE emit. Retained as an emergency kill-switch for the soak
-     * window — an explicit false restores legacy emission without a
-     * reinstall. Retiring legacy emission (and this flag) is the
-     * deprecation-window follow-up in docs/double-ratchet-design.md.
+     * WE emit. Default off until every required physical-device exit
+     * criterion in issue #47 is recorded green. Legacy emission remains
+     * available during validation.
      */
-    fun ratchetSendEnabled(): Boolean = prefs.getBoolean(KEY_RATCHET_SEND, true)
+    fun ratchetSendEnabled(): Boolean = prefs.getBoolean(KEY_RATCHET_SEND, false)
 
     fun setRatchetSendEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_RATCHET_SEND, enabled).apply()

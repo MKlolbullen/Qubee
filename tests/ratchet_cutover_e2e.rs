@@ -2,9 +2,8 @@
 //! (`docs/two-device-walkthrough.md`) for the ratchet send path, over
 //! exactly the public API the JNI bridge calls. The send flip
 //! (`ratchetSendEnabled`) is gated on device validation; this file
-//! proves the full multi-member choreography — distribution fan-out,
-//! mesh messaging, removal rekey, late join, restart — so the only
-//! thing left for the devices to validate is transport.
+//! exercises multi-member choreography and Rust persistence. It does not
+//! exercise Room, JNI execution, process death, or physical-device lifecycle.
 
 use qubee_crypto::groups::group_handshake::sign_prekey_bundle;
 use qubee_crypto::groups::group_manager::GroupId;
@@ -13,6 +12,7 @@ use qubee_crypto::ratchet::direct::{
     decrypt_direct_payload, encrypt_direct_distribution, encrypt_direct_text, install_peer_bundle,
     DirectPayload,
 };
+use qubee_crypto::ratchet::direct_message::DirectMessage;
 use qubee_crypto::ratchet::prekey_store::{build_body, get_or_create_local_bundle};
 use qubee_crypto::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message_v5, encrypt_sender_key_message_v5,
@@ -482,4 +482,114 @@ fn crash_after_advance_never_reuses_a_group_iteration() {
     let sender_id = devs[0].id();
     let (from, pt) = recv(&mut devs[1], &group, &key, &wire);
     assert_eq!((from, pt), (sender_id, b"after restart".to_vec()));
+}
+
+#[test]
+fn delayed_direct_keys_survive_ratchet_steps_restart_and_failed_authentication() {
+    let (mut a, mut b) = (Device::new(), Device::new());
+    pair(&mut a, &mut b, 1);
+    let (aid, bid) = (a.id(), b.id());
+    let mut old = Vec::new();
+    for text in ["zero", "one", "two"] {
+        old.push(encrypt_direct_text(&mut a.ks, aid, bid, text, 2).unwrap());
+    }
+    assert_eq!(
+        decrypt_direct_payload(&mut b.ks, bid, &old[2], 2).unwrap(),
+        (aid, DirectPayload::Text("two".into()))
+    );
+    let reply = encrypt_direct_text(&mut b.ks, bid, aid, "reply", 3).unwrap();
+    decrypt_direct_payload(&mut a.ks, aid, &reply, 3).unwrap();
+    let next = encrypt_direct_text(&mut a.ks, aid, bid, "new chain", 4).unwrap();
+    let old_header = DirectMessage::from_wire(&old[2]).unwrap().header;
+    let next_header = DirectMessage::from_wire(&next).unwrap().header;
+    assert_ne!(old_header.dh, next_header.dh);
+    assert_eq!(next_header.pn, 3);
+    decrypt_direct_payload(&mut b.ks, bid, &next, 4).unwrap();
+    b.restart();
+
+    let before = std::fs::read(b.dir.path().join("ks.db")).unwrap();
+    for header_tamper in [false, true] {
+        let mut bad = DirectMessage::from_wire(&old[0]).unwrap();
+        if header_tamper {
+            bad.header.pn += 1;
+        } else {
+            bad.ciphertext[0] ^= 1;
+        }
+        assert!(decrypt_direct_payload(&mut b.ks, bid, &bad.to_wire().unwrap(), 5).is_err());
+        assert_eq!(std::fs::read(b.dir.path().join("ks.db")).unwrap(), before);
+    }
+    for (index, text) in [(1, "one"), (0, "zero")] {
+        assert_eq!(
+            decrypt_direct_payload(&mut b.ks, bid, &old[index], 5).unwrap(),
+            (aid, DirectPayload::Text(text.into()))
+        );
+        b.restart();
+        assert!(decrypt_direct_payload(&mut b.ks, bid, &old[index], 6).is_err());
+    }
+    assert!(decrypt_direct_payload(&mut b.ks, bid, &next, 6).is_err());
+}
+
+#[test]
+fn direct_commit_failure_exposes_no_wire_and_requires_reopen() {
+    let (mut a, mut b) = (Device::new(), Device::new());
+    pair(&mut a, &mut b, 1);
+    let (aid, bid) = (a.id(), b.id());
+    for text in ["fresh establishment", "established session"] {
+        let path = a.dir.path().join("ks.db");
+        let backup = a.dir.path().join("saved.db");
+        let before = std::fs::read(&path).unwrap();
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let failed = encrypt_direct_text(&mut a.ks, aid, bid, text, 2);
+        let err = failed.unwrap_err();
+        assert!(format!("{err:#}").contains("atomic rename"), "{err:#}");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        assert!(encrypt_direct_text(&mut a.ks, aid, bid, text, 2).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        a.restart();
+        let wire = encrypt_direct_text(&mut a.ks, aid, bid, text, 3).unwrap();
+        assert_eq!(
+            decrypt_direct_payload(&mut b.ks, bid, &wire, 3).unwrap(),
+            (aid, DirectPayload::Text(text.into()))
+        );
+        let reply = encrypt_direct_text(&mut b.ks, bid, aid, "acknowledge session", 4).unwrap();
+        decrypt_direct_payload(&mut a.ks, aid, &reply, 4).unwrap();
+    }
+}
+
+#[test]
+fn delayed_group_keys_and_rekey_survive_restart() {
+    let mut devs = [Device::new(), Device::new()];
+    let group = GroupId::from_bytes([0x78; 32]);
+    let key = [0x34; 32];
+    mesh(&mut devs, &group, 1);
+    let wires: Vec<_> = (0..3u8)
+        .map(|i| send(&mut devs[0], &group, &key, &[i]))
+        .collect();
+    assert_eq!(recv(&mut devs[1], &group, &key, &wires[2]).1, vec![2]);
+    devs[1].restart();
+    let mut bad = wires[0].clone();
+    *bad.last_mut().unwrap() ^= 1;
+    let before = std::fs::read(devs[1].dir.path().join("ks.db")).unwrap();
+    assert!(try_recv(&mut devs[1], &group, &key, &bad).is_err());
+    assert_eq!(
+        std::fs::read(devs[1].dir.path().join("ks.db")).unwrap(),
+        before
+    );
+    for i in [1, 0] {
+        assert_eq!(recv(&mut devs[1], &group, &key, &wires[i]).1, vec![i as u8]);
+        devs[1].restart();
+        assert!(try_recv(&mut devs[1], &group, &key, &wires[i]).is_err());
+    }
+    reset_group_sender_state(&mut devs[0].ks, &group).unwrap();
+    reset_group_sender_state(&mut devs[1].ks, &group).unwrap();
+    devs[0].restart();
+    devs[1].restart();
+    let (left, right) = devs.split_at_mut(1);
+    distribute(&mut left[0], &mut right[0], &group, 2);
+    let new_key = [0x35; 32];
+    let wire = send(&mut devs[0], &group, &new_key, b"rekeyed");
+    assert_eq!(recv(&mut devs[1], &group, &new_key, &wire).1, b"rekeyed");
+    assert!(try_recv(&mut devs[1], &group, &new_key, &wires[0]).is_err());
 }

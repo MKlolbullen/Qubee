@@ -4,13 +4,15 @@ Part of the **v0.2.0 — Ratchet Cutover** milestone (#47). Before flipping
 `ratchetSendEnabled` to true by default and retiring the legacy envelope,
 the cutover matrix has to go green. It splits in two:
 
-- **Category A — already automated** (host/emulator, CI-gating). The
+- **Category A — automated in separate layers** (host/emulator, CI-gating). The
   crypto correctness — PQXDH establishment, DH ratchet advance, sustained
   no-desync, out-of-order/skip-window, replay/tamper rejection, cross-
   group/cross-session isolation, restart survival, group future-only +
-  removal rekey, and **no key reuse across a crash** — is proven in
-  `tests/ratchet_cutover_e2e.rs`, and parser robustness in
-  `tests/wire_parser_robustness.rs`. Don't re-do those by hand.
+  removal rekey, and persisted chain advancement — is exercised through
+  Rust APIs in `tests/ratchet_cutover_e2e.rs` and primitive unit tests.
+  Rust store reopen is not Android process death. Room recovery tests
+  exercise a separate durability boundary; neither suite proves the
+  entire Room ↔ Kotlin ↔ JNI ↔ Rust ↔ network crash window.
 - **Category B — this document.** The device-environment and lifecycle
   behaviours that emulators can't fake: Doze, network transitions, R8
   minification, the auth-bound datastore, reboot, and reinstall/identity
@@ -35,8 +37,8 @@ exchange 1:1 and group messages.
   at least one near-AOSP device (Pixel / Android One) **and** one
   aggressive-background-management OEM skin (Samsung One UI or Xiaomi
   MIUI/HyperOS), spanning **Android 12–15**. The near-AOSP device is the
-  reference pass; an OEM skin failing row 7 is a deployment caveat (see
-  Exit), not necessarily a blocker.
+  reference pass; an OEM skin failing a required row remains a cutover
+  blocker until resolved and revalidated.
 - `ratchetSendEnabled` **on** for the run (Settings → developer toggle,
   or `PreferenceRepository`). The whole point is validating the live
   ratchet path, not the legacy envelope.
@@ -157,10 +159,96 @@ if the expected result is observed on a **release** build unless noted.
   end-to-end on hardware with the real removal flow.)
 - **Exercises:** removal rekey + chain wipe over the live transport.
 
+### 13. Fresh PQXDH establishment, reply, and future-only group join
+- **Procedure:** With explicit ratchet opt-in on fresh A/B installs, exchange
+  signed prekey bundles, send A→B, reply B→A, and alternate 100 messages.
+  In an A/B group, retain pre-join packets, add C, then send new traffic.
+- **Expected:** Authenticated text arrives without desync. C reads new
+  traffic but cannot decrypt retained pre-join packets.
+- **Exercises:** live prekey exchange, ratchet advancement, and sender-key
+  distribution on join (not just the host choreography).
+
+## Automated evidence and remaining blockers
+
+Local host validation for this focused #47 PR (2026-10-10):
+
+| Command | Result |
+|---|---|
+| `cargo test --locked --test ratchet_cutover_e2e` | 14 passed |
+| `cargo test --locked --test wire_stability` | 29 passed |
+| `cargo test --locked --test wire_parser_robustness` | 10 passed |
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | passed |
+| `cargo test --locked --all-targets` | 259 tests passed; 7 benchmark smoke cases succeeded |
+| `bash scripts/check_jni_contracts.sh` | 62/62 symbols; reverse callback descriptors match |
+| `bash scripts/audit_message_file_bridge.sh` | passed (symbol presence only) |
+| `cargo build --locked --features _typecheck_jni` | passed (host typecheck, not JNI execution) |
+| `cargo bench --locked --no-run` | passed |
+
+The added host cases check persisted skipped keys across a DH step and
+store reopen, header/ciphertext rejection without durable state mutation,
+duplicate rejection after reopen, and group delayed-key/rekey persistence.
+An actual filesystem rename failure during fresh/established direct
+encryption returns no wire, poisons the store until reopen, and leaves the
+previous snapshot usable. This tests Rust commit failure, not Room failure.
+
+`MessageDaoInstrumentedTest` adds file-backed Room close/reopen tests:
+an aborting SQLite trigger on the real INSERT/REPLACE queue operation
+leaves the PREPARED text intact, recovery marks it FAILED; a durable
+SENDING row is promoted once and selected for retry with the exact bytes,
+wire id, schedule, and attempt count. Inbound, terminal, and no-wire rows
+are not promoted. These tests do **not** call JNI or encrypt real packets.
+The production PREPARED intent still lacks a durable recipient identity
+field; targeted retry/recipient binding from #56 remains a prerequisite.
+
+Android compilation was attempted with
+`./gradlew :app:compileDebugAndroidTestKotlin --no-daemon`, but stopped at
+AGP 8.4.0 plugin resolution before source compilation. Thus the new Room
+tests and default-OFF preference unit test are **unverified locally**;
+the existing instrumented workflow runs them on API 34, and the existing
+Android smoke workflow runs JVM tests. Current PR Actions require approval
+(`action_required`, no jobs/logs); no remote CI success is claimed.
+
+Golden vectors now pin full direct frames with/without PQXDH initial and
+sender-key distributions, not only magic bytes/round trips. Bounded
+direct-frame proptests and malformed/oversized tests run in the existing
+`cargo test --locked --all-targets` CI gate. No workflow files changed.
+Coverage-guided fuzz campaigns remain pending (`fuzz/README.md`); no fuzz
+campaign success is inferred from proptest.
+
+Reproducibility remains **unverified**: pinned inputs and printed `.so`
+hashes in `build_rust.sh` are not an independent two-build comparison.
+Follow `docs/reproducible-builds.md` with identical locked inputs and record
+per-ABI hashes plus unsigned APK-content comparison from independent clean
+builds. No APK/NDK reproducibility result is claimed here.
+
+Secret scanning found no secrets in changed files. A read-only fallback
+code review found no significant issues. The parallel automated reviewer
+was unavailable (model configuration error), and CodeQL timed out; security
+scan completion remains pending, not a green result.
+
+### Manual Category B evidence checklist (all pending)
+
+For each row record commit/APK hash, device/OEM, OS version, release/R8
+configuration, explicit ratchet opt-in, procedure, expected/actual result,
+timestamp, and log/report location. Never attach plaintext or key material.
+
+- [ ] Rows 1–3: offline delivery, both-process death, send-window recovery
+- [ ] Row 4: reboot both phones and recover identities/session/outbox
+- [ ] Rows 5–6: Wi-Fi↔LTE and airplane→online retry
+- [ ] Row 7: Doze/background kill on near-AOSP and OEM devices
+- [ ] Row 8: R8-on-device JNI callbacks and receipt handling
+- [ ] Row 9: auth-bound Keystore/SQLCipher inaccessible before unlock
+- [ ] Rows 10–11: reinstall/key change invalidates verified trust
+- [ ] Rows 12–13: live fresh PQXDH/reply, future-only join, immediate
+  removal/rekey, removed-member old-state rejection
+
 ## Exit
 
-When rows 1–12 pass on a **release** build across at least two
+Only when every required physical-device criterion is recorded green,
+including rows 1–13 on a **release** build across at least two
 distinct OEMs (row 7 especially), flip `ratchetSendEnabled` to true by
 default and remove the legacy signed-envelope emission — tracked in #47.
-Log any OEM that fails row 7/8 as a deployment caveat rather than a
-blocker on the default flip, unless it drops messages outright.
+Until then the default remains **OFF**, explicit opt-in is only for
+validation, and legacy signed-envelope emission stays available. This PR
+is progress toward #47, not closure of the epic.

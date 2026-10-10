@@ -1,0 +1,11 @@
+name: Qubee CodeQL config
+
+# Test code is not a security surface. The integration tests print
+# recovered plaintext and secrets in assertion failures on purpose, and
+# the pinned wire vectors are hard-coded keys and nonces by definition.
+# Both read as findings to the security queries and bury real ones.
+paths-ignore:
+  - tests
+  - app/src/test
+  - app/src/androidTest
+  - deploy/calling/test_issue_turn_credentials.py

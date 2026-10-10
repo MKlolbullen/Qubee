@@ -598,10 +598,9 @@ impl SecureKeyStore {
         // "QKM3" || salt(16) || count(1) || [nonce(12) || ct]×count.
         let v3_header = MASTER_V3_MAGIC.len() + WRAP_SALT_LEN + 1;
         if encrypted_data.starts_with(MASTER_V3_MAGIC) && encrypted_data.len() >= v3_header {
-            let mut wrap_salt = [0u8; WRAP_SALT_LEN];
-            wrap_salt.copy_from_slice(
-                &encrypted_data[MASTER_V3_MAGIC.len()..MASTER_V3_MAGIC.len() + WRAP_SALT_LEN],
-            );
+            let wrap_salt: [u8; WRAP_SALT_LEN] = encrypted_data
+                [MASTER_V3_MAGIC.len()..MASTER_V3_MAGIC.len() + WRAP_SALT_LEN]
+                .try_into()?;
             let count = encrypted_data[MASTER_V3_MAGIC.len() + WRAP_SALT_LEN] as usize;
             if count == 0
                 || count > 2
@@ -640,10 +639,9 @@ impl SecureKeyStore {
         if encrypted_data.starts_with(MASTER_V2_MAGIC)
             && encrypted_data.len() >= MASTER_V2_MAGIC.len() + WRAP_SALT_LEN + 12
         {
-            let mut wrap_salt = [0u8; WRAP_SALT_LEN];
-            wrap_salt.copy_from_slice(
-                &encrypted_data[MASTER_V2_MAGIC.len()..MASTER_V2_MAGIC.len() + WRAP_SALT_LEN],
-            );
+            let wrap_salt: [u8; WRAP_SALT_LEN] = encrypted_data
+                [MASTER_V2_MAGIC.len()..MASTER_V2_MAGIC.len() + WRAP_SALT_LEN]
+                .try_into()?;
             let body = &encrypted_data[MASTER_V2_MAGIC.len() + WRAP_SALT_LEN..];
             let wrap_key = Self::derive_wrap_key_v2(passphrase, &wrap_salt)?;
             if let Ok(master_key) = Self::try_decrypt_master(body, wrap_key.expose_secret()) {

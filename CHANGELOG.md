@@ -65,6 +65,13 @@ between minor versions.
   also triggers on bare semver tags such as `0.1.0-alpha`. A manual
   "Record Paparazzi baselines" workflow re-records the screenshot
   baselines on a runner and pushes them to the dispatched branch.
+- CodeQL no longer scans test trees (`tests/`, `app/src/test`,
+  `app/src/androidTest`, the TURN issuer's unit test): assertion
+  output and pinned wire vectors read as secret leaks and hard-coded
+  keys. The keystore master-file parser builds its salt straight from
+  the file bytes, and the v5 selector golden vector lives only in
+  `tests/wire_stability.rs` (the copy inside `sender_keys.rs` was a
+  duplicate).
 
 ## [0.1.0-alpha] — 2026-08-06
 

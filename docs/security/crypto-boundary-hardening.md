@@ -192,11 +192,15 @@ tests. RustSec's vulnerability gate passed, but OSV reported two existing,
 non-allowlisted `hickory-resolver` 0.25.2 advisories:
 `GHSA-5j98-2g5x-46v6` and `GHSA-6f2x-v7q7-m7m5`. The upstream patched resolver
 line is 0.26.2+; libp2p-dns 0.44.0 requires 0.25.2, so the fix is the libp2p
-0.57 upgrade (libp2p-dns 0.45). Until then both are allowlisted in
-`scripts/osv_scan.sh`, bound to hickory-resolver 0.25.2 exactly: the DNSSEC
-one needs validation enabled, which nothing in the stack turns on, and the
-CNAME-amplification one only runs for operator-supplied `/dns*` bootstrap
-addresses since Qubee itself dials and advertises IP multiaddrs. Any version
+0.57 upgrade (libp2p-dns 0.45). That upgrade is not a drop-in: libp2p-quic
+0.14 moves QUIC onto rustls's aws-lc-rs provider (C code, cmake, untested
+Android cross-compile) and libp2p-identity 0.3 moves to ed25519-dalek 3 and
+rand 0.10. Instead, the unused `dns` and `websocket` libp2p features were
+dropped: the swarm only ever built TCP and QUIC, so hickory-resolver is no
+longer compiled at all. It remains listed in `Cargo.lock` because libp2p's
+`tokio` feature names `libp2p-dns?/tokio` and cargo records weak-feature
+targets without building them, so both advisories are allowlisted in
+`scripts/osv_scan.sh`, bound to hickory-resolver 0.25.2 exactly. Any version
 movement drops the entries and forces a re-triage.
 
 The scan also reports the PQ crates as unmaintained following PQClean archival

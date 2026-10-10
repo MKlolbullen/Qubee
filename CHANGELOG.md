@@ -43,11 +43,15 @@ between minor versions.
   phone numbers and emails are cleared on database open.
 - Every activity declares an empty `taskAffinity`, not only the
   launcher, so no Qubee screen can be pulled into a foreign app's task.
-- Dependency audit: two hickory-resolver 0.25.2 advisories
-  (`GHSA-5j98-2g5x-46v6`, `GHSA-6f2x-v7q7-m7m5`) are allowlisted in
-  `scripts/osv_scan.sh`, bound to that exact version. Neither code path
-  is reachable with Qubee's configuration; the fix is the libp2p 0.57
-  upgrade and the entries fall away with it.
+- The unused libp2p `dns` and `websocket` features are gone: the swarm
+  only ever built TCP and QUIC. libp2p-websocket, soketto and
+  webpki-roots leave the build, and hickory-resolver is no longer
+  compiled. It stays listed in `Cargo.lock` through a weak feature
+  reference, so its two open advisories (`GHSA-5j98-2g5x-46v6`,
+  `GHSA-6f2x-v7q7-m7m5`) are allowlisted in `scripts/osv_scan.sh`,
+  bound to 0.25.2 exactly. The real fix is libp2p 0.57, which also
+  switches QUIC to aws-lc-rs and therefore needs an Android build
+  validation of its own.
 - Ratchet message-key derivation builds the AEAD key and nonce directly
   from the HKDF output and zeroizes the scratch buffer on every exit
   path, including the error path.

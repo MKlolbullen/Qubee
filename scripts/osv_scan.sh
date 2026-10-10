@@ -47,8 +47,8 @@ GHSA-3v94-mw7p-v465|hickory-proto|0.25.2|NSEC3 loop (= RUSTSEC-2026-0118): no fi
 GHSA-q2qq-hmj6-3wpp|hickory-proto|0.25.2|O(n^2) encoding (= RUSTSEC-2026-0119): fixed only in hickory 0.26, not yet adopted by libp2p-dns/mdns. Tracked in .cargo/audit.toml.
 RUSTSEC-2026-0118|hickory-proto|0.25.2|Duplicate id for GHSA-3v94-mw7p-v465 (OSV mirrors both).
 RUSTSEC-2026-0119|hickory-proto|0.25.2|Duplicate id for GHSA-q2qq-hmj6-3wpp (OSV mirrors both).
-GHSA-5j98-2g5x-46v6|hickory-resolver|0.25.2|lookup()/lookup_ip() return Ok on DNSSEC-bogus answers: reachable only with DNSSEC validation enabled, which neither libp2p-dns nor Qubee turns on. Fixed in hickory 0.26.2, consumed by libp2p-dns 0.45 / libp2p 0.57; re-triage with that bump.
-GHSA-6f2x-v7q7-m7m5|hickory-resolver|0.25.2|Follows CNAMEs outside the queried chain (query amplification): Qubee dials and advertises IP multiaddrs only, so the resolver runs solely for operator-supplied /dns* bootstrap addresses. Fixed in hickory 0.26.2 via libp2p 0.57; re-triage with that bump.
+GHSA-5j98-2g5x-46v6|hickory-resolver|0.25.2|Not compiled: libp2p's `dns` feature is off and the swarm never calls with_dns(); the crate sits in Cargo.lock only because libp2p's `tokio` feature names `libp2p-dns?/tokio`. The bug (lookup() hides DNSSEC-bogus answers) also needs DNSSEC validation, which nothing enables. Fixed in hickory 0.26.2 via libp2p 0.57; re-triage with that bump.
+GHSA-6f2x-v7q7-m7m5|hickory-resolver|0.25.2|Not compiled, same reason as above. The bug (following CNAMEs outside the queried chain) needs a resolver instance, which Qubee never constructs. Fixed in hickory 0.26.2 via libp2p 0.57; re-triage with that bump.
 EOF
 )
 

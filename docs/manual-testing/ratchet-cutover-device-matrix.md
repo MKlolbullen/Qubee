@@ -182,6 +182,8 @@ Local host validation for this focused #47 PR (2026-10-10):
 | `cargo test --locked --all-targets` | 259 tests passed; 7 benchmark smoke cases succeeded |
 | `bash scripts/check_jni_contracts.sh` | 62/62 symbols; reverse callback descriptors match |
 | `bash scripts/audit_message_file_bridge.sh` | passed (symbol presence only) |
+| `cargo build --locked --features _typecheck_jni` | passed (host typecheck, not JNI execution) |
+| `cargo bench --locked --no-run` | passed |
 
 The added host cases check persisted skipped keys across a DH step and
 store reopen, header/ciphertext rejection without durable state mutation,
@@ -219,6 +221,11 @@ hashes in `build_rust.sh` are not an independent two-build comparison.
 Follow `docs/reproducible-builds.md` with identical locked inputs and record
 per-ABI hashes plus unsigned APK-content comparison from independent clean
 builds. No APK/NDK reproducibility result is claimed here.
+
+Secret scanning found no secrets in changed files. A read-only fallback
+code review found no significant issues. The parallel automated reviewer
+was unavailable (model configuration error), and CodeQL timed out; security
+scan completion remains pending, not a green result.
 
 ### Manual Category B evidence checklist (all pending)
 

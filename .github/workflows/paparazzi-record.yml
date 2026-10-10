@@ -1,0 +1,78 @@
+name: Record Paparazzi baselines
+
+# Re-records app/src/test/snapshots/ on a runner and pushes the PNGs
+# back to the branch this was dispatched on. Recording needs the
+# Android SDK, which not every contributor environment can fetch; the
+# verify job in android-smoke.yml stays the gate, this is the tool that
+# feeds it. Review the pushed PNGs like any other diff before merging.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: paparazzi-record-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  record:
+    name: ./gradlew :app:recordPaparazziDebug
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-paparazzi-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties') }}
+
+      - name: Record baselines
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:recordPaparazziDebug --no-daemon --stacktrace
+
+      # A baseline that does not verify against itself is
+      # non-deterministic and would flap in android-smoke.yml.
+      - name: Verify the fresh baselines round-trip
+        run: ./gradlew :app:verifyPaparazziDebug --no-daemon --stacktrace
+
+      - name: Push updated baselines
+        run: |
+          git add app/src/test/snapshots
+          if git diff --cached --quiet; then
+            echo "Baselines unchanged; nothing to push."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "test: re-record Paparazzi baselines" \
+                     -m "Recorded by the Record Paparazzi baselines workflow, run ${GITHUB_RUN_ID}."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Upload baselines
+        uses: actions/upload-artifact@v4
+        with:
+          name: paparazzi-baselines-${{ github.sha }}
+          path: app/src/test/snapshots/
+          retention-days: 7

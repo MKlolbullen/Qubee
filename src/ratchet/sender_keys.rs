@@ -174,14 +174,11 @@ fn kdf_chain(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 
 fn derive_msg_aead(mk: &[u8; 32]) -> Result<([u8; 32], [u8; 12])> {
     let hk = Hkdf::<Sha256>::new(None, mk);
-    let mut okm = [0u8; 44];
-    hk.expand(SENDER_MSG_KDF_INFO, &mut okm)
+    let mut okm = Zeroizing::new([0u8; 44]);
+    hk.expand(SENDER_MSG_KDF_INFO, &mut okm[..])
         .map_err(|e| anyhow!("sender message KDF expand: {e}"))?;
-    let mut key = [0u8; 32];
-    let mut nonce = [0u8; 12];
-    key.copy_from_slice(&okm[..32]);
-    nonce.copy_from_slice(&okm[32..]);
-    okm.zeroize();
+    let key: [u8; 32] = okm[..32].try_into()?;
+    let nonce: [u8; 12] = okm[32..].try_into()?;
     Ok((key, nonce))
 }
 
@@ -747,8 +744,7 @@ fn open_outer_v5(
     if &wire[..magic_len] != MAGIC_GROUP_MESSAGE_V5 {
         bail!("not a v5 group message frame");
     }
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&wire[magic_len..magic_len + 12]);
+    let nonce_bytes: [u8; 12] = wire[magic_len..magic_len + 12].try_into()?;
     let wire_selector = &wire[magic_len + 12..magic_len + 12 + V5_SELECTOR_LEN];
     let ciphertext = &wire[magic_len + 12 + V5_SELECTOR_LEN..];
 

@@ -11,11 +11,10 @@
 
 use anyhow::{Context, Result};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit, OsRng},
     ChaCha20Poly1305, Key, Nonce,
 };
 use hkdf::Hkdf;
-use rand::RngCore;
 use secrecy::{ExposeSecret, SecretBox};
 use sha2::Sha256;
 
@@ -117,10 +116,10 @@ impl MediaKey {
     /// the same derived key.
     fn derive_stream_key(&self, stream_id: u64) -> Key {
         let hk = Hkdf::<Sha256>::new(None, self.as_bytes());
-        let mut okm = [0u8; 32];
-        let info = stream_id.to_le_bytes();
-        hk.expand(&info, &mut okm).expect("HKDF expand failed");
-        *Key::from_slice(&okm)
+        let mut key = Key::default();
+        hk.expand(&stream_id.to_le_bytes(), key.as_mut_slice())
+            .expect("HKDF expand failed");
+        key
     }
 
     /// Encrypt a media frame using the derived stream key.  The `stream_id`
@@ -129,16 +128,13 @@ impl MediaKey {
     pub fn encrypt_frame(&self, stream_id: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
         let key = self.derive_stream_key(stream_id);
         let cipher = ChaCha20Poly1305::new(&key);
-        // Generate a random 12‑byte nonce.
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .context("media frame encryption failed")?;
         // Prepend nonce to ciphertext.
-        let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
+        let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
+        out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
         Ok(out)
     }

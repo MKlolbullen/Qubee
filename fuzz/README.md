@@ -23,7 +23,7 @@ cargo install cargo-fuzz
 | Target | Parser under test |
 |---|---|
 | `parse_group_handshake` | `GroupHandshake::from_wire` (bounded-bincode handshake frames) |
-| `parse_direct_message`  | `DirectMessage::from_wire` + `inspect_direct_sender` (1:1 `QUBEE_DMS`) |
+| `parse_direct_message`  | `DirectMessage::from_wire` + `inspect_direct_selectors` (1:1 `QUBEE_DMS`) |
 | `parse_invite_link`     | `InvitePayload::from_invite_link` (`qubee://invite/...`) |
 | `parse_identity_key`    | `IdentityKey::from_bytes` (direct bincode — allocation-DoS surface) |
 
@@ -47,6 +47,13 @@ cargo +nightly fuzz run parse_group_handshake fuzz/artifacts/parse_group_handsha
 
 Seed corpora (optional) go in `fuzz/corpus/<target>/`; a good seed is any
 valid frame captured from `tests/wire_stability.rs`.
+
+The CI-gating proptests include 96 cases each for direct-magic-framed
+arbitrary bytes and structural direct-frame round trips with/without a
+PQXDH initial. Deterministic tests reject every truncated initial-frame
+prefix, invalid option tags, trailing bytes, forged `u64::MAX` vector
+lengths, and frames exceeding the 512 KiB decoder input bound. These are
+bounded regression checks, not a completed coverage-guided fuzz campaign.
 
 ## Note
 

@@ -287,4 +287,113 @@ class MessageDaoInstrumentedTest {
             present?.id == "row-4",
         )
     }
+
+    @Test
+    fun failed_durable_queue_update_preserves_prepared_intent_after_reopen() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "queue-failure-${java.util.UUID.randomUUID()}.db"
+        db.close()
+        db = Room.databaseBuilder(context, QubeeDatabase::class.java, name).build()
+        dao = db.messageDao()
+        try {
+            val prepared = Message(
+                id = "prepared",
+                conversationId = "direct-peer",
+                senderId = "me",
+                content = "preserve this text",
+                status = MessageStatus.PREPARED,
+                isFromMe = true,
+            )
+            dao.insertMessage(prepared)
+            db.openHelper.writableDatabase.execSQL(
+                "CREATE TRIGGER fail_queue BEFORE INSERT ON messages " +
+                    "WHEN NEW.status = 'SENDING' BEGIN SELECT RAISE(ABORT, 'queue write failed'); END"
+            )
+            var rejected = false
+            try {
+                dao.insertMessage(
+                    prepared.copy(
+                        status = MessageStatus.SENDING,
+                        wireId = "wire-id",
+                        wireBytes = byteArrayOf(1, 2, 3),
+                        nextRetryAt = 100L,
+                    )
+                )
+            } catch (_: android.database.sqlite.SQLiteException) {
+                rejected = true
+            }
+            assertTrue("the actual SQLite queue replacement must fail", rejected)
+            db.close()
+            db = Room.databaseBuilder(context, QubeeDatabase::class.java, name).build()
+            dao = db.messageDao()
+            assertEquals(MessageStatus.PREPARED, dao.getMessageById(prepared.id)!!.status)
+            assertEquals(1, dao.failStalePreparedOutbound())
+            assertEquals(0, dao.failStalePreparedOutbound())
+            assertEquals(0, dao.recoverOrphanedSendingOutbound())
+            val recovered = dao.getMessageById(prepared.id)!!
+            assertEquals(MessageStatus.FAILED, recovered.status)
+            assertEquals(prepared.content, recovered.content)
+            assertEquals(prepared.conversationId, recovered.conversationId)
+            assertNull(recovered.wireBytes)
+            assertNull(recovered.wireId)
+            assertTrue(dao.getRetryableOutbound(Long.MAX_VALUE, 99, 100).isEmpty())
+        } finally {
+            db.close()
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
+    fun durable_sending_recovery_retries_exact_bytes_and_preserves_other_states() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "queue-recovery-${java.util.UUID.randomUUID()}.db"
+        db.close()
+        db = Room.databaseBuilder(context, QubeeDatabase::class.java, name).build()
+        dao = db.messageDao()
+        try {
+            val queued = Message(
+                id = "queued",
+                conversationId = "direct-peer",
+                senderId = "me",
+                content = "queued text",
+                status = MessageStatus.SENDING,
+                isFromMe = true,
+                wireId = "durable-wire-id",
+                wireBytes = byteArrayOf(4, 5, 6),
+                nextRetryAt = 100L,
+                retryAttempt = 2,
+            )
+            val untouched = listOf(
+                queued.copy(id = "inbound", isFromMe = false),
+                queued.copy(id = "no-wire", wireBytes = null),
+                queued.copy(id = "delivered", status = MessageStatus.DELIVERED, nextRetryAt = null),
+                queued.copy(id = "inbound-prepared", status = MessageStatus.PREPARED, isFromMe = false),
+            )
+            for (row in listOf(queued) + untouched) dao.insertMessage(row)
+            db.close()
+            db = Room.databaseBuilder(context, QubeeDatabase::class.java, name).build()
+            dao = db.messageDao()
+            assertEquals(0, dao.failStalePreparedOutbound())
+            assertEquals(1, dao.recoverOrphanedSendingOutbound())
+            assertEquals(0, dao.recoverOrphanedSendingOutbound())
+            assertTrue(dao.getRetryableOutbound(99L, 3, 100).isEmpty())
+            val retry = dao.getRetryableOutbound(100L, 3, 100).single()
+            assertEquals(queued.id, retry.id)
+            assertEquals(MessageStatus.SENT, retry.status)
+            assertEquals(queued.conversationId, retry.conversationId)
+            assertEquals(queued.wireId, retry.wireId)
+            assertEquals(queued.nextRetryAt, retry.nextRetryAt)
+            assertEquals(queued.retryAttempt, retry.retryAttempt)
+            assertArrayEquals(queued.wireBytes, retry.wireBytes)
+            assertTrue(dao.getRetryableOutbound(100L, 2, 100).isEmpty())
+            for (row in untouched) {
+                val stored = dao.getMessageById(row.id)!!
+                assertEquals(row.status, stored.status)
+                assertArrayEquals(row.wireBytes, stored.wireBytes)
+            }
+        } finally {
+            db.close()
+            context.deleteDatabase(name)
+        }
+    }
 }

@@ -17,9 +17,10 @@ use qubee_crypto::groups::group_invite::InvitePayload;
 use qubee_crypto::groups::group_manager::GroupId;
 use qubee_crypto::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
 use qubee_crypto::ratchet::direct_message::{
-    direct_identity_selector, inspect_direct_selectors, DirectMessage,
+    direct_identity_selector, extract_direct_message_id, inspect_direct_selectors, DirectMessage,
 };
 use qubee_crypto::ratchet::double_ratchet::MessageHeader;
+use qubee_crypto::ratchet::pqxdh::WireInitialMessage;
 use qubee_crypto::ratchet::sender_keys::extract_v3_message_id;
 
 fn valid_request_join_wire() -> Vec<u8> {
@@ -88,6 +89,88 @@ proptest! {
         framed.extend_from_slice(&bytes);
         let _ = GroupHandshake::from_wire(&framed);
     }
+
+    #[test]
+    fn direct_magic_framed_bytes_decode_gracefully(
+        bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+    ) {
+        let mut framed = b"QUBEE_DMS\x02".to_vec();
+        framed.extend_from_slice(&bytes);
+        let _ = DirectMessage::from_wire(&framed);
+        let _ = extract_direct_message_id(&framed);
+    }
+
+    #[test]
+    fn direct_frames_roundtrip_both_initial_shapes(
+        nonce in any::<[u8; 16]>(),
+        sender in any::<[u8; 16]>(),
+        recipient in any::<[u8; 16]>(),
+        dh in any::<[u8; 32]>(),
+        pn in any::<u32>(),
+        n in any::<u32>(),
+        ciphertext in proptest::collection::vec(any::<u8>(), 0..4096),
+        has_initial in any::<bool>(),
+        used_otp in any::<bool>(),
+    ) {
+        let dm = DirectMessage {
+            route_nonce: nonce,
+            sender_selector: sender,
+            recipient_selector: recipient,
+            initial: has_initial.then(|| WireInitialMessage {
+                identity: [6; 32],
+                ephemeral: [7; 32],
+                kem_ciphertext: vec![8; 1088],
+                used_one_time_prekey: used_otp,
+            }),
+            header: MessageHeader { dh, pn, n },
+            ciphertext,
+        };
+        prop_assert_eq!(DirectMessage::from_wire(&dm.to_wire().unwrap()), Some(dm));
+    }
+}
+
+#[test]
+fn direct_initial_truncation_lengths_options_and_trailing_bytes_are_rejected() {
+    let mut dm = DirectMessage::from_wire(&valid_direct_message_wire()).unwrap();
+    dm.initial = Some(WireInitialMessage {
+        identity: [6; 32],
+        ephemeral: [7; 32],
+        kem_ciphertext: vec![8; 1088],
+        used_one_time_prekey: true,
+    });
+    let initial = dm.to_wire().unwrap();
+    for n in 0..initial.len() {
+        assert!(
+            DirectMessage::from_wire(&initial[..n]).is_none(),
+            "prefix {n}"
+        );
+        assert!(extract_direct_message_id(&initial[..n]).is_none());
+    }
+    for wire in [valid_direct_message_wire(), initial] {
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(DirectMessage::from_wire(&trailing).is_none());
+        assert!(extract_direct_message_id(&trailing).is_none());
+        let mut invalid_option = wire;
+        invalid_option[10 + 48] = 2;
+        assert!(DirectMessage::from_wire(&invalid_option).is_none());
+    }
+    let mut length_bomb = valid_direct_message_wire();
+    length_bomb[10 + 48 + 1 + 40..10 + 48 + 1 + 40 + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(DirectMessage::from_wire(&length_bomb).is_none());
+    let mut kem_length_bomb = dm.to_wire().unwrap();
+    kem_length_bomb[10 + 48 + 1 + 64..10 + 48 + 1 + 64 + 8]
+        .copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(DirectMessage::from_wire(&kem_length_bomb).is_none());
+    dm.ciphertext = vec![0; 512 * 1024];
+    assert!(DirectMessage::from_wire(&dm.to_wire().unwrap()).is_none());
+}
+
+#[test]
+fn oversized_handshake_is_rejected_before_decode() {
+    let mut wire = valid_request_join_wire();
+    wire.resize(10 + 512 * 1024 + 1, 0);
+    assert!(GroupHandshake::from_wire(&wire).is_none());
 }
 
 /// Truncation at every byte offset of a valid frame must be *rejected*

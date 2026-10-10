@@ -161,7 +161,67 @@ fn sender_key_distribution_round_trips() {
         signing_pub: [10u8; 32],
     };
     let bytes = d.to_bytes().unwrap();
+    let mut expected = vec![7; 32];
+    expected.extend_from_slice(&[8; 32]);
+    expected.extend_from_slice(&[42, 0, 0, 0]);
+    expected.extend_from_slice(&[9; 32]);
+    expected.extend_from_slice(&[10; 32]);
+    assert_eq!(bytes, expected, "sender-key distribution layout changed");
     assert_eq!(SenderKeyDistribution::from_bytes(&bytes).unwrap(), d);
+}
+
+#[test]
+fn direct_message_full_layout_is_pinned_with_and_without_initial() {
+    use qubee_crypto::ratchet::direct_message::DirectMessage;
+    use qubee_crypto::ratchet::double_ratchet::MessageHeader;
+    use qubee_crypto::ratchet::pqxdh::WireInitialMessage;
+
+    for initial in [
+        None,
+        Some(WireInitialMessage {
+            identity: [6; 32],
+            ephemeral: [7; 32],
+            kem_ciphertext: vec![9; 1088],
+            used_one_time_prekey: true,
+        }),
+    ] {
+        let dm = DirectMessage {
+            route_nonce: [1; 16],
+            sender_selector: [2; 16],
+            recipient_selector: [3; 16],
+            initial,
+            header: MessageHeader {
+                dh: [8; 32],
+                pn: 0x04030201,
+                n: 0x08070605,
+            },
+            ciphertext: vec![0x11, 0x22, 0x33],
+        };
+        let mut expected = b"QUBEE_DMS\x02".to_vec();
+        expected.extend_from_slice(&[1; 16]);
+        expected.extend_from_slice(&[2; 16]);
+        expected.extend_from_slice(&[3; 16]);
+        if dm.initial.is_some() {
+            expected.push(1);
+            expected.extend_from_slice(&[6; 32]);
+            expected.extend_from_slice(&[7; 32]);
+            expected.extend_from_slice(&[0x40, 0x04, 0, 0, 0, 0, 0, 0]);
+            expected.extend_from_slice(&[9; 1088]);
+            expected.push(1);
+        } else {
+            expected.push(0);
+        }
+        expected.extend_from_slice(&[8; 32]);
+        expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        expected.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[0x11, 0x22, 0x33]);
+        assert_eq!(
+            dm.to_wire().unwrap(),
+            expected,
+            "direct frame layout changed"
+        );
+        assert_eq!(DirectMessage::from_wire(&expected).unwrap(), dm);
+    }
 }
 
 #[test]

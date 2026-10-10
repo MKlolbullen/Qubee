@@ -41,6 +41,26 @@ between minor versions.
 - A session is not a phone call. The only accepted peer identifier is a
   32-byte identity id. Phone-book lookup is not requested, and stored
   phone numbers and emails are cleared on database open.
+- Every activity declares an empty `taskAffinity`, not only the
+  launcher, so no Qubee screen can be pulled into a foreign app's task.
+- Dependency audit: two hickory-resolver 0.25.2 advisories
+  (`GHSA-5j98-2g5x-46v6`, `GHSA-6f2x-v7q7-m7m5`) are allowlisted in
+  `scripts/osv_scan.sh`, bound to that exact version. Neither code path
+  is reachable with Qubee's configuration; the fix is the libp2p 0.57
+  upgrade and the entries fall away with it.
+- Ratchet message-key derivation builds the AEAD key and nonce directly
+  from the HKDF output and zeroizes the scratch buffer on every exit
+  path, including the error path.
+
+### Changed
+
+- CI: CodeQL analyses Kotlin from source instead of autobuilding the
+  app, which the runner cannot do. MobSF findings are published to code
+  scanning again rather than only to a 30-day artifact. The clippy
+  code-scanning job uses the pinned 1.88 toolchain. The release build
+  also triggers on bare semver tags such as `0.1.0-alpha`. A manual
+  "Record Paparazzi baselines" workflow re-records the screenshot
+  baselines on a runner and pushes them to the dispatched branch.
 
 ## [0.1.0-alpha] — 2026-08-06
 

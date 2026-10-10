@@ -26,6 +26,9 @@ def issue(secret: bytes, now: int, ttl: int) -> dict[str, object]:
     expires = now + ttl
     # Random opaque username suffix: no stable Qubee IdentityId or PeerId.
     username = f"{expires}:{secrets.token_hex(12)}"
+    # Coturn's use-auth-secret scheme verifies HMAC-SHA1 and nothing else.
+    # The digest authenticates a random short-lived username; it does not
+    # hash sensitive data.
     digest = hmac.new(secret, username.encode("ascii"), hashlib.sha1).digest()
     return {
         "username": username,

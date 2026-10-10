@@ -191,9 +191,13 @@ failed. PR CI is running the Android build and five attachment instrumentation
 tests. RustSec's vulnerability gate passed, but OSV reported two existing,
 non-allowlisted `hickory-resolver` 0.25.2 advisories:
 `GHSA-5j98-2g5x-46v6` and `GHSA-6f2x-v7q7-m7m5`. The upstream patched resolver
-line is 0.26.2+; libp2p-dns 0.44.0 requires 0.25.2, so this needs a compatible
-DNS/libp2p integration update. No advisory suppression was added. This is a
-merge/release blocker, not a regression introduced by this pass.
+line is 0.26.2+; libp2p-dns 0.44.0 requires 0.25.2, so the fix is the libp2p
+0.57 upgrade (libp2p-dns 0.45). Until then both are allowlisted in
+`scripts/osv_scan.sh`, bound to hickory-resolver 0.25.2 exactly: the DNSSEC
+one needs validation enabled, which nothing in the stack turns on, and the
+CNAME-amplification one only runs for operator-supplied `/dns*` bootstrap
+addresses since Qubee itself dials and advertises IP multiaddrs. Any version
+movement drops the entries and forces a re-triage.
 
 The scan also reports the PQ crates as unmaintained following PQClean archival
 (RustSec informational advisories dated 4 June 2026). These warnings are not

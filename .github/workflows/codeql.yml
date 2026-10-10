@@ -45,11 +45,14 @@ jobs:
         include:
         - language: actions
           build-mode: none
-        # Autobuild needs the Android SDK, the NDK and the Rust .so,
-        # none of which the runner has; it failed on every run. Build
-        # mode none extracts Kotlin/Java straight from source.
+        # Autobuild ran `gradlew build` without an Android SDK and failed
+        # on every run; build mode none only extracts Java and this app
+        # is pure Kotlin ("could not process any code"). Manual mode
+        # compiles the Kotlin sources with the SDK installed, which is
+        # all the Kotlin extractor needs. No NDK or Rust .so: that is
+        # packaging, not compilation.
         - language: java-kotlin
-          build-mode: none
+          build-mode: manual
         - language: python
           build-mode: none
         - language: rust
@@ -66,11 +69,28 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v7
 
-    # Add any setup steps before running the `github/codeql-action/init` action.
-    # This includes steps like installing compilers or runtimes (`actions/setup-node`
-    # or others). This is typically only required for manual builds.
-    # - name: Setup runtime (example)
-    #   uses: actions/setup-example@v1
+    - name: Set up JDK 17
+      if: matrix.language == 'java-kotlin'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Set up Android SDK
+      if: matrix.language == 'java-kotlin'
+      uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      with:
+        packages: 'platform-tools'
+        log-accepted-android-sdk-licenses: false
+
+    - name: Cache Gradle
+      if: matrix.language == 'java-kotlin'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-codeql-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties') }}
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
@@ -91,16 +111,12 @@ jobs:
     # to build your code.
     # ℹ️ Command-line programs to run using the OS shell.
     # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
-    - name: Run manual build steps
+    - name: Compile Kotlin sources under CodeQL tracing
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
-        echo 'If you are using a "manual" build mode for one or more of the' \
-          'languages you are analyzing, replace this with the commands to build' \
-          'your code, for example:'
-        echo '  make bootstrap'
-        echo '  make release'
-        exit 1
+        chmod +x ./gradlew
+        ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4

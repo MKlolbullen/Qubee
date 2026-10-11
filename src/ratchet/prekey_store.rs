@@ -382,6 +382,8 @@ mod tests {
         assert!(ids.contains(&kp.identity_id()));
     }
 
+    /// `get_peer_bundle_for_handshake` admits only timestamps within the
+    /// clock-skew/max-age window, read-only, while raw cache lookup still works.
     #[test]
     fn handshake_cache_enforces_age_and_clock_skew_boundaries_without_mutation() {
         let (mut ks, dir) = fresh_ks();

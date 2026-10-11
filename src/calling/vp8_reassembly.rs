@@ -2,7 +2,8 @@
 //!
 //! webrtc-rs hands the app individual RTP packets. Android's MediaCodec
 //! decoder needs a complete VP8 frame, so packets are concatenated until
-//! the RTP marker bit. A new partition start drops an unfinished frame.
+//! the RTP marker bit. A new frame start in partition 0 drops an
+//! unfinished frame; starts in later partitions continue the current one.
 //! The buffer is capped so a missing marker cannot grow without limit.
 
 use bytes::Bytes;

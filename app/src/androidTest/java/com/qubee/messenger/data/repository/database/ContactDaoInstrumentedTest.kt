@@ -76,7 +76,7 @@ class ContactDaoInstrumentedTest {
                 Message(
                     id = "outbound",
                     conversationId = "direct-new",
-                    senderId = "alice",
+                    senderId = "me",
                     content = "outbound",
                     timestamp = 50L,
                     status = MessageStatus.SENT,

@@ -347,7 +347,7 @@ impl IdentityKey {
     /// timestamp. Frames dated further into the future than this are
     /// rejected (see the future-dated-signature note in
     /// [`verify_with_max_age`]).
-    const MAX_CLOCK_SKEW_SECS: u64 = 60;
+    pub(crate) const MAX_CLOCK_SKEW_SECS: u64 = 60;
 
     /// Verify a hybrid signature with the default 5-minute freshness window.
     pub fn verify(&self, data: &[u8], signature: &HybridSignature) -> Result<bool> {

@@ -52,8 +52,8 @@ use crate::ratchet::direct_message::{
 };
 use crate::ratchet::pqxdh::WireInitialMessage;
 use crate::ratchet::prekey_store::{
-    body_to_public, consume_one_time_prekey, get_or_create_local_bundle, get_peer_bundle,
-    list_peer_bundle_ids, store_peer_bundle,
+    body_to_public, consume_one_time_prekey, get_or_create_local_bundle,
+    get_peer_bundle_for_handshake, list_peer_bundle_ids, store_peer_bundle,
 };
 use crate::ratchet::sender_keys::SenderKeyDistribution;
 use crate::ratchet::session::{load_session, store_session, Session};
@@ -139,7 +139,7 @@ fn encrypt_direct_inner(
     let mut session = match load_session(ks, &peer_id)? {
         Some(s) => s,
         None => {
-            let body = get_peer_bundle(ks, &peer_id)?
+            let body = get_peer_bundle_for_handshake(ks, &peer_id, now)?
                 .ok_or_else(|| anyhow!("no prekey bundle installed for peer"))?;
             let peer_public = body_to_public(&body)?;
             let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
@@ -251,7 +251,7 @@ fn decrypt_direct_inner(
         }
     }
 
-    let bundle = get_peer_bundle(ks, &peer_id)?
+    let bundle = get_peer_bundle_for_handshake(ks, &peer_id, now)?
         .ok_or_else(|| anyhow!("no verified prekey bundle for claimed sender"))?;
     if initial.identity != bundle.identity_x25519 {
         bail!("initial message identity key does not match sender's verified bundle");
@@ -727,8 +727,12 @@ mod tests {
         }
 
         fn signed_bundle_wire(&mut self) -> Vec<u8> {
-            let (secret, kem_pub) = get_or_create_local_bundle(&mut self.ks, 1).unwrap();
-            let body = build_body(&secret, &kem_pub, self.kp.public_key(), 1);
+            self.signed_bundle_wire_at(1)
+        }
+
+        fn signed_bundle_wire_at(&mut self, now: u64) -> Vec<u8> {
+            let (secret, kem_pub) = get_or_create_local_bundle(&mut self.ks, now).unwrap();
+            let body = build_body(&secret, &kem_pub, self.kp.public_key(), now);
             sign_prekey_bundle(&self.kp, body)
                 .unwrap()
                 .to_wire()
@@ -859,6 +863,122 @@ mod tests {
         let b = Device::new();
         let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
         assert!(encrypt_direct(&mut a.ks, aid, bid, b"x", 1).is_err());
+    }
+
+    #[test]
+    fn expired_cached_bundle_cannot_initiate_or_commit_and_refresh_recovers() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let late = 1 + crate::groups::group_handshake::PREKEY_BUNDLE_MAX_AGE_SECS + 1;
+        let path = a._dir.path().join("ks.db");
+        let before = std::fs::read(&path).unwrap();
+        let err = encrypt_direct(&mut a.ks, aid, bid, b"must refresh", late).unwrap_err();
+        assert!(err.to_string().contains("expired"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(load_session(&mut a.ks, &bid).unwrap().is_none());
+        assert!(a
+            .ks
+            .retrieve_key(&pending_initial_key(&bid))
+            .unwrap()
+            .is_none());
+
+        // Expiry rejection survives reload; authenticated publication refresh
+        // enables a new handshake without changing either identity.
+        a.ks = SecureKeyStore::new(&path, b"test-direct").unwrap();
+        assert!(encrypt_direct(&mut a.ks, aid, bid, b"still expired", late).is_err());
+        let (aw, bw) = (a.signed_bundle_wire_at(late), b.signed_bundle_wire_at(late));
+        install_peer_bundle(&mut a.ks, &bw).unwrap();
+        install_peer_bundle(&mut b.ks, &aw).unwrap();
+        let wire = encrypt_direct(&mut a.ks, aid, bid, b"after refresh", late).unwrap();
+        assert_eq!(
+            decrypt_direct(&mut b.ks, bid, &wire, late).unwrap().1,
+            b"after refresh"
+        );
+    }
+
+    #[test]
+    fn expired_sender_bundle_cannot_establish_or_consume_responder_state() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let wire = encrypt_direct(&mut a.ks, aid, bid, b"delayed initial", 1).unwrap();
+        let late = 1 + crate::groups::group_handshake::PREKEY_BUNDLE_MAX_AGE_SECS + 1;
+        let path = b._dir.path().join("ks.db");
+        let before = std::fs::read(&path).unwrap();
+        let err = decrypt_direct(&mut b.ks, bid, &wire, late).unwrap_err();
+        assert!(err.to_string().contains("expired"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(load_session(&mut b.ks, &aid).unwrap().is_none());
+        assert!(b
+            .ks
+            .retrieve_key(&accepted_initial_key(&aid))
+            .unwrap()
+            .is_none());
+
+        b.ks = SecureKeyStore::new(&path, b"test-direct").unwrap();
+        let refreshed = a.signed_bundle_wire_at(late);
+        install_peer_bundle(&mut b.ks, &refreshed).unwrap();
+        // Only the authenticated publication time changed: the original
+        // matching identity and unconsumed local OTP still open this initial.
+        assert_eq!(
+            decrypt_direct(&mut b.ks, bid, &wire, late).unwrap().1,
+            b"delayed initial"
+        );
+    }
+
+    #[test]
+    fn future_cached_bundle_cannot_initiate_until_within_clock_skew() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let bw = b.signed_bundle_wire_at(100);
+        install_peer_bundle(&mut a.ks, &bw).unwrap();
+        let path = a._dir.path().join("ks.db");
+        let before = std::fs::read(&path).unwrap();
+        let err = encrypt_direct(&mut a.ks, aid, bid, b"future", 39).unwrap_err();
+        assert!(err.to_string().contains("future"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(encrypt_direct(&mut a.ks, aid, bid, b"within skew", 40).is_ok());
+    }
+
+    #[test]
+    fn future_sender_bundle_cannot_establish_or_consume_responder_state() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let aw = a.signed_bundle_wire_at(100);
+        install_peer_bundle(&mut b.ks, &aw).unwrap();
+        let wire = encrypt_direct(&mut a.ks, aid, bid, b"future sender", 39).unwrap();
+        let path = b._dir.path().join("ks.db");
+        let before = std::fs::read(&path).unwrap();
+        let err = decrypt_direct(&mut b.ks, bid, &wire, 39).unwrap_err();
+        assert!(err.to_string().contains("future"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            decrypt_direct(&mut b.ks, bid, &wire, 40).unwrap().1,
+            b"future sender"
+        );
+    }
+
+    #[test]
+    fn cached_bundle_expiry_does_not_expire_an_established_session() {
+        let (mut a, mut b) = paired();
+        let (aid, bid) = (a.kp.identity_id(), b.kp.identity_id());
+        let initial = encrypt_direct(&mut a.ks, aid, bid, b"initial", 1).unwrap();
+        decrypt_direct(&mut b.ks, bid, &initial, 1).unwrap();
+        let reply = encrypt_direct(&mut b.ks, bid, aid, b"confirmed", 2).unwrap();
+        decrypt_direct(&mut a.ks, aid, &reply, 2).unwrap();
+        a.ks = SecureKeyStore::new(a._dir.path().join("ks.db"), b"test-direct").unwrap();
+        b.ks = SecureKeyStore::new(b._dir.path().join("ks.db"), b"test-direct").unwrap();
+        let late = 1 + crate::groups::group_handshake::PREKEY_BUNDLE_MAX_AGE_SECS + 1;
+        let wire = encrypt_direct(&mut a.ks, aid, bid, b"existing session", late).unwrap();
+        assert!(DirectMessage::from_wire(&wire).unwrap().initial.is_none());
+        assert_eq!(
+            decrypt_direct(&mut b.ks, bid, &wire, late).unwrap().1,
+            b"existing session"
+        );
+        let reply = encrypt_direct(&mut b.ks, bid, aid, b"still works", late).unwrap();
+        assert_eq!(
+            decrypt_direct(&mut a.ks, aid, &reply, late).unwrap().1,
+            b"still works"
+        );
     }
 
     #[test]

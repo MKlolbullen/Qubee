@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::groups::group_handshake::PrekeyBundleBody;
+use crate::groups::group_handshake::{PrekeyBundleBody, PREKEY_BUNDLE_MAX_AGE_SECS};
 use crate::identity::identity_key::{IdentityId, IdentityKey};
 use crate::ratchet::pqxdh::{PrekeyBundlePublic, PrekeyBundleSecret};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeyStore};
@@ -256,6 +256,30 @@ pub fn get_peer_bundle(
     }
 }
 
+/// Load a signature-verified cached bundle for new session establishment.
+/// Installation-time signature checks do not keep a cached publication fresh:
+/// enforce its signed body timestamp again before either side uses its keys.
+/// The caller supplies the current Unix time, never a peer-provided timestamp.
+/// Keep the raw cache available for routing and already-established sessions.
+pub(crate) fn get_peer_bundle_for_handshake(
+    ks: &mut SecureKeyStore,
+    id: &IdentityId,
+    now: u64,
+) -> Result<Option<PrekeyBundleBody>> {
+    let bundle = get_peer_bundle(ks, id)?;
+    if let Some(body) = &bundle {
+        anyhow::ensure!(
+            body.timestamp.saturating_sub(now) <= IdentityKey::MAX_CLOCK_SKEW_SECS,
+            "cached prekey bundle timestamp is in the future"
+        );
+        anyhow::ensure!(
+            now.saturating_sub(body.timestamp) <= PREKEY_BUNDLE_MAX_AGE_SECS,
+            "cached prekey bundle expired; refresh before establishing a session"
+        );
+    }
+    Ok(bundle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +380,40 @@ mod tests {
         assert_eq!(got.kem_public, body.kem_public);
         let ids = list_peer_bundle_ids(&ks).unwrap();
         assert!(ids.contains(&kp.identity_id()));
+    }
+
+    #[test]
+    fn handshake_cache_enforces_age_and_clock_skew_boundaries_without_mutation() {
+        let (mut ks, dir) = fresh_ks();
+        let kp = IdentityKeyPair::generate().unwrap();
+        let peer = kp.identity_id();
+        assert!(get_peer_bundle_for_handshake(&mut ks, &peer, 100)
+            .unwrap()
+            .is_none());
+        let (secret, kem) = get_or_create_local_bundle(&mut ks, 100).unwrap();
+        let body = build_body(&secret, &kem, kp.public_key(), 100);
+        store_peer_bundle(&mut ks, &body).unwrap();
+        let before = std::fs::read(dir.path().join("ks.db")).unwrap();
+
+        for now in [40, 100, 100 + PREKEY_BUNDLE_MAX_AGE_SECS] {
+            assert!(get_peer_bundle_for_handshake(&mut ks, &peer, now)
+                .unwrap()
+                .is_some());
+        }
+        for now in [0, 39, 100 + PREKEY_BUNDLE_MAX_AGE_SECS + 1, u64::MAX] {
+            assert!(get_peer_bundle_for_handshake(&mut ks, &peer, now).is_err());
+        }
+        assert_eq!(std::fs::read(dir.path().join("ks.db")).unwrap(), before);
+        // Routing may still resolve this cached identity after publication expiry.
+        assert!(get_peer_bundle(&mut ks, &peer).unwrap().is_some());
+
+        let mut future = body;
+        future.timestamp = u64::MAX;
+        store_peer_bundle(&mut ks, &future).unwrap();
+        assert!(get_peer_bundle_for_handshake(&mut ks, &peer, 100).is_err());
+        assert!(get_peer_bundle_for_handshake(&mut ks, &peer, u64::MAX - 60)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

@@ -71,9 +71,6 @@ class MessageService : Service(), NetworkCallback {
     // duplicates of one ciphertext cannot race the read -> ratchet-encrypt ->
     // receipt-cache sequence, while keeping memory bounded under hostile input.
     private val directFrameLocks = Array(DIRECT_FRAME_LOCK_STRIPES) { Mutex() }
-    // Node starts and restarts run one at a time: two overlapping restarts
-    // would each stop nothing and start a node of their own.
-    private val nodeLock = Mutex()
     private var isRunning = false
 
     companion object {
@@ -141,14 +138,17 @@ class MessageService : Service(), NetworkCallback {
             context.stopService(Intent(context, MessageService::class.java))
         }
 
-        /// Re-create the P2P node with the current discovery settings
-        /// (LAN discovery, bootstrap peers). Only the node restarts; the
-        /// service, its retry loops and the identity stay up. Sent with
-        /// plain startService: the caller is the Settings screen, so the
-        /// app is in the foreground, and the service is already a
-        /// foreground service or starts as one on this same intent.
+        /** Intent action requesting [restartP2PNetwork] on an already-running service. */
         const val ACTION_RESTART_NETWORK = "com.qubee.messenger.action.RESTART_NETWORK"
 
+        /**
+         * Ask the running service to re-create the P2P node with the current
+         * discovery settings (LAN discovery, bootstrap peers). Only the node
+         * restarts; the service, its retry loops and the identity stay up.
+         * Sent with plain startService: the caller is the Settings screen, so
+         * the app is in the foreground, and the service is already a
+         * foreground service or starts as one on this same intent.
+         */
         fun restartNetwork(context: Context) {
             try {
                 context.startService(
@@ -231,7 +231,7 @@ class MessageService : Service(), NetworkCallback {
                     Timber.d("Calling subsystem not started (feature off or no identity)")
                 }
                 qubeeManager.setNetworkCallback(this@MessageService)
-                nodeLock.withLock { startNode() }
+                startNode()
             }
         }
     }
@@ -269,11 +269,9 @@ class MessageService : Service(), NetworkCallback {
      */
     private fun restartP2PNetwork() {
         serviceScope.launch {
-            nodeLock.withLock {
-                qubeeManager.stopNetworkNode()
-                networkStatus.reset()
-                startNode()
-            }
+            qubeeManager.stopNetworkNode()
+            networkStatus.reset()
+            startNode()
         }
     }
 
@@ -964,19 +962,23 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Discovered new peer: %s", peerId)
     }
 
+    /** Forward a new dialable address to [networkStatus] for the Settings UI. */
     override fun onListening(multiaddr: String) {
         networkStatus.onListening(multiaddr)
     }
 
+    /** Forward an expired listen address to [networkStatus] for the Settings UI. */
     override fun onListenAddrExpired(multiaddr: String) {
         networkStatus.onListenAddrExpired(multiaddr)
     }
 
+    /** Forward a new peer connection to [networkStatus] for the Settings UI. */
     override fun onPeerConnected(peerId: String) {
         Timber.d("Peer connected: %s", peerId)
         networkStatus.onPeerConnected(peerId)
     }
 
+    /** Forward a peer disconnection to [networkStatus] for the Settings UI. */
     override fun onPeerDisconnected(peerId: String) {
         Timber.d("Peer disconnected: %s", peerId)
         networkStatus.onPeerDisconnected(peerId)

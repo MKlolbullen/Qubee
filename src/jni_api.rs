@@ -434,6 +434,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRegist
 
 // --- Network Management ---
 
+/// Start the P2P swarm on a dedicated Tokio runtime thread. A no-op
+/// (returns 1 without restarting) if a node is already running; call
+/// `nativeStopNetwork` first to apply new bootstrap peers or the LAN
+/// toggle. `bootstrap_nodes` entries that fail to parse are logged and
+/// skipped rather than aborting the start.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartNetwork(
     mut env: JNIEnv,
@@ -865,6 +870,11 @@ fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::Decrypte
     );
 }
 
+/// Forward a `NodeEvent` from the P2P thread to the registered Kotlin
+/// callback. Runs on the P2P node's own thread, so it attaches to the
+/// JVM itself; any failure to look up the JVM, callback, or method is
+/// swallowed, since a dropped event is recoverable but a panic here
+/// would take the P2P node down with it.
 fn dispatch_event_to_kotlin(event: NodeEvent) {
     let jvm_lock = JVM.lock().unwrap();
     let jvm = match jvm_lock.as_ref() {

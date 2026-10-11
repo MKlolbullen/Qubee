@@ -462,6 +462,7 @@ pub fn parse_bootstrap_peers(input: &str) -> (Vec<Multiaddr>, Vec<String>) {
     (accepted, rejected)
 }
 
+/// Extract the trailing `/p2p/<PeerId>` component, if present.
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
     addr.iter().find_map(|p| match p {
         Protocol::P2p(id) => Some(id),
@@ -469,6 +470,8 @@ fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
+/// Strip any `/p2p/<PeerId>` component so the remainder can be passed
+/// to `Kademlia::add_address`, which takes the transport address alone.
 fn without_peer_id(addr: &Multiaddr) -> Multiaddr {
     addr.iter()
         .filter(|p| !matches!(p, Protocol::P2p(_)))
@@ -809,11 +812,6 @@ impl P2PNode {
     /// Main event loop. Drives the swarm forward and translates
     /// behaviour events into [`NodeEvent`] messages for Kotlin.
     pub async fn run(mut self, event_sender: mpsc::Sender<NodeEvent>) {
-        // A stop that landed while the node was being built has already
-        // closed the channel; leave before the swarm emits anything.
-        if self.command_receiver.is_closed() {
-            return;
-        }
         let chat_topic = gossipsub::IdentTopic::new(GLOBAL_TOPIC);
         if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&chat_topic) {
             eprintln!("Failed to subscribe to topic: {e:?}");

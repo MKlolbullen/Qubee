@@ -4,6 +4,8 @@ import com.qubee.messenger.crypto.QubeeManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -17,9 +19,6 @@ import javax.inject.Singleton
  * The current call is held in a durable [StateFlow] so a late-arriving
  * collector (the call UI, which subscribes after startup) always sees
  * the present state rather than missing a one-shot event.
- *
- * The media root passed to [initiateCall] / [acceptCall] is the 32-byte
- * secret both endpoints derive from their shared 1:1 session.
  */
 @Singleton
 class CallRepository @Inject constructor(
@@ -47,6 +46,9 @@ class CallRepository @Inject constructor(
 
     private val _state = MutableStateFlow<CallUiState>(CallUiState.Idle)
     val state: StateFlow<CallUiState> = _state.asStateFlow()
+    private val operations = Mutex()
+    private val lifecycleLock = Any()
+    private var lifecycleRevision = 0L
 
     /**
      * True only when this APK was built with `-PqubeeCalling=true` and the
@@ -72,12 +74,23 @@ class CallRepository @Inject constructor(
      * Place a call. The media root is minted natively and shipped in
      * the encrypted invitation. Returns the new call id (hex) or null.
      */
-    suspend fun initiateCall(peerIdHex: String, isVideo: Boolean): String? {
+    suspend fun initiateCall(peerIdHex: String, isVideo: Boolean): String? = operations.withLock {
+        if (!_callingAvailable.value || isVideo) return null
         val peer = identityHexOrNull(peerIdHex) ?: return null
-        val callType = if (isVideo) 1 else 0
-        val callIdHex = qubeeManager.initiateCall(peer, callType) ?: return null
-        _state.value = CallUiState.Active(callIdHex, peer, callType)
-        return callIdHex
+        val revision = synchronized(lifecycleLock) {
+            if (_state.value != CallUiState.Idle) return null
+            lifecycleRevision
+        }
+        val callIdHex = qubeeManager.initiateCall(peer, 0) ?: return null
+        val published = synchronized(lifecycleLock) {
+            revision == lifecycleRevision && _callingAvailable.value &&
+                _state.compareAndSet(CallUiState.Idle, CallUiState.Active(callIdHex, peer, 0))
+        }
+        if (!published) {
+            qubeeManager.endCall(callIdHex, peer)
+            return null
+        }
+        callIdHex
     }
 
     /**
@@ -91,31 +104,41 @@ class CallRepository @Inject constructor(
     }
 
     /** Accept the currently-ringing call (media root came from the invite). */
-    suspend fun acceptCall(callIdHex: String, peerIdHex: String): Boolean {
+    suspend fun acceptCall(callIdHex: String, peerIdHex: String): Boolean = operations.withLock {
+        if (!_callingAvailable.value) return false
         val peer = identityHexOrNull(peerIdHex) ?: return false
-        // Snapshot the ringing state before suspending: a terminal
-        // lifecycle callback (hang-up, timeout) can land while
-        // acceptCall() awaits, and we must not clobber it.
-        val callType = (_state.value as? CallUiState.Incoming)
-            ?.takeIf { it.callIdHex == callIdHex }
-            ?.callType
-            ?: return false
-        val accepted = qubeeManager.acceptCall(callIdHex, peer)
-        if (accepted) {
-            // Only transition if this call is still the one ringing.
-            val current = _state.value
-            if (current is CallUiState.Incoming && current.callIdHex == callIdHex) {
-                _state.value = CallUiState.Active(callIdHex, peer, callType)
-            }
+        val (incoming, revision) = synchronized(lifecycleLock) {
+            val incoming = (_state.value as? CallUiState.Incoming)
+                ?.takeIf { it.callIdHex == callIdHex && it.peerIdHex == peer && it.callType == 0 }
+                ?: return false
+            incoming to lifecycleRevision
         }
-        return accepted
+        val accepted = qubeeManager.acceptCall(callIdHex, peer)
+        if (!accepted) return false
+        val published = synchronized(lifecycleLock) {
+            revision == lifecycleRevision && _callingAvailable.value &&
+                _state.compareAndSet(incoming, CallUiState.Active(callIdHex, peer, 0))
+        }
+        if (!published) {
+            qubeeManager.endCall(callIdHex, peer)
+        }
+        published
     }
 
-    /** End (or leave) a call; always returns to idle locally. */
-    suspend fun endCall(callIdHex: String, peerIdHex: String): Boolean {
+    /** End (or leave) the matching call, without clearing a newer lifecycle. */
+    suspend fun endCall(callIdHex: String, peerIdHex: String): Boolean = operations.withLock {
+        val (current, revision) = synchronized(lifecycleLock) {
+            val current = _state.value
+            if (!current.matches(callIdHex, peerIdHex)) return false
+            current to lifecycleRevision
+        }
         val ended = qubeeManager.endCall(callIdHex, peerIdHex)
-        _state.value = CallUiState.Idle
-        return ended
+        synchronized(lifecycleLock) {
+            if (revision == lifecycleRevision && _state.compareAndSet(current, CallUiState.Idle)) {
+                lifecycleRevision++
+            }
+        }
+        ended
     }
 
     /** Reject a ringing call — the same teardown as ending it. */
@@ -123,32 +146,57 @@ class CallRepository @Inject constructor(
         endCall(callIdHex, peerIdHex)
 
     /** Toggle local mute; returns the new muted state, or null on error. */
-    suspend fun toggleMute(callIdHex: String, peerIdHex: String): Boolean? =
-        qubeeManager.toggleMute(callIdHex, peerIdHex)
+    suspend fun toggleMute(callIdHex: String, peerIdHex: String): Boolean? = operations.withLock {
+        val (current, revision) = synchronized(lifecycleLock) {
+            val current = _state.value as? CallUiState.Active ?: return null
+            if (!current.matches(callIdHex, peerIdHex)) return null
+            current to lifecycleRevision
+        }
+        val muted = qubeeManager.toggleMute(callIdHex, peerIdHex)
+        synchronized(lifecycleLock) {
+            muted.takeIf { revision == lifecycleRevision && _state.value == current }
+        }
+    }
 
-    /** Toggle local video; returns the new enabled state, or null on error. */
+    /** Video remains unavailable until the voice-only hardware validation is complete. */
+    @Suppress("UNUSED_PARAMETER")
     suspend fun toggleVideo(callIdHex: String, peerIdHex: String): Boolean? =
-        qubeeManager.toggleVideo(callIdHex, peerIdHex)
+        null
 
     /** From the NetworkCallback: a remote invite is ringing. */
     fun onIncoming(callIdHex: String, callerIdHex: String, callType: Int) {
-        // Ignore a second invite while already busy with a call.
-        if (_state.value is CallUiState.Idle) {
-            _state.value = CallUiState.Incoming(callIdHex, callerIdHex, callType)
+        if (!_callingAvailable.value || callType != 0 || identityHexOrNull(callerIdHex) == null) return
+        synchronized(lifecycleLock) {
+            if (_state.compareAndSet(CallUiState.Idle, CallUiState.Incoming(callIdHex, callerIdHex, callType))) {
+                lifecycleRevision++
+            }
         }
     }
 
     /** From the NetworkCallback: a native lifecycle token for a call. */
     fun onStateChanged(callIdHex: String, stateToken: String) {
-        val current = _state.value
-        val concernsCurrent = when (current) {
-            is CallUiState.Incoming -> current.callIdHex == callIdHex
-            is CallUiState.Active -> current.callIdHex == callIdHex
-            CallUiState.Idle -> false
+        if (!isTerminal(stateToken)) return
+        synchronized(lifecycleLock) {
+            val current = _state.value
+            val concernsCurrent = when (current) {
+                is CallUiState.Incoming -> current.callIdHex == callIdHex
+                is CallUiState.Active -> current.callIdHex == callIdHex
+                CallUiState.Idle -> false
+            }
+            // A newly initiated call can terminate before JNI returns its id.
+            if (current == CallUiState.Idle || concernsCurrent) {
+                lifecycleRevision++
+            }
+            if (concernsCurrent) {
+                _state.compareAndSet(current, CallUiState.Idle)
+            }
         }
-        if (concernsCurrent && isTerminal(stateToken)) {
-            _state.value = CallUiState.Idle
-        }
+    }
+
+    private fun CallUiState.matches(callIdHex: String, peerIdHex: String): Boolean = when (this) {
+        is CallUiState.Incoming -> this.callIdHex == callIdHex && this.peerIdHex == peerIdHex
+        is CallUiState.Active -> this.callIdHex == callIdHex && this.peerIdHex == peerIdHex
+        CallUiState.Idle -> false
     }
 
     private fun isTerminal(token: String): Boolean {

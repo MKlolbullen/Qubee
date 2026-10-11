@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.content.ContextCompat
+import com.qubee.messenger.BuildConfig
 import com.qubee.messenger.calling.VideoSurfaces
 import com.qubee.messenger.data.repository.CallRepository.CallUiState
 import com.qubee.messenger.ui.theme.QubeePalette
@@ -59,20 +60,16 @@ import com.qubee.messenger.ui.theme.QubeeTheme
 fun CallOverlay(viewModel: CallViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val muted by viewModel.muted.collectAsStateWithLifecycle()
-    val videoOn by viewModel.videoOn.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) viewModel.accept()
-    }
-    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) viewModel.toggleVideo()
     }
 
     when (val call = state) {
         is CallUiState.Idle -> Unit
         is CallUiState.Incoming -> IncomingCallBody(
             callerLabel = shortId(call.peerIdHex),
-            isVideo = call.callType == CALL_TYPE_VIDEO,
+            isVideo = false,
             onAccept = {
                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                     viewModel.accept()
@@ -84,20 +81,13 @@ fun CallOverlay(viewModel: CallViewModel = hiltViewModel()) {
         )
         is CallUiState.Active -> ActiveCallBody(
             peerLabel = shortId(call.peerIdHex),
-            isVideo = call.callType == CALL_TYPE_VIDEO,
+            isVideo = false,
             muted = muted,
-            videoOn = videoOn,
+            videoOn = false,
             onToggleMute = viewModel::toggleMute,
-            onToggleVideo = {
-                if (videoOn) {
-                    viewModel.toggleVideo()
-                } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                    viewModel.toggleVideo()
-                } else {
-                    cameraPermission.launch(Manifest.permission.CAMERA)
-                }
-            },
+            onToggleVideo = {},
             onHangUp = viewModel::hangUp,
+            showVideoControls = BuildConfig.CALLING_VIDEO_ENABLED,
         )
     }
 }
@@ -148,13 +138,14 @@ internal fun ActiveCallBody(
     onToggleVideo: () -> Unit,
     onHangUp: () -> Unit,
     modifier: Modifier = Modifier,
+    showVideoControls: Boolean = true,
 ) {
     CallSurface(modifier) {
         CallHeader(
             title = peerLabel,
             subtitle = if (isVideo) "Video call" else "Voice call",
         )
-        if (isVideo || videoOn) {
+        if (showVideoControls && (isVideo || videoOn)) {
             RemoteVideoSurface(Modifier.fillMaxWidth().height(260.dp))
             Spacer(Modifier.size(20.dp))
         }
@@ -175,12 +166,14 @@ internal fun ActiveCallBody(
                 contentDescription = "Hang up",
                 onClick = onHangUp,
             )
-            RoundCallButton(
-                icon = if (videoOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff,
-                tint = if (videoOn) QubeePalette.Cyan else QubeePalette.MutedText,
-                contentDescription = if (videoOn) "Turn video off" else "Turn video on",
-                onClick = onToggleVideo,
-            )
+            if (showVideoControls) {
+                RoundCallButton(
+                    icon = if (videoOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff,
+                    tint = if (videoOn) QubeePalette.Cyan else QubeePalette.MutedText,
+                    contentDescription = if (videoOn) "Turn video off" else "Turn video on",
+                    onClick = onToggleVideo,
+                )
+            }
         }
     }
 }

@@ -3,8 +3,11 @@
 Status: **gated research surface.** The default native library is built
 without `--features calling`, and `BuildConfig.CALLING_NATIVE_ENABLED`
 is false unless Gradle is invoked with `-PqubeeCalling=true`. A default
-APK must not present a call control. Video capture/rendering are integrated
-behind the build gate but remain unvalidated on physical devices. Calling
+APK must not present a call control. `BuildConfig.CALLING_VIDEO_ENABLED`
+is fixed false, independently of the native calling opt-in. Android rejects
+video invitations and does not create the video engine or expose camera controls.
+The existing video scaffold must remain dormant until voice passes the
+physical-device matrix. Calling
 startup still fails with the default empty TURN configuration. The signaling
 availability guard currently returns true as a development override; it no
 longer enforces verified relayed signaling. Nothing in this document is a ship claim.
@@ -92,6 +95,7 @@ call, and ICE for an unknown call is not cached.
 | ICE candidate text | Reject above 1 KiB; cache at most 16 per peer |
 | Audio frame (RTP or app sample) | 1..=2048 bytes. Opus itself is at most 1275 |
 | Video RTP payload | 1..=16 KiB. Video hardware validation is pending |
+| Complete VP8 access unit | 1..=128 KiB, including RTP reassembly |
 | Remote media queue | 12 frames, drop oldest. Same window as Android playback |
 | Live calls | `max_concurrent_calls`, rechecked under the write lock |
 
@@ -177,8 +181,15 @@ are in [calling-metadata-matrix.md](calling-metadata-matrix.md).
 `AudioCallEngine` before `stopService` returns. A start command that
 was already queued sees the cleared id and does not reopen the
 microphone. `AudioCallEngine.stop` is idempotent and releases
-`AudioRecord`, the encoder, the decoder, and `AudioTrack`. This is
-still unproven on API 34+ foreground-service and permission races.
+`AudioRecord`, the encoder, the decoder, and `AudioTrack`. Service start,
+stop, and camera changes share a lifecycle lock; commands are not sticky.
+Permission is checked before requesting the microphone service and again
+before foreground promotion. Rejected foreground starts clear the desired call.
+Audio stop explicitly stops the recorder and track before timed worker joins;
+workers recheck shutdown before starting either device, and a stopped engine
+cannot restart while its old workers remain alive. Playback writes are
+nonblocking and decoded allocations are capped at 120 ms of mono PCM.
+These guards still require API 34+ and OEM hardware verification.
 
 ## Still required before a release claim
 

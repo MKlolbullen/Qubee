@@ -71,3 +71,16 @@ Host-tested: signaling state/replay checks, bounded media queues, payload caps,
 and the mono 48 kHz Opus profile. PR #86's relay policy and Coturn staging have
 no deployed credential service or two-phone proof. The device procedures above
 remain pending; keep #79 open until those results are recorded and reviewed.
+
+## Execution record
+
+No physical phones were available for this hardening change. No row is green
+on the basis of host tests or compilation.
+
+| Device class | API / model | G0–G5 | G6–G7 | G8 video |
+|---|---|---|---|---|
+| Near-AOSP | Not supplied | Not run | Not run | Blocked until voice passes |
+| Samsung/Xiaomi-class OEM | Not supplied | Not run | Not run | Blocked until voice passes |
+
+The Android video gate is fixed off even in opt-in calling builds. Do not
+enable it or the default native calling feature to bypass this record.

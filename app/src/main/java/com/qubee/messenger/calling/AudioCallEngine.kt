@@ -41,6 +41,9 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
     private val running = AtomicBoolean(false)
     private var captureThread: Thread? = null
     private var playbackThread: Thread? = null
+    private val deviceLock = Any()
+    private var activeRecord: AudioRecord? = null
+    private var activeTrack: AudioTrack? = null
 
     // 12 x 20 ms ≈ 240 ms maximum compressed-audio backlog. This is a
     // latency/backpressure boundary, not a delivery queue: real-time media
@@ -51,7 +54,9 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
     @Volatile private var peerIdHex: String = ""
 
     /** Begin capturing the mic for [callIdHex] and playing [peerIdHex]'s audio. */
+    @Synchronized
     fun start(callIdHex: String, peerIdHex: String) {
+        if (captureThread?.isAlive == true || playbackThread?.isAlive == true) return
         if (!running.compareAndSet(false, true)) return
         this.callIdHex = callIdHex
         this.peerIdHex = peerIdHex
@@ -61,16 +66,19 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
     }
 
     /** Stop capture + playback and release all codecs/devices. */
+    @Synchronized
     fun stop() {
         if (!running.compareAndSet(true, false)) return
+        synchronized(deviceLock) {
+            runCatching { activeRecord?.stop() }
+            runCatching { activeTrack?.stop() }
+        }
         // Discard stale media and guarantee the poison marker can be queued even
         // when the bounded backlog was full at the moment teardown started.
         remoteFrames.clear()
         remoteFrames.offer(POISON)
         captureThread?.join(TEARDOWN_JOIN_MS)
         playbackThread?.join(TEARDOWN_JOIN_MS)
-        captureThread = null
-        playbackThread = null
     }
 
     /** Hand an Opus packet from the remote track to the playback decoder. */
@@ -120,7 +128,11 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
             }
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
-            record.startRecording()
+            synchronized(deviceLock) {
+                if (!running.get()) return
+                activeRecord = record
+                record.startRecording()
+            }
 
             val pcm = ByteArray(FRAME_BYTES)
             val info = MediaCodec.BufferInfo()
@@ -139,8 +151,10 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
                 }
 
                 var outIndex = encoder.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
-                while (outIndex >= 0) {
-                    if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                while (outIndex >= 0 && running.get()) {
+                    if (running.get() && info.size in 1..MAX_REMOTE_FRAME_BYTES &&
+                        info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0
+                    ) {
                         val outBuf = encoder.getOutputBuffer(outIndex)
                         if (outBuf != null) {
                             val frame = ByteArray(info.size)
@@ -156,8 +170,11 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
         } catch (e: Exception) {
             Timber.e(e, "Audio capture loop failed")
         } finally {
-            runCatching { record?.stop() }
-            runCatching { record?.release() }
+            synchronized(deviceLock) {
+                if (activeRecord === record) activeRecord = null
+                runCatching { record?.stop() }
+                runCatching { record?.release() }
+            }
             runCatching { encoder?.stop() }
             runCatching { encoder?.release() }
         }
@@ -200,7 +217,11 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
                 .setBufferSizeInBytes(maxOf(minBuf, FRAME_BYTES * 4))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
-            track.play()
+            synchronized(deviceLock) {
+                if (!running.get()) return
+                activeTrack = track
+                track.play()
+            }
 
             val info = MediaCodec.BufferInfo()
             var ptsUs = 0L
@@ -227,14 +248,14 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
                 }
 
                 var outIndex = decoder.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
-                while (outIndex >= 0) {
-                    if (info.size > 0) {
+                while (outIndex >= 0 && running.get()) {
+                    if (info.size in 1..MAX_DECODED_FRAME_BYTES) {
                         val outBuf = decoder.getOutputBuffer(outIndex)
                         if (outBuf != null) {
                             val pcm = ByteArray(info.size)
                             outBuf.position(info.offset)
                             outBuf.get(pcm, 0, info.size)
-                            track.write(pcm, 0, pcm.size)
+                            track.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
                         }
                     }
                     decoder.releaseOutputBuffer(outIndex, false)
@@ -244,8 +265,11 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
         } catch (e: Exception) {
             Timber.e(e, "Audio playback loop failed")
         } finally {
-            runCatching { track?.stop() }
-            runCatching { track?.release() }
+            synchronized(deviceLock) {
+                if (activeTrack === track) activeTrack = null
+                runCatching { track?.stop() }
+                runCatching { track?.release() }
+            }
             runCatching { decoder?.stop() }
             runCatching { decoder?.release() }
         }
@@ -286,6 +310,7 @@ class AudioCallEngine(private val qubeeManager: QubeeManager) {
         // Matches `media_policy::MAX_AUDIO_FRAME_BYTES`. Opus frames are
         // at most 1275 bytes; anything larger is dropped before decode.
         const val MAX_REMOTE_FRAME_BYTES = 2048
+        const val MAX_DECODED_FRAME_BYTES = SAMPLE_RATE * 120 / 1000 * 2
         val POISON = ByteArray(0)
     }
 }

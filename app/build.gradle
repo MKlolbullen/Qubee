@@ -60,6 +60,8 @@ android {
         // control stays hidden. Do not flip this without the cargo feature.
         def callingNativeEnabled = (project.findProperty('qubeeCalling') ?: 'false').toString() == 'true'
         buildConfigField 'boolean', 'CALLING_NATIVE_ENABLED', callingNativeEnabled ? 'true' : 'false'
+        // Voice must pass the physical-device matrix before camera capture is enabled.
+        buildConfigField 'boolean', 'CALLING_VIDEO_ENABLED', 'false'
 
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 

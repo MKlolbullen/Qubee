@@ -30,14 +30,14 @@ class CallRepositoryTest {
     private val replacement = "second-call"
 
     @Suppress("UNCHECKED_CAST")
-    private fun enableCalling() {
+    private fun setCallingAvailable(available: Boolean = true) {
         val field = CallRepository::class.java.getDeclaredField("_callingAvailable")
         field.isAccessible = true
-        (field.get(repository) as MutableStateFlow<Boolean>).value = true
+        (field.get(repository) as MutableStateFlow<Boolean>).value = available
     }
 
     private suspend fun activate() {
-        enableCalling()
+        setCallingAvailable()
         `when`(manager.initiateCall(peer, 0)).thenReturn(call)
         assertEquals(call, repository.initiateCall(peer, false))
     }
@@ -52,8 +52,18 @@ class CallRepositoryTest {
     }
 
     @Test
+    fun accept_rechecks_availability_after_an_invite_was_published() = runTest {
+        setCallingAvailable()
+        repository.onIncoming(call, peer, 0)
+        setCallingAvailable(false)
+        assertFalse(repository.acceptCall(call, peer))
+        assertEquals(CallUiState.Incoming(call, peer, 0), repository.state.value)
+        verifyNoInteractions(manager)
+    }
+
+    @Test
     fun video_and_unknown_incoming_types_are_unavailable() = runTest {
-        enableCalling()
+        setCallingAvailable()
         assertNull(repository.initiateCall(peer, true))
         for (type in listOf(1, -1, 2)) {
             repository.onIncoming(call, peer, type)
@@ -66,7 +76,7 @@ class CallRepositoryTest {
 
     @Test
     fun invalid_identity_and_mismatched_accept_never_reach_native() = runTest {
-        enableCalling()
+        setCallingAvailable()
         assertNull(repository.initiateCall("phone-number", false))
         repository.onIncoming(call, "not-an-identity", 0)
         assertEquals(CallUiState.Idle, repository.state.value)
@@ -78,7 +88,7 @@ class CallRepositoryTest {
 
     @Test
     fun accept_publishes_only_the_current_voice_call() = runTest {
-        enableCalling()
+        setCallingAvailable()
         repository.onIncoming(call, peer, 0)
         `when`(manager.acceptCall(call, peer)).thenReturn(true)
         assertTrue(repository.acceptCall(call, peer))
@@ -90,7 +100,7 @@ class CallRepositoryTest {
     @Test
     @Suppress("UNCHECKED_CAST")
     fun accept_result_does_not_restore_a_terminated_call_or_replace_a_new_invite() = runTest {
-        enableCalling()
+        setCallingAvailable()
         repository.onIncoming(call, peer, 0)
         lateinit var pending: Continuation<Boolean>
         `when`(manager.acceptCall(call, peer)).thenAnswer {
@@ -110,7 +120,7 @@ class CallRepositoryTest {
     @Test
     @Suppress("UNCHECKED_CAST")
     fun initiate_result_does_not_restore_a_call_terminated_before_native_returns_its_id() = runTest {
-        enableCalling()
+        setCallingAvailable()
         lateinit var pending: Continuation<String?>
         `when`(manager.initiateCall(peer, 0)).thenAnswer {
             pending = it.rawArguments.last() as Continuation<String?>
@@ -127,7 +137,7 @@ class CallRepositoryTest {
 
     @Test
     fun initiate_result_does_not_overwrite_an_incoming_call() = runTest {
-        enableCalling()
+        setCallingAvailable()
         `when`(manager.initiateCall(peer, 0)).thenAnswer {
             repository.onIncoming(replacement, peer, 0)
             call
@@ -178,7 +188,7 @@ class CallRepositoryTest {
 
     @Test
     fun identical_replacement_invite_is_not_promoted_by_an_old_accept_result() = runTest {
-        enableCalling()
+        setCallingAvailable()
         repository.onIncoming(call, peer, 0)
         `when`(manager.acceptCall(call, peer)).thenAnswer {
             repository.onStateChanged(call, "ended")

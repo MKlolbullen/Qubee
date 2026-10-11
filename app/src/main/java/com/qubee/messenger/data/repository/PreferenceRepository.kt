@@ -138,15 +138,13 @@ class PreferenceRepository @Inject constructor(
      * cold start and after returning from the background past the
      * grace window. Default off, opt-in from Settings.
      *
-     * This gates the *UI*, not yet the database key — the deeper
-     * `setUserAuthenticationRequired(true)` keystore binding tracked
-     * in SECURITY.md is a separate change. See [AppLockManager].
+     * A successful toggle also re-wraps the local database and Rust-core
+     * secrets under an authentication-bound Keystore key. See [AppLockManager].
      */
     fun appLockEnabled(): Boolean = prefs.getBoolean(KEY_APP_LOCK, false)
 
-    fun setAppLockEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_APP_LOCK, enabled).apply()
-    }
+    fun setAppLockEnabled(enabled: Boolean): Boolean =
+        prefs.edit().putBoolean(KEY_APP_LOCK, enabled).commit()
 
     /**
      * Persist the ratchet sender-key "pending distribution" map

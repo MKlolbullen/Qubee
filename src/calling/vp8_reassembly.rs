@@ -2,7 +2,8 @@
 //!
 //! webrtc-rs hands the app individual RTP packets. Android's MediaCodec
 //! decoder needs a complete VP8 frame, so packets are concatenated until
-//! the RTP marker bit. A new partition start drops an unfinished frame.
+//! the RTP marker bit. A new frame start in partition 0 drops an
+//! unfinished frame; starts in later partitions continue the current one.
 //! The buffer is capped so a missing marker cannot grow without limit.
 
 use bytes::Bytes;
@@ -30,7 +31,7 @@ impl Vp8Assembler {
                 return None;
             }
         };
-        if self.packet.s == 1 {
+        if self.packet.s == 1 && self.packet.pid == 0 {
             self.frame.clear();
             self.started = true;
         }
@@ -77,5 +78,15 @@ mod tests {
     fn packet_before_partition_start_is_dropped() {
         let mut assembler = Vp8Assembler::default();
         assert!(assembler.push(&[0x00, 1, 2, 3], true).is_none());
+    }
+
+    #[test]
+    fn later_partition_start_preserves_earlier_partition_data() {
+        let mut assembler = Vp8Assembler::default();
+        assert!(assembler.push(&[0x10, 1, 2, 3], false).is_none());
+        let frame = assembler
+            .push(&[0x11, 4, 5, 6], true)
+            .expect("marker closes the frame");
+        assert_eq!(frame, vec![1, 2, 3, 4, 5, 6]);
     }
 }

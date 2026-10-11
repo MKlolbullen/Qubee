@@ -36,5 +36,5 @@
     <string name="unlock_button">Unlock</string>
     <string name="app_lock_panel_status">SCREEN LOCK</string>
     <string name="app_lock_panel_title">Require unlock</string>
-    <string name="app_lock_panel_body">Ask for your fingerprint, face, or device PIN when Qubee opens or returns from the background. Gates the app UI; it does not yet encrypt the database under your unlock.</string>
+    <string name="app_lock_panel_body">Require device authentication to open Qubee. The local database and identity-store keys are protected by an authentication-bound Android Keystore key.</string>
 </resources>

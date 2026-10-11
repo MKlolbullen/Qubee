@@ -19,12 +19,8 @@ object PermissionHelper {
         permissions.add(Manifest.permission.INTERNET)
         permissions.add(Manifest.permission.ACCESS_NETWORK_STATE)
         permissions.add(Manifest.permission.CAMERA)
-        // RECORD_AUDIO intentionally not requested — the audio-note
-        // feature isn't implemented and the manifest no longer declares
-        // the permission. (TODO: this helper still lists several other
-        // permissions the manifest doesn't declare; requesting an
-        // undeclared permission is a silent no-op. Prune to the
-        // declared set in a follow-up.)
+        // RECORD_AUDIO is requested only when starting a call, not in
+        // this startup permission batch; it is declared in the manifest.
         // READ_CONTACTS is intentionally not requested. Contacts are
         // cryptographic identities, not the device phone book. A phone
         // number is not a way to reach someone.

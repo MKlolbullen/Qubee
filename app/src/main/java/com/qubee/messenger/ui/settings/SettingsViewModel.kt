@@ -76,10 +76,32 @@ class SettingsViewModel @Inject constructor(
                     )
                     return@withLock
                 }
-                try {
+                val previousEnabled = _appLockEnabled.value
+                val persisted = try {
                     withContext(Dispatchers.IO) {
                         if (enabled) keyProvider.enableAuthBinding(keyHolder)
                         else keyProvider.disableAuthBinding(keyHolder)
+                        val saved = runCatching {
+                            preferences.setAppLockEnabled(enabled)
+                        }.getOrElse { error ->
+                            Timber.e(error, "Failed to persist Screen Lock preference")
+                            false
+                        }
+                        if (!saved) {
+                            runCatching {
+                                if (enabled) keyProvider.disableAuthBinding(keyHolder)
+                                else keyProvider.enableAuthBinding(keyHolder)
+                            }.onFailure { error ->
+                                Timber.e(error, "Failed to roll back Screen Lock binding")
+                            }
+                            val restored = runCatching {
+                                preferences.setAppLockEnabled(previousEnabled)
+                            }.getOrDefault(false)
+                            if (!restored) {
+                                Timber.e("Failed to restore Screen Lock preference")
+                            }
+                        }
+                        saved
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
@@ -88,9 +110,10 @@ class SettingsViewModel @Inject constructor(
                     _appLockNotice.tryEmit("Couldn't change Screen Lock. Restart the app before retrying.")
                     return@withLock
                 }
-                // Publish the setting only after the secret transition commits.
-                // A failed disable must never advertise an unlocked datastore.
-                preferences.setAppLockEnabled(enabled)
+                if (!persisted) {
+                    _appLockNotice.tryEmit("Couldn't change Screen Lock. Restart the app before retrying.")
+                    return@withLock
+                }
                 _appLockEnabled.value = enabled
                 appLockManager.onPreferenceChanged()
             }

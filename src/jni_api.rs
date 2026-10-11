@@ -97,6 +97,7 @@ lazy_static! {
 
     // Command channel to talk to the background P2P node
     static ref P2P_COMMANDER: Mutex<Option<tokio::sync::mpsc::Sender<P2PCommand>>> = Mutex::new(None);
+    static ref P2P_NODE_LIFETIME: Mutex<()> = Mutex::new(());
 
     // JVM Reference for callbacks
     static ref JVM: Mutex<Option<JavaVM>> = Mutex::new(None);
@@ -464,7 +465,10 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
         // A nativeStopNetwork during construction drops the slot's sender,
         // so once the node is built its command channel is already closed
         // and it exits before polling the swarm. nativeStopNetwork is the
-        // way to apply new settings.
+        // way to apply new settings. Node threads also serialize on
+        // P2P_NODE_LIFETIME, so a restart waits for the previous node to
+        // finish shutting down, and a start that was stopped before its
+        // turn never builds a node.
         let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
         {
             let mut slot = P2P_COMMANDER.lock().unwrap();
@@ -476,6 +480,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
         }
 
         std::thread::spawn(move || {
+            let _lifetime = P2P_NODE_LIFETIME
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let still_current = P2P_COMMANDER
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|held| held.same_channel(&tx_cmd));
+            if !still_current {
+                return;
+            }
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let id_keys = match load_or_create_libp2p_keypair() {

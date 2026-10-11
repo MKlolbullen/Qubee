@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.qubee.messenger.QubeeApplication
+import com.qubee.messenger.BuildConfig
 import com.qubee.messenger.R
 import com.qubee.messenger.crypto.QubeeManager
 import dagger.hilt.android.AndroidEntryPoint
@@ -42,8 +43,8 @@ class CallMediaService : Service() {
 
     @Inject lateinit var qubeeManager: QubeeManager
 
-    private var engine: AudioCallEngine? = null
-    private var video: VideoCallEngine? = null
+    @Volatile private var engine: AudioCallEngine? = null
+    @Volatile private var video: VideoCallEngine? = null
 
     @Volatile private var activeCallIdHex: String = ""
 
@@ -52,13 +53,13 @@ class CallMediaService : Service() {
         active = this
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = synchronized(lifecycleLock) {
         val callIdHex = intent?.getStringExtra(EXTRA_CALL_ID)
         val peerIdHex = intent?.getStringExtra(EXTRA_PEER_ID)
         // stop() clears desiredCallId before stopService returns. A start
         // that was already queued must not bring the microphone back up
         // after the call has ended.
-        if (callIdHex.isNullOrEmpty() || desiredCallId != callIdHex) {
+        if (!BuildConfig.CALLING_NATIVE_ENABLED || callIdHex.isNullOrEmpty() || desiredCallId != callIdHex) {
             Timber.w("CallMediaService start ignored; no live call")
             if (desiredCallId == null) {
                 releaseEngine()
@@ -99,6 +100,7 @@ class CallMediaService : Service() {
             // or from a disallowed state. Fail closed — no call audio —
             // rather than crash the process.
             Timber.e(e, "startForeground(microphone) rejected; stopping call media")
+            if (desiredCallId == callIdHex) desiredCallId = null
             releaseEngine()
             stopSelf()
             return START_NOT_STICKY
@@ -107,18 +109,22 @@ class CallMediaService : Service() {
         // A second invite for the same call is idempotent; a different call
         // replaces the engine (the previous call must already be tearing down).
         if (engine != null && activeCallIdHex == callIdHex) {
-            return START_STICKY
+            return START_NOT_STICKY
         }
         engine?.stop()
+        engine = null
+        video?.stop()
+        video = null
         activeCallIdHex = callIdHex
         engine = AudioCallEngine(qubeeManager).apply { start(callIdHex, peerIdHex) }
-        video?.stop()
-        video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
+        if (BuildConfig.CALLING_VIDEO_ENABLED) {
+            video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
+        }
         Timber.d("CallMediaService audio engine started")
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
-    override fun onDestroy() {
+    override fun onDestroy(): Unit = synchronized(lifecycleLock) {
         if (desiredCallId == activeCallIdHex) desiredCallId = null
         releaseEngine()
         super.onDestroy()
@@ -129,7 +135,7 @@ class CallMediaService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     /** Stop capture and drop the engine. Safe to call more than once. */
-    private fun releaseEngine() {
+    private fun releaseEngine(): Unit = synchronized(lifecycleLock) {
         engine?.stop()
         engine = null
         video?.stop()
@@ -139,20 +145,23 @@ class CallMediaService : Service() {
 
     /** Route one remote Opus frame to the running engine, if it's this call. */
     private fun onRemoteAudio(callIdHex: String, payload: ByteArray) {
+        val target = engine
         if (callIdHex == activeCallIdHex) {
-            engine?.onRemoteAudioFrame(payload)
+            target?.onRemoteAudioFrame(payload)
         }
     }
 
     /** Route one remote VP8 access unit to the running engine, if it's this call. */
     private fun onRemoteVideo(callIdHex: String, payload: ByteArray) {
+        val target = video
         if (callIdHex == activeCallIdHex) {
-            video?.onRemoteAccessUnit(payload)
+            target?.onRemoteAccessUnit(payload)
         }
     }
 
     /** Starts/stops the camera, upgrading the foreground service type to include camera on enable. */
-    private fun applyCapture(enabled: Boolean) {
+    private fun applyCapture(enabled: Boolean): Unit = synchronized(lifecycleLock) {
+        if (!BuildConfig.CALLING_VIDEO_ENABLED) return
         if (activeCallIdHex.isEmpty()) return
         if (!enabled) {
             video?.setCaptureEnabled(false)
@@ -209,6 +218,7 @@ class CallMediaService : Service() {
         private const val NOTIFICATION_ID = 1002
         private const val EXTRA_CALL_ID = "call_id_hex"
         private const val EXTRA_PEER_ID = "peer_id_hex"
+        private val lifecycleLock = Any()
 
         // The single live service instance, so the network thread can push
         // remote frames without binding. Written on create/destroy on the
@@ -222,7 +232,11 @@ class CallMediaService : Service() {
         private var desiredCallId: String? = null
 
         /** Bring up mic capture + playback for [callIdHex] ↔ [peerIdHex]. */
-        fun start(context: Context, callIdHex: String, peerIdHex: String) {
+        fun start(context: Context, callIdHex: String, peerIdHex: String): Unit = synchronized(lifecycleLock) {
+            if (!BuildConfig.CALLING_NATIVE_ENABLED ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                    != PackageManager.PERMISSION_GRANTED
+            ) return
             desiredCallId = callIdHex
             val intent = Intent(context, CallMediaService::class.java).apply {
                 putExtra(EXTRA_CALL_ID, callIdHex)
@@ -231,15 +245,17 @@ class CallMediaService : Service() {
             try {
                 ContextCompat.startForegroundService(context, intent)
             } catch (e: Exception) {
+                if (desiredCallId == callIdHex) desiredCallId = null
                 Timber.w(e, "Could not start CallMediaService")
             }
         }
 
         /** Tear down the live call's media and stop the foreground service. */
-        fun stop(context: Context) {
+        fun stop(context: Context): Unit = synchronized(lifecycleLock) {
             desiredCallId = null
             active?.releaseEngine()
             context.stopService(Intent(context, CallMediaService::class.java))
+            Unit
         }
 
         /**

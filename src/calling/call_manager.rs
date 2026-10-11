@@ -93,6 +93,18 @@ fn is_terminal(state: &CallState) -> bool {
     )
 }
 
+fn require_matching_invitation(call: &Call, caller: IdentityId) -> Result<()> {
+    if is_terminal(&call.state) {
+        return Err(anyhow::anyhow!("stale call invitation"));
+    }
+    if call.initiator != caller || !call.participants.contains_key(&caller) {
+        return Err(anyhow::anyhow!(
+            "call invitation caller does not match the existing call"
+        ));
+    }
+    Ok(())
+}
+
 /// Individual call instance
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Call {
@@ -798,7 +810,7 @@ impl CallManager {
     /// Handle an inbound call invitation: register the call in the
     /// ringing state with the caller as its remote participant and
     /// surface an [`CallEvent::IncomingCall`] so the app can ring. A
-    /// duplicate invitation for a known call is ignored.
+    /// duplicate invitation from the same live call's initiator is ignored.
     async fn on_call_invitation(
         &self,
         call_id: CallId,
@@ -821,11 +833,8 @@ impl CallManager {
         {
             let calls = self.calls.read().await;
             if let Some(existing) = calls.get(&call_id) {
-                if is_terminal(&existing.state) {
-                    return Err(anyhow::anyhow!("stale call invitation"));
-                }
                 // A live duplicate must not replace the media root or re-ring.
-                return Ok(());
+                return require_matching_invitation(existing, caller);
             }
             let active_calls = calls
                 .values()
@@ -874,10 +883,7 @@ impl CallManager {
             // Re-check under the write lock: another inbound frame may
             // have registered this call between the read and the write.
             if let Some(existing) = calls.get(&call_id) {
-                if is_terminal(&existing.state) {
-                    return Err(anyhow::anyhow!("stale call invitation"));
-                }
-                return Ok(());
+                return require_matching_invitation(existing, caller);
             }
             let active_calls = calls
                 .values()
@@ -1728,6 +1734,161 @@ mod tests {
             .expect("duplicate invitation ignored");
     }
 
+    async fn assert_media_root(
+        manager: &CallManager,
+        call_id: CallId,
+        caller: IdentityId,
+        root: u8,
+    ) {
+        let pair = canonical_peer_pair(manager.local_identity, caller);
+        let original = MediaEncryption::from_shared_root([root; 32])
+            .generate_media_key(call_id.as_bytes(), &pair);
+        let frame = original.encrypt_frame(0, b"original root").unwrap();
+        let media = manager.call_media.read().await;
+        let actual = media[&call_id].generate_media_key(call_id.as_bytes(), &pair);
+        assert_eq!(actual.decrypt_frame(0, &frame).unwrap(), b"original root");
+    }
+
+    fn assert_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut context).is_pending());
+    }
+
+    #[tokio::test]
+    async fn live_duplicate_invitation_preserves_state_media_root_and_events() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1; 32]);
+        let call_id = CallId::from([4; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CallEvent::IncomingCall { .. })
+        ));
+
+        for state in [CallState::Ringing, CallState::Active] {
+            manager.calls.write().await.get_mut(&call_id).unwrap().state = state;
+            let before = bincode::serialize(&manager.get_call(call_id).await.unwrap()).unwrap();
+            let duplicate = SignalingMessage::CallInvitation {
+                call_id,
+                caller,
+                call_type: CallType::VideoCall,
+                settings: CallSettings {
+                    auto_mute_on_join: true,
+                    ..CallSettings::default()
+                },
+                media_root: [8; 32],
+            }
+            .to_bytes()
+            .unwrap();
+            manager
+                .handle_inbound_signaling(caller, &duplicate)
+                .await
+                .unwrap();
+            assert_eq!(
+                bincode::serialize(&manager.get_call(call_id).await.unwrap()).unwrap(),
+                before
+            );
+            assert_media_root(&manager, call_id, caller, 7).await;
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_invitation_rejects_caller_substitution_without_mutation() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1; 32]);
+        let stranger = IdentityId::from([3; 32]);
+        let call_id = CallId::from([4; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+        let _incoming = events.try_recv().unwrap();
+
+        for participant_present in [false, true] {
+            if participant_present {
+                let mut calls = manager.calls.write().await;
+                let call = calls.get_mut(&call_id).unwrap();
+                let mut participant = call.participants[&caller].clone();
+                participant.identity_id = stranger;
+                call.participants.insert(stranger, participant);
+            }
+            let before = bincode::serialize(&manager.get_call(call_id).await.unwrap()).unwrap();
+            let err = manager
+                .handle_inbound_signaling(stranger, &invite(call_id, stranger, 8))
+                .await
+                .expect_err("another authenticated caller cannot reuse a live call id");
+            assert!(err.to_string().contains("caller does not match"));
+            assert_eq!(
+                bincode::serialize(&manager.get_call(call_id).await.unwrap()).unwrap(),
+                before
+            );
+            assert_media_root(&manager, call_id, caller, 7).await;
+            assert!(events.try_recv().is_err());
+        }
+
+        manager
+            .calls
+            .write()
+            .await
+            .get_mut(&call_id)
+            .unwrap()
+            .participants
+            .remove(&caller);
+        let before = bincode::serialize(&manager.get_call(call_id).await.unwrap()).unwrap();
+        assert!(manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 8))
+            .await
+            .is_err());
+        assert_eq!(
+            bincode::serialize(&manager.get_call(call_id).await.unwrap()).unwrap(),
+            before
+        );
+        assert_media_root(&manager, call_id, caller, 7).await;
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_duplicate_invitation_rechecks_caller_under_write_lock() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1; 32]);
+        let stranger = IdentityId::from([3; 32]);
+        let call_id = CallId::from([4; 16]);
+        let first_payload = invite(call_id, caller, 7);
+        let second_payload = invite(call_id, stranger, 8);
+        let mut first = std::pin::pin!(manager.handle_inbound_signaling(caller, &first_payload));
+        let mut second =
+            std::pin::pin!(manager.handle_inbound_signaling(stranger, &second_payload));
+
+        // Queue both readers before either handler can reach the write recheck.
+        let calls = manager.calls.write().await;
+        assert_pending(first.as_mut());
+        assert_pending(second.as_mut());
+        drop(calls);
+        assert_pending(first.as_mut());
+        assert_pending(second.as_mut());
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.unwrap();
+        assert!(second_result
+            .unwrap_err()
+            .to_string()
+            .contains("caller does not match"));
+        let call = manager.get_call(call_id).await.unwrap();
+        assert_eq!(call.state, CallState::Ringing);
+        assert_eq!(call.initiator, caller);
+        assert_eq!(call.participants.len(), 1);
+        assert!(call.participants.contains_key(&caller));
+        assert_media_root(&manager, call_id, caller, 7).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CallEvent::IncomingCall { caller: sender, .. }) if sender == caller
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn inbound_hangup_ends_the_call() {
         let (manager, mut events) = manager_with_events().await;
@@ -2219,6 +2380,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replayed_invitation_after_rejection_does_not_rering() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1; 32]);
+        let call_id = CallId::from([4; 16]);
+        let payload = invite(call_id, caller, 7);
+        manager
+            .handle_inbound_signaling(caller, &payload)
+            .await
+            .unwrap();
+        let _incoming = events.try_recv().unwrap();
+        manager.reject_call(call_id, caller).await.unwrap();
+        let _left = events.try_recv().unwrap();
+        assert_eq!(
+            manager.get_call(call_id).await.unwrap().state,
+            CallState::Rejected
+        );
+        assert!(!manager.call_media.read().await.contains_key(&call_id));
+
+        for remove_terminal_call in [false, true] {
+            if remove_terminal_call {
+                manager.calls.write().await.remove(&call_id);
+            }
+            let err = manager
+                .handle_inbound_signaling(caller, &payload)
+                .await
+                .expect_err("rejected invitation replay");
+            assert!(err.to_string().contains("stale"));
+            assert!(!manager.call_media.read().await.contains_key(&call_id));
+            assert!(events.try_recv().is_err());
+        }
+        assert!(manager.get_call(call_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn replayed_invitation_after_ring_timeout_does_not_rering() {
+        let (mut manager, mut events) = manager_with_events().await;
+        // Tokio's test-util feature is not enabled; keep the real timer short.
+        manager.config.ring_timeout = Duration::from_millis(10);
+        let caller = IdentityId::from([1; 32]);
+        let call_id = CallId::from([4; 16]);
+        let payload = invite(call_id, caller, 7);
+        manager
+            .handle_inbound_signaling(caller, &payload)
+            .await
+            .unwrap();
+        let _incoming = events.try_recv().unwrap();
+        let timeout_event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("ring timer fired")
+            .unwrap();
+        assert!(matches!(
+            timeout_event,
+            CallEvent::CallStateChanged {
+                old_state: CallState::Ringing,
+                new_state: CallState::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager.get_call(call_id).await.unwrap().state,
+            CallState::TimedOut
+        );
+        assert!(!manager.call_media.read().await.contains_key(&call_id));
+
+        for remove_terminal_call in [false, true] {
+            if remove_terminal_call {
+                manager.calls.write().await.remove(&call_id);
+            }
+            let err = manager
+                .handle_inbound_signaling(caller, &payload)
+                .await
+                .expect_err("timed-out invitation replay");
+            assert!(err.to_string().contains("stale"));
+            assert!(!manager.call_media.read().await.contains_key(&call_id));
+            assert!(events.try_recv().is_err());
+        }
+        assert!(manager.get_call(call_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_invitations_respect_concurrent_call_cap() {
+        let (mut manager, mut events) = manager_with_events().await;
+        manager.config.max_concurrent_calls = 1;
+        let caller = IdentityId::from([1; 32]);
+        let stranger = IdentityId::from([3; 32]);
+        let first_id = CallId::from([4; 16]);
+        let second_id = CallId::from([5; 16]);
+        let first_payload = invite(first_id, caller, 7);
+        let second_payload = invite(second_id, stranger, 8);
+        let mut first = std::pin::pin!(manager.handle_inbound_signaling(caller, &first_payload));
+        let mut second =
+            std::pin::pin!(manager.handle_inbound_signaling(stranger, &second_payload));
+
+        let calls = manager.calls.write().await;
+        assert_pending(first.as_mut());
+        assert_pending(second.as_mut());
+        drop(calls);
+        assert_pending(first.as_mut());
+        assert_pending(second.as_mut());
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.unwrap();
+        assert!(second_result
+            .unwrap_err()
+            .to_string()
+            .contains("Maximum concurrent"));
+        assert_eq!(manager.calls.read().await.len(), 1);
+        assert!(manager.get_call(second_id).await.is_none());
+        assert!(!manager.call_media.read().await.contains_key(&second_id));
+        assert_media_root(&manager, first_id, caller, 7).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CallEvent::IncomingCall { .. })
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn second_live_call_is_rejected_when_the_cap_is_one() {
         let (event_sender, _events) = mpsc::unbounded_channel();
         let server = Arc::new(SignalingServer::new().await.unwrap());
@@ -2314,6 +2592,45 @@ mod tests {
             .unwrap()
             .is_muted;
         assert!(muted, "33 flips from unmuted must end muted");
+    }
+
+    #[tokio::test]
+    async fn concurrent_video_toggles_preserve_parity_and_media_state() {
+        let (manager, mut events) = manager_with_events().await;
+        let caller = IdentityId::from([1; 32]);
+        let call_id = CallId::from([4; 16]);
+        manager
+            .handle_inbound_signaling(caller, &invite(call_id, caller, 7))
+            .await
+            .unwrap();
+        let _incoming = events.try_recv().unwrap();
+        let manager = Arc::new(manager);
+        let mut enabled = false;
+        for count in [33, 32, 1] {
+            let mut tasks = Vec::new();
+            for _ in 0..count {
+                let manager = manager.clone();
+                tasks.push(tokio::spawn(async move {
+                    manager.toggle_video(call_id, caller).await.unwrap()
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            for _ in 0..count {
+                enabled = !enabled;
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(CallEvent::MediaStateChanged { media_state, .. })
+                        if media_state.video_enabled == enabled
+                ));
+            }
+            let call = manager.get_call(call_id).await.unwrap();
+            let participant = &call.participants[&caller];
+            assert_eq!(participant.is_video_enabled, enabled);
+            assert_eq!(participant.media_state.video_enabled, enabled);
+            assert!(events.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

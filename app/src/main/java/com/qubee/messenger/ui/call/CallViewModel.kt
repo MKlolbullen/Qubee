@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 
 /**
@@ -31,6 +33,7 @@ class CallViewModel @Inject constructor(
 
     private val _videoOn = MutableStateFlow(false)
     val videoOn: StateFlow<Boolean> = _videoOn.asStateFlow()
+    private val muteLock = Mutex()
 
     init {
         // Reset the local control state whenever the call changes (or
@@ -88,18 +91,22 @@ class CallViewModel @Inject constructor(
         val active = state.value as? CallUiState.Active ?: return
         val callId = active.callIdHex
         viewModelScope.launch {
-            val result = callRepository.toggleMute(active.callIdHex, active.peerIdHex) ?: return@launch
-            // Apply only if that same call is still active (a delayed
-            // result must not touch a later call's controls).
-            val now = state.value
-            if (now is CallUiState.Active && now.callIdHex == callId) {
-                _muted.value = result
+            muteLock.withLock {
+                if (state.value != active) return@withLock
+                val result = callRepository.toggleMute(active.callIdHex, active.peerIdHex) ?: return@withLock
+                // Apply only if that same call is still active (a delayed
+                // result must not touch a later call's controls).
+                val now = state.value
+                if (now is CallUiState.Active && now.callIdHex == callId) {
+                    _muted.value = result
+                }
             }
         }
     }
 
     /** Toggle video on the active call; reflects the native result. */
     fun toggleVideo() {
+        if (!com.qubee.messenger.BuildConfig.CALLING_VIDEO_ENABLED) return
         val active = state.value as? CallUiState.Active ?: return
         val callId = active.callIdHex
         viewModelScope.launch {

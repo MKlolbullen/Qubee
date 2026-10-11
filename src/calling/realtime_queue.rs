@@ -123,6 +123,7 @@ impl<T> RealtimeReceiver<T> {
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut queue = lock(&self.inner.items);
                 if let Some(item) = queue.pop_front() {
@@ -195,5 +196,29 @@ mod tests {
         drop(tx);
         assert_eq!(rx.recv().await, Some(7));
         assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn idle_receiver_wakes_when_last_sender_closes() {
+        let (tx, mut rx) = realtime_channel::<u8>(2);
+        let consumer = tokio::spawn(async move { rx.recv().await });
+        tokio::task::yield_now().await;
+        drop(tx);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), consumer)
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn dropping_receiver_rejects_further_media() {
+        let (tx, rx) = realtime_channel::<u8>(2);
+        let clone = tx.clone();
+        drop(rx);
+        assert!(!tx.push_freshest(1));
+        assert!(!clone.push_freshest(2));
     }
 }

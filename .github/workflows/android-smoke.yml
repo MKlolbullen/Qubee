@@ -82,7 +82,7 @@ jobs:
           ./build_rust.sh
 
       - name: Assemble debug APK
-        # Debug variant is unsigned; doesn't need any of the
+        # Debug variant uses a test certificate; doesn't need any of the
         # release-only secrets. Catches Kotlin compile errors,
         # missing Hilt providers, AndroidManifest problems, and
         # resource-reference errors that the JNI-only Rust CI
@@ -91,17 +91,23 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Assemble release APK (unsigned, R8 dry-run)
+      - name: Assemble release APK (debug-signed, R8 dry-run)
         # The release variant has minifyEnabled=true, so this is the
         # ONLY pre-tag check that exercises R8/ProGuard. Debug builds
         # and unit tests run un-minified and would sail past an
         # R8-stripped JNI callback or a Gson Signature-attribute
         # break. No signing secrets needed: the `hasReleaseSigning`
-        # gate in app/build.gradle leaves the APK unsigned when the
+        # gate in app/build.gradle uses debug signing when the
         # RELEASE_* env vars are absent, but still runs the full
         # shrink/obfuscate pipeline. A failure here is a release
         # blocker caught on the PR instead of at `git tag` time.
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify product signer against the real minified APK
+        env:
+          QUBEE_SIGNING_TEST_APK: app/build/outputs/apk/release/app-release.apk
+        # Disposable fixture keys only; this step never uses owner secrets.
+        run: python3 scripts/test_product_signing.py
 
       - name: Lint debug
         # Non-fatal — lint catches a much broader surface than

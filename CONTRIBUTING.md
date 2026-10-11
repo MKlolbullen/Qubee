@@ -11,18 +11,47 @@ below is the long form of that.
 # 1. Clone and check the toolchain Qubee expects.
 git clone https://github.com/MKlolbullen/Qubee.git
 cd Qubee
-rustup show           # honours rust-toolchain.toml (1.86 stable)
+rustup show           # honours rust-toolchain.toml (1.88.0)
 
 # 2. Sanity-check your environment (Rust, Android NDK, cargo-ndk, etc.).
 ./scripts/qubee_doctor.sh
 
-# 3. Run the Rust suite. Should print "60+ passed" green.
-cargo test --locked
+# 3. Run the Rust suite used by CI.
+cargo test --locked --all-targets
 
 # 4. (Optional) Build the Android side. Requires the Android SDK.
 ./build_rust.sh        # bash; build_rust.ps1 on Windows
 ./gradlew :app:assembleDebug
 ```
+
+## Optional local release signing
+
+Debug builds require no release-signing secrets. Gradle reads
+`RELEASE_KEYSTORE_FILE`, `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS`, and
+`RELEASE_KEY_PASSWORD` from the current process environment; it does not load
+`.env` or other dotenv files automatically.
+
+`.env.example` lists these optional variables with blank values. If you use a
+local `.env` copy, keep it private and never commit it or real credentials.
+In Bash or Zsh, export values from that shell-compatible file before building:
+
+```bash
+cp .env.example .env
+# Fill .env locally, then:
+set -a
+. ./.env
+set +a
+./gradlew :app:assembleRelease
+unset RELEASE_KEYSTORE_FILE RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD
+```
+
+In PowerShell, set `$env:RELEASE_KEYSTORE_FILE`, `$env:RELEASE_KEYSTORE_PASSWORD`,
+`$env:RELEASE_KEY_ALIAS`, and `$env:RELEASE_KEY_PASSWORD` in the current session
+(or configure them in your IDE's run environment) before invoking
+`.\gradlew.bat :app:assembleRelease`. Do not save passwords in scripts or
+commit them. Without these variables, a local release build uses the debug
+keystore and is not suitable for distribution; the tagged-release workflow
+requires its signing secrets.
 
 ## Before you open a PR
 
@@ -31,7 +60,7 @@ Run these locally; they're the same checks CI runs (`.github/workflows/ci.yml`):
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --locked
+cargo test --locked --all-targets
 cargo build --features _typecheck_jni
 cargo bench --no-run
 ./scripts/check_jni_contracts.sh

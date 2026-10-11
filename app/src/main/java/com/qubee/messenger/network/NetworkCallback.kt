@@ -129,7 +129,8 @@ interface NetworkCallback {
      * @param callIdHex   hex-encoded CallId.
      * @param senderIdHex hex-encoded remote IdentityId.
      * @param kind        0 = audio, 1 = video.
-     * @param payload     the codec bitstream from one RTP packet.
+     * @param payload     one Opus payload for audio, or a complete VP8
+     *                    access unit reassembled from RTP packets for video.
      */
     fun onRemoteMedia(callIdHex: String, senderIdHex: String, kind: Int, payload: ByteArray) {
         // default no-op

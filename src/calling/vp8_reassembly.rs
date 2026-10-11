@@ -30,7 +30,7 @@ impl Vp8Assembler {
                 return None;
             }
         };
-        if self.packet.s == 1 {
+        if self.packet.s == 1 && self.packet.pid == 0 {
             self.frame.clear();
             self.started = true;
         }
@@ -77,5 +77,15 @@ mod tests {
     fn packet_before_partition_start_is_dropped() {
         let mut assembler = Vp8Assembler::default();
         assert!(assembler.push(&[0x00, 1, 2, 3], true).is_none());
+    }
+
+    #[test]
+    fn later_partition_start_preserves_earlier_partition_data() {
+        let mut assembler = Vp8Assembler::default();
+        assert!(assembler.push(&[0x10, 1, 2, 3], false).is_none());
+        let frame = assembler
+            .push(&[0x11, 4, 5, 6], true)
+            .expect("marker closes the frame");
+        assert_eq!(frame, vec![1, 2, 3, 4, 5, 6]);
     }
 }

@@ -38,26 +38,26 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE peerId = :peerId LIMIT 1")
     suspend fun getContactByPeerId(peerId: String): Contact?
 
-    // Aggregate read for the conversations list. Joins the latest
-    // message per `senderId == contact.id` and counts unread inbound
-    // messages. The unread-count subquery filters on `status != 3`
-    // (the ordinal of `MessageStatus.READ` in the enum) and `isFromMe = 0`.
+    // Aggregate read for the conversations list. Projects the latest
+    // message from each contact and counts all unread inbound messages.
     @Query(
         """
         SELECT c.*,
                m.content as lastMessageContent,
                m.timestamp as lastMessageTimestamp,
-               COUNT(CASE WHEN m.status != 'READ' AND m.isFromMe = 0 THEN 1 END) as unreadCount
+               (SELECT COUNT(*) FROM messages unread
+                WHERE unread.senderId = c.id
+                  AND unread.status != 'READ'
+                  AND unread.isFromMe = 0
+                  AND unread.isDeleted = 0) as unreadCount
         FROM contacts c
-        LEFT JOIN messages m ON c.id = m.senderId
-            AND m.id = (
-                SELECT m2.id FROM messages m2
-                WHERE m2.conversationId = m.conversationId
-                ORDER BY m2.timestamp DESC, m2.id DESC
-                LIMIT 1
-            )
+        LEFT JOIN messages m ON m.id = (
+            SELECT m2.id FROM messages m2
+            WHERE m2.senderId = c.id AND m2.isDeleted = 0
+            ORDER BY m2.timestamp DESC, m2.id DESC
+            LIMIT 1
+        )
         WHERE c.isBlocked = 0
-        GROUP BY c.id
         ORDER BY COALESCE(m.timestamp, c.createdAt) DESC
         """
     )

@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The navy field behind the mark in docs/branding/qubee_logo.png,
+     sampled at the top and bottom of the mark's band. The foreground
+     layer was lifted off this exact gradient, so the composite matches
+     the logo. -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
-    <solid android:color="#040C16" />
+    <gradient
+        android:angle="270"
+        android:startColor="#011432"
+        android:endColor="#030C29" />
 </shape>

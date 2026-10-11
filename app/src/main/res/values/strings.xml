@@ -43,7 +43,7 @@
     <string name="network_lan_discovery_title">Discover peers on this Wi-Fi</string>
     <string name="network_lan_discovery_body">Announces this device and its local IP to everyone on the network (mDNS) and connects to the Qubee devices it hears. Off by default.</string>
     <string name="network_bootstrap_title">Bootstrap peers</string>
-    <string name="network_bootstrap_body">Addresses copied from the other device\'s "This device" list, one per line. Qubee dials them at start and keeps retrying while disconnected.</string>
+    <string name="network_bootstrap_body">Addresses copied from the other device\'s \"This device\" list, one per line. Qubee dials them at start and keeps retrying while disconnected.</string>
     <string name="network_bootstrap_label">Addresses</string>
     <string name="network_bootstrap_apply">Apply and reconnect</string>
     <string name="network_this_device_title">This device</string>

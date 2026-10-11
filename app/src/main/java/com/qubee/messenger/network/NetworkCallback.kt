@@ -20,6 +20,30 @@ interface NetworkCallback {
     fun onPeerDiscovered(peerId: String)
 
     /**
+     * The local node bound a listen address, already suffixed with
+     * `/p2p/<our PeerId>`: pasted into another device's bootstrap
+     * peers, it makes this device reachable from there.
+     */
+    fun onListening(multiaddr: String) {
+        // default no-op
+    }
+
+    /** A previously reported listen address went away. */
+    fun onListenAddrExpired(multiaddr: String) {
+        // default no-op
+    }
+
+    /** The first connection to [peerId] came up, in either direction. */
+    fun onPeerConnected(peerId: String) {
+        // default no-op
+    }
+
+    /** The last connection to [peerId] went away. */
+    fun onPeerDisconnected(peerId: String) {
+        // default no-op
+    }
+
+    /**
      * Called when an encrypted group message has been received,
      * verified (sender is an active member, signature passes), and
      * AEAD-decrypted with the current group key. Default impl is a

@@ -3,7 +3,9 @@ package com.qubee.messenger.ui.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.repository.NetworkStatusRepository
 import com.qubee.messenger.data.repository.PreferenceRepository
+import com.qubee.messenger.service.MessageService
 import android.content.Context
 import androidx.biometric.BiometricManager
 import com.qubee.messenger.identity.IdentityBundle
@@ -39,7 +41,32 @@ class SettingsViewModel @Inject constructor(
     private val appLockManager: AppLockManager,
     private val keyProvider: SqlCipherKeyProvider,
     private val keyHolder: DatabaseKeyHolder,
+    networkStatus: NetworkStatusRepository,
 ) : ViewModel() {
+
+    private val _lanDiscoveryEnabled = MutableStateFlow(preferences.lanDiscoveryEnabled())
+    val lanDiscoveryEnabled: StateFlow<Boolean> = _lanDiscoveryEnabled.asStateFlow()
+
+    private val _bootstrapPeers = MutableStateFlow(preferences.bootstrapPeers())
+    val bootstrapPeers: StateFlow<String> = _bootstrapPeers.asStateFlow()
+
+    val listenAddresses: StateFlow<List<String>> = networkStatus.listenAddresses
+    val connectedPeers: StateFlow<Set<String>> = networkStatus.connectedPeers
+
+    /** Persist the toggle and restart the node so it applies now. */
+    fun setLanDiscoveryEnabled(enabled: Boolean) {
+        preferences.setLanDiscoveryEnabled(enabled)
+        _lanDiscoveryEnabled.value = enabled
+        MessageService.restartNetwork(context)
+    }
+
+    /** Persist the address list and restart the node so it dials them now. */
+    fun saveBootstrapPeers(peers: String) {
+        val normalized = peers.trim()
+        preferences.setBootstrapPeers(normalized)
+        _bootstrapPeers.value = normalized
+        MessageService.restartNetwork(context)
+    }
 
     private val appLockChangeMutex = Mutex()
 

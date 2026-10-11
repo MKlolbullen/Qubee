@@ -19,6 +19,18 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
 
 ### Added
 
+- Peer discovery that two phones can actually use. Settings → **Find
+  peers** has a **Discover peers on this Wi-Fi** switch (mDNS, off by
+  default) and a **Bootstrap peers** list; **This device** shows the
+  node's dialable `/ip4/…/p2p/<PeerId>` addresses to copy to the other
+  phone, plus the connected-peer count. `nativeStartNetwork` now
+  honours its bootstrap argument: each address is added to Kademlia
+  and gossipsub, dialled at start and redialled every 30 s while
+  disconnected, and `kademlia.bootstrap()` runs off those peers.
+  mDNS discoveries are dialled instead of only recorded. Changing a
+  setting restarts the node through the new `nativeStopNetwork`; the
+  PeerId is unchanged. `NetworkCallback` gained `onListening`,
+  `onListenAddrExpired`, `onPeerConnected` and `onPeerDisconnected`.
 - Android camera capture using VP8 and remote VP8 decode/rendering for
   optional identity-to-identity video sessions. Camera capture remains
   off until the user grants permission and enables it. On-device codec
@@ -136,9 +148,10 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
   physical-device exit criteria in issue #47 are recorded green;
   receive-side support for the ratchet frames is always on and the
   Settings opt-in works.
-- Android peer discovery and bootstrap wiring are incomplete: mDNS is
-  off by default and the bootstrap-node argument is not used yet, so
-  two phones on one Wi-Fi do not find each other on their own.
+- Peer discovery is local only: Wi-Fi discovery must be switched on,
+  or an address copied between the phones. There are no public
+  bootstrap servers and no NAT traversal, so phones on different
+  networks do not reach each other.
 - Voice and video calling are compiled out of default APKs.
 - No independent security audit.
 

@@ -29,7 +29,9 @@ use crate::groups::handshake_handlers::{
     process_key_rotation_announce, process_request_join, HandshakeOutcome,
 };
 use crate::identity::identity_key::{IdentityId, IdentityKey, IdentityKeyPair};
-use crate::network::p2p_node::{group_topic, NodeEvent, P2PCommand, P2PNode};
+use crate::network::p2p_node::{
+    group_topic, parse_bootstrap_peers, NodeEvent, P2PCommand, P2PNode, P2PNodeConfig,
+};
 use crate::onboarding::OnboardingBundle;
 use crate::ratchet::direct::{
     decrypt_direct_payload_with_route, encrypt_direct_ack_with_route,
@@ -436,17 +438,33 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
     mut env: JNIEnv,
     _class: JClass,
     bootstrap_nodes: JString,
+    enable_lan_discovery: jboolean,
 ) -> jboolean {
     catch_unwind_result(|| {
-        // Read (currently unused) bootstrap list defensively: a
-        // malformed JString must not panic the process. Fail closed
+        // A malformed JString must not panic the process. Fail closed
         // (return 0 = network not started) instead.
-        let _bootstrap_str: String = match env.get_string(&bootstrap_nodes) {
+        let bootstrap_str: String = match env.get_string(&bootstrap_nodes) {
             Ok(s) => s.into(),
             Err(_) => return 0,
         };
+        // Two swarms on one node key would fight over the PeerId. A
+        // second start while a node runs is a no-op that still reports
+        // "running"; nativeStopNetwork is the way to apply new settings.
+        if P2P_COMMANDER.lock().unwrap().is_some() {
+            tracing::warn!("nativeStartNetwork called while the P2P node is running; ignoring");
+            return 1;
+        }
+        let (bootstrap_peers, rejected) = parse_bootstrap_peers(&bootstrap_str);
+        for reason in &rejected {
+            tracing::warn!(%reason, "ignoring bootstrap peer");
+        }
+        let config = P2PNodeConfig {
+            enable_mdns: enable_lan_discovery != 0,
+            bootstrap_peers,
+            ..P2PNodeConfig::default()
+        };
 
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let id_keys = match load_or_create_libp2p_keypair() {
@@ -466,7 +484,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                 let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
                 let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32);
 
-                match P2PNode::new(id_keys, rx_cmd).await {
+                match P2PNode::with_config(id_keys, rx_cmd, config).await {
                     Ok(node) => {
                         *P2P_COMMANDER.lock().unwrap() = Some(tx_cmd);
 
@@ -516,6 +534,19 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
 
         1
     })
+}
+
+/// Stop the P2P node so it can be started again with new settings.
+/// Dropping the only command sender ends `P2PNode::run` (its receiver
+/// yields `None`), which drops the swarm and every connection with it.
+/// The node key stays in the keystore, so the restarted node keeps its
+/// PeerId. Returns whether a node was running.
+#[no_mangle]
+pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStopNetwork(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    catch_unwind_result(|| u8::from(P2P_COMMANDER.lock().unwrap().take().is_some()))
 }
 
 /// Send an outbound frame.
@@ -833,11 +864,43 @@ fn dispatch_event_to_kotlin(event: NodeEvent) {
                 &[JValue::Object(&j_peer)],
             );
         }
-        NodeEvent::Listening { .. } => {
-            // Bound-address event used by integration tests; no
-            // Kotlin callback exists for it today, so silently
-            // ignore — the swarm is up by the time the JNI thread
-            // sees this and we don't need to forward.
+        // Descriptors stay literal here: scripts/check_jni_contracts.sh
+        // pairs each "onX" with the descriptor that follows it.
+        NodeEvent::Listening { multiaddr } => {
+            let j_addr = env.new_string(multiaddr).unwrap();
+            let _ = env.call_method(
+                callback_obj,
+                "onListening",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&j_addr)],
+            );
+        }
+        NodeEvent::ListenAddrExpired { multiaddr } => {
+            let j_addr = env.new_string(multiaddr).unwrap();
+            let _ = env.call_method(
+                callback_obj,
+                "onListenAddrExpired",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&j_addr)],
+            );
+        }
+        NodeEvent::PeerConnected { peer_id } => {
+            let j_peer = env.new_string(peer_id).unwrap();
+            let _ = env.call_method(
+                callback_obj,
+                "onPeerConnected",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&j_peer)],
+            );
+        }
+        NodeEvent::PeerDisconnected { peer_id } => {
+            let j_peer = env.new_string(peer_id).unwrap();
+            let _ = env.call_method(
+                callback_obj,
+                "onPeerDisconnected",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&j_peer)],
+            );
         }
     }
 }

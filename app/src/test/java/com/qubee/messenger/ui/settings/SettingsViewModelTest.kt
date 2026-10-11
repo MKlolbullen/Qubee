@@ -2,6 +2,7 @@ package com.qubee.messenger.ui.settings
 
 import android.content.Context
 import com.qubee.messenger.crypto.QubeeManager
+import com.qubee.messenger.data.repository.NetworkStatusRepository
 import com.qubee.messenger.data.repository.PreferenceRepository
 import com.qubee.messenger.security.AppLockManager
 import com.qubee.messenger.security.DatabaseKeyHolder
@@ -34,11 +35,12 @@ class SettingsViewModelTest {
             val lock = mock(AppLockManager::class.java)
             val holder = DatabaseKeyHolder()
             `when`(preferences.appLockEnabled()).thenReturn(true)
+            `when`(preferences.bootstrapPeers()).thenReturn("")
             doThrow(SecurityException("Injected persistence failure"))
                 .`when`(keys).disableAuthBinding(holder)
             val viewModel = SettingsViewModel(
                 mock(Context::class.java), mock(QubeeManager::class.java),
-                preferences, lock, keys, holder,
+                preferences, lock, keys, holder, NetworkStatusRepository(),
             )
             val notice = async(start = CoroutineStart.UNDISPATCHED) { viewModel.appLockNotice.first() }
             viewModel.setAppLockEnabled(false)

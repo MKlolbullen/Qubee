@@ -23,6 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -135,6 +136,10 @@ private fun SettingsContent(
 
                 Spacer(Modifier.height(20.dp))
 
+                NetworkPanel(viewModel)
+
+                Spacer(Modifier.height(20.dp))
+
                 QubeePanel {
                     QubeeStatusPill("KEY MATERIAL")
                     Spacer(Modifier.height(14.dp))
@@ -231,6 +236,127 @@ internal fun AppLockPanelBody(enabled: Boolean, onToggle: (Boolean) -> Unit) {
                     uncheckedThumbColor = QubeePalette.MutedText,
                     uncheckedTrackColor = QubeePalette.PanelAlt,
                 ),
+            )
+        }
+    }
+}
+
+/**
+ * Peer discovery controls. Split into a stateless [NetworkPanelBody]
+ * so the visual can be snapshot-tested without a ViewModel.
+ */
+@Composable
+private fun NetworkPanel(viewModel: SettingsViewModel) {
+    val lanDiscovery by viewModel.lanDiscoveryEnabled.collectAsStateWithLifecycle()
+    val bootstrapPeers by viewModel.bootstrapPeers.collectAsStateWithLifecycle()
+    val addresses by viewModel.listenAddresses.collectAsStateWithLifecycle()
+    val peers by viewModel.connectedPeers.collectAsStateWithLifecycle()
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    NetworkPanelBody(
+        lanDiscoveryEnabled = lanDiscovery,
+        onToggleLanDiscovery = viewModel::setLanDiscoveryEnabled,
+        bootstrapPeers = bootstrapPeers,
+        onSaveBootstrapPeers = viewModel::saveBootstrapPeers,
+        listenAddresses = addresses,
+        connectedPeerCount = peers.size,
+        onCopyAddresses = {
+            clipboard.setText(androidx.compose.ui.text.AnnotatedString(addresses.joinToString("\n")))
+        },
+    )
+}
+
+@Composable
+@androidx.annotation.VisibleForTesting
+internal fun NetworkPanelBody(
+    lanDiscoveryEnabled: Boolean,
+    onToggleLanDiscovery: (Boolean) -> Unit,
+    bootstrapPeers: String,
+    onSaveBootstrapPeers: (String) -> Unit,
+    listenAddresses: List<String>,
+    connectedPeerCount: Int,
+    onCopyAddresses: () -> Unit,
+) {
+    var draft by remember(bootstrapPeers) { mutableStateOf(bootstrapPeers) }
+    val monospace = androidx.compose.ui.text.font.FontFamily.Monospace
+    QubeePanel {
+        QubeeStatusPill(stringResource(R.string.network_panel_status))
+        Spacer(Modifier.height(14.dp))
+        Text(stringResource(R.string.network_panel_title), style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(6.dp))
+        QubeeMutedText(stringResource(R.string.network_panel_body))
+
+        Spacer(Modifier.height(18.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.network_lan_discovery_title),
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Spacer(Modifier.height(4.dp))
+                QubeeMutedText(stringResource(R.string.network_lan_discovery_body))
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(
+                checked = lanDiscoveryEnabled,
+                onCheckedChange = onToggleLanDiscovery,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = QubeePalette.Void,
+                    checkedTrackColor = QubeePalette.Cyan,
+                    uncheckedThumbColor = QubeePalette.MutedText,
+                    uncheckedTrackColor = QubeePalette.PanelAlt,
+                ),
+            )
+        }
+
+        Spacer(Modifier.height(18.dp))
+        Text(
+            stringResource(R.string.network_bootstrap_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(Modifier.height(4.dp))
+        QubeeMutedText(stringResource(R.string.network_bootstrap_body))
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            label = { Text(stringResource(R.string.network_bootstrap_label)) },
+            minLines = 2,
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = monospace),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(10.dp))
+        QubeeSecondaryButton(
+            text = stringResource(R.string.network_bootstrap_apply),
+            onClick = { onSaveBootstrapPeers(draft) },
+            enabled = draft.trim() != bootstrapPeers.trim(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        Spacer(Modifier.height(18.dp))
+        Text(
+            stringResource(R.string.network_this_device_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(Modifier.height(4.dp))
+        QubeeMutedText(stringResource(R.string.network_connected_count, connectedPeerCount))
+        Spacer(Modifier.height(8.dp))
+        if (listenAddresses.isEmpty()) {
+            QubeeMutedText(stringResource(R.string.network_no_addresses))
+        } else {
+            listenAddresses.forEach { address ->
+                Text(
+                    address,
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = monospace,
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+            Spacer(Modifier.height(6.dp))
+            QubeeSecondaryButton(
+                text = stringResource(R.string.network_copy_addresses),
+                onClick = onCopyAddresses,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }

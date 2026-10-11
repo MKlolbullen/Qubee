@@ -63,6 +63,8 @@ class MessageService : Service(), NetworkCallback {
     @Inject lateinit var contactRepository: ContactRepository
     @Inject lateinit var ratchetSender: com.qubee.messenger.crypto.RatchetSender
     @Inject lateinit var callRepository: com.qubee.messenger.data.repository.CallRepository
+    @Inject lateinit var preferences: com.qubee.messenger.data.repository.PreferenceRepository
+    @Inject lateinit var networkStatus: com.qubee.messenger.data.repository.NetworkStatusRepository
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // Network callbacks launch concurrently. Stripe by exact direct wire id so
@@ -135,6 +137,24 @@ class MessageService : Service(), NetworkCallback {
         fun stop(context: Context) {
             context.stopService(Intent(context, MessageService::class.java))
         }
+
+        /// Re-create the P2P node with the current discovery settings
+        /// (LAN discovery, bootstrap peers). Only the node restarts; the
+        /// service, its retry loops and the identity stay up. Sent with
+        /// plain startService: the caller is the Settings screen, so the
+        /// app is in the foreground, and the service is already a
+        /// foreground service or starts as one on this same intent.
+        const val ACTION_RESTART_NETWORK = "com.qubee.messenger.action.RESTART_NETWORK"
+
+        fun restartNetwork(context: Context) {
+            try {
+                context.startService(
+                    Intent(context, MessageService::class.java).setAction(ACTION_RESTART_NETWORK),
+                )
+            } catch (e: Exception) {
+                Timber.w(e, "Could not request a network restart (background start?)")
+            }
+        }
     }
 
     override fun onCreate() {
@@ -143,6 +163,10 @@ class MessageService : Service(), NetworkCallback {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RESTART_NETWORK && isRunning) {
+            restartP2PNetwork()
+            return START_STICKY
+        }
         if (!isRunning) {
             try {
                 // Explicitly bind the foreground-service type. On API
@@ -204,21 +228,47 @@ class MessageService : Service(), NetworkCallback {
                     Timber.d("Calling subsystem not started (feature off or no identity)")
                 }
                 qubeeManager.setNetworkCallback(this@MessageService)
-                if (qubeeManager.startNetworkNode()) {
-                    Timber.d("P2P Network Node started successfully")
-                    // Announce our signed prekey bundle so peers can
-                    // open forward-secret sessions with us (Ratchet
-                    // Stage 5). Best-effort: peers who miss it get it
-                    // on our next service start; without it they
-                    // simply can't initiate v3 and their sends fail
-                    // closed on their side.
-                    if (!qubeeManager.publishLocalPrekeyBundle()) {
-                        Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
-                    }
-                } else {
-                    Timber.e("Failed to start P2P Network Node")
-                }
+                startNode()
             }
+        }
+    }
+
+    /**
+     * Start the node with the user's discovery settings, then announce
+     * our signed prekey bundle so peers can open forward-secret sessions
+     * with us (Ratchet Stage 5). The publish is best-effort: peers who
+     * miss it get it on the next start, and without it they simply
+     * cannot initiate v3 and their sends fail closed on their side.
+     */
+    private suspend fun startNode(): Boolean {
+        val started = qubeeManager.startNetworkNode(
+            bootstrapNodes = preferences.bootstrapPeers(),
+            lanDiscovery = preferences.lanDiscoveryEnabled(),
+        )
+        if (started) {
+            Timber.d("P2P Network Node started successfully")
+            if (!qubeeManager.publishLocalPrekeyBundle()) {
+                Timber.w("Prekey bundle publish failed — peers cannot initiate ratchet sessions")
+            }
+        } else {
+            Timber.e("Failed to start P2P Network Node")
+        }
+        return started
+    }
+
+    /**
+     * Apply changed discovery settings. The node key is persisted, so
+     * the new node keeps the PeerId peers already know. Stopping the
+     * node closes its command channel, which ends its event loop and
+     * drops the swarm; the status view is cleared because a dropped
+     * swarm reports no expiry for its addresses, and the new node then
+     * reports its own.
+     */
+    private fun restartP2PNetwork() {
+        serviceScope.launch {
+            qubeeManager.stopNetworkNode()
+            networkStatus.reset()
+            startNode()
         }
     }
 
@@ -907,6 +957,24 @@ class MessageService : Service(), NetworkCallback {
 
     override fun onPeerDiscovered(peerId: String) {
         Timber.d("Discovered new peer: %s", peerId)
+    }
+
+    override fun onListening(multiaddr: String) {
+        networkStatus.onListening(multiaddr)
+    }
+
+    override fun onListenAddrExpired(multiaddr: String) {
+        networkStatus.onListenAddrExpired(multiaddr)
+    }
+
+    override fun onPeerConnected(peerId: String) {
+        Timber.d("Peer connected: %s", peerId)
+        networkStatus.onPeerConnected(peerId)
+    }
+
+    override fun onPeerDisconnected(peerId: String) {
+        Timber.d("Peer disconnected: %s", peerId)
+        networkStatus.onPeerDisconnected(peerId)
     }
 
     override fun onMessageAcked(

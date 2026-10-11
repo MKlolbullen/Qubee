@@ -22,11 +22,18 @@ believe instead of seeing real behavior.
   per-install identity key, not the APK signing cert. The only
   caveat is that `adb install` over an existing install with a
   different signing cert needs `adb uninstall` first.
-* Both devices on the same local network so libp2p mDNS / loopback
-  TCP can find each other. mDNS-only deployments also work as long
-  as the network doesn't suppress multicast (most home Wi-Fi
-  networks do; tether off a phone hotspot if the corporate network
-  blocks it).
+* Both devices on the same local network (one Wi-Fi, or a hotspot
+  from one of them), and one of the two discovery routes set up in
+  Settings → **Find peers** on both:
+  * **Discover peers on this Wi-Fi** switched on. Needs a network
+    that passes multicast; most home Wi-Fi does, many corporate
+    and guest networks do not (tether off a phone hotspot there).
+  * Or **Bootstrap peers**: on A, copy the addresses under **This
+    device**; on B, paste them into Bootstrap peers and tap
+    **Apply and reconnect**. Works wherever B can reach A's IP,
+    multicast or not. One direction is enough.
+  Either way, **Connected peers** on both devices must read 1 before
+  the steps below; messages queue as `SENT` until it does.
 * Notification permission granted on both devices (the foreground
   P2P service runs under
   `NOTIFICATION_CHANNEL_SERVICE`).
@@ -279,9 +286,11 @@ useful when running the walkthrough against an older build.)
   store-and-forward / offline queue is post-alpha.
 * **No message arrives on B even though A sees `SENT`**: the
   group key isn't shared yet (B isn't an active member of the
-  group, or libp2p isn't routing). Check that B's app is
-  foregrounded (the foreground service stays alive in the
-  background, but mDNS discovery is fragile across screen-off).
+  group, or libp2p isn't routing). Check Settings → Find peers on
+  both: **Connected peers** must be at least 1. Wi-Fi discovery is
+  fragile across screen-off and on networks that drop multicast;
+  the bootstrap-address route redials every 30 seconds and does
+  not depend on multicast.
 * **"Verification bridge unreachable"**: the
   `nativeVerifyIdentityKey` JNI symbol failed to load. Means the
   shared library didn't link the Rust bridge — check the build

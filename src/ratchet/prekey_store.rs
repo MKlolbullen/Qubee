@@ -382,6 +382,10 @@ mod tests {
         assert!(ids.contains(&kp.identity_id()));
     }
 
+    /// Pins the exact age/skew boundaries `get_peer_bundle_for_handshake`
+    /// accepts or rejects, confirms rejections leave the keystore
+    /// untouched, and confirms the raw cache (`get_peer_bundle`) stays
+    /// readable for routing even once the handshake gate expires it.
     #[test]
     fn handshake_cache_enforces_age_and_clock_skew_boundaries_without_mutation() {
         let (mut ks, dir) = fresh_ks();

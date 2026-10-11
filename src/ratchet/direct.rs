@@ -122,6 +122,9 @@ pub fn encrypt_direct(
     })
 }
 
+/// `now` is re-checked against the cached peer bundle (not just at
+/// install time) so a stale or future-dated publication can't be used
+/// to start a brand-new session.
 fn encrypt_direct_inner(
     ks: &mut SecureKeyStore,
     local_id: IdentityId,
@@ -202,6 +205,10 @@ pub fn decrypt_direct(
     Ok((peer, std::mem::take(&mut *plaintext)))
 }
 
+/// As with [`encrypt_direct_inner`], `now` re-validates the sender's
+/// cached bundle before it's trusted to establish responder state, so an
+/// expired or future-dated publication can't be replayed into a new
+/// session.
 fn decrypt_direct_inner(
     ks: &mut SecureKeyStore,
     local_id: IdentityId,
@@ -726,10 +733,15 @@ mod tests {
             }
         }
 
+        /// Signed bundle published at a fixed `now = 1`, for tests that
+        /// don't care about bundle freshness.
         fn signed_bundle_wire(&mut self) -> Vec<u8> {
             self.signed_bundle_wire_at(1)
         }
 
+        /// Like [`Device::signed_bundle_wire`] but with a caller-chosen
+        /// publication time, so expiry/clock-skew tests can control how
+        /// stale or future-dated the bundle is relative to `now`.
         fn signed_bundle_wire_at(&mut self, now: u64) -> Vec<u8> {
             let (secret, kem_pub) = get_or_create_local_bundle(&mut self.ks, now).unwrap();
             let body = build_body(&secret, &kem_pub, self.kp.public_key(), now);
@@ -865,6 +877,11 @@ mod tests {
         assert!(encrypt_direct(&mut a.ks, aid, bid, b"x", 1).is_err());
     }
 
+    /// An initiator must not start a session from its own cached copy of
+    /// the peer's bundle once that publication has expired, and failing
+    /// to do so must not mutate the keystore or leave half-open state
+    /// behind. Installing a freshly re-signed bundle (same identities)
+    /// recovers the handshake.
     #[test]
     fn expired_cached_bundle_cannot_initiate_or_commit_and_refresh_recovers() {
         let (mut a, mut b) = paired();
@@ -896,6 +913,11 @@ mod tests {
         );
     }
 
+    /// Mirror of the initiator expiry test for the responder side: an
+    /// expired cached bundle for the claimed sender must block
+    /// responder-state establishment without side effects, but a
+    /// re-signed bundle at the same identity still opens the original
+    /// (unexpired) initial.
     #[test]
     fn expired_sender_bundle_cannot_establish_or_consume_responder_state() {
         let (mut a, mut b) = paired();
@@ -925,6 +947,9 @@ mod tests {
         );
     }
 
+    /// A bundle timestamped ahead of `now` by more than the allowed
+    /// clock skew must reject initiation; once `now` closes within the
+    /// skew window, the same cached bundle becomes usable.
     #[test]
     fn future_cached_bundle_cannot_initiate_until_within_clock_skew() {
         let (mut a, mut b) = paired();
@@ -939,6 +964,10 @@ mod tests {
         assert!(encrypt_direct(&mut a.ks, aid, bid, b"within skew", 40).is_ok());
     }
 
+    /// Responder-side analogue of
+    /// [`future_cached_bundle_cannot_initiate_until_within_clock_skew`]:
+    /// a future-dated sender bundle must block consuming the initial
+    /// until `now` is within the clock-skew tolerance.
     #[test]
     fn future_sender_bundle_cannot_establish_or_consume_responder_state() {
         let (mut a, mut b) = paired();
@@ -957,6 +986,9 @@ mod tests {
         );
     }
 
+    /// The freshness check only gates establishing a *new* session from
+    /// a cached bundle; once a session exists, prekey bundle expiry must
+    /// not block ordinary ratcheted traffic on it.
     #[test]
     fn cached_bundle_expiry_does_not_expire_an_established_session() {
         let (mut a, mut b) = paired();

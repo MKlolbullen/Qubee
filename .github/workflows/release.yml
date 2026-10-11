@@ -14,9 +14,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build (e.g. v0.1.0-alpha)'
+        description: 'Tag to build (e.g. v0.2.0-beta.1)'
         required: true
         type: string
+      dry_run:
+        description: 'Only verify the signing secrets and certificate pin; build nothing'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write  # needed to upload release assets
@@ -29,8 +34,50 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fails in seconds, not after a 15-minute native build, when the
+  # signing configuration is incomplete. Values are never printed.
+  preflight:
+    name: Verify signing configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+      RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+      RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      RELEASE_CERTIFICATE_SHA256: ${{ vars.RELEASE_CERTIFICATE_SHA256 }}
+    steps:
+      - name: Check the four RELEASE_* secrets and the certificate pin
+        run: |
+          missing=()
+          for name in RELEASE_KEYSTORE_BASE64 RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            [ -n "${!name}" ] || missing+=("secret $name")
+          done
+          if ! [[ "${RELEASE_CERTIFICATE_SHA256//:/}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            missing+=("repository variable RELEASE_CERTIFICATE_SHA256 (64 hex digits)")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Release signing is not configured. Missing: $(printf '%s; ' "${missing[@]}")see RELEASE.md, One-time setup."
+            exit 1
+          fi
+          echo "All four RELEASE_* secrets and the certificate pin are present."
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # A tester can only check an APK's signer against a value that
+      # does not come with the APK. SECURITY.md is that value, so a
+      # release whose SECURITY.md does not carry the pinned fingerprint
+      # is refused here (and again on the tag commit in the build job).
+      - name: Check SECURITY.md publishes the pinned fingerprint
+        run: scripts/check_security_pin.sh SECURITY.md "$RELEASE_CERTIFICATE_SHA256"
+
   build:
     name: Build + sign + release
+    needs: preflight
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -62,6 +109,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0  # full history for `git rev-list --count`
           ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Check SECURITY.md on the tag publishes the pinned fingerprint
+        env:
+          RELEASE_CERTIFICATE_SHA256: ${{ vars.RELEASE_CERTIFICATE_SHA256 }}
+        run: scripts/check_security_pin.sh SECURITY.md "$RELEASE_CERTIFICATE_SHA256"
 
       - name: Compute monotonic versionCode
         id: vcode
@@ -162,6 +214,7 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
           EXPECTED_RELEASE_CERT_SHA256: ${{ vars.RELEASE_CERTIFICATE_SHA256 }}
         run: |
+          set -o pipefail
           src=$(find app/build/outputs/apk/release -name '*.apk' | head -n1)
           if [ -z "$src" ]; then
             echo "::error::No APK in app/build/outputs/apk/release"
@@ -169,7 +222,10 @@ jobs:
           fi
           dst="qubee-${{ steps.tag.outputs.version }}.apk"
           python3 scripts/sign_product_apk.py "$src" "$dst" \
-            --certificate-sha256 "$EXPECTED_RELEASE_CERT_SHA256"
+            --certificate-sha256 "$EXPECTED_RELEASE_CERT_SHA256" | tee sign-report.txt
+          # The verified signer fingerprint goes into the release notes
+          # so a tester can compare it without trusting the APK itself.
+          echo "cert=$(sed -n 's/^Verified owner certificate SHA-256: //p' sign-report.txt)" >> "$GITHUB_OUTPUT"
           echo "path=$dst" >> "$GITHUB_OUTPUT"
           echo "Built APK: $dst ($(stat -c%s $dst) bytes)"
           # Verify signature scheme
@@ -209,6 +265,11 @@ jobs:
           else
             printf "Release %s.\n" "$version" > "$out"
           fi
+          {
+            printf '\n### Verify this build\n\n'
+            printf 'Signer certificate SHA-256: `%s`\n\n' '${{ steps.apk.outputs.cert }}'
+            printf '```\nsha256sum -c qubee-%s.apk.sha256\napksigner verify --print-certs qubee-%s.apk\n```\n' "$version" "$version"
+          } >> "$out"
           echo "path=$out" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/branding/qubee_mark_master.svg" alt="Qubee" width="300" />
+  <img src="docs/branding/qubee_logo.png" alt="Qubee" width="300" />
 </p>
 
 # Qubee
@@ -11,7 +11,7 @@ core. The goal is a functional, metadata-minimizing messenger inspired by
 **Session, Threema, and Teleguard**—not a claim of equivalent features, anonymity,
 or security.
 
-> **Pre-alpha • For contributors and early testers • No independent security audit**
+> **Beta • For contributors and early testers • No independent security audit**
 >
 > A buildable Android app exists, with onboarding, contacts, chats, groups, and
 > encrypted storage. Peer discovery and physical-device acceptance remain
@@ -249,9 +249,25 @@ download is currently available.
 
 These are test builds, including debug-signed, R8-minified release variants—not
 production releases. Local `assembleRelease` also falls back to debug signing
-without a configured keystore. The tagged release workflow requires real signing
-secrets; see [release instructions](RELEASE.md). This README does not assume a
-current public release APK or app-store listing exists.
+without a configured keystore.
+
+### Releases
+
+Tagged versions (`v0.2.0-beta.1` and later) are built by the
+[release workflow](.github/workflows/release.yml), signed with the owner's
+key, checked against the pinned certificate, and published on the
+[Releases](https://github.com/MKlolbullen/Qubee/releases) page as
+`qubee-<version>.apk` with a `.sha256` file. Before sideloading one:
+
+```bash
+sha256sum -c qubee-<version>.apk.sha256
+apksigner verify --print-certs qubee-<version>.apk
+```
+
+The printed `Signer #1 certificate SHA-256 digest` must match the fingerprint
+in [SECURITY.md](SECURITY.md#release-signing) and the one in the release notes.
+A debug-signed workflow artifact never installs over a signed release, or the
+reverse; see [troubleshooting](#troubleshooting). There is no app-store listing.
 
 ## Local development and tests
 

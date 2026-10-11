@@ -55,7 +55,7 @@ android {
         minSdk 32
         targetSdk 34
 
-        // versionName / versionCode default to a "0.1.0-alpha" pre-release
+        // versionName / versionCode default to the current pre-release
         // label. Override from the release workflow with
         //   ./gradlew assembleRelease \
         //     -PqubeeVersionName=$tag -PqubeeVersionCode=$code
@@ -63,7 +63,7 @@ android {
         // (so every tag gets a unique increasing versionCode that
         // Android's per-package version comparator accepts as an
         // upgrade).
-        versionName project.findProperty('qubeeVersionName') ?: '0.1.0-alpha'
+        versionName project.findProperty('qubeeVersionName') ?: '0.2.0-beta.1'
         // No parens after `versionCode`: `versionCode (x).toInteger()`
         // parses as `(versionCode(x)).toInteger()` in Groovy, passing
         // the raw String to AGP and crashing configuration with

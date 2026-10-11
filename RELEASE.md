@@ -70,23 +70,35 @@ add:
 | `RELEASE_KEY_ALIAS` | `qubee` (or whatever `-alias` you used) |
 | `RELEASE_KEY_PASSWORD` | the key password from step 1 |
 
-The release workflow reads all four. Missing any of them aborts
-the build at the "Decode release keystore" step with a clear error
-message.
+Then, under `Settings → Secrets and variables → Actions → Variables`,
+add the public certificate pin:
+
+| Variable | Value |
+|----------|-------|
+| `RELEASE_CERTIFICATE_SHA256` | the `SHA256:` certificate fingerprint printed by `keytool -list -v` in step 1 (colons optional) |
+
+The release workflow reads all five. Its `preflight` job fails within
+seconds, naming whatever is missing, before any native build starts;
+`scripts/sign_product_apk.py` then refuses to publish an APK whose
+signer does not match the pin.
+
+Finally, put the same fingerprint on the "Owner signing certificate
+SHA-256" line of `SECURITY.md` (section "Release signing") and commit
+it before tagging. Testers compare a downloaded APK's signer against
+that line, and `scripts/check_security_pin.sh` makes the workflow
+refuse any tag whose `SECURITY.md` lacks the pinned value.
 
 ### 4. Verify the workflow can see the secrets
 
-Trigger a manual dispatch run with a fake tag input — the workflow
-will fail at the build step (no real tag exists yet) but if the
-"Decode release keystore" step succeeds you know the secrets are
-visible.
+Dispatch the workflow with `dry_run` set: only the preflight job
+runs, nothing is built, and a green run proves the four secrets and
+the variable are visible. The `tag` input is required by the form but
+unused in a dry run.
 
 ```bash
-gh workflow run release.yml --ref main -f tag=v0.0.0-test
+gh workflow run release.yml --ref main -f tag=v0.0.0-probe -f dry_run=true
 gh run watch
 ```
-
-Cancel the run after the keystore step finishes.
 
 ## Cutting a release
 
@@ -114,7 +126,7 @@ grep -c "^## \[$version\]" CHANGELOG.md    # must print exactly 1
 ### 2. Run the local sanity checks
 
 ```bash
-cargo test --no-fail-fast               # 73 green
+cargo test --locked --all-targets       # all green
 cargo build --features _typecheck_jni   # JNI typecheck clean
 ./build_rust.sh                          # cross-compile all 4 ABIs (optional locally)
 ```
@@ -122,7 +134,7 @@ cargo build --features _typecheck_jni   # JNI typecheck clean
 ### 3. Tag and push
 
 ```bash
-version=0.1.0-alpha
+version=0.2.0-beta.1
 git tag -a v$version -m "v$version"
 git push origin v$version
 ```
@@ -133,15 +145,19 @@ what the changelog heading lookup, the docs, and the earlier tags
 agree on. Any other shape (`Qubee-beta-v.1.2`) builds nothing. The
 workflow runs end-to-end in ~12-15 minutes:
 
-1. Resolves `versionName` from the tag
-2. Computes `versionCode` from `git rev-list --count HEAD`
-3. Cross-compiles `libqubee_crypto.so` for arm64-v8a /
+1. Preflight: the four secrets and the certificate pin are present
+2. Resolves `versionName` from the tag
+3. Computes `versionCode` from `git rev-list --count HEAD`
+4. Cross-compiles `libqubee_crypto.so` for arm64-v8a /
    armeabi-v7a / x86_64 / x86
-4. Decodes the keystore from secrets, signs `:app:assembleRelease`
-5. Verifies the signature with `apksigner verify --verbose`
-6. Computes SHA256 + collects the ProGuard mapping
-7. Creates the GitHub Release with `qubee-<version>.apk` +
-   `.sha256` + mapping attached
+5. Decodes the keystore from secrets, runs `:app:assembleRelease`
+   with `-PqubeeRequireReleaseSigning=true` (no debug fallback)
+6. `scripts/sign_product_apk.py` aligns, signs with v2/v3 and
+   verifies the signer against `RELEASE_CERTIFICATE_SHA256`
+7. Computes SHA256 + collects the ProGuard mapping
+8. Creates the GitHub Release with `qubee-<version>.apk` +
+   `.sha256` + mapping attached; the notes end with the signer
+   certificate SHA-256 and the verification commands
 
 ### 4. Verify the released APK
 
@@ -236,7 +252,8 @@ A copy-pasteable checklist for the final review before tagging:
 - [ ] No uncommitted changes on the tag commit (`git status` clean)
 - [ ] `app/build.gradle` `versionName` default still reasonable
       (the workflow overrides it; this is the local-build fallback)
-- [ ] Keystore + secrets verified per "Verify the workflow can see
-      the secrets" above
+- [ ] Keystore, secrets and `RELEASE_CERTIFICATE_SHA256` verified by
+      a `dry_run` dispatch per "Verify the workflow can see the
+      secrets" above
 - [ ] Smoke-test plan in `docs/two-device-walkthrough.md` is current
 - [ ] Tag is annotated (`git tag -a`, not lightweight)

@@ -122,6 +122,8 @@ pub fn encrypt_direct(
     })
 }
 
+/// Core of [`encrypt_direct`], run inside the keystore transaction so a
+/// freshly established session is only persisted on full success.
 fn encrypt_direct_inner(
     ks: &mut SecureKeyStore,
     local_id: IdentityId,
@@ -202,6 +204,8 @@ pub fn decrypt_direct(
     Ok((peer, std::mem::take(&mut *plaintext)))
 }
 
+/// Core of [`decrypt_direct`], run inside the keystore transaction so a
+/// failed decrypt never mutates persisted ratchet or prekey state.
 fn decrypt_direct_inner(
     ks: &mut SecureKeyStore,
     local_id: IdentityId,
@@ -730,6 +734,8 @@ mod tests {
             self.signed_bundle_wire_at(1)
         }
 
+        /// Same as [`Self::signed_bundle_wire`] but with a caller-chosen
+        /// publication timestamp, for exercising expiry/clock-skew checks.
         fn signed_bundle_wire_at(&mut self, now: u64) -> Vec<u8> {
             let (secret, kem_pub) = get_or_create_local_bundle(&mut self.ks, now).unwrap();
             let body = build_body(&secret, &kem_pub, self.kp.public_key(), now);
@@ -865,6 +871,8 @@ mod tests {
         assert!(encrypt_direct(&mut a.ks, aid, bid, b"x", 1).is_err());
     }
 
+    /// An expired cached peer bundle fails closed on both ends without
+    /// touching durable state, and a re-published bundle recovers.
     #[test]
     fn expired_cached_bundle_cannot_initiate_or_commit_and_refresh_recovers() {
         let (mut a, mut b) = paired();
@@ -896,6 +904,8 @@ mod tests {
         );
     }
 
+    /// A responder rejects an initial whose sender bundle has expired, and
+    /// recovers once the sender's identity is republished with a fresh timestamp.
     #[test]
     fn expired_sender_bundle_cannot_establish_or_consume_responder_state() {
         let (mut a, mut b) = paired();
@@ -925,6 +935,8 @@ mod tests {
         );
     }
 
+    /// A cached peer bundle dated beyond the allowed clock skew blocks
+    /// initiation until the current time catches up to it.
     #[test]
     fn future_cached_bundle_cannot_initiate_until_within_clock_skew() {
         let (mut a, mut b) = paired();
@@ -939,6 +951,8 @@ mod tests {
         assert!(encrypt_direct(&mut a.ks, aid, bid, b"within skew", 40).is_ok());
     }
 
+    /// A responder rejects an initial whose sender bundle is dated beyond
+    /// the allowed clock skew, then accepts it once within skew.
     #[test]
     fn future_sender_bundle_cannot_establish_or_consume_responder_state() {
         let (mut a, mut b) = paired();
@@ -957,6 +971,8 @@ mod tests {
         );
     }
 
+    /// Prekey bundle expiry only gates new session establishment; an
+    /// already-established session keeps working past that age.
     #[test]
     fn cached_bundle_expiry_does_not_expire_an_established_session() {
         let (mut a, mut b) = paired();

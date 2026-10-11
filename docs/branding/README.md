@@ -17,8 +17,10 @@ field. The full lockup adds the `Qubee` wordmark below the mark.
 
 ## Regenerating
 
-Every file under `app/src/main/res/mipmap-*` and `qubee_mark.png` is
-produced by one script. Replace `qubee_logo.png`, then:
+Every PNG under `app/src/main/res/mipmap-<density>/` and
+`qubee_mark.png` is produced by one script; the adaptive-icon XML in
+`mipmap-anydpi-v26/` and the background gradient are hand-written and
+stay as they are. Replace `qubee_logo.png`, then:
 
 ```bash
 python3 -m pip install pillow

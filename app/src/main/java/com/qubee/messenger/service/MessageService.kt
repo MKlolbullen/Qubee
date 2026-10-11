@@ -71,6 +71,9 @@ class MessageService : Service(), NetworkCallback {
     // duplicates of one ciphertext cannot race the read -> ratchet-encrypt ->
     // receipt-cache sequence, while keeping memory bounded under hostile input.
     private val directFrameLocks = Array(DIRECT_FRAME_LOCK_STRIPES) { Mutex() }
+    // Node starts and restarts run one at a time: two overlapping restarts
+    // would each stop nothing and start a node of their own.
+    private val nodeLock = Mutex()
     private var isRunning = false
 
     companion object {
@@ -228,7 +231,7 @@ class MessageService : Service(), NetworkCallback {
                     Timber.d("Calling subsystem not started (feature off or no identity)")
                 }
                 qubeeManager.setNetworkCallback(this@MessageService)
-                startNode()
+                nodeLock.withLock { startNode() }
             }
         }
     }
@@ -266,9 +269,11 @@ class MessageService : Service(), NetworkCallback {
      */
     private fun restartP2PNetwork() {
         serviceScope.launch {
-            qubeeManager.stopNetworkNode()
-            networkStatus.reset()
-            startNode()
+            nodeLock.withLock {
+                qubeeManager.stopNetworkNode()
+                networkStatus.reset()
+                startNode()
+            }
         }
     }
 

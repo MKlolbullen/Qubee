@@ -70,8 +70,13 @@ def main():
                         '--v3-signing-enabled', 'true', '--min-sdk-version', '32',
                         '--out', str(signed), str(aligned)], check=True)
         report = subprocess.check_output([str(tools / 'apksigner'), 'verify', '--verbose', '--print-certs',
-                                          '--min-sdk-version', '32', str(signed)], text=True)
+                                          '--min-sdk-version', '24', str(signed)], text=True)
+        # Include APIs 24-27 in signature verification so apksigner actually
+        # checks v2, rather than skipping it in favor of v3 on API 32+. This
+        # does not change the APK manifest's install minimum (32).
         validate_report(report, expected)
+        subprocess.run([str(tools / 'apksigner'), 'verify', '--min-sdk-version', '32', str(signed)],
+                       check=True, stdout=subprocess.DEVNULL)
         # Exclusive creation protects an existing release if paths raced.
         with args.output.open('xb') as output:
             output.write(signed.read_bytes())

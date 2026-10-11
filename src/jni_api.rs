@@ -433,6 +433,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRegist
 
 // --- Network Management ---
 
+/// Start the P2P swarm on a dedicated Tokio runtime thread. A no-op
+/// (returns 1 without restarting) if a node is already running; call
+/// `nativeStopNetwork` first to apply new bootstrap peers or the LAN
+/// toggle. `bootstrap_nodes` entries that fail to parse are logged and
+/// skipped rather than aborting the start.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartNetwork(
     mut env: JNIEnv,
@@ -447,6 +452,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
             Ok(s) => s.into(),
             Err(_) => return 0,
         };
+        // Two swarms on one node key would fight over the PeerId. A
+        // second start while a node runs is a no-op that still reports
+        // "running"; nativeStopNetwork is the way to apply new settings.
+        if P2P_COMMANDER.lock().unwrap().is_some() {
+            tracing::warn!("nativeStartNetwork called while the P2P node is running; ignoring");
+            return 1;
+        }
         let (bootstrap_peers, rejected) = parse_bootstrap_peers(&bootstrap_str);
         for reason in &rejected {
             tracing::warn!(%reason, "ignoring bootstrap peer");
@@ -457,24 +469,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
             ..P2PNodeConfig::default()
         };
 
-        // Two swarms on one node key would fight over the PeerId, so the
-        // command slot is claimed before the node exists, in the same lock
-        // acquisition as the check. A second start during construction
-        // sees the slot taken and is a no-op that still reports "running".
-        // A nativeStopNetwork during construction drops the slot's sender,
-        // so once the node is built its command channel is already closed
-        // and it exits before polling the swarm. nativeStopNetwork is the
-        // way to apply new settings.
-        let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
-        {
-            let mut slot = P2P_COMMANDER.lock().unwrap();
-            if slot.is_some() {
-                tracing::warn!("nativeStartNetwork called while the P2P node is running; ignoring");
-                return 1;
-            }
-            *slot = Some(tx_cmd.clone());
-        }
-
         std::thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
@@ -482,7 +476,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                     Ok(k) => k,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to load libp2p node key; not starting P2P node");
-                        release_commander_slot(&tx_cmd);
                         return;
                     }
                 };
@@ -493,13 +486,12 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                     "Starting P2P Node",
                 );
 
+                let (tx_cmd, rx_cmd) = tokio::sync::mpsc::channel(32);
                 let (tx_event, mut rx_event) = tokio::sync::mpsc::channel(32);
 
                 match P2PNode::with_config(id_keys, rx_cmd, config).await {
                     Ok(node) => {
-                        // From here on only the slot holds a sender, so a
-                        // stop closes the channel and ends the node.
-                        drop(tx_cmd);
+                        *P2P_COMMANDER.lock().unwrap() = Some(tx_cmd);
 
                         // Re-subscribe to every group the local
                         // identity already belongs to so a process
@@ -540,7 +532,6 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to start P2P node");
-                        release_commander_slot(&tx_cmd);
                     }
                 }
             });
@@ -550,22 +541,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartN
     })
 }
 
-/// Free the command slot after a failed start, but only while it still
-/// holds this start's sender: a stop followed by a newer start may have
-/// put another node's sender there in the meantime.
-fn release_commander_slot(claim: &tokio::sync::mpsc::Sender<P2PCommand>) {
-    let mut slot = P2P_COMMANDER.lock().unwrap();
-    if slot.as_ref().is_some_and(|held| held.same_channel(claim)) {
-        *slot = None;
-    }
-}
-
 /// Stop the P2P node so it can be started again with new settings.
 /// Dropping the only command sender ends `P2PNode::run` (its receiver
-/// yields `None`), which drops the swarm and every connection with it;
-/// a node still under construction exits as soon as it is built. The
-/// node key stays in the keystore, so the restarted node keeps its
-/// PeerId. Returns whether a node was running or starting.
+/// yields `None`), which drops the swarm and every connection with it.
+/// The node key stays in the keystore, so the restarted node keeps its
+/// PeerId. Returns whether a node was running.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStopNetwork(
     _env: JNIEnv,
@@ -850,6 +830,11 @@ fn dispatch_group_message_to_kotlin(msg: &crate::groups::group_message::Decrypte
     );
 }
 
+/// Forward a `NodeEvent` from the P2P thread to the registered Kotlin
+/// callback. Runs on the P2P node's own thread, so it attaches to the
+/// JVM itself; any failure to look up the JVM, callback, or method is
+/// swallowed, since a dropped event is recoverable but a panic here
+/// would take the P2P node down with it.
 fn dispatch_event_to_kotlin(event: NodeEvent) {
     let jvm_lock = JVM.lock().unwrap();
     let jvm = match jvm_lock.as_ref() {

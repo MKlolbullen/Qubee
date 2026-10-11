@@ -43,8 +43,8 @@ class CallMediaService : Service() {
 
     @Inject lateinit var qubeeManager: QubeeManager
 
-    private var engine: AudioCallEngine? = null
-    private var video: VideoCallEngine? = null
+    @Volatile private var engine: AudioCallEngine? = null
+    @Volatile private var video: VideoCallEngine? = null
 
     @Volatile private var activeCallIdHex: String = ""
 
@@ -112,9 +112,11 @@ class CallMediaService : Service() {
             return START_NOT_STICKY
         }
         engine?.stop()
+        engine = null
+        video?.stop()
+        video = null
         activeCallIdHex = callIdHex
         engine = AudioCallEngine(qubeeManager).apply { start(callIdHex, peerIdHex) }
-        video?.stop()
         if (BuildConfig.CALLING_VIDEO_ENABLED) {
             video = VideoCallEngine(this, qubeeManager).also { it.start(callIdHex, peerIdHex) }
         }
@@ -142,16 +144,18 @@ class CallMediaService : Service() {
     }
 
     /** Route one remote Opus frame to the running engine, if it's this call. */
-    private fun onRemoteAudio(callIdHex: String, payload: ByteArray): Unit = synchronized(lifecycleLock) {
+    private fun onRemoteAudio(callIdHex: String, payload: ByteArray) {
+        val target = engine
         if (callIdHex == activeCallIdHex) {
-            engine?.onRemoteAudioFrame(payload)
+            target?.onRemoteAudioFrame(payload)
         }
     }
 
     /** Route one remote VP8 access unit to the running engine, if it's this call. */
-    private fun onRemoteVideo(callIdHex: String, payload: ByteArray): Unit = synchronized(lifecycleLock) {
+    private fun onRemoteVideo(callIdHex: String, payload: ByteArray) {
+        val target = video
         if (callIdHex == activeCallIdHex) {
-            video?.onRemoteAccessUnit(payload)
+            target?.onRemoteAccessUnit(payload)
         }
     }
 

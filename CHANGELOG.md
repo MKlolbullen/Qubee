@@ -9,6 +9,14 @@ between minor versions.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0-beta.1] — 2026-10-11
+
+First signed beta. Tagged `v0.2.0-beta.1`; the APK on the GitHub
+release is signed with the owner's key and the signer certificate
+SHA-256 is listed in the release notes and in `SECURITY.md`.
+
 ### Added
 
 - Android camera capture using VP8 and remote VP8 decode/rendering for
@@ -19,6 +27,25 @@ between minor versions.
   direct/group message paths, capped at 256 KiB per file. Attachment
   copies are encrypted at rest with Android Keystore-backed storage;
   opening uses a short-lived decrypted cache copy.
+- Versioned prekey pools for direct sessions: signed, ID-addressed pools
+  of 32 one-time X25519/ML-KEM pairs with seven-day signed-prekey
+  rotation and bounded retention of retired epochs. New initial messages
+  use direct-message frame v3; v2 outboxes and established sessions stay
+  readable. Both peers need this version for new v3 session setup. See
+  `docs/security/prekey-pool-v2.md`.
+- New logo: an infinity loop of cyan, blue and green ribbons with a cyan
+  node, on navy. It is the README header and the adaptive launcher icon
+  (foreground, gradient background and themed-icon silhouette), all
+  rendered from `docs/branding/qubee_logo.png` by
+  `scripts/render_launcher_icons.py`. The former Q-and-bee vector mark
+  is gone.
+- Release workflow: a preflight job fails within seconds when any of
+  the four `RELEASE_*` signing secrets or the `RELEASE_CERTIFICATE_SHA256`
+  variable is missing, instead of after a full native build. A
+  `dry_run` dispatch input runs only that check. Release notes now
+  carry the signer certificate SHA-256 of the published APK.
+- `.env.example` lists the four optional local signing variables;
+  Gradle reads them from the process environment only.
 
 ### Security
 
@@ -55,6 +82,20 @@ between minor versions.
 - Ratchet message-key derivation builds the AEAD key and nonce directly
   from the HKDF output and zeroizes the scratch buffer on every exit
   path, including the error path.
+- Cached signed-prekey publications are rechecked at direct-session
+  setup on both sides: anything older than 30 days or more than 60
+  seconds in the future is rejected until an authenticated refresh
+  arrives. Established sessions are unaffected.
+- Calling: a live call id cannot be reused by a different authenticated
+  caller; call operations and mute updates are serialized with stale
+  JNI results discarded; audio capture stops before worker teardown and
+  encoded/decoded audio allocations are capped. Calling availability is
+  required before initiation or acceptance, and Android video stays
+  disabled independently of the native calling opt-in.
+- Product APK signing is owner-pinned: `-PqubeeRequireReleaseSigning=true`
+  refuses the debug fallback, and `scripts/sign_product_apk.py` aligns,
+  signs with v2/v3, and verifies the signer against the expected
+  certificate fingerprint before anything is published.
 
 ### Changed
 
@@ -77,6 +118,29 @@ between minor versions.
   the RNG or HKDF) and `py/weak-sensitive-data-hashing` (coturn's
   mandatory HMAC-SHA1). `.github/codeql/codeql-config.yml` says how to
   turn either back on.
+- Calling signaling availability is set to `true` as a development
+  override so calling-enabled builds reach the TURN validation step.
+  This is not a verified relayed transport: signaling still runs over
+  direct libp2p and can expose peer IP addresses. Default APKs keep
+  calling compiled out, and startup still refuses to proceed without
+  TURN servers.
+- README rewritten as a contributor and tester guide grounded in the
+  build configuration: API 32 minimum, native-first build order,
+  device and emulator install, and an explicit account of what is
+  implemented versus roadmap.
+
+### Known limits of this beta
+
+- Ratchet sending is **off by default**. Outbound 1:1 and group traffic
+  uses the shared-group-key compatibility envelope until the
+  physical-device exit criteria in issue #47 are recorded green;
+  receive-side support for the ratchet frames is always on and the
+  Settings opt-in works.
+- Android peer discovery and bootstrap wiring are incomplete: mDNS is
+  off by default and the bootstrap-node argument is not used yet, so
+  two phones on one Wi-Fi do not find each other on their own.
+- Voice and video calling are compiled out of default APKs.
+- No independent security audit.
 
 ## [0.1.0-alpha] — 2026-08-06
 

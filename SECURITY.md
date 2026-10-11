@@ -211,7 +211,7 @@ High-value reports often demonstrate a violation of one of these:
 
 Signed releases on the GitHub Releases page are built by `.github/workflows/release.yml` and signed with the owner's app key. The workflow refuses the debug-signing fallback, verifies the v2 and v3 signature schemes, and compares the signer certificate with the `RELEASE_CERTIFICATE_SHA256` repository variable before anything is uploaded. Each release's notes print the same fingerprint.
 
-Owner signing certificate SHA-256: _published here with the first signed release._
+Owner signing certificate SHA-256: _none yet. No signed release has been published. The fingerprint is added to this line before the first one, and the release workflow refuses to build a tag whose `SECURITY.md` does not contain the pinned value (`scripts/check_security_pin.sh`)._
 
 Verify a downloaded APK before installing it:
 

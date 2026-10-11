@@ -62,6 +62,18 @@ jobs:
           fi
           echo "All four RELEASE_* secrets and the certificate pin are present."
 
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # A tester can only check an APK's signer against a value that
+      # does not come with the APK. SECURITY.md is that value, so a
+      # release whose SECURITY.md does not carry the pinned fingerprint
+      # is refused here (and again on the tag commit in the build job).
+      - name: Check SECURITY.md publishes the pinned fingerprint
+        run: scripts/check_security_pin.sh SECURITY.md "$RELEASE_CERTIFICATE_SHA256"
+
   build:
     name: Build + sign + release
     needs: preflight
@@ -97,6 +109,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0  # full history for `git rev-list --count`
           ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Check SECURITY.md on the tag publishes the pinned fingerprint
+        env:
+          RELEASE_CERTIFICATE_SHA256: ${{ vars.RELEASE_CERTIFICATE_SHA256 }}
+        run: scripts/check_security_pin.sh SECURITY.md "$RELEASE_CERTIFICATE_SHA256"
 
       - name: Compute monotonic versionCode
         id: vcode

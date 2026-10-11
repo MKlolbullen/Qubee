@@ -80,9 +80,13 @@ add the public certificate pin:
 The release workflow reads all five. Its `preflight` job fails within
 seconds, naming whatever is missing, before any native build starts;
 `scripts/sign_product_apk.py` then refuses to publish an APK whose
-signer does not match the pin. Publish the same fingerprint in
-`SECURITY.md` under "Release signing" so testers can verify
-sideloads.
+signer does not match the pin.
+
+Finally, put the same fingerprint on the "Owner signing certificate
+SHA-256" line of `SECURITY.md` (section "Release signing") and commit
+it before tagging. Testers compare a downloaded APK's signer against
+that line, and `scripts/check_security_pin.sh` makes the workflow
+refuse any tag whose `SECURITY.md` lacks the pinned value.
 
 ### 4. Verify the workflow can see the secrets
 

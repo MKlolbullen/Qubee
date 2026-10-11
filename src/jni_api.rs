@@ -13,9 +13,8 @@ use tokio::runtime::Runtime;
 
 // Core modules
 use crate::groups::group_handshake::{
-    generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_prekey_bundle,
-    sign_request_join, sign_role_change, verify_prekey_bundle, GroupHandshake, MessageAckBody,
-    RequestJoinBody,
+    generate_ephemeral_kyber, sign_message_ack, sign_ownership_transfer, sign_request_join,
+    sign_role_change, verify_prekey_bundle, GroupHandshake, MessageAckBody, RequestJoinBody,
 };
 use crate::groups::group_invite::InvitePayload;
 use crate::groups::group_manager::{
@@ -39,7 +38,8 @@ use crate::ratchet::direct::{
     install_peer_bundle, reset_direct_session, DirectPayload,
 };
 use crate::ratchet::direct_message::{extract_direct_message_id, is_direct_message_frame};
-use crate::ratchet::prekey_store::{build_body, get_or_create_local_bundle, store_peer_bundle};
+use crate::ratchet::prekey_pool;
+use crate::ratchet::prekey_store::store_peer_bundle;
 use crate::ratchet::sender_keys::{
     create_or_get_own_sender_key, decrypt_sender_key_message, decrypt_sender_key_message_v5,
     encrypt_sender_key_message_v5, extract_v3_message_id, extract_v5_message_id,
@@ -1869,6 +1869,7 @@ fn extract_peer_identity_hex(frame: &GroupHandshake) -> Option<String> {
         GroupHandshake::RequestStateSync { body, .. } => body.requester_id,
         GroupHandshake::StateSyncResponse { body, .. } => body.responder_id,
         GroupHandshake::PrekeyBundle { body, .. } => body.publisher.identity_id,
+        GroupHandshake::PrekeyPool { body, .. } => body.publisher.identity_id,
         GroupHandshake::JoinAccepted { .. } | GroupHandshake::JoinRejected { .. } => return None,
         // Retired legacy frame (phase 2D): inbound KeyRotation is
         // dropped unprocessed, so it must not feed peer↔identity
@@ -2082,6 +2083,16 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
             drop(gm_guard);
             ingest_summary_peer_ids(&body.members);
         }
+        GroupHandshake::PrekeyPool { body, signature } => {
+            if active_identity()?.is_some_and(|i| i.identity_id() == body.publisher.identity_id) {
+                return Ok(());
+            }
+            let mut guard = KEYSTORE.lock().unwrap();
+            let ks = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            prekey_pool::install(ks, &body, &signature)?;
+        }
         GroupHandshake::PrekeyBundle { body, signature } => {
             // Stage 2: verify + cache a peer's published prekey bundle.
             // Not yet consumed by send/receive (that's Stage 3) — this
@@ -2106,6 +2117,10 @@ fn process_handshake(frame: GroupHandshake, sender_peer_id: String) -> anyhow::R
             let ks = ks_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
+            anyhow::ensure!(
+                prekey_pool::peer(ks, &body.publisher.identity_id)?.is_none(),
+                "cannot downgrade an installed prekey pool"
+            );
             store_peer_bundle(ks, &body)?;
         }
     }
@@ -2845,10 +2860,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeEncryp
     })
 }
 
-/// Build + sign the local device's prekey bundle (Ratchet Stage 2),
-/// generating and persisting fresh X25519/ML-KEM prekey material on the
-/// first call and reloading it thereafter. Returns the signed
-/// `GroupHandshake::PrekeyBundle` wire frame as a Java `byte[]` for the
+/// Publish the local ID-addressed X25519/ML-KEM pool, replenishing
+/// one-time pairs and rotating signed-prekey epochs on age. Returns a
+/// signed `GroupHandshake::PrekeyPool` wire frame as a Java `byte[]` for the
 /// caller to publish on a group topic. Returns `null` when there's no
 /// active identity or the keystore isn't open.
 #[no_mangle]
@@ -2861,16 +2875,13 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeBuildL
             let identity =
                 active_identity()?.ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let now = now_secs();
-            let (secret, kem_public) = {
+            let wire = {
                 let mut ks_guard = KEYSTORE.lock().unwrap();
                 let ks = ks_guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-                get_or_create_local_bundle(ks, now)?
+                prekey_pool::publish(ks, identity.as_ref(), now)?
             };
-            let body = build_body(&secret, &kem_public, identity.public_key(), now);
-            let signed = sign_prekey_bundle(identity.as_ref(), body)?;
-            let wire = signed.to_wire()?;
             let arr = env
                 .byte_array_from_slice(&wire)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;

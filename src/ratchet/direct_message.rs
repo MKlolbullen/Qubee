@@ -23,11 +23,13 @@ use crate::groups::group_handshake::bounded_bincode_deserialize;
 use crate::identity::identity_key::IdentityId;
 use crate::ratchet::double_ratchet::MessageHeader;
 use crate::ratchet::pqxdh::WireInitialMessage;
+use crate::ratchet::prekey_pool::PrekeySelection;
 
 /// Magic prefix for the current direct-message frame. `\x02` adds an
 /// opaque per-message routing envelope so route-less bootstrap traffic does
 /// not expose either Qubee IdentityId outside the ratchet ciphertext.
 pub const MAGIC_DIRECT_MESSAGE: &[u8] = b"QUBEE_DMS\x02";
+pub const MAGIC_POOL_DIRECT_MESSAGE: &[u8] = b"QUBEE_DMS\x03";
 
 const DIRECT_ID_SELECTOR_TAG: &[u8] = b"qubee_direct_identity_selector_v1";
 pub const DIRECT_ROUTE_NONCE_LEN: usize = 16;
@@ -68,6 +70,8 @@ pub struct DirectMessage {
     /// Present only on the conversation's first message: the PQXDH
     /// initial handshake material. `None` on every subsequent message.
     pub initial: Option<WireInitialMessage>,
+    /// Present with a pool initial only. Bound into the initial session KDF.
+    pub prekey_selection: Option<PrekeySelection>,
     /// The Double Ratchet header (sender DH public, previous-chain
     /// length, message index). Sent in the clear but bound as AEAD
     /// associated data, so tampering fails decryption.
@@ -76,12 +80,42 @@ pub struct DirectMessage {
     pub ciphertext: Vec<u8>,
 }
 
+// Exact v2 layout retained for durable outboxes and established sessions.
+#[derive(Serialize, Deserialize)]
+struct LegacyDirectMessage {
+    route_nonce: [u8; DIRECT_ROUTE_NONCE_LEN],
+    sender_selector: [u8; DIRECT_ID_SELECTOR_LEN],
+    recipient_selector: [u8; DIRECT_ID_SELECTOR_LEN],
+    initial: Option<WireInitialMessage>,
+    header: MessageHeader,
+    ciphertext: Vec<u8>,
+}
+
 impl DirectMessage {
     /// Encode as a magic-prefixed byte string for transport/storage.
     pub fn to_wire(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(MAGIC_DIRECT_MESSAGE.len() + 128 + self.ciphertext.len());
-        out.extend_from_slice(MAGIC_DIRECT_MESSAGE);
-        out.extend_from_slice(&bincode::serialize(self).context("direct message serialize")?);
+        if self.prekey_selection.is_some() {
+            anyhow::ensure!(
+                self.initial
+                    .as_ref()
+                    .is_some_and(|i| i.used_one_time_prekey),
+                "pool selection requires a one-time prekey initial"
+            );
+            out.extend_from_slice(MAGIC_POOL_DIRECT_MESSAGE);
+            out.extend_from_slice(&bincode::serialize(self).context("pool direct serialize")?);
+        } else {
+            out.extend_from_slice(MAGIC_DIRECT_MESSAGE);
+            let legacy = LegacyDirectMessage {
+                route_nonce: self.route_nonce,
+                sender_selector: self.sender_selector,
+                recipient_selector: self.recipient_selector,
+                initial: self.initial.clone(),
+                header: self.header.clone(),
+                ciphertext: self.ciphertext.clone(),
+            };
+            out.extend_from_slice(&bincode::serialize(&legacy).context("direct serialize")?);
+        }
         Ok(out)
     }
 
@@ -93,10 +127,31 @@ impl DirectMessage {
         if bytes.len() < MAGIC_DIRECT_MESSAGE.len() {
             return None;
         }
-        if &bytes[..MAGIC_DIRECT_MESSAGE.len()] != MAGIC_DIRECT_MESSAGE {
+        let prefix = &bytes[..MAGIC_DIRECT_MESSAGE.len()];
+        if prefix == MAGIC_POOL_DIRECT_MESSAGE {
+            let dm: Self =
+                bounded_bincode_deserialize(&bytes[MAGIC_DIRECT_MESSAGE.len()..]).ok()?;
+            if dm.prekey_selection.as_ref().is_none_or(|s| s.epoch == 0)
+                || !dm.initial.as_ref().is_some_and(|i| i.used_one_time_prekey)
+            {
+                return None;
+            }
+            return Some(dm);
+        }
+        if prefix != MAGIC_DIRECT_MESSAGE {
             return None;
         }
-        bounded_bincode_deserialize(&bytes[MAGIC_DIRECT_MESSAGE.len()..]).ok()
+        let old: LegacyDirectMessage =
+            bounded_bincode_deserialize(&bytes[MAGIC_DIRECT_MESSAGE.len()..]).ok()?;
+        Some(Self {
+            route_nonce: old.route_nonce,
+            sender_selector: old.sender_selector,
+            recipient_selector: old.recipient_selector,
+            initial: old.initial,
+            prekey_selection: None,
+            header: old.header,
+            ciphertext: old.ciphertext,
+        })
     }
 }
 
@@ -118,7 +173,10 @@ pub fn extract_direct_message_id(bytes: &[u8]) -> Option<[u8; DIRECT_MESSAGE_ID_
 /// check for the inbound dispatcher, mirroring `is_group_message_frame`.
 pub fn is_direct_message_frame(bytes: &[u8]) -> bool {
     bytes.len() >= MAGIC_DIRECT_MESSAGE.len()
-        && &bytes[..MAGIC_DIRECT_MESSAGE.len()] == MAGIC_DIRECT_MESSAGE
+        && matches!(
+            &bytes[..MAGIC_DIRECT_MESSAGE.len()],
+            MAGIC_DIRECT_MESSAGE | MAGIC_POOL_DIRECT_MESSAGE
+        )
 }
 
 /// Read only the opaque routing tuple from a syntactically valid frame.
@@ -164,6 +222,7 @@ mod tests {
             sender_selector: direct_identity_selector(&sender, &route_nonce),
             recipient_selector: direct_identity_selector(&recipient, &route_nonce),
             initial: Some(sample_initial()),
+            prekey_selection: None,
             header: MessageHeader {
                 dh: [9u8; 32],
                 pn: 3,
@@ -186,6 +245,7 @@ mod tests {
             sender_selector: direct_identity_selector(&sender, &route_nonce),
             recipient_selector: direct_identity_selector(&recipient, &route_nonce),
             initial: None,
+            prekey_selection: None,
             header: MessageHeader {
                 dh: [0u8; 32],
                 pn: 0,
@@ -219,6 +279,7 @@ mod tests {
             sender_selector: direct_identity_selector(&sender, &route_nonce),
             recipient_selector: direct_identity_selector(&recipient, &route_nonce),
             initial: None,
+            prekey_selection: None,
             header: MessageHeader {
                 dh: [0x64u8; 32],
                 pn: 2,

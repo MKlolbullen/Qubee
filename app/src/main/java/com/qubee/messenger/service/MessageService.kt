@@ -73,9 +73,6 @@ class MessageService : Service(), NetworkCallback {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
-        /// "QUBEE_DMS\x02" — current PQXDH + Double Ratchet frame magic.
-        private val DIRECT_V2_MAGIC: ByteArray =
-            "QUBEE_DMS".toByteArray(Charsets.US_ASCII) + byteArrayOf(0x02)
         /// "QUBEE_GMS\x03" — the Stage 4 sender-keys group frame magic.
         /// Kept in sync with MAGIC_GROUP_MESSAGE_V3 in
         /// src/ratchet/sender_keys.rs (pinned in wire_stability).
@@ -108,7 +105,7 @@ class MessageService : Service(), NetworkCallback {
         /// Prekey bundles ride gossipsub, so peers offline at publish
         /// time miss them and can never initiate v3 toward us. A
         /// periodic republish bounds that window; the bundle is
-        /// stable between prekey rotations, so re-broadcasts are
+        /// refreshed on publication and replenished after consumption; re-broadcasts are
         /// idempotent on the receiving side.
         private const val PREKEY_REPUBLISH_INTERVAL_MS: Long = 30L * 60 * 1000
         /// Soft cap on rows processed per tick to keep the DB scan
@@ -630,7 +627,7 @@ class MessageService : Service(), NetworkCallback {
         // 1:1 PQXDH + Double Ratchet frame (QUBEE_DMS). Detect by magic,
         // not by sender resolution: an unknown/tampered selector is still a
         // direct frame and must fail closed here rather than reach legacy decrypt.
-        if (isDirectV2Frame(data)) {
+        if (com.qubee.messenger.crypto.DirectFrameMagic.matches(data)) {
             val directMessageId = qubeeManager.extractDirectMessageId(data)
             if (directMessageId == null) {
                 Timber.w("Malformed QUBEE_DMS frame from %s", peerId)
@@ -863,8 +860,6 @@ class MessageService : Service(), NetworkCallback {
             Timber.d("Direct delivery ack enqueue failed for %s; exact-text retry can replay it", messageIdHex)
         }
     }
-
-    private fun isDirectV2Frame(data: ByteArray): Boolean = hasMagic(data, DIRECT_V2_MAGIC)
 
     private fun isGroupV3Frame(data: ByteArray): Boolean = hasMagic(data, GROUP_V3_MAGIC)
 

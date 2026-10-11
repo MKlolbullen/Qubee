@@ -346,3 +346,9 @@ not in public issues.
 ## License
 
 Qubee is licensed under the [MIT License](LICENSE.md).
+
+### Prekey pools and owner-signed APKs
+
+New direct-session setup uses signed pools of 32 ID-addressed one-time X25519/ML-KEM pairs. Signed-prekey epochs rotate after seven days; bounded retired epochs admit delayed initials, and established conversations continue across rotation. Both peers need the pool-capable version for new v3 setup. See [pool lifecycle and migration](docs/security/prekey-pool-v2.md).
+
+[Product APK signing](docs/product-apk-signing.md) requires the owner keystore and a pinned certificate fingerprint. `-PqubeeRequireReleaseSigning=true` forbids debug fallback; ordinary minified test builds remain debug-signed. Product signing and physical Samsung acceptance remain separate gates. Use the [Samsung runbook](docs/manual-testing/samsung-android16-apk-acceptance.md) to record exact APK identity and device results.

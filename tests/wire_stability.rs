@@ -91,6 +91,7 @@ fn direct_message_round_trips_through_wire() {
         sender_selector: direct_identity_selector(&sender, &route_nonce),
         recipient_selector: direct_identity_selector(&recipient, &route_nonce),
         initial: None,
+        prekey_selection: None,
         header: MessageHeader {
             dh: [8u8; 32],
             pn: 1,
@@ -190,6 +191,7 @@ fn direct_message_full_layout_is_pinned_with_and_without_initial() {
             sender_selector: [2; 16],
             recipient_selector: [3; 16],
             initial,
+            prekey_selection: None,
             header: MessageHeader {
                 dh: [8; 32],
                 pn: 0x04030201,
@@ -688,6 +690,7 @@ fn frozen_handshake_tag(frame: &GroupHandshake) -> &'static str {
         GroupHandshake::PrekeyBundle { .. } => "qubee_handshake_prekey_bundle_v1",
         GroupHandshake::KeyRotationAnnounce { .. } => "qubee_handshake_key_rotation_announce_v1",
         GroupHandshake::KeyDelivery { .. } => "qubee_handshake_key_delivery_v1",
+        GroupHandshake::PrekeyPool { .. } => "qubee_prekey_pool_v2",
     }
 }
 
@@ -863,4 +866,100 @@ proptest! {
             other => prop_assert!(false, "expected RoleChange variant, got {:?}", other),
         }
     }
+}
+
+#[test]
+fn pool_variant_and_selection_versions_are_pinned() {
+    use qubee_crypto::ratchet::prekey_pool::{
+        canonical, context, OneTimePublic, PoolBody, PrekeySelection,
+    };
+    let kp = IdentityKeyPair::generate().unwrap();
+    let publisher = kp.public_key();
+    let body = PoolBody {
+        publisher: publisher.clone(),
+        identity_x25519: [1; 32],
+        epoch: 0x0807060504030201,
+        signed_prekey: [2; 32],
+        created_at: 3,
+        timestamp: 4,
+        prekeys: vec![OneTimePublic {
+            id: [5; 16],
+            x25519: [6; 32],
+            kem_public: vec![7; 1184],
+        }],
+    };
+    let mut expected = b"qubee_prekey_pool_v2\0".to_vec();
+    expected.extend(bincode::serialize(&publisher).unwrap());
+    expected.extend([1; 32]);
+    expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+    expected.extend([2; 32]);
+    expected.extend(3u64.to_le_bytes());
+    expected.extend(4u64.to_le_bytes());
+    expected.extend(1u64.to_le_bytes());
+    expected.extend([5; 16]);
+    expected.extend([6; 32]);
+    expected.extend(1184u64.to_le_bytes());
+    expected.extend([7; 1184]);
+    assert_eq!(canonical(&body).unwrap(), expected);
+    let signature = kp.sign(&expected).unwrap();
+    let frame = GroupHandshake::PrekeyPool { body, signature };
+    assert_eq!(frozen_handshake_tag(&frame), "qubee_prekey_pool_v2");
+    let wire = frame.to_wire().unwrap();
+    assert_eq!(
+        &wire[HANDSHAKE_MAGIC.len()..HANDSHAKE_MAGIC.len() + 4],
+        &13u32.to_le_bytes()
+    );
+    let mut expected = b"qubee_pool_selection_v2\0".to_vec();
+    expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+    expected.extend([9; 16]);
+    assert_eq!(
+        context(&PrekeySelection {
+            epoch: 0x0807060504030201,
+            id: [9; 16]
+        }),
+        expected
+    );
+}
+
+#[test]
+fn direct_v3_pool_layout_and_v2_compatibility_are_pinned() {
+    use qubee_crypto::ratchet::direct_message::{DirectMessage, MAGIC_POOL_DIRECT_MESSAGE};
+    use qubee_crypto::ratchet::double_ratchet::MessageHeader;
+    use qubee_crypto::ratchet::pqxdh::WireInitialMessage;
+    use qubee_crypto::ratchet::prekey_pool::PrekeySelection;
+    assert_eq!(MAGIC_POOL_DIRECT_MESSAGE, b"QUBEE_DMS\x03");
+    let mut dm = DirectMessage {
+        route_nonce: [1; 16],
+        sender_selector: [2; 16],
+        recipient_selector: [3; 16],
+        initial: Some(WireInitialMessage {
+            identity: [4; 32],
+            ephemeral: [5; 32],
+            kem_ciphertext: vec![6; 1088],
+            used_one_time_prekey: true,
+        }),
+        prekey_selection: None,
+        header: MessageHeader {
+            dh: [7; 32],
+            pn: 8,
+            n: 9,
+        },
+        ciphertext: vec![10; 16],
+    };
+    let legacy = dm.to_wire().unwrap();
+    let initial_end = 10 + 48 + 1 + 32 + 32 + 8 + 1088 + 1;
+    let mut expected = legacy.clone();
+    expected[9] = 3;
+    let mut extension = vec![1];
+    extension.extend(2u64.to_le_bytes());
+    extension.extend([11; 16]);
+    expected.splice(initial_end..initial_end, extension);
+    dm.prekey_selection = Some(PrekeySelection {
+        epoch: 2,
+        id: [11; 16],
+    });
+    assert_eq!(dm.to_wire().unwrap(), expected);
+    assert_eq!(DirectMessage::from_wire(&expected).unwrap(), dm);
+    dm.prekey_selection = None;
+    assert_eq!(DirectMessage::from_wire(&legacy).unwrap(), dm);
 }

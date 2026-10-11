@@ -46,6 +46,7 @@ fn valid_direct_message_wire() -> Vec<u8> {
         sender_selector: direct_identity_selector(&sender, &route_nonce),
         recipient_selector: direct_identity_selector(&recipient, &route_nonce),
         initial: None,
+        prekey_selection: None,
         header: MessageHeader {
             dh: [8u8; 32],
             pn: 1,
@@ -122,6 +123,7 @@ proptest! {
                 kem_ciphertext: vec![8; 1088],
                 used_one_time_prekey: used_otp,
             }),
+            prekey_selection: None,
             header: MessageHeader { dh, pn, n },
             ciphertext,
         };
@@ -233,5 +235,46 @@ fn single_byte_corruption_never_panics() {
         let mut bad = wire.clone();
         bad[i] ^= 0xFF;
         let _ = GroupHandshake::from_wire(&bad);
+    }
+}
+
+#[test]
+fn pool_direct_parser_rejects_truncation_trailing_bytes_and_missing_selection() {
+    use qubee_crypto::ratchet::prekey_pool::PrekeySelection;
+    let mut dm = DirectMessage::from_wire(&valid_direct_message_wire()).unwrap();
+    dm.initial = Some(WireInitialMessage {
+        identity: [6; 32],
+        ephemeral: [7; 32],
+        kem_ciphertext: vec![8; 1088],
+        used_one_time_prekey: true,
+    });
+    dm.prekey_selection = Some(PrekeySelection {
+        epoch: 1,
+        id: [9; 16],
+    });
+    let valid = dm.to_wire().unwrap();
+    for n in 0..valid.len() {
+        assert!(DirectMessage::from_wire(&valid[..n]).is_none());
+    }
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    assert!(DirectMessage::from_wire(&trailing).is_none());
+    dm.prekey_selection = None;
+    let mut wrong_version = dm.to_wire().unwrap();
+    wrong_version[9] = 3;
+    assert!(DirectMessage::from_wire(&wrong_version).is_none());
+    dm.prekey_selection = Some(PrekeySelection {
+        epoch: 0,
+        id: [9; 16],
+    });
+    assert!(DirectMessage::from_wire(&dm.to_wire().unwrap()).is_none());
+}
+
+proptest! {
+    #[test]
+    fn pool_direct_parser_survives_arbitrary_frames(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let mut frame = b"QUBEE_DMS\x03".to_vec(); frame.extend(bytes);
+        let _ = DirectMessage::from_wire(&frame);
+        let _ = extract_direct_message_id(&frame);
     }
 }

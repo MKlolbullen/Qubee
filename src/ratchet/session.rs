@@ -91,8 +91,25 @@ impl Session {
         local_secret: &PrekeyBundleSecret,
         peer_public: &PrekeyBundlePublic,
     ) -> Result<(Self, InitialMessage)> {
-        let result = initiate(&local_secret.identity, peer_public)?;
-        let ratchet = DoubleRatchet::init_alice(result.shared_secret, result.bob_ratchet_public)?;
+        Self::establish_initiator_bound(
+            local_id,
+            peer_id,
+            &local_secret.identity,
+            peer_public,
+            None,
+        )
+    }
+
+    pub(crate) fn establish_initiator_bound(
+        local_id: IdentityId,
+        peer_id: IdentityId,
+        identity: &x25519_dalek::StaticSecret,
+        peer_public: &PrekeyBundlePublic,
+        context: Option<&[u8]>,
+    ) -> Result<(Self, InitialMessage)> {
+        let result = initiate(identity, peer_public)?;
+        let sk = bind_setup(result.shared_secret, local_id, peer_id, context)?;
+        let ratchet = DoubleRatchet::init_alice(sk, result.bob_ratchet_public)?;
         let session = Session {
             peer_id,
             conversation_ad: conversation_ad(&local_id, &peer_id),
@@ -110,7 +127,18 @@ impl Session {
         local_secret: &PrekeyBundleSecret,
         initial: &InitialMessage,
     ) -> Result<Self> {
+        Self::establish_responder_bound(local_id, peer_id, local_secret, initial, None)
+    }
+
+    pub(crate) fn establish_responder_bound(
+        local_id: IdentityId,
+        peer_id: IdentityId,
+        local_secret: &PrekeyBundleSecret,
+        initial: &InitialMessage,
+        context: Option<&[u8]>,
+    ) -> Result<Self> {
         let (sk, ratchet_secret) = respond(local_secret, initial)?;
+        let sk = bind_setup(sk, local_id, peer_id, context)?;
         let ratchet = DoubleRatchet::init_bob(sk, ratchet_secret);
         Ok(Session {
             peer_id,
@@ -174,6 +202,24 @@ impl Session {
             ratchet: DoubleRatchet::deserialize_state(&stored.ratchet)?,
         })
     }
+}
+
+fn bind_setup(
+    sk: [u8; 32],
+    local: IdentityId,
+    peer: IdentityId,
+    context: Option<&[u8]>,
+) -> Result<[u8; 32]> {
+    let Some(context) = context else {
+        return Ok(sk);
+    };
+    let sk = Zeroizing::new(sk);
+    let salt = conversation_ad(&local, &peer);
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), sk.as_ref());
+    let mut out = [0u8; 32];
+    hk.expand(context, &mut out)
+        .map_err(|_| anyhow!("pool setup KDF failed"))?;
+    Ok(out)
 }
 
 fn session_metadata() -> KeyMetadata {

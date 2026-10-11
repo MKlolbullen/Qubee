@@ -74,8 +74,9 @@ continue without expiring their peer identity or deleting cached routing data.
 
 This is an admission check, not automatic key rotation, a trusted clock,
 filesystem rollback protection or a proof that a freshly republished bundle
-contains newly generated keys. Prekey epochs, an ID-addressed one-time-prekey
-pool and cross-device key transparency remain separate work. Bundle signatures
+contains newly generated keys. ID-addressed one-time pairs and rotation epochs are implemented in
+[prekey-pool-v2.md](prekey-pool-v2.md); global allocation and cross-device
+key transparency remain separate work. Bundle signatures
 are verified at installation; the cached body relies on the encrypted keystore
 and the existing signature-verifying installation path.
 

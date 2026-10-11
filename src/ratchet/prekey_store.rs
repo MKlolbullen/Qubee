@@ -95,6 +95,13 @@ pub fn get_or_create_local_bundle(
         return stored_to_secret(stored);
     }
 
+    anyhow::ensure!(
+        !ks.list_keys()
+            .iter()
+            .any(|id| id == super::prekey_pool::LOCAL),
+        "legacy prekeys retired; upgrade peer to the ID-addressed pool protocol"
+    );
+
     // First run: generate + persist.
     let (secret, kem_public) = super::pqxdh::generate_bundle()?;
     let stored = StoredLocalBundle {
@@ -115,6 +122,11 @@ pub fn get_or_create_local_bundle(
         bundle_metadata(),
     )?;
     Ok((secret, kem_public))
+}
+
+pub(crate) fn retire_legacy_bundle(ks: &mut SecureKeyStore) -> Result<()> {
+    ks.delete_key(LOCAL_BUNDLE_KEY_ID)?;
+    Ok(())
 }
 
 /// Consume this device's one-time prekey after a responder handshake

@@ -514,6 +514,12 @@ pub enum GroupHandshake {
         body: KeyDeliveryBody,
         signature: HybridSignature,
     },
+    /// Versioned ID-addressed one-time X25519/ML-KEM pool. Appended to
+    /// preserve every existing bincode enum tag.
+    PrekeyPool {
+        body: crate::ratchet::prekey_pool::PoolBody,
+        signature: HybridSignature,
+    },
 }
 
 impl GroupHandshake {

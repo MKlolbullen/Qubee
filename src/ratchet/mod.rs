@@ -24,6 +24,7 @@ pub mod direct;
 pub mod direct_message;
 pub mod double_ratchet;
 pub mod pqxdh;
+pub mod prekey_pool;
 pub mod prekey_store;
 pub mod sender_keys;
 pub mod session;

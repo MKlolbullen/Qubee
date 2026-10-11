@@ -20,7 +20,24 @@ def releaseKeystoreFile = System.getenv('RELEASE_KEYSTORE_FILE')
 def releaseKeystorePassword = System.getenv('RELEASE_KEYSTORE_PASSWORD')
 def releaseKeyAlias = System.getenv('RELEASE_KEY_ALIAS')
 def releaseKeyPassword = System.getenv('RELEASE_KEY_PASSWORD')
-def hasReleaseSigning = releaseKeystoreFile && file(releaseKeystoreFile).exists()
+def signingValues = [releaseKeystoreFile, releaseKeystorePassword, releaseKeyAlias, releaseKeyPassword]
+def hasReleaseSigning = signingValues.every { it != null && !it.isEmpty() }
+if (signingValues.any { it != null && !it.isEmpty() } && !hasReleaseSigning) {
+    throw new GradleException('Incomplete RELEASE_* signing environment; all four credentials are required.')
+}
+if (hasReleaseSigning && !file(releaseKeystoreFile).isFile()) {
+    throw new GradleException('RELEASE_KEYSTORE_FILE is not a readable keystore file.')
+}
+def requireReleaseSigning = (project.findProperty('qubeeRequireReleaseSigning') ?: 'false').toString() == 'true'
+if (requireReleaseSigning && !hasReleaseSigning) {
+    throw new GradleException('Product APK signing requires an owner-controlled RELEASE_* keystore; debug fallback is forbidden.')
+}
+// Device-test builds may package only the ABI actually cross-compiled.
+// Product/CI builds retain all four ABIs by default.
+def nativeAbis = (project.findProperty('qubeeAbis') ?: 'arm64-v8a,armeabi-v7a,x86,x86_64').toString().split(',').toList()
+if (nativeAbis.isEmpty() || nativeAbis.any { !['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'].contains(it) }) {
+    throw new GradleException('qubeeAbis must contain supported Android ABI names.')
+}
 
 android {
     namespace 'com.qubee.messenger'
@@ -64,7 +81,7 @@ android {
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+            abiFilters(*nativeAbis)
         }
     }
 

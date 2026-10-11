@@ -117,9 +117,9 @@ class QubeeManager @Inject constructor(
     }
 
     /**
-     * Build the local device's signed prekey bundle (Ratchet Stage 2).
-     * Rust generates and persists fresh X25519/ML-KEM prekey material on
-     * first call and returns the signed PrekeyBundle wire frame, which
+     * Publish the local signed ID-addressed X25519/ML-KEM pool. Rust
+     * replenishes consumed pairs and rotates signed-prekey epochs on age.
+     * Returns the signed PrekeyPool wire frame, which
      * the caller publishes on the group topic. Bundles are cached by
      * receivers but not yet consumed by send/receive (Stage 3).
      */
@@ -649,7 +649,7 @@ class QubeeManager @Inject constructor(
      * global topic so peers can initiate ratchet sessions with us.
      * Receivers verify + cache it Rust-side from any topic. Call after
      * the network node starts; re-publishing is idempotent (the bundle
-     * is stable until its prekeys rotate).
+     * contains a fresh signed publication time and available prekey pairs).
      */
     suspend fun publishLocalPrekeyBundle(): Boolean = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext false

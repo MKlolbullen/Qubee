@@ -42,6 +42,7 @@
 //! both directions. Same trade-off Signal makes for session racing.
 
 use anyhow::{anyhow, bail, Result};
+use secrecy::ExposeSecret;
 use zeroize::Zeroizing;
 
 use crate::groups::group_handshake::{verify_prekey_bundle, GroupHandshake};
@@ -51,6 +52,7 @@ use crate::ratchet::direct_message::{
     DIRECT_ROUTE_NONCE_LEN,
 };
 use crate::ratchet::pqxdh::WireInitialMessage;
+use crate::ratchet::prekey_pool;
 use crate::ratchet::prekey_store::{
     body_to_public, consume_one_time_prekey, get_or_create_local_bundle,
     get_peer_bundle_for_handshake, list_peer_bundle_ids, store_peer_bundle,
@@ -79,6 +81,13 @@ fn marker_metadata() -> KeyMetadata {
     }
 }
 
+fn pending_selection_key(peer: &IdentityId) -> String {
+    format!(
+        "ratchet_pending_pool_selection_{}",
+        hex::encode(peer.as_ref())
+    )
+}
+
 fn initial_hash(initial: &WireInitialMessage) -> Result<[u8; 32]> {
     let bytes =
         bincode::serialize(initial).map_err(|e| anyhow!("serialize initial for hash: {e}"))?;
@@ -96,12 +105,21 @@ pub fn install_peer_bundle(ks: &mut SecureKeyStore, wire: &[u8]) -> Result<Ident
         GroupHandshake::from_wire(wire).ok_or_else(|| anyhow!("not a handshake wire frame"))?;
     let (body, signature) = match frame {
         GroupHandshake::PrekeyBundle { body, signature } => (body, signature),
+        GroupHandshake::PrekeyPool { body, signature } => {
+            let id = body.publisher.identity_id;
+            prekey_pool::install(ks, &body, &signature)?;
+            return Ok(id);
+        }
         _ => bail!("not a prekey bundle frame"),
     };
     if !verify_prekey_bundle(&body, &signature)? {
         bail!("prekey bundle signature verification failed");
     }
     let id = body.publisher.identity_id;
+    anyhow::ensure!(
+        prekey_pool::peer(ks, &id)?.is_none(),
+        "cannot downgrade an installed prekey pool"
+    );
     store_peer_bundle(ks, &body)?;
     Ok(id)
 }
@@ -141,12 +159,32 @@ fn encrypt_direct_inner(
     let mut session = match load_session(ks, &peer_id)? {
         Some(s) => s,
         None => {
-            let body = get_peer_bundle_for_handshake(ks, &peer_id, now)?
-                .ok_or_else(|| anyhow!("no prekey bundle installed for peer"))?;
-            let peer_public = body_to_public(&body)?;
-            let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
-            let (session, initial) =
-                Session::establish_initiator(local_id, peer_id, &local_secret, &peer_public)?;
+            let (session, initial) = if let Some(body) = prekey_pool::fresh_peer(ks, &peer_id, now)?
+            {
+                let (selection, public) = prekey_pool::reserve(ks, &body)?;
+                let identity = prekey_pool::local_identity(ks, now)?;
+                let context = prekey_pool::context(&selection);
+                let result = Session::establish_initiator_bound(
+                    local_id,
+                    peer_id,
+                    &identity,
+                    &public,
+                    Some(&context),
+                )?;
+                ks.store_key(
+                    &pending_selection_key(&peer_id),
+                    &bincode::serialize(&selection)?,
+                    KeyType::EphemeralKey,
+                    marker_metadata(),
+                )?;
+                result
+            } else {
+                let body = get_peer_bundle_for_handshake(ks, &peer_id, now)?
+                    .ok_or_else(|| anyhow!("no prekey bundle installed for peer"))?;
+                let peer_public = body_to_public(&body)?;
+                let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
+                Session::establish_initiator(local_id, peer_id, &local_secret, &peer_public)?
+            };
             let wire_initial = WireInitialMessage::from_message(&initial);
             let bytes = bincode::serialize(&wire_initial)
                 .map_err(|e| anyhow!("serialize pending initial: {e}"))?;
@@ -169,6 +207,10 @@ fn encrypt_direct_inner(
         ),
         None => None,
     };
+    let prekey_selection = match ks.retrieve_key(&pending_selection_key(&peer_id))? {
+        Some(secret) => Some(bincode::deserialize(secret.expose_secret())?),
+        None => None,
+    };
 
     // Length-hiding: pad before the ratchet AEAD so distinct 1:1
     // messages (and the sender-key distributions that ride these
@@ -181,6 +223,7 @@ fn encrypt_direct_inner(
         sender_selector,
         recipient_selector,
         initial,
+        prekey_selection,
         header,
         ciphertext,
     }
@@ -229,6 +272,7 @@ fn decrypt_direct_inner(
                 // Receiving on this session proves the peer holds it too:
                 // stop attaching our own initial (if we were initiator).
                 ks.delete_key(&pending_initial_key(&peer_id))?;
+                ks.delete_key(&pending_selection_key(&peer_id))?;
                 let plaintext = crate::security::padding::unpad(&padded)?;
                 return Ok((peer_id, stamp_call_root(plaintext, root)?));
             }
@@ -255,15 +299,35 @@ fn decrypt_direct_inner(
         }
     }
 
-    let bundle = get_peer_bundle_for_handshake(ks, &peer_id, now)?
-        .ok_or_else(|| anyhow!("no verified prekey bundle for claimed sender"))?;
-    if initial.identity != bundle.identity_x25519 {
+    let sender_identity = if let Some(body) = prekey_pool::fresh_peer(ks, &peer_id, now)? {
+        body.identity_x25519
+    } else {
+        get_peer_bundle_for_handshake(ks, &peer_id, now)?
+            .ok_or_else(|| anyhow!("no verified prekey bundle for claimed sender"))?
+            .identity_x25519
+    };
+    if initial.identity != sender_identity {
         bail!("initial message identity key does not match sender's verified bundle");
     }
 
-    let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
-    let mut session =
-        Session::establish_responder(local_id, peer_id, &local_secret, &initial.to_message()?)?;
+    let mut session = if let Some(selection) = &dm.prekey_selection {
+        anyhow::ensure!(
+            initial.used_one_time_prekey,
+            "pool initial must use a one-time prekey"
+        );
+        let secret = prekey_pool::responder_secret(ks, selection, now)?;
+        let context = prekey_pool::context(selection);
+        Session::establish_responder_bound(
+            local_id,
+            peer_id,
+            &secret,
+            &initial.to_message()?,
+            Some(&context),
+        )?
+    } else {
+        let (local_secret, _kem) = get_or_create_local_bundle(ks, now)?;
+        Session::establish_responder(local_id, peer_id, &local_secret, &initial.to_message()?)?
+    };
     let (padded, root) =
         session.decrypt_with_call_root(&dm.header, &dm.ciphertext, select_call_invitation)?;
     let padded = Zeroizing::new(padded);
@@ -274,7 +338,9 @@ fn decrypt_direct_inner(
     // spoofed initial from burning OTPs.
     //
     // Session advancement, OTP consumption and replay marker share one commit.
-    if initial.used_one_time_prekey {
+    if let Some(selection) = &dm.prekey_selection {
+        prekey_pool::consume(ks, selection, now)?;
+    } else if initial.used_one_time_prekey {
         consume_one_time_prekey(ks)?;
     }
     ks.store_key(
@@ -293,7 +359,13 @@ fn resolve_direct_selector(
     selector: &[u8; DIRECT_ID_SELECTOR_LEN],
 ) -> Result<IdentityId> {
     let mut matched: Option<IdentityId> = None;
-    for candidate in list_peer_bundle_ids(ks)? {
+    let mut candidates = list_peer_bundle_ids(ks)?;
+    for candidate in prekey_pool::peer_ids(ks)? {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    for candidate in candidates {
         if direct_identity_selector(&candidate, route_nonce) == *selector
             && matched.replace(candidate).is_some()
         {
@@ -341,6 +413,7 @@ fn reset_direct_session_inner(ks: &mut SecureKeyStore, peer: &IdentityId) -> Res
     for key in [
         crate::ratchet::session::session_key_id(peer),
         pending_initial_key(peer),
+        pending_selection_key(peer),
         accepted_initial_key(peer),
     ] {
         if ks.delete_key(&key)? {

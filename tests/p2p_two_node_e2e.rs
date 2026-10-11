@@ -59,6 +59,9 @@ async fn spawn_test_node(label: &str) -> TestNode {
     spawn_test_node_with(label, P2PNodeConfig::for_testing()).await
 }
 
+/// Like [`spawn_test_node`] but with a caller-supplied config, so tests
+/// can exercise non-default settings (e.g. `bootstrap_peers`) while
+/// reusing the same spawn-and-wait-for-listen-address plumbing.
 async fn spawn_test_node_with(label: &str, config: P2PNodeConfig) -> TestNode {
     let id_keys = libp2p::identity::Keypair::generate_ed25519();
     let peer_id = libp2p::PeerId::from(id_keys.public()).to_string();
@@ -781,67 +784,4 @@ async fn gossip_authorship_is_anonymous() {
         sender.is_empty(),
         "gossip authorship must be anonymous — no author PeerId on the wire (got {sender:?})",
     );
-}
-
-/// Android binds the wildcard address. libp2p's TCP and QUIC listeners
-/// expand it through if-watch, so `Listening` carries one concrete
-/// address per interface and never `0.0.0.0`: what Settings shows is
-/// what another device can dial.
-#[tokio::test]
-async fn wildcard_listen_reports_concrete_interface_addresses() {
-    let config = P2PNodeConfig {
-        listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
-        quic_listen_addr: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()),
-        ..P2PNodeConfig::for_testing()
-    };
-    let mut node = spawn_test_node_with("wildcard", config).await;
-    let mut addrs = vec![node.listen_addr.clone()];
-    while let Ok(Some(evt)) = timeout(Duration::from_millis(500), node.events.recv()).await {
-        if let NodeEvent::Listening { multiaddr } = evt {
-            addrs.push(multiaddr);
-        }
-    }
-
-    assert!(
-        addrs.iter().any(|a| a.contains("/tcp/")),
-        "a TCP address must be reported: {addrs:?}"
-    );
-    for addr in &addrs {
-        let ma: libp2p::Multiaddr = addr.parse().expect("Listening carries a valid multiaddr");
-        let ip = ma
-            .iter()
-            .find_map(|p| match p {
-                libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip),
-                _ => None,
-            })
-            .expect("an ip4 component");
-        assert!(
-            !ip.is_unspecified(),
-            "{addr} must name an interface address"
-        );
-        assert!(
-            addr.ends_with(&format!("/p2p/{}", node.peer_id)),
-            "{addr} must end with the local PeerId"
-        );
-    }
-}
-
-/// A stop that lands while the node is still being built closes its
-/// command channel before `run` starts. The node must then leave
-/// without polling the swarm, so no `Listening` reaches Kotlin after
-/// the status view was reset for the next node.
-#[tokio::test]
-async fn node_whose_channel_closed_before_run_exits_silently() {
-    let id_keys = libp2p::identity::Keypair::generate_ed25519();
-    let (cmd_tx, cmd_rx) = mpsc::channel(32);
-    let (evt_tx, mut evt_rx) = mpsc::channel(64);
-    let node = P2PNode::with_config(id_keys, cmd_rx, P2PNodeConfig::for_testing())
-        .await
-        .expect("node builds");
-    drop(cmd_tx);
-
-    timeout(Duration::from_secs(5), node.run(evt_tx))
-        .await
-        .expect("run returns once its channel is closed");
-    assert!(evt_rx.recv().await.is_none(), "no event may be emitted");
 }

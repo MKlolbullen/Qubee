@@ -154,6 +154,7 @@ class PreferenceRepository @Inject constructor(
      */
     fun lanDiscoveryEnabled(): Boolean = prefs.getBoolean(KEY_LAN_DISCOVERY, false)
 
+    /** Persist the LAN discovery toggle; takes effect on the next node start. */
     fun setLanDiscoveryEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_LAN_DISCOVERY, enabled).apply()
     }
@@ -164,6 +165,7 @@ class PreferenceRepository @Inject constructor(
      */
     fun bootstrapPeers(): String = prefs.getString(KEY_BOOTSTRAP_PEERS, null).orEmpty()
 
+    /** Persist the raw bootstrap peer list, trimmed; takes effect on the next node start. */
     fun setBootstrapPeers(peers: String) {
         prefs.edit().putString(KEY_BOOTSTRAP_PEERS, peers.trim()).apply()
     }

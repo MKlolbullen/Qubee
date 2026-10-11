@@ -265,6 +265,7 @@ private fun NetworkPanel(viewModel: SettingsViewModel) {
     )
 }
 
+/** Stateless render of [NetworkPanel]'s content, exposed for Paparazzi snapshot tests. */
 @Composable
 @androidx.annotation.VisibleForTesting
 internal fun NetworkPanelBody(

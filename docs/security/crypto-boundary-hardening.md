@@ -62,8 +62,22 @@ and value, ML-KEM public key, publisher ID and timestamp. Cached peer bundles
 reject timestamp rollback and mismatched cache IDs. Equal timestamps remain
 allowed because publication can occur more than once per second; they are not
 an anti-equivocation mechanism. Signed bundle verification uses the existing
-seven-day signature-age window. Long-lived cache expiry, prekey epochs and
-cross-device key transparency are not implemented by this pass.
+30-day signature-age window. New direct sessions additionally recheck the
+cached body's signed publication timestamp at use: at most 30 days old and
+at most 60 seconds ahead of the supplied current Unix time. Both the initiator
+and responder reject stale/future bundles before establishing a session or
+consuming a one-time prekey. The caller must supply its own current time, never
+an inbound frame's timestamp. Authenticated bundle refresh is required to
+resume new establishment; rejected handshakes leave the durable keystore
+unchanged, including across reload. Existing authenticated ratchet sessions
+continue without expiring their peer identity or deleting cached routing data.
+
+This is an admission check, not automatic key rotation, a trusted clock,
+filesystem rollback protection or a proof that a freshly republished bundle
+contains newly generated keys. Prekey epochs, an ID-addressed one-time-prekey
+pool and cross-device key transparency remain separate work. Bundle signatures
+are verified at installation; the cached body relies on the encrypted keystore
+and the existing signature-verifying installation path.
 
 Existing conversation associated data binds the sorted pair of identity IDs.
 Hybrid KDF and wire formats are unchanged. Failure must never silently invoke

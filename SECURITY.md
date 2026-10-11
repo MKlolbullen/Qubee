@@ -1,6 +1,6 @@
 # Security policy
 
-Qubee is a **pre-alpha, research-grade post-quantum P2P messenger**.
+Qubee is a **beta, research-grade post-quantum P2P messenger**.
 
 The cryptographic primitives are not the only — or even the most likely — place for a serious defect. The highest-value attack surface is the glue around them: wire parsing, JNI, protocol state, persistence, libp2p routing, Android lifecycle, trust policy and the feature-gated calling stack.
 
@@ -106,13 +106,13 @@ Particularly interesting calling findings include:
 
 These are security-relevant project limitations, but are not automatically vulnerabilities by themselves.
 
-### 1. Forward-secret messaging is default-on but still soaking
+### 1. Forward-secret messaging is implemented but off by default
 
-`PreferenceRepository.ratchetSendEnabled()` currently defaults to `true`.
+`PreferenceRepository.ratchetSendEnabled()` defaults to `false` again (PR #93) until every physical-device exit criterion in issue #47 is recorded green. Until a user opts in from Settings, outbound 1:1 and group traffic uses the shared-group-key compatibility envelope, which is signed with long-term identity keys and is neither forward-secret nor deniable.
 
-Outbound 1:1 traffic uses the `QUBEE_DMS` PQXDH + Double Ratchet path. Outbound group traffic uses sender keys, with keyed-selector **v5** as the current group emission format.
+With the opt-in, outbound 1:1 traffic uses the `QUBEE_DMS` PQXDH + Double Ratchet path and outbound group traffic uses sender keys, with keyed-selector **v5** as the group emission format. Receive-side support for all of these frames is always on.
 
-The emergency rollout flag remains as a temporary kill-switch. Compatibility paths also remain:
+Compatibility paths also remain:
 
 - older direct/group formats may still be accepted;
 - sender-key v3 remains an inbound compatibility path;
@@ -206,6 +206,21 @@ High-value reports often demonstrate a violation of one of these:
 12. **A retry reuses durable ciphertext and never advances the ratchet twice.**
 13. **A frame for one session/group/call cannot be substituted into another.**
 14. **Resource use from untrusted peers is bounded.**
+
+## Release signing
+
+Signed releases on the GitHub Releases page are built by `.github/workflows/release.yml` and signed with the owner's app key. The workflow refuses the debug-signing fallback, verifies the v2 and v3 signature schemes, and compares the signer certificate with the `RELEASE_CERTIFICATE_SHA256` repository variable before anything is uploaded. Each release's notes print the same fingerprint.
+
+Owner signing certificate SHA-256: _published here with the first signed release._
+
+Verify a downloaded APK before installing it:
+
+```bash
+sha256sum -c qubee-<version>.apk.sha256
+apksigner verify --print-certs qubee-<version>.apk
+```
+
+The `Signer #1 certificate SHA-256 digest` line must match the fingerprint above. Anything else did not come from this project's key.
 
 ## Disclosure policy
 

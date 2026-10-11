@@ -2,8 +2,11 @@
 
 This directory starts **Coturn for media only**. It does not host Qubee's
 encrypted 1:1 signaling, issue credentials to Android, or enable calls.
-The direct libp2p path remains in the application, so `nativeStartCalling`
-continues to fail closed. Never remove that gate merely because Coturn runs.
+The direct libp2p path remains in the application. The signaling availability
+guard currently returns true as an explicit development override, not a
+verified private transport. Android startup still supplies an empty TURN
+configuration and fails the independent TURN validation. Running Coturn alone
+does not configure the app or satisfy the private-signaling release gate.
 
 ## Host prerequisites
 
@@ -76,8 +79,9 @@ policy already rejects public STUN and direct ICE candidates.
    and address advertisement in the client. A relay server sees client
    IPs, peer routing and timing; its operator must be part of the threat
    model. Regular direct chat can still expose IPs while it is connected.
-3. Bind the Android `relay_call_signaling_available` gate to verified
-   transport state, not an environment variable or user toggle. Add
+3. Replace the current true development override in
+   `relay_call_signaling_available` with verified transport state, not an
+   environment variable or user toggle. Add
    fail-closed reconnect tests and packet capture for zero peer-direct
    packets through Wi-Fi↔mobile and ICE restart.
 4. Complete issue #79's two-phone matrix. Debug/host success alone is

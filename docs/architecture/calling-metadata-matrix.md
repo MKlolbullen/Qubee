@@ -1,6 +1,9 @@
 # Calling metadata and physical-device gates (#79)
 
-Status: calling is disabled in the standard APK and blocked at native startup
+Status: calling is disabled in the standard APK. The native signaling guard
+currently returns true as an explicit development override; this does not
+verify relayed signaling. Android startup still uses an empty TURN configuration
+and is blocked by TURN validation. Private calling remains release-blocked
 until the complete signaling path is relayed and validated. PR #86's relay-only
 ICE policy and TURN staging, and PR #91's authenticated encrypted signaling and
 session-derived media roots, are merged; neither provides physical-device proof
@@ -51,10 +54,13 @@ credentials, SDP or device identifiers in an issue.
 
 1. Install a build from the reviewed commit on Samsung API 34+ and a second
    phone. Confirm G0 first; the current standard build must not initiate calls.
-2. In a controlled opt-in build, keep the current native guard intact. Record
-   that startup fails without verified relayed signaling; no microphone or
-   camera starts. This is a **successful fail-closed test**, not a call pass.
-3. Once relayed signaling and runtime TURN provisioning exist, run G1–G5
+2. In a controlled opt-in build, record that startup fails with the default
+   empty TURN configuration and no microphone or camera starts. This is a
+   **TURN fail-closed test**, not a call pass or a signaling-privacy pass.
+   The current true signaling override cannot prove fail-closed private
+   signaling; mark that case blocked until verified transport state replaces it.
+3. Once relayed signaling, a verified runtime signaling guard, and runtime
+   TURN provisioning exist, run G1–G5
    on Samsung and the second phone with sanitized device and relay captures.
    Test denied permission, relay outage, Wi-Fi↔mobile, and teardown first.
 4. Only after G1–G5 are green, run G6–G9 and decide whether voice can be a

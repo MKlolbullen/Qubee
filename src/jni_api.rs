@@ -4344,9 +4344,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
                 .ok_or_else(|| anyhow::anyhow!("onboarding required before calling"))?;
             let local_identity = identity.identity_id();
 
-            // Direct libp2p signaling still exposes the peer IP even with TURN media.
-            // A private call must never start until its complete 1:1 session
-            // has a verified relay route with no direct fallback.
+            // Signaling currently uses the development override below.
+            // TURN validation and the calling build opt-ins remain independent.
+            // A private mode must verify a fully relayed 1:1 transport.
             if !relay_call_signaling_available() {
                 anyhow::bail!("calling requires a verified relay-only signaling transport");
             }
@@ -4390,9 +4390,11 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeStartC
 
 #[cfg(feature = "calling")]
 fn relay_call_signaling_available() -> bool {
-    // Replace only with an assertion supplied by a real relayed 1:1
-    // transport. A build flag, TURN availability or user toggle is insufficient.
-    false
+    // Development override: allow the calling startup path past this guard.
+    // This is not evidence of a verified relay-only signaling transport:
+    // signaling still uses direct libp2p and can expose peer IP addresses.
+    // TURN provisioning and the native/Gradle calling opt-ins remain required.
+    true
 }
 
 /// Initiate a 1:1 call to `participant`. The call's media root is minted

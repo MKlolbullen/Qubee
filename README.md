@@ -297,8 +297,12 @@ Do not regenerate baselines just to hide an unexpected failure.
   QUBEE_CALLING=1 ./build_rust.sh
   ./gradlew :app:assembleDebug -PqubeeCalling=true
   ```
-  This does not remove the runtime gate requiring TURN/private signaling
-  provisioning or establish device readiness. Current media protection is
+  The signaling availability guard currently returns true as an explicit
+  development override; it does not verify a relayed transport. Signaling
+  still uses direct libp2p and can expose peer IPs. The Android startup path
+  still passes an empty TURN configuration, so TURN validation blocks startup.
+  Neither build opt-ins nor this override establish device readiness.
+  Current media protection is
   WebRTC DTLS-SRTP, not the separate in-tree frame-encryption helper. Consult the
   [calling threat model](docs/architecture/calling-threat-model.md) and
   [deployment notes](deploy/calling/README.md).

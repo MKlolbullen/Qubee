@@ -5,8 +5,9 @@ without `--features calling`, and `BuildConfig.CALLING_NATIVE_ENABLED`
 is false unless Gradle is invoked with `-PqubeeCalling=true`. A default
 APK must not present a call control. Video capture/rendering are integrated
 behind the build gate but remain unvalidated on physical devices. Calling
-startup also remains blocked by the relay-only signaling gate below.
-Nothing in this document is a ship claim.
+startup still fails with the default empty TURN configuration. The signaling
+availability guard currently returns true as a development override; it no
+longer enforces verified relayed signaling. Nothing in this document is a ship claim.
 
 ## Addressing
 
@@ -124,8 +125,12 @@ Calling does not hide network location.
   credential provisioning is not yet implemented.
 - **Call signaling still uses the direct libp2p message path.** A media-only
   TURN policy cannot hide the peer IP while that path exists. Android
-  `nativeStartCalling` therefore fails closed until the signaling transport
-  is relay-only and tested. Existing ordinary chat traffic retains its
+  `relay_call_signaling_available()` currently returns true as an explicit
+  development override, not a verified transport assertion. Once TURN is
+  provisioned, this bypass can allow direct signaling; it must not be treated
+  as an IP-private mode. Current Android startup still supplies the default
+  empty TURN configuration and fails its independent validation.
+  Existing ordinary chat traffic retains its
   documented direct-network metadata behavior.
 - DTLS-SRTP protects media contents from the path. It does not hide that
   a media flow exists, its timing, or its volume.
@@ -160,6 +165,9 @@ Release gates for metadata: provision TURN at runtime, relay the complete
 prove packet-capture absence of direct peer traffic including reconnection
 and ICE restart, then run the physical device matrix. Do not merely flip
 the Android guard or add TURN credentials to the APK.
+The current development override does not satisfy these release gates. Before
+a private calling release, replace it with verified transport state and retain
+fail-closed behavior when that route is unavailable.
 The observer-by-observer risks, exact physical cases and first Samsung run
 are in [calling-metadata-matrix.md](calling-metadata-matrix.md).
 

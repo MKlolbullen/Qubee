@@ -14,8 +14,10 @@ or security.
 > **Beta • For contributors and early testers • No independent security audit**
 >
 > A buildable Android app exists, with onboarding, contacts, chats, groups, and
-> encrypted storage. Peer discovery and physical-device acceptance remain
-> incomplete. Do not use Qubee for sensitive or safety-critical communications.
+> encrypted storage. Peers are found on one Wi-Fi or through hand-exchanged
+> addresses only; there are no public bootstrap servers, and physical-device
+> acceptance remains incomplete. Do not use Qubee for sensitive or
+> safety-critical communications.
 
 [Android setup](#build-the-android-app) · [Install](#install-and-try-it) ·
 [Development](#local-development-and-tests) · [Security policy](SECURITY.md)
@@ -33,7 +35,7 @@ These are implementation capabilities, not a production-readiness checklist.
 | Delivery | Acknowledgement handling and durable ciphertext retries exist. They do not provide a hosted offline mailbox or guarantee reachability. |
 | Attachments | Encrypted messages can carry files up to **256 KiB**. Local attachment copies use Android Keystore-backed encryption; large/chunked transfers are not implemented. |
 | Storage | Room/SQLCipher for Android records; an encrypted Rust keystore for identities, group keys, and ratchet state. Upgrade and cross-store crash recovery need device testing. |
-| Networking | libp2p TCP/Noise/Yamux and QUIC, gossipsub, Kademlia, and a direct request-response channel. **Android discovery/bootstrap wiring is incomplete; see below.** |
+| Networking | libp2p TCP/Noise/Yamux and QUIC, gossipsub, Kademlia, and a direct request-response channel. Peer discovery is a Settings matter: an mDNS toggle for the local Wi-Fi (off by default) and a bootstrap-peer list fed from the other device's addresses. **No public bootstrap servers and no NAT traversal; see below.** |
 | Voice/video calls | Disabled by default; build-gated research integration with runtime privacy/provisioning gates. Not a usable default-app feature. |
 | Voice messages, Tor/Nym transport, multi-device sync | Goals or unfinished work, not shipped capabilities. |
 
@@ -53,18 +55,23 @@ These are implementation capabilities, not a production-readiness checklist.
 
 ### Connectivity is the main early-testing caveat
 
-`P2PNodeConfig` disables mDNS by default. Android starts the default node, and
-`nativeStartNetwork` currently reads but **does not use** its bootstrap-node
-argument. There is no user-facing peer-address/bootstrap configuration.
-Simply installing Qubee on two phones on the same Wi-Fi does **not** establish a
-working peer mesh. Kademlia also needs known peers to get started.
+Qubee has no servers, so two phones only talk once one of them has found the
+other. Settings → **Find peers** offers the two ways that exist today:
 
-Host P2P tests explicitly dial known loopback addresses; the stock Android flow
-does not expose that test setup. Onboarding and local UI can be explored now,
-but two-device messaging requires contributor work on discovery/routing first.
-The [two-device walkthrough](docs/two-device-walkthrough.md) is useful background,
-but its automatic mDNS discovery and some protocol descriptions are historical,
-not current setup guarantees.
+- **Discover peers on this Wi-Fi** turns on mDNS. It is off by default because
+  it announces the device and its LAN IP to everyone on the network. With it on
+  on both phones, they connect on their own on a network that passes multicast
+  (most home Wi-Fi does; many corporate and guest networks do not).
+- **Bootstrap peers** takes addresses copied from the other phone's **This
+  device** list (the `/ip4/…/p2p/…` lines, one per line). Qubee dials them at
+  start, keeps retrying every 30 seconds while disconnected, and seeds Kademlia
+  with them. Applying a change restarts the node; the PeerId stays the same.
+
+Both paths need the phones to be reachable from each other: the same Wi-Fi, a
+hotspot, or a VPN that routes between them. There are **no public bootstrap
+servers and no NAT traversal**, so two phones on different carrier networks do
+not find each other. The [two-device walkthrough](docs/two-device-walkthrough.md)
+describes the setup step by step.
 
 ## Privacy and security: intent versus guarantees
 
@@ -333,7 +340,7 @@ Do not regenerate baselines just to hide an unexpected failure.
 | Native library/JNI linkage failure | Rebuild Rust before Gradle; check `app/src/main/jniLibs/<device-abi>/libqubee_crypto.so` and run both JNI contract scripts. |
 | Device absent or unauthorized | Check `adb devices`, unlock the device, accept the USB-debugging prompt, and verify API/ABI compatibility. |
 | APK signature mismatch or version downgrade | Existing debug/release installs may have different certificates or version codes. **Uninstalling or clearing data destroys local identities and messages**; use a disposable device/profile instead of casually resetting a valuable install. |
-| No peer discovery / messages stay pending | Same Wi-Fi and exchanging QR links are not enough with current discovery wiring. Do not treat `SENT` or a queued publish as remote delivery. Check routing and prekey/group membership before blaming encryption. |
+| No peer discovery / messages stay pending | Exchanging QR links is not enough: Settings → Find peers must show **Connected peers: 1** or more. Turn on Wi-Fi discovery on both phones or paste the other phone's **This device** address into bootstrap peers; a network that blocks multicast or isolates clients needs the address route. Do not treat `SENT` or a queued publish as remote delivery. Check routing and prekey/group membership before blaming encryption. |
 | Screenshot mismatch | Inspect `app/build/paparazzi/failures/` and compare against committed snapshots. |
 
 For build diagnostics, append `--stacktrace` to Gradle commands. Before sharing

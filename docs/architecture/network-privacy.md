@@ -145,8 +145,10 @@ Cheap, self-contained, ships without a new network dependency. Does
   Pre-alpha, no migration.
 - **Tighter discovery defaults.** ✅ *Landed.* `P2PNodeConfig::default`
   sets `enable_mdns: false`, so a device no longer broadcasts its
-  presence + LAN IP by default (Kademlia / bootstrap remain the
-  discovery path; a caller can re-enable mDNS explicitly for local use).
+  presence + LAN IP by default. On Android the user opts in through
+  Settings → Find peers → "Discover peers on this Wi-Fi"; the switch
+  text names the exposure. Bootstrap peers (addresses the user pastes)
+  and Kademlia seeded from them are the default discovery path.
   `kademlia_client_mode` now offers `kad::Mode::Client` — query the DHT
   without advertising our own addresses into it. It is **opt-in, default
   off** on purpose: a client-mode node cannot be found through the DHT

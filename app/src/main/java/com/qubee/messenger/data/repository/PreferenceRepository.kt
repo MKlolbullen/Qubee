@@ -149,6 +149,26 @@ class PreferenceRepository @Inject constructor(
     }
 
     /**
+     * LAN discovery (libp2p mDNS). Off by default: it announces this
+     * device and its local IP to every host on the same network.
+     */
+    fun lanDiscoveryEnabled(): Boolean = prefs.getBoolean(KEY_LAN_DISCOVERY, false)
+
+    fun setLanDiscoveryEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_LAN_DISCOVERY, enabled).apply()
+    }
+
+    /**
+     * Bootstrap peers as the user typed them: multiaddrs ending in
+     * `/p2p/<PeerId>`, one per line. Rust parses and reports rejects.
+     */
+    fun bootstrapPeers(): String = prefs.getString(KEY_BOOTSTRAP_PEERS, null).orEmpty()
+
+    fun setBootstrapPeers(peers: String) {
+        prefs.edit().putString(KEY_BOOTSTRAP_PEERS, peers.trim()).apply()
+    }
+
+    /**
      * Persist the ratchet sender-key "pending distribution" map
      * (groupIdHex → set of member identity hexes still owed the current
      * chain) as JSON, so a process restart doesn't drop members who
@@ -221,6 +241,8 @@ class PreferenceRepository @Inject constructor(
         private const val KEY_ONBOARDED = "onboarded"
         private const val KEY_RATCHET_SEND = "ratchet_send_enabled"
         private const val KEY_APP_LOCK = "app_lock_enabled"
+        private const val KEY_LAN_DISCOVERY = "lan_discovery_enabled"
+        private const val KEY_BOOTSTRAP_PEERS = "bootstrap_peers"
         private const val KEY_PENDING_DIST = "ratchet_pending_distribution"
         private const val KEY_SECRET_PREFIX = "secret/"
     }

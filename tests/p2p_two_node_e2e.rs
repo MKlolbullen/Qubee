@@ -28,7 +28,8 @@ use qubee_crypto::groups::handshake_handlers::{
 };
 use qubee_crypto::identity::identity_key::IdentityKeyPair;
 use qubee_crypto::network::p2p_node::{
-    group_topic as build_group_topic, NodeEvent, P2PCommand, P2PNode, P2PNodeConfig,
+    group_topic as build_group_topic, parse_bootstrap_peers, NodeEvent, P2PCommand, P2PNode,
+    P2PNodeConfig,
 };
 use qubee_crypto::storage::secure_keystore::SecureKeyStore;
 use std::time::Duration;
@@ -55,13 +56,17 @@ struct TestNode {
 /// for it to publish its listen address. Returns command/event
 /// channels and the address other nodes should dial.
 async fn spawn_test_node(label: &str) -> TestNode {
+    spawn_test_node_with(label, P2PNodeConfig::for_testing()).await
+}
+
+async fn spawn_test_node_with(label: &str, config: P2PNodeConfig) -> TestNode {
     let id_keys = libp2p::identity::Keypair::generate_ed25519();
     let peer_id = libp2p::PeerId::from(id_keys.public()).to_string();
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (evt_tx, mut evt_rx) = mpsc::channel(64);
 
-    let node = P2PNode::with_config(id_keys, cmd_rx, P2PNodeConfig::for_testing())
+    let node = P2PNode::with_config(id_keys, cmd_rx, config)
         .await
         .unwrap_or_else(|e| panic!("[{label}] P2PNode::with_config failed: {e:#}"));
 
@@ -138,6 +143,88 @@ async fn send_cmd(node: &TestNode, cmd: P2PCommand, label: &str) {
         .send(cmd)
         .await
         .unwrap_or_else(|e| panic!("[{label}] cmd channel closed: {e}"));
+}
+
+// ---------------------------------------------------------------------------
+// Test 0 — a configured bootstrap peer connects on its own
+// ---------------------------------------------------------------------------
+
+/// The Android path: the user pastes the other device's `Listening`
+/// address as a bootstrap peer and nothing else. No `Dial` command is
+/// ever sent; the node must dial at start, both sides must see the
+/// connection, and gossip must flow over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_peer_connects_without_an_explicit_dial() {
+    let mut alice = spawn_test_node("alice").await;
+    let (bootstrap_peers, rejected) = parse_bootstrap_peers(&alice.listen_addr);
+    assert!(
+        rejected.is_empty(),
+        "Listening address must be a valid bootstrap entry: {rejected:?}"
+    );
+
+    let mut bob = spawn_test_node_with(
+        "bob",
+        P2PNodeConfig {
+            bootstrap_peers,
+            ..P2PNodeConfig::for_testing()
+        },
+    )
+    .await;
+
+    let alice_id = alice.peer_id.clone();
+    let bob_id = bob.peer_id.clone();
+    next_matching(
+        &mut bob,
+        Duration::from_secs(5),
+        |evt| matches!(evt, NodeEvent::PeerConnected { peer_id } if *peer_id == alice_id),
+    )
+    .await;
+    next_matching(
+        &mut alice,
+        Duration::from_secs(5),
+        |evt| matches!(evt, NodeEvent::PeerConnected { peer_id } if *peer_id == bob_id),
+    )
+    .await;
+
+    let topic = "qubee-bootstrap-test".to_string();
+    send_cmd(
+        &alice,
+        P2PCommand::Subscribe {
+            topic: topic.clone(),
+        },
+        "alice",
+    )
+    .await;
+    send_cmd(
+        &bob,
+        P2PCommand::Subscribe {
+            topic: topic.clone(),
+        },
+        "bob",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    send_cmd(
+        &bob,
+        P2PCommand::PublishToTopic {
+            topic: topic.clone(),
+            data: b"hello over bootstrap".to_vec(),
+        },
+        "bob",
+    )
+    .await;
+
+    let got = next_matching(&mut alice, Duration::from_secs(5), |evt| {
+        matches!(evt, NodeEvent::MessageReceived { .. })
+    })
+    .await;
+    match got {
+        NodeEvent::MessageReceived { data, topic: t, .. } => {
+            assert_eq!(data, b"hello over bootstrap");
+            assert_eq!(t, topic);
+        }
+        other => panic!("expected MessageReceived, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

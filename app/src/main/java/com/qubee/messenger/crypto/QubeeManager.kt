@@ -82,9 +82,25 @@ class QubeeManager @Inject constructor(
         nativeRegisterCallback(callback)
     }
 
-    suspend fun startNetworkNode(bootstrapNodes: String = ""): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * Start the P2P node. [bootstrapNodes] is the user's address list
+     * (multiaddrs ending in `/p2p/<PeerId>`, any whitespace or comma
+     * separated); [lanDiscovery] enables mDNS on the local network.
+     * A node that is already running stays as it is: stop it first to
+     * apply new settings.
+     */
+    suspend fun startNetworkNode(
+        bootstrapNodes: String = "",
+        lanDiscovery: Boolean = false,
+    ): Boolean = withContext(Dispatchers.IO) {
         if (!isInitialized) return@withContext false
-        nativeStartNetwork(bootstrapNodes)
+        nativeStartNetwork(bootstrapNodes, lanDiscovery)
+    }
+
+    /** Stop the node so [startNetworkNode] can apply new settings. The PeerId survives. */
+    suspend fun stopNetworkNode(): Boolean = withContext(Dispatchers.IO) {
+        if (!isInitialized) return@withContext false
+        nativeStopNetwork()
     }
 
     suspend fun sendP2PMessage(peerId: String, data: ByteArray): Boolean = withContext(Dispatchers.IO) {
@@ -1108,7 +1124,8 @@ class QubeeManager @Inject constructor(
 
     private external fun nativeInitialize(dataDir: String, keystorePassphrase: ByteArray): Boolean
     private external fun nativeRegisterCallback(callback: NetworkCallback)
-    private external fun nativeStartNetwork(bootstrapNodes: String): Boolean
+    private external fun nativeStartNetwork(bootstrapNodes: String, enableLanDiscovery: Boolean): Boolean
+    private external fun nativeStopNetwork(): Boolean
     private external fun nativeSendP2PMessage(peerId: String, data: ByteArray): Boolean
 
     // Direct-message/session JNI owned by Rust.

@@ -18,14 +18,10 @@ Signer #1 certificate SHA-256 digest: {DIGEST}
 '''
 
 class ProductSigningTests(unittest.TestCase):
-    """Exercises validate_report's admission checks, plus an optional real-APK smoke test."""
-
     def test_expected_owner_and_both_schemes(self):
-        """A report matching the pinned owner cert with both schemes verified passes."""
         validate_report(REPORT, ':'.join(['AB'] * 32))
 
     def test_wrong_signer_debug_signer_missing_scheme_and_multiple_signers(self):
-        """Each disqualifying report variant (wrong signer, debug cert, missing scheme, multi-signer) is rejected."""
         cases = [REPORT.replace(DIGEST, 'cd' * 32),
                  REPORT.replace('CN=Qubee', 'CN=Android Debug'),
                  REPORT.replace('v3): true', 'v3): false'),
@@ -37,7 +33,7 @@ class ProductSigningTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('QUBEE_SIGNING_TEST_APK'), 'Requires the Android smoke APK')
     def test_real_apk_signatures_owner_pin_and_debug_rejection(self):
-        """End-to-end: sign_product_apk.py accepts an owner-signed APK and rejects a debug-signed one."""
+        """Sign the smoke APK with owner and debug keystores and check acceptance/rejection."""
         apk = str(Path(os.environ['QUBEE_SIGNING_TEST_APK']).resolve())
         helper = str(Path(__file__).with_name('sign_product_apk.py'))
         env = os.environ.copy()

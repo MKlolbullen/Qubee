@@ -13,7 +13,6 @@ import zipfile
 
 
 def fingerprint(value):
-    """Normalize a certificate SHA-256 fingerprint to lowercase hex, validating its shape."""
     result = value.replace(':', '').strip().lower()
     if not re.fullmatch(r'[0-9a-f]{64}', result):
         raise ValueError('Expected a 64-digit SHA-256 certificate fingerprint')
@@ -21,7 +20,6 @@ def fingerprint(value):
 
 
 def validate_report(report, expected):
-    """Check an apksigner verify report pins the owner's single signer and rejects debug certs."""
     digests = re.findall(r'^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]+)$', report, re.M)
     if len(digests) != 1 or fingerprint(digests[0]) != fingerprint(expected):
         raise ValueError('APK signer does not match the pinned owner certificate')
@@ -33,7 +31,7 @@ def validate_report(report, expected):
 
 
 def main():
-    """Zipalign, sign, and verify a built APK against the pinned owner certificate."""
+    """Sign, zipalign and verify the APK, then write it out under its pinned certificate."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('apk', type=Path)
     parser.add_argument('output', type=Path)

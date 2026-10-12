@@ -41,6 +41,42 @@ class ContactRepository @Inject constructor(
         contactDao.insertContact(contact)
     }
 
+    suspend fun saveOnboardingContact(
+        identityId: String,
+        displayName: String,
+        observedIdentityKey: ByteArray?,
+    ): Contact {
+        val now = System.currentTimeMillis()
+        val existing = contactDao.getContactByIdentityId(identityId)
+        val contact = if (existing == null) {
+            Contact(
+                id = identityId,
+                identityId = identityId,
+                displayName = displayName,
+                identityKey = observedIdentityKey?.copyOf(),
+                trustLevel = TrustLevel.UNKNOWN,
+                verificationStatus = ContactVerificationStatus.UNVERIFIED,
+                createdAt = now,
+                updatedAt = now,
+            )
+        } else {
+            TrustStatePolicy.applyObservedIdentityKey(
+                contact = existing,
+                observedIdentityKey = observedIdentityKey,
+                nowMillis = now,
+            ).copy(
+                displayName = displayName.ifBlank { existing.displayName },
+                updatedAt = now,
+            )
+        }
+        if (existing == null) {
+            contactDao.insertContact(contact)
+        } else {
+            contactDao.updateContact(contact)
+        }
+        return contact
+    }
+
     fun getContactFlow(contactId: String): Flow<Contact?> =
         contactDao.getContactFlow(contactId)
 

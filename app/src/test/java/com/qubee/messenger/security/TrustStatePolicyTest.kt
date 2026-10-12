@@ -1,6 +1,7 @@
 package com.qubee.messenger.security
 
 import com.qubee.messenger.data.model.Contact
+import com.qubee.messenger.data.model.ContactMetadata
 import com.qubee.messenger.data.model.ContactVerificationStatus
 import com.qubee.messenger.data.model.TrustLevel
 import org.junit.Assert.assertArrayEquals
@@ -33,7 +34,11 @@ class TrustStatePolicyTest {
     fun verifiedContactReceivingChangedIdentityKeyBecomesKeyChanged() {
         val oldKey = byteArrayOf(1, 2, 3, 4)
         val newKey = byteArrayOf(9, 8, 7, 6)
-        val contact = verifiedContact(identityKey = oldKey)
+        val contact = verifiedContact(identityKey = oldKey).copy(
+            peerId = "peer-id",
+            isBlocked = true,
+            metadata = ContactMetadata(notes = "keep", tags = listOf("tag")),
+        )
 
         val updated = TrustStatePolicy.applyObservedIdentityKey(
             contact = contact,
@@ -45,6 +50,9 @@ class TrustStatePolicyTest {
         assertEquals(ContactVerificationStatus.UNVERIFIED, updated.verificationStatus)
         assertArrayEquals(newKey, updated.identityKey)
         assertEquals(2_000L, updated.updatedAt)
+        assertEquals("peer-id", updated.peerId)
+        assertTrue(updated.isBlocked)
+        assertEquals(contact.metadata, updated.metadata)
         assertFalse(TrustStatePolicy.canRenderAsVerified(updated))
         assertTrue(TrustStatePolicy.requiresKeyChangeWarning(updated))
     }

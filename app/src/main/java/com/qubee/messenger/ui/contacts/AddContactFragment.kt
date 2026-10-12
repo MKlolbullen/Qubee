@@ -36,9 +36,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
 import com.qubee.messenger.crypto.QubeeManager
-import com.qubee.messenger.data.model.Contact
-import com.qubee.messenger.data.model.ContactVerificationStatus
-import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.identity.IdentityBundle
 import com.qubee.messenger.util.HexUtils
@@ -123,24 +120,16 @@ class AddContactViewModel @Inject constructor(
         viewModelScope.launch {
             _state.value = _state.value.copy(isWorking = true, error = null)
 
-            // Persist the contact row first. Reuse the peer's
-            // identityIdHex as the local primary key so the
-            // ChatViewModel's `contactId` route maps cleanly.
-            // Store the serialized public key returned by the verified
-            // onboarding bundle; verification JNI APIs decode this field
-            // as an IdentityKey.
             val identityKeyBytes = runCatching {
                 current.identityKeyHex?.let(HexUtils::hexToBytes)
             }.getOrNull()
-            val contact = Contact(
-                id = current.identityIdHex,
-                identityId = current.identityIdHex,
-                displayName = current.displayName,
-                identityKey = identityKeyBytes,
-                trustLevel = TrustLevel.UNKNOWN,
-                verificationStatus = ContactVerificationStatus.UNVERIFIED,
-            )
-            runCatching { contactRepository.addContact(contact) }
+            runCatching {
+                contactRepository.saveOnboardingContact(
+                    identityId = current.identityIdHex,
+                    displayName = current.displayName,
+                    observedIdentityKey = identityKeyBytes,
+                )
+            }
                 .onFailure { e ->
                     Timber.e(e, "addContact failed")
                     _state.value = _state.value.copy(

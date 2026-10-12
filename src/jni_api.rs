@@ -2251,6 +2251,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerify
                 "user_id": bundle.user_id,
                 "display_name": bundle.display_name,
                 "identity_id_hex": hex::encode(bundle.identity_id().as_ref()),
+                "identity_key_hex": hex::encode(bundle.public_key.to_bytes()),
                 "fingerprint": bundle.public_key.fingerprint(),
             }))
         })();

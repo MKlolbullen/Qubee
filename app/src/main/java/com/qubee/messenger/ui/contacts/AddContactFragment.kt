@@ -126,13 +126,11 @@ class AddContactViewModel @Inject constructor(
             // Persist the contact row first. Reuse the peer's
             // identityIdHex as the local primary key so the
             // ChatViewModel's `contactId` route maps cleanly.
-            // Also stamp identityKey from the same hex — fingerprint
-            // computation and verification flows look at this field,
-            // and leaving it null surfaces as "Not available" in the
-            // chat header plus blocks ContactVerificationViewModel
-            // from ever showing a SAS.
+            // Store the serialized public key returned by the verified
+            // onboarding bundle; verification JNI APIs decode this field
+            // as an IdentityKey.
             val identityKeyBytes = runCatching {
-                HexUtils.hexToBytes(current.identityIdHex)
+                current.identityKeyHex?.let(HexUtils::hexToBytes)
             }.getOrNull()
             val contact = Contact(
                 id = current.identityIdHex,

@@ -199,6 +199,7 @@ private fun MyIdentityPanel(viewModel: SettingsViewModel, onOpenConnect: () -> U
         fingerprint = bundle?.fingerprint,
         onMyCode = onOpenConnect,
         onShare = { bundle?.shareLink?.let { shareIdentityLink(context, it) } },
+        canShare = bundle?.shareLink != null,
     )
 }
 
@@ -210,6 +211,7 @@ internal fun IdentityPanelBody(
     fingerprint: String?,
     onMyCode: () -> Unit,
     onShare: () -> Unit,
+    canShare: Boolean = true,
 ) {
     QubeePanel {
         if (name == null) {
@@ -264,6 +266,7 @@ internal fun IdentityPanelBody(
                 primary = false,
                 onClick = onShare,
                 modifier = Modifier.weight(1f),
+                enabled = canShare,
             )
         }
     }
@@ -276,14 +279,18 @@ private fun IdentityActionButton(
     primary: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.height(44.dp),
         shape = RoundedCornerShape(12.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = if (primary) QubeePalette.Cyan else QubeePalette.PanelAlt,
             contentColor = if (primary) QubeePalette.Void else QubeePalette.Text,
+            disabledContainerColor = QubeePalette.Panel,
+            disabledContentColor = QubeePalette.MutedText,
         ),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp),
     ) {

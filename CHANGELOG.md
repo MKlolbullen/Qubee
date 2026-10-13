@@ -61,6 +61,8 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
 
 ### Security
 
+- `quinn-proto` 0.11.16 → 0.11.19 (RUSTSEC-2026-0338 through -0342:
+  remote panics and memory-exhaustion bypasses in the QUIC transport).
 - Calling signaling is bound to the authenticated 1:1 peer. A frame
   whose embedded caller or sender does not match that peer is rejected,
   and ICE or SDP for a call that peer is not in cannot be applied to

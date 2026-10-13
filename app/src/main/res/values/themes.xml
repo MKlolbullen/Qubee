@@ -10,4 +10,9 @@
         <item name="android:navigationBarColor" tools:targetApi="l">@color/qubee_void2</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
     </style>
+
+    <!-- The tab bar marks the active tab by colour alone; no pill behind the icon. -->
+    <style name="Qubee.NavIndicator" parent="Widget.Material3.BottomNavigationView.ActiveIndicator">
+        <item name="android:color">@android:color/transparent</item>
+    </style>
 </resources>

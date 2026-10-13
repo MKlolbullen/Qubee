@@ -54,7 +54,7 @@
         android:layout_height="wrap_content"
         android:background="@color/qubee_void2"
         app:elevation="0dp"
-        app:itemActiveIndicatorEnabled="false"
+        app:itemActiveIndicatorStyle="@style/Qubee.NavIndicator"
         app:itemIconTint="@color/bottom_nav_item"
         app:itemTextColor="@color/bottom_nav_item"
         app:labelVisibilityMode="labeled"

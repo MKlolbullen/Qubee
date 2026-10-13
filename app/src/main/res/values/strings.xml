@@ -95,6 +95,7 @@
     <string name="connect_title">Add someone</string>
     <string name="connect_qr_title">Let them scan this</string>
     <string name="connect_qr_body">Your name and public keys. Nothing private is in it.</string>
+    <string name="qr_unavailable">No code to show yet</string>
     <string name="connect_qr_description">Your Qubee code, scanned by the other phone</string>
     <string name="connect_scan">Scan their code</string>
     <string name="connect_share">Share my link instead</string>

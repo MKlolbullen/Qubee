@@ -18,8 +18,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.qubee.messenger.R
 
 /** A QR code on the one light surface in the app, so any camera reads it. */
 @Composable
@@ -46,7 +48,14 @@ fun QubeeQrCard(
                     modifier = Modifier.size(200.dp),
                 )
             } else {
-                Box(modifier = Modifier.size(200.dp))
+                Box(modifier = Modifier.size(200.dp), contentAlignment = Alignment.Center) {
+                    Text(
+                        text = stringResource(R.string.qr_unavailable),
+                        color = Color(0xFF43596B),
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
             if (title != null) {
                 Spacer(Modifier.height(12.dp))

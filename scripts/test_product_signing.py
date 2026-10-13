@@ -66,9 +66,7 @@ class ProductSigningTests(unittest.TestCase):
                                     '--key-pass', 'env:RELEASE_KEY_PASSWORD', '--out', str(probe), apk],
                                    env=env, check=True, stdout=subprocess.DEVNULL)
                     report = subprocess.check_output([signer, 'verify', '--print-certs', str(probe)], text=True)
-                    pin = re.search(r'^Signer #1 certificate SHA-256 digest: ([0-9a-f]+)
-    unittest.main()
-, report, re.M).group(1)
+                    pin = re.search(r'^Signer #1 certificate SHA-256 digest: ([0-9a-f]+)$', report, re.M).group(1)
                 out = directory / f'{label}.apk'
                 result = subprocess.run(['python3', helper, apk, str(out), '--certificate-sha256', pin],
                                         env=env, capture_output=True, text=True)

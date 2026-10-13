@@ -1,31 +1,23 @@
 package com.qubee.messenger.ui
 
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.qubee.messenger.ui.settings.IdentityPanelBody
 import com.qubee.messenger.ui.settings.NetworkPanelBody
 import com.qubee.messenger.ui.settings.ResetButton
-import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
-import androidx.compose.foundation.background
 import org.junit.Rule
 import org.junit.Test
 
 /**
- * Baselines for the Settings destructive-action section, driving the
- * real production [ResetButton] (replaces the earlier inline-replica
- * test) in both its enabled and disabled states so a change to the
- * danger colours / disabled treatment breaks here before shipping,
- * and for the peer-discovery panel ([NetworkPanelBody]) empty and
- * with addresses, a saved bootstrap peer and a connected peer.
+ * Baselines for the Settings cards: the identity card, the reaching
+ * other phones card empty and connected, and the reset action in both
+ * states. Each drives the stateless body without a ViewModel.
  */
 class SettingsScreenshotTest {
 
@@ -34,24 +26,25 @@ class SettingsScreenshotTest {
 
     private fun host(content: @Composable () -> Unit) {
         paparazzi.snapshotThemed {
-            Surface {
+            Surface(color = QubeePalette.Void) {
                 Column(
                     Modifier
                         .fillMaxWidth()
-                        .background(QubeePalette.Void)
-                        .padding(24.dp),
-                    verticalArrangement = Arrangement.Top,
-                ) {
-                    Text("Danger zone", color = QubeePalette.Text)
-                    Spacer(Modifier.height(6.dp))
-                    QubeeMutedText(
-                        "Destroys the local identity keystore (private keys and " +
-                            "group state) and forces re-onboarding. This cannot be undone.",
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    content()
-                }
+                        .padding(20.dp),
+                ) { content() }
             }
+        }
+    }
+
+    @Test
+    fun identity_panel() {
+        host {
+            IdentityPanelBody(
+                name = "Alex Rydén",
+                fingerprint = "7c4e 19b2 0d8a 5f31 c6e9 42ab d07f 8e15",
+                onMyCode = {},
+                onShare = {},
+            )
         }
     }
 
@@ -65,22 +58,10 @@ class SettingsScreenshotTest {
         host { ResetButton(enabled = false, onClick = {}) }
     }
 
-    private fun networkHost(content: @Composable () -> Unit) {
-        paparazzi.snapshotThemed {
-            Surface(color = QubeePalette.Void) {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(24.dp),
-                ) { content() }
-            }
-        }
-    }
-
     /** Fresh install: nothing configured, node not up yet. */
     @Test
     fun network_panel_idle() {
-        networkHost {
+        host {
             NetworkPanelBody(
                 lanDiscoveryEnabled = false,
                 onToggleLanDiscovery = {},
@@ -96,7 +77,7 @@ class SettingsScreenshotTest {
     /** LAN discovery on, one bootstrap peer saved, one peer connected. */
     @Test
     fun network_panel_connected() {
-        networkHost {
+        host {
             NetworkPanelBody(
                 lanDiscoveryEnabled = true,
                 onToggleLanDiscovery = {},

@@ -2,15 +2,18 @@ package com.qubee.messenger.ui.main
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.qubee.messenger.data.model.Conversation
 import com.qubee.messenger.data.model.ConversationType
+import com.qubee.messenger.data.model.ConversationWithDetails
+import com.qubee.messenger.data.repository.ContactRepository
 import com.qubee.messenger.data.repository.ConversationRepository
+import com.qubee.messenger.ui.theme.QubeeTrust
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import javax.inject.Inject
@@ -18,62 +21,73 @@ import javax.inject.Inject
 @HiltViewModel
 class ConversationsViewModel @Inject constructor(
     conversationRepository: ConversationRepository,
+    contactRepository: ContactRepository,
 ) : ViewModel() {
 
-    val uiState: StateFlow<ConversationsUiState> = conversationRepository
-        .getAllConversations()
-        .map { conversations ->
-            ConversationsUiState(
-                conversations = conversations.map { it.toSummary() },
-            )
-        }
+    val uiState: StateFlow<ConversationsUiState> = combine(
+        conversationRepository.getConversationsWithDetails(),
+        contactRepository.getAllContactsFlow(),
+    ) { conversations, contacts ->
+        val trustById = contacts.associate { it.id to QubeeTrust.of(it.trustLevel) }
+        ConversationsUiState(
+            conversations = conversations.map { it.toSummary(trustById) },
+        )
+    }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = ConversationsUiState(isLoading = true),
         )
 
-    private fun Conversation.toSummary(): ConversationSummaryUi {
-        // `participants` is a `List<String>` per `data.model.Conversation`,
-        // not a JSON-encoded string. Pick the first non-self id;
-        // fall back to the conversation id itself for groups.
-        val peerId = participants
+    private fun ConversationWithDetails.toSummary(trustById: Map<String, QubeeTrust>): ConversationSummaryUi {
+        val c = conversation
+        // `participants` holds contact ids; the first non-self one is the
+        // peer of a direct chat. Groups fall back to the conversation id.
+        val peerId = c.participants
             .firstOrNull { it.isNotBlank() && it != "current_user_id" }
-            ?: id
-
+            ?: c.id
+        val isGroup = c.type == ConversationType.GROUP
         val title = when {
-            !name.isNullOrBlank() -> name
-            type == ConversationType.GROUP -> "Private group"
+            c.name.isNotBlank() -> c.name
+            isGroup -> "Private group"
             else -> "Secure peer"
         }
-
-        val preview = when {
-            type == ConversationType.GROUP -> "Group channel · post-quantum session"
-            else -> "Direct channel · post-quantum session"
-        }
-
-        val timestamp = lastMessageTimestamp?.let { formatTime(it) }
-            ?: formatTime(updatedAt)
+        val preview = lastMessageContent
+            ?.lineSequence()
+            ?.map { it.trim() }
+            ?.firstOrNull { it.isNotEmpty() }
+            .orEmpty()
+        val at = lastMessageTimestamp ?: c.lastMessageTimestamp ?: c.updatedAt
 
         return ConversationSummaryUi(
-            conversationId = id,
+            conversationId = c.id,
             peerId = peerId,
             title = title,
             preview = preview,
-            timestamp = timestamp,
-            isGroup = type == ConversationType.GROUP,
-            isPinned = isPinned,
-            isMuted = isMuted,
-            unreadCount = 0,
-            securityState = ConversationListSecurityState.PqReady,
+            timestamp = formatTimestamp(at),
+            isGroup = isGroup,
+            isPinned = c.isPinned,
+            isMuted = c.isMuted,
+            unreadCount = unreadCount,
+            trust = if (isGroup) null else trustById[peerId] ?: QubeeTrust.Unverified,
         )
     }
+}
 
-    private fun formatTime(date: Date): String =
-        SimpleDateFormat("HH:mm", Locale.getDefault()).format(date)
-
-    private fun formatTime(epochMillis: Long): String =
-        SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(epochMillis))
+/** Today as a clock time, the past week as a weekday, anything older as a date. */
+internal fun formatTimestamp(epochMillis: Long, now: Long = System.currentTimeMillis()): String {
+    if (epochMillis <= 0L) return ""
+    val locale = Locale.getDefault()
+    val then = Calendar.getInstance().apply { timeInMillis = epochMillis }
+    val today = Calendar.getInstance().apply { timeInMillis = now }
+    val sameDay = then.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+        then.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR)
+    val pattern = when {
+        sameDay -> "HH:mm"
+        now - epochMillis < 6L * 24 * 60 * 60 * 1000 -> "EEE"
+        else -> "d MMM"
+    }
+    return SimpleDateFormat(pattern, locale).format(Date(epochMillis))
 }
 
 data class ConversationsUiState(
@@ -91,11 +105,6 @@ data class ConversationSummaryUi(
     val isPinned: Boolean,
     val isMuted: Boolean,
     val unreadCount: Int,
-    val securityState: ConversationListSecurityState,
+    /** Null for groups: trust is per member and lives in the group details. */
+    val trust: QubeeTrust?,
 )
-
-enum class ConversationListSecurityState(val label: String) {
-    PqReady("PQ READY"),
-    Unverified("VERIFY"),
-    Offline("QUEUED"),
-}

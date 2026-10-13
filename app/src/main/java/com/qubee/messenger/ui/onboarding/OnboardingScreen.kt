@@ -1,11 +1,8 @@
 package com.qubee.messenger.ui.onboarding
 
-import android.content.Intent
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,37 +12,41 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.GppGood
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.qubee.messenger.R
 import com.qubee.messenger.identity.IdentityBundle
+import com.qubee.messenger.ui.connect.shareIdentityLink
+import com.qubee.messenger.ui.theme.QubeeAvatar
 import com.qubee.messenger.ui.theme.QubeeHeroMark
+import com.qubee.messenger.ui.theme.QubeeMono
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
-import com.qubee.messenger.ui.theme.QubeePanel
 import com.qubee.messenger.ui.theme.QubeePrimaryButton
+import com.qubee.messenger.ui.theme.QubeeQrCard
 import com.qubee.messenger.ui.theme.QubeeScreen
 import com.qubee.messenger.ui.theme.QubeeSecondaryButton
-import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.QubeeTextField
 import com.qubee.messenger.ui.theme.QubeeTheme
 import com.qubee.messenger.util.QrUtils
 
@@ -67,9 +68,7 @@ fun OnboardingScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 22.dp, vertical = 28.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center,
+                    .padding(horizontal = 24.dp, vertical = 28.dp),
             ) {
                 when (val s = state) {
                     is OnboardingState.Success -> SuccessView(
@@ -96,79 +95,109 @@ fun OnboardingScreen(
     }
 }
 
+/**
+ * The welcome screen body. A column-scope extension so the primary
+ * button can take the remaining height and sit at the bottom on a
+ * tall screen while the whole thing still scrolls on a short one.
+ */
 @Composable
 @androidx.annotation.VisibleForTesting
-internal fun IdentityBootstrapView(
+internal fun ColumnScope.IdentityBootstrapView(
     state: OnboardingState,
     nickname: String,
     onNicknameChange: (String) -> Unit,
     onCreate: () -> Unit,
 ) {
-    QubeeHeroMark()
-    Spacer(Modifier.height(22.dp))
+    val loading = state is OnboardingState.Loading
 
-    QubeeStatusPill("POST-QUANTUM IDENTITY BOOTSTRAP")
-    Spacer(Modifier.height(14.dp))
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+        QubeeHeroMark(width = 200.dp)
+    }
+    Spacer(Modifier.height(20.dp))
 
     Text(
-        "Own your keys.\nOwn your graph.",
+        stringResource(R.string.welcome_title),
         color = QubeePalette.Text,
         style = MaterialTheme.typography.headlineLarge,
-        fontWeight = FontWeight.Black,
     )
-    Spacer(Modifier.height(10.dp))
+    Spacer(Modifier.height(12.dp))
     QubeeMutedText(
-        "Qubee creates a local Kyber/Dilithium identity. Your private key stays on-device; the shareable QR is only your public introduction bundle.",
-        modifier = Modifier.fillMaxWidth(),
+        stringResource(R.string.welcome_body),
+        style = MaterialTheme.typography.bodyLarge,
     )
 
     Spacer(Modifier.height(24.dp))
+    FeatureRow(Icons.Outlined.Lock, stringResource(R.string.welcome_feature_pq))
+    Spacer(Modifier.height(12.dp))
+    FeatureRow(Icons.Outlined.Wifi, stringResource(R.string.welcome_feature_lan))
+    Spacer(Modifier.height(12.dp))
+    FeatureRow(Icons.Filled.GppGood, stringResource(R.string.welcome_feature_verify))
 
-    QubeePanel {
+    Spacer(Modifier.height(28.dp))
+    Text(
+        stringResource(R.string.welcome_name_label),
+        color = QubeePalette.MutedText,
+        style = MaterialTheme.typography.labelMedium,
+    )
+    Spacer(Modifier.height(8.dp))
+    QubeeTextField(
+        value = nickname,
+        onValueChange = onNicknameChange,
+        placeholder = stringResource(R.string.welcome_name_placeholder),
+        enabled = !loading,
+    )
+    Spacer(Modifier.height(8.dp))
+    QubeeMutedText(
+        stringResource(R.string.welcome_name_hint),
+        style = MaterialTheme.typography.bodySmall,
+    )
+    if (state is OnboardingState.Error) {
+        Spacer(Modifier.height(12.dp))
         Text(
-            "Create secure identity",
-            color = QubeePalette.Text,
-            style = MaterialTheme.typography.titleLarge,
+            state.message,
+            color = QubeePalette.Danger,
+            style = MaterialTheme.typography.bodySmall,
         )
-        Spacer(Modifier.height(6.dp))
-        QubeeMutedText("This is your cryptographic callsign. Keep it human; Qubee handles the math gremlins.")
-        Spacer(Modifier.height(18.dp))
+    }
 
-        OutlinedTextField(
-            value = nickname,
-            onValueChange = onNicknameChange,
-            label = { Text("Display name") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+    Spacer(Modifier.weight(1f))
+    Spacer(Modifier.height(24.dp))
+
+    if (loading) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            CircularProgressIndicator(color = QubeePalette.Cyan, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            QubeeMutedText(stringResource(R.string.welcome_generating))
+        }
+    } else {
+        QubeePrimaryButton(
+            text = stringResource(R.string.welcome_create),
+            onClick = onCreate,
+            enabled = nickname.isNotBlank(),
         )
+    }
+    Spacer(Modifier.height(14.dp))
+    Text(
+        stringResource(R.string.welcome_footnote),
+        modifier = Modifier.fillMaxWidth(),
+        color = QubeePalette.MutedText,
+        style = MaterialTheme.typography.bodySmall,
+        textAlign = TextAlign.Center,
+    )
+}
 
-        Spacer(Modifier.height(18.dp))
-
-        if (state is OnboardingState.Loading) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                CircularProgressIndicator(color = QubeePalette.Cyan, modifier = Modifier.size(28.dp))
-                Spacer(Modifier.width(12.dp))
-                QubeeMutedText("Generating Kyber/Dilithium keys…")
-            }
-        } else {
-            QubeePrimaryButton(
-                text = "Create identity",
-                onClick = onCreate,
-                enabled = nickname.isNotBlank(),
-            )
-        }
-
-        if (state is OnboardingState.Error) {
-            Spacer(Modifier.height(12.dp))
-            Text(
-                state.message,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
+@Composable
+private fun FeatureRow(icon: ImageVector, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        QubeeAvatar(initials = "", size = 36.dp, icon = icon)
+        Spacer(Modifier.width(12.dp))
+        Text(text, color = QubeePalette.Text, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -179,89 +208,55 @@ private fun SuccessView(
 ) {
     val context = LocalContext.current
     val link = bundle.shareLink
-    val bitmap = remember(link) { link?.let { QrUtils.encodeAsBitmap(it) } }
+    val bitmap = remember(link) { link?.let { QrUtils.encodeAsBitmap(it, sizePx = 540) } }
 
-    QubeeHeroMark()
-    Spacer(Modifier.height(18.dp))
-    QubeeStatusPill("IDENTITY ONLINE")
-    Spacer(Modifier.height(14.dp))
-
+    Spacer(Modifier.height(8.dp))
     Text(
-        "Identity ready",
+        stringResource(R.string.identity_ready_title),
         color = QubeePalette.Text,
         style = MaterialTheme.typography.headlineLarge,
-        fontWeight = FontWeight.Black,
     )
-    QubeeMutedText(bundle.displayName)
+    Spacer(Modifier.height(6.dp))
+    Text(
+        bundle.displayName,
+        color = QubeePalette.Cyan,
+        style = MaterialTheme.typography.titleLarge,
+    )
+    Spacer(Modifier.height(12.dp))
+    QubeeMutedText(
+        stringResource(R.string.identity_ready_body),
+        style = MaterialTheme.typography.bodyLarge,
+    )
 
-    Spacer(Modifier.height(22.dp))
+    Spacer(Modifier.height(24.dp))
+    QubeeQrCard(
+        bitmap = bitmap,
+        contentDescription = stringResource(R.string.connect_qr_description),
+        title = stringResource(R.string.connect_qr_title),
+        body = stringResource(R.string.connect_qr_body),
+    )
 
-    QubeePanel {
-        Text("Public introduction bundle", style = MaterialTheme.typography.titleLarge)
-        Spacer(Modifier.height(6.dp))
-        QubeeMutedText("Share this QR/link with a peer to establish contact. It does not contain your private keys.")
-        Spacer(Modifier.height(16.dp))
+    Spacer(Modifier.height(20.dp))
+    Text(
+        stringResource(R.string.identity_fingerprint),
+        color = QubeePalette.MutedText,
+        style = MaterialTheme.typography.labelMedium,
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+        bundle.fingerprint,
+        color = QubeePalette.Text,
+        style = MaterialTheme.typography.bodyMedium,
+        fontFamily = QubeeMono,
+    )
 
-        bitmap?.let {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.CenterHorizontally)
-                    .size(248.dp)
-                    .clip(RoundedCornerShape(28.dp))
-                    .background(QubeePalette.Text)
-                    .padding(12.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Image(
-                    bitmap = it.asImageBitmap(),
-                    contentDescription = "Your Qubee identity QR",
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-            Spacer(Modifier.height(14.dp))
-        }
-
-        Text(
-            "Fingerprint",
-            color = QubeePalette.MutedText,
-            style = MaterialTheme.typography.bodySmall,
-            fontWeight = FontWeight.Bold,
+    Spacer(Modifier.height(24.dp))
+    if (link != null) {
+        QubeeSecondaryButton(
+            text = stringResource(R.string.identity_share_link),
+            onClick = { shareIdentityLink(context, link) },
         )
-        Text(
-            bundle.fingerprint,
-            color = QubeePalette.Cyan,
-            style = MaterialTheme.typography.bodySmall,
-            // Fingerprints set monospace everywhere they're meant to
-            // be read digit-by-digit — Settings, Verify, the details
-            // sheet. This one was the odd one out.
-            fontFamily = FontFamily.Monospace,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-
-        if (link != null) {
-            Spacer(Modifier.height(12.dp))
-            Text(
-                link,
-                color = QubeePalette.MutedText,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Spacer(Modifier.height(14.dp))
-            QubeeSecondaryButton(
-                text = "Share link",
-                onClick = {
-                    val intent = Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, link)
-                    }
-                    context.startActivity(Intent.createChooser(intent, "Share Qubee identity"))
-                },
-            )
-        }
-
-        Spacer(Modifier.height(12.dp))
-        QubeePrimaryButton(text = "Continue", onClick = onDone)
+        Spacer(Modifier.height(10.dp))
     }
+    QubeePrimaryButton(text = stringResource(R.string.identity_continue), onClick = onDone)
 }

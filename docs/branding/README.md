@@ -13,6 +13,8 @@ field. The full lockup adds the `Qubee` wordmark below the mark.
 | `app/src/main/res/mipmap-*/ic_launcher_foreground.png` | Adaptive launcher foreground, 108dp canvas with the mark 64dp wide so its tips stay inside the 66dp safe circle. |
 | `app/src/main/res/mipmap-*/ic_launcher_monochrome.png` | Themed-icon silhouette: the solid ribbons and node only, so it stays crisp at 48dp. |
 | `app/src/main/res/drawable/ic_launcher_background.xml` | The navy gradient the mark was lifted from. |
+| `app/src/main/res/drawable-nodpi/qubee_mark.png` | The mark at 480px wide, palette-quantised, for the welcome and unlock screens (`QubeeHeroMark`). |
+| `app/src/main/res/font/manrope_variable.ttf` | Manrope, the app typeface, as one variable font. SIL OFL; the license text ships in `app/src/main/assets/licenses/`. |
 | `app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml`, `ic_launcher_round.xml` | Adaptive launcher icons wiring the three layers. |
 
 ## Regenerating

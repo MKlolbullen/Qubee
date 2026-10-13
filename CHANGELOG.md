@@ -61,6 +61,8 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
 
 ### Security
 
+- `quinn-proto` 0.11.16 → 0.11.19 (RUSTSEC-2026-0338 through -0342:
+  remote panics and memory-exhaustion bypasses in the QUIC transport).
 - Calling signaling is bound to the authenticated 1:1 peer. A frame
   whose embedded caller or sender does not match that peer is rejected,
   and ICE or SDP for a call that peer is not in cannot be applied to
@@ -111,6 +113,23 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
 
 ### Changed
 
+- The app follows one visual language built around three plain trust
+  states. Welcome screen with the mark, three promises and a name
+  field; Chats with a privacy line, trust shields, real last-message
+  previews and unread counts (the list now joins contacts for trust
+  and reads `getConversationsWithDetails`); Contacts grouped into
+  "needs a check", "not confirmed yet" and "confirmed in person"
+  with a search field and a Confirm action; a new Add someone screen
+  (your code, a scanner for theirs, the Wi-Fi switch and the address
+  route); Settings as cards (identity, reaching other phones, ask to
+  unlock, start over); the chat with flat bubbles, a privacy strip
+  and a tap-to-confirm header; the confirm screen with the short code
+  as cards and "They match" / "They do not match". Manrope is bundled
+  as a variable font (OFL, license in `assets/licenses`). The tab bar
+  is restyled and shown on the three tabs only; the toolbar serves
+  only screens without a header of their own. The composer's camera
+  and microphone buttons, which only queued placeholder rows, are
+  gone.
 - CI: CodeQL analyses Kotlin from source instead of autobuilding the
   app, which the runner cannot do. MobSF findings are published to code
   scanning again rather than only to a 30-day artifact. The clippy

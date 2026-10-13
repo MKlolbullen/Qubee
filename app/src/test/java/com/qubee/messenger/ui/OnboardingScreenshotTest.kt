@@ -1,8 +1,10 @@
 package com.qubee.messenger.ui
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.qubee.messenger.ui.onboarding.IdentityBootstrapView
@@ -12,20 +14,19 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * Baselines for the onboarding identity-bootstrap screen — the very
- * first surface a new user sees, and the returning-user landing when
- * no identity exists yet. Locks the hero mark, callsign field, and
- * primary/error states.
+ * Baselines for the welcome screen — the very first surface a new
+ * user sees. Locks the mark, the three promises, the name field and
+ * the ready, busy and error states of the primary action.
  */
 class OnboardingScreenshotTest {
 
     @get:Rule
     val paparazzi = paparazziRule()
 
-    private fun host(content: @androidx.compose.runtime.Composable () -> Unit) {
+    private fun host(content: @Composable ColumnScope.() -> Unit) {
         paparazzi.snapshotThemed {
             QubeeScreen {
-                Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 28.dp)) {
+                Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 28.dp)) {
                     content()
                 }
             }

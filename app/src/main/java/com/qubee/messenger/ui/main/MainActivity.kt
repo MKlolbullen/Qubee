@@ -191,26 +191,21 @@ class MainActivity : AppCompatActivity() {
 
         // Handle navigation changes
         navController.addOnDestinationChangedListener { _, destination, _ ->
-            // Onboarding gets the full screen — no toolbar, no bottom
-            // nav, since the user hasn't picked an identity yet and
-            // there's nowhere meaningful to navigate to.
-            val isOnboarding = destination.id == R.id.onboardingFragment
-            binding.appBarLayout.visibility =
-                if (isOnboarding) View.GONE else View.VISIBLE
-            binding.bottomNavigation.visibility =
-                if (isOnboarding) View.GONE else View.VISIBLE
-
-            when (destination.id) {
-                R.id.navigation_conversations -> {
-                    supportActionBar?.title = getString(R.string.title_conversations)
-                }
-                R.id.navigation_contacts -> {
-                    supportActionBar?.title = getString(R.string.title_contacts)
-                }
-                R.id.navigation_settings -> {
-                    supportActionBar?.title = getString(R.string.title_settings)
-                }
-            }
+            // The tabs, the chat and the add-someone screen draw their
+            // own headers, so the toolbar only serves the nested screens
+            // that do not. The tab bar belongs to the tabs alone.
+            val topLevel = destination.id in setOf(
+                R.id.navigation_conversations,
+                R.id.navigation_contacts,
+                R.id.navigation_settings,
+            )
+            val composeHeaded = topLevel || destination.id in setOf(
+                R.id.onboardingFragment,
+                R.id.chatFragment,
+                R.id.connectFragment,
+            )
+            binding.appBarLayout.visibility = if (composeHeaded) View.GONE else View.VISIBLE
+            binding.bottomNavigation.visibility = if (topLevel) View.VISIBLE else View.GONE
         }
     }
 

@@ -13,7 +13,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.qubee.messenger.R
@@ -22,16 +21,11 @@ import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeePrimaryButton
 import com.qubee.messenger.ui.theme.QubeeScreen
-import com.qubee.messenger.ui.theme.QubeeStatusPill
 import com.qubee.messenger.ui.theme.QubeeTheme
 
 /**
  * Full-screen lock gate shown over the app when [AppLockManager] is
- * locked. Renders the Qubee mark, a status line, an optional error
- * from a failed/cancelled attempt, and an "Unlock" button that
- * re-launches the biometric / device-credential prompt.
- *
- * Stateless by design (all state is hoisted) so it renders in
+ * locked. Stateless by design (all state is hoisted) so it renders in
  * Paparazzi and never needs a live BiometricPrompt to draw.
  */
 @Composable
@@ -48,23 +42,20 @@ fun UnlockScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
-                QubeeHeroMark()
-                Spacer(Modifier.height(24.dp))
-
-                QubeeStatusPill(stringResource(R.string.unlock_screen_status))
-                Spacer(Modifier.height(16.dp))
+                QubeeHeroMark(width = 180.dp)
+                Spacer(Modifier.height(28.dp))
 
                 Text(
                     stringResource(R.string.unlock_screen_title),
                     color = QubeePalette.Text,
                     style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.Black,
                     textAlign = TextAlign.Center,
                 )
                 Spacer(Modifier.height(10.dp))
                 QubeeMutedText(
                     stringResource(R.string.unlock_screen_body),
                     modifier = Modifier.fillMaxWidth(),
+                    style = MaterialTheme.typography.bodyLarge,
                 )
 
                 if (error != null) {
@@ -78,7 +69,7 @@ fun UnlockScreen(
                 }
 
                 Spacer(Modifier.height(28.dp))
-                QubeePrimaryButton(text = "Unlock", onClick = onUnlockClick)
+                QubeePrimaryButton(text = stringResource(R.string.unlock_button), onClick = onUnlockClick)
             }
         }
     }

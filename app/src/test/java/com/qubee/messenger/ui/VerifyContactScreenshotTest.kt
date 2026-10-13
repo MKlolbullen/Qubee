@@ -7,24 +7,23 @@ import androidx.compose.ui.Modifier
 import com.qubee.messenger.ui.contacts.verification.ContactVerificationUiState
 import com.qubee.messenger.ui.contacts.verification.VerifyContent
 import com.qubee.messenger.ui.theme.QubeePalette
-import androidx.compose.foundation.background
 import org.junit.Rule
 import org.junit.Test
 
-/** Baselines for the out-of-band contact verification screen: the
- * fresh compare state (fingerprint + SAS + my-fingerprint blocks) and
- * the already-verified state. */
+/** Baselines for the confirm-a-contact screen: the fresh compare state
+ * (short code cards, fingerprint, scan, my code) and the already
+ * confirmed state. */
 class VerifyContactScreenshotTest {
 
     @get:Rule
     val paparazzi = paparazziRule()
 
     private val fingerprint = "AF3C 9021 7788 D4E1 5B60 2290 1C4F 8830 6612 AAB9 0071 2F5D"
-    private val sas = "garden-piano-42"
+    private val sas = "4821 0937"
 
     private fun host(content: @Composable () -> Unit) {
         paparazzi.snapshotThemed {
-            Surface { androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().background(QubeePalette.Void)) { content() } }
+            Surface(color = QubeePalette.Void, modifier = Modifier.fillMaxSize()) { content() }
         }
     }
 
@@ -34,7 +33,7 @@ class VerifyContactScreenshotTest {
             VerifyContent(
                 state = ContactVerificationUiState(
                     isLoading = false,
-                    contactName = "Ada Lovelace",
+                    contactName = "Mira Ekholm",
                     contactFingerprint = fingerprint,
                     myFingerprint = fingerprint,
                     sasCode = sas,
@@ -56,7 +55,7 @@ class VerifyContactScreenshotTest {
             VerifyContent(
                 state = ContactVerificationUiState(
                     isLoading = false,
-                    contactName = "Ada Lovelace",
+                    contactName = "Mira Ekholm",
                     contactFingerprint = fingerprint,
                     myFingerprint = fingerprint,
                     sasCode = sas,

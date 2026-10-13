@@ -3,8 +3,9 @@ package com.qubee.messenger.ui.contacts
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qubee.messenger.data.model.Contact
-import com.qubee.messenger.data.model.TrustLevel
 import com.qubee.messenger.data.repository.ContactRepository
+import com.qubee.messenger.ui.theme.QubeeTrust
+import com.qubee.messenger.ui.theme.qubeeInitials
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -18,11 +19,6 @@ import javax.inject.Inject
  * — that one observes the conversations table for the inbox surface;
  * this one observes [ContactRepository.getAllContactsFlow] for the
  * full alphabetical address book (no message-history join).
- *
- * Maps the storage-layer [Contact] entity to a UI-shaped
- * [ContactSummaryUi] — keeps Compose ignorant of which fields are
- * persistence vs. derived (initials, verified-flag boolean from
- * `trustLevel == VERIFIED`, etc.).
  */
 @HiltViewModel
 class ContactsViewModel @Inject constructor(
@@ -68,11 +64,9 @@ class ContactsViewModel @Inject constructor(
         }
     }
 
-    /// Counterpart to [blockContact]. Called from the "Blocked"
-    /// section's Unblock button on the Contacts tab. The blocked
-    /// list flow updates atomically — the row disappears from
-    /// "Blocked" and reappears on the active list on the same
-    /// emission.
+    /// Counterpart to [blockContact]. The blocked list flow updates
+    /// atomically — the row disappears from "Blocked" and reappears
+    /// on the active list on the same emission.
     fun unblockContact(contactId: String) {
         viewModelScope.launch {
             contactRepository.unblockContact(contactId)
@@ -81,19 +75,15 @@ class ContactsViewModel @Inject constructor(
 
     private fun Contact.toSummary(): ContactSummaryUi {
         val name = displayName.ifBlank { identityId.take(8) }
-        val initials = name
-            .split(' ', '\t', '\n')
-            .mapNotNull { it.firstOrNull()?.toString()?.uppercase() }
-            .take(2)
-            .joinToString(separator = "")
-            .ifBlank { name.take(2).uppercase() }
+        val trust = QubeeTrust.of(trustLevel)
         return ContactSummaryUi(
             contactId = id,
             displayName = name,
             identityIdHex = identityId,
-            isVerified = trustLevel == TrustLevel.VERIFIED,
+            trust = trust,
+            isVerified = trust == QubeeTrust.Verified,
             isOnline = isOnline,
-            initials = initials,
+            initials = name.qubeeInitials(),
             lastSeenEpochMillis = lastSeen,
         )
     }
@@ -109,11 +99,11 @@ data class ContactSummaryUi(
     val contactId: String,
     val displayName: String,
     val identityIdHex: String,
+    val trust: QubeeTrust,
     val isVerified: Boolean,
     val isOnline: Boolean,
     val initials: String,
     /// Epoch milliseconds. Null for contacts that have never been
-    /// observed online — we default to "Last seen offline" in the
-    /// row subtitle in that case.
+    /// observed online.
     val lastSeenEpochMillis: Long?,
 )

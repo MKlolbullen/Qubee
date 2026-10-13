@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,44 +16,61 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.QrCode
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.ViewCompositionStrategy
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.findNavController
 import com.qubee.messenger.R
+import com.qubee.messenger.ui.connect.shareIdentityLink
+import com.qubee.messenger.ui.theme.QubeeAvatar
+import com.qubee.messenger.ui.theme.QubeeDangerButton
+import com.qubee.messenger.ui.theme.QubeeMono
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeePanel
-import com.qubee.messenger.ui.theme.QubeeScreen
-import com.qubee.messenger.ui.theme.QubeeSecondaryButton
 import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.QubeeTextField
 import com.qubee.messenger.ui.theme.QubeeTheme
+import com.qubee.messenger.ui.theme.QubeeToggleRow
+import com.qubee.messenger.ui.theme.qubeeInitials
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
@@ -66,7 +84,13 @@ class SettingsFragment : Fragment() {
         savedInstanceState: Bundle?,
     ): View = ComposeView(requireContext()).apply {
         setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
-        setContent { SettingsContent(viewModel, ::routeToOnboarding) }
+        setContent {
+            SettingsContent(
+                viewModel = viewModel,
+                onResetComplete = ::routeToOnboarding,
+                onOpenConnect = { findNavController().navigate(R.id.action_settings_to_connect) },
+            )
+        }
     }
 
     /**
@@ -90,10 +114,12 @@ class SettingsFragment : Fragment() {
 private fun SettingsContent(
     viewModel: SettingsViewModel,
     onResetComplete: () -> Unit,
+    onOpenConnect: () -> Unit,
 ) {
     QubeeTheme {
         val state by viewModel.state.collectAsStateWithLifecycle()
         var confirmOpen by remember { mutableStateOf(false) }
+        val snackbarHostState = remember { SnackbarHostState() }
 
         LaunchedEffect(state) {
             if (state is SettingsResetState.Done) {
@@ -101,109 +127,175 @@ private fun SettingsContent(
                 viewModel.acknowledgeReset()
             }
         }
+        LaunchedEffect(viewModel) {
+            viewModel.appLockNotice.collect { snackbarHostState.showSnackbar(it) }
+        }
 
-        QubeeScreen {
+        Scaffold(
+            containerColor = QubeePalette.Void,
+            snackbarHost = { SnackbarHost(snackbarHostState) },
+        ) { padding ->
             Column(
                 modifier = Modifier
+                    .padding(padding)
                     .fillMaxSize()
-                    // The identity panel alone runs past the viewport
-                    // once the 220dp share QR is in it — without this
-                    // the reset panel below is unreachable.
                     .verticalScroll(rememberScrollState())
-                    .padding(24.dp),
+                    .padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 28.dp),
                 verticalArrangement = Arrangement.Top,
             ) {
-                QubeeStatusPill("LOCAL DEVICE CONTROL")
-                Spacer(Modifier.height(14.dp))
                 Text(
-                    "Settings",
+                    stringResource(R.string.title_settings),
                     color = QubeePalette.Text,
-                    style = MaterialTheme.typography.headlineLarge,
-                    fontWeight = FontWeight.Black,
+                    style = MaterialTheme.typography.headlineMedium,
                 )
-                Spacer(Modifier.height(6.dp))
-                QubeeMutedText(
-                    "Theme, network bootstrap, contact verification and privacy controls belong here. Today this screen exposes the one dangerous switch that matters: destroying the local identity.",
-                )
+                Spacer(Modifier.height(16.dp))
 
-                Spacer(Modifier.height(26.dp))
-
-                MyIdentityPanel(viewModel)
-
-                Spacer(Modifier.height(20.dp))
-
-                AppLockPanel(viewModel)
-
-                Spacer(Modifier.height(20.dp))
+                MyIdentityPanel(viewModel, onOpenConnect)
+                Spacer(Modifier.height(14.dp))
 
                 NetworkPanel(viewModel)
+                Spacer(Modifier.height(14.dp))
 
-                Spacer(Modifier.height(20.dp))
+                AppLockPanel(viewModel)
+                Spacer(Modifier.height(14.dp))
 
-                QubeePanel {
-                    QubeeStatusPill("KEY MATERIAL")
-                    Spacer(Modifier.height(14.dp))
-                    Text("Reset identity", style = MaterialTheme.typography.titleLarge)
-                    Spacer(Modifier.height(6.dp))
-                    QubeeMutedText(
-                        "Reset deletes the local identity keystore, private keys and group state, then forces onboarding again. Existing peers are not notified and will still know the previous identity until you re-share the new one.",
-                    )
-
-                    Spacer(Modifier.height(18.dp))
-
-                    when (state) {
-                        SettingsResetState.Working -> {
-                            CircularProgressIndicator(color = QubeePalette.Cyan)
-                        }
-                        is SettingsResetState.Error -> {
-                            Text(
-                                (state as SettingsResetState.Error).message,
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            ResetButton(enabled = true) { confirmOpen = true }
-                        }
-                        else -> ResetButton(enabled = state !is SettingsResetState.Done) {
-                            confirmOpen = true
-                        }
-                    }
-                }
+                StartOverPanel(state = state, onReset = { confirmOpen = true })
             }
         }
 
         if (confirmOpen) {
             AlertDialog(
                 onDismissRequest = { confirmOpen = false },
-                containerColor = QubeePalette.PanelAlt,
+                containerColor = QubeePalette.Panel,
                 titleContentColor = QubeePalette.Text,
                 textContentColor = QubeePalette.MutedText,
-                title = { Text("Reset identity?") },
-                text = {
-                    Text(
-                        "This deletes your local private keys and group state. You'll be sent back to onboarding to generate a new identity. This can't be undone.",
-                    )
-                },
+                title = { Text(stringResource(R.string.settings_reset_confirm_title)) },
+                text = { Text(stringResource(R.string.settings_reset_confirm_body)) },
                 confirmButton = {
                     TextButton(
                         onClick = {
                             confirmOpen = false
                             viewModel.resetIdentity()
                         },
-                    ) { Text("Reset", color = MaterialTheme.colorScheme.error) }
+                    ) { Text(stringResource(R.string.settings_reset_confirm_ok), color = QubeePalette.Danger) }
                 },
                 dismissButton = {
-                    TextButton(onClick = { confirmOpen = false }) { Text("Cancel") }
+                    TextButton(onClick = { confirmOpen = false }) {
+                        Text(stringResource(R.string.cancel), color = QubeePalette.MutedText)
+                    }
                 },
             )
         }
     }
 }
 
+@Composable
+private fun MyIdentityPanel(viewModel: SettingsViewModel, onOpenConnect: () -> Unit) {
+    val identity by viewModel.identity.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val bundle = identity
+    IdentityPanelBody(
+        name = bundle?.displayName,
+        fingerprint = bundle?.fingerprint,
+        onMyCode = onOpenConnect,
+        onShare = { bundle?.shareLink?.let { shareIdentityLink(context, it) } },
+    )
+}
+
+/** Stateless identity card, exposed for Paparazzi. A null name means no identity exists yet. */
+@Composable
+@androidx.annotation.VisibleForTesting
+internal fun IdentityPanelBody(
+    name: String?,
+    fingerprint: String?,
+    onMyCode: () -> Unit,
+    onShare: () -> Unit,
+) {
+    QubeePanel {
+        if (name == null) {
+            Text(
+                stringResource(R.string.settings_no_identity),
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(Modifier.height(4.dp))
+            QubeeMutedText(stringResource(R.string.connect_no_identity), style = MaterialTheme.typography.bodySmall)
+            return@QubeePanel
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            QubeeAvatar(
+                initials = name.qubeeInitials(),
+                size = 52.dp,
+                color = QubeePalette.Void,
+                background = QubeePalette.Cyan,
+            )
+            Spacer(Modifier.width(14.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    name.ifBlank { "Anonymous" },
+                    color = QubeePalette.Text,
+                    style = MaterialTheme.typography.titleLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    fingerprint.orEmpty().ifBlank { "Not available" },
+                    color = QubeePalette.MutedText,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = QubeeMono,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            IdentityActionButton(
+                text = stringResource(R.string.settings_my_code),
+                icon = Icons.Filled.QrCode,
+                primary = true,
+                onClick = onMyCode,
+                modifier = Modifier.weight(1f),
+            )
+            IdentityActionButton(
+                text = stringResource(R.string.settings_share_link),
+                icon = Icons.Filled.Share,
+                primary = false,
+                onClick = onShare,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun IdentityActionButton(
+    text: String,
+    icon: ImageVector,
+    primary: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(44.dp),
+        shape = RoundedCornerShape(12.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (primary) QubeePalette.Cyan else QubeePalette.PanelAlt,
+            contentColor = if (primary) QubeePalette.Void else QubeePalette.Text,
+        ),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp),
+    ) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(text, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
 /**
- * Screen-lock panel: a switch that gates the app behind a biometric /
- * device-credential unlock. Split into a stateless [AppLockPanelBody]
- * so the visual can be snapshot-tested without a ViewModel.
+ * Screen-lock card. Split into a stateless [AppLockPanelBody] so the
+ * visual can be snapshot-tested without a ViewModel.
  */
 @Composable
 private fun AppLockPanel(viewModel: SettingsViewModel) {
@@ -215,29 +307,13 @@ private fun AppLockPanel(viewModel: SettingsViewModel) {
 @androidx.annotation.VisibleForTesting
 internal fun AppLockPanelBody(enabled: Boolean, onToggle: (Boolean) -> Unit) {
     QubeePanel {
-        QubeeStatusPill(stringResource(R.string.app_lock_panel_status))
-        Spacer(Modifier.height(14.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    stringResource(R.string.app_lock_panel_title),
-                    style = MaterialTheme.typography.titleLarge,
-                )
-                Spacer(Modifier.height(6.dp))
-                QubeeMutedText(stringResource(R.string.app_lock_panel_body))
-            }
-            Spacer(Modifier.width(12.dp))
-            Switch(
-                checked = enabled,
-                onCheckedChange = onToggle,
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = QubeePalette.Void,
-                    checkedTrackColor = QubeePalette.Cyan,
-                    uncheckedThumbColor = QubeePalette.MutedText,
-                    uncheckedTrackColor = QubeePalette.PanelAlt,
-                ),
-            )
-        }
+        QubeeToggleRow(
+            title = stringResource(R.string.settings_unlock_title),
+            body = stringResource(R.string.settings_unlock_body),
+            checked = enabled,
+            onCheckedChange = onToggle,
+            icon = Icons.Outlined.Lock,
+        )
     }
 }
 
@@ -251,7 +327,7 @@ private fun NetworkPanel(viewModel: SettingsViewModel) {
     val bootstrapPeers by viewModel.bootstrapPeers.collectAsStateWithLifecycle()
     val addresses by viewModel.listenAddresses.collectAsStateWithLifecycle()
     val peers by viewModel.connectedPeers.collectAsStateWithLifecycle()
-    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val clipboard = LocalClipboardManager.current
     NetworkPanelBody(
         lanDiscoveryEnabled = lanDiscovery,
         onToggleLanDiscovery = viewModel::setLanDiscoveryEnabled,
@@ -260,7 +336,7 @@ private fun NetworkPanel(viewModel: SettingsViewModel) {
         listenAddresses = addresses,
         connectedPeerCount = peers.size,
         onCopyAddresses = {
-            clipboard.setText(androidx.compose.ui.text.AnnotatedString(addresses.joinToString("\n")))
+            clipboard.setText(AnnotatedString(addresses.joinToString("\n")))
         },
     )
 }
@@ -278,87 +354,140 @@ internal fun NetworkPanelBody(
     onCopyAddresses: () -> Unit,
 ) {
     var draft by remember(bootstrapPeers) { mutableStateOf(bootstrapPeers) }
-    val monospace = androidx.compose.ui.text.font.FontFamily.Monospace
     QubeePanel {
-        QubeeStatusPill(stringResource(R.string.network_panel_status))
-        Spacer(Modifier.height(14.dp))
-        Text(stringResource(R.string.network_panel_title), style = MaterialTheme.typography.titleLarge)
-        Spacer(Modifier.height(6.dp))
-        QubeeMutedText(stringResource(R.string.network_panel_body))
-
-        Spacer(Modifier.height(18.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    stringResource(R.string.network_lan_discovery_title),
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                Spacer(Modifier.height(4.dp))
-                QubeeMutedText(stringResource(R.string.network_lan_discovery_body))
-            }
-            Spacer(Modifier.width(12.dp))
-            Switch(
-                checked = lanDiscoveryEnabled,
-                onCheckedChange = onToggleLanDiscovery,
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = QubeePalette.Void,
-                    checkedTrackColor = QubeePalette.Cyan,
-                    uncheckedThumbColor = QubeePalette.MutedText,
-                    uncheckedTrackColor = QubeePalette.PanelAlt,
-                ),
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                stringResource(R.string.settings_network_title),
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleMedium,
+            )
+            QubeeStatusPill(
+                text = stringResource(R.string.settings_connected_count, connectedPeerCount),
+                color = if (connectedPeerCount > 0) QubeePalette.Green else QubeePalette.MutedText,
+                dot = true,
             )
         }
 
-        Spacer(Modifier.height(18.dp))
-        Text(
-            stringResource(R.string.network_bootstrap_title),
-            style = MaterialTheme.typography.titleMedium,
-        )
-        Spacer(Modifier.height(4.dp))
-        QubeeMutedText(stringResource(R.string.network_bootstrap_body))
-        Spacer(Modifier.height(10.dp))
-        OutlinedTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            label = { Text(stringResource(R.string.network_bootstrap_label)) },
-            minLines = 2,
-            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = monospace),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(10.dp))
-        QubeeSecondaryButton(
-            text = stringResource(R.string.network_bootstrap_apply),
-            onClick = { onSaveBootstrapPeers(draft) },
-            enabled = draft.trim() != bootstrapPeers.trim(),
-            modifier = Modifier.fillMaxWidth(),
+        Spacer(Modifier.height(14.dp))
+        QubeeToggleRow(
+            title = stringResource(R.string.connect_lan_title),
+            body = stringResource(R.string.settings_lan_body),
+            checked = lanDiscoveryEnabled,
+            onCheckedChange = onToggleLanDiscovery,
         )
 
-        Spacer(Modifier.height(18.dp))
+        Spacer(Modifier.height(16.dp))
         Text(
-            stringResource(R.string.network_this_device_title),
-            style = MaterialTheme.typography.titleMedium,
+            stringResource(R.string.settings_address_title),
+            color = QubeePalette.MutedText,
+            style = MaterialTheme.typography.labelMedium,
         )
-        Spacer(Modifier.height(4.dp))
-        QubeeMutedText(stringResource(R.string.network_connected_count, connectedPeerCount))
         Spacer(Modifier.height(8.dp))
         if (listenAddresses.isEmpty()) {
-            QubeeMutedText(stringResource(R.string.network_no_addresses))
+            QubeeMutedText(stringResource(R.string.settings_address_none), style = MaterialTheme.typography.bodySmall)
         } else {
-            listenAddresses.forEach { address ->
-                Text(
-                    address,
-                    color = QubeePalette.Text,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = monospace,
-                )
-                Spacer(Modifier.height(4.dp))
-            }
-            Spacer(Modifier.height(6.dp))
-            QubeeSecondaryButton(
-                text = stringResource(R.string.network_copy_addresses),
-                onClick = onCopyAddresses,
+            Surface(
                 modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = QubeePalette.Void,
+                border = BorderStroke(1.dp, QubeePalette.PanelAlt),
+            ) {
+                Row(
+                    modifier = Modifier.padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        listenAddresses.forEach { address ->
+                            Text(
+                                address,
+                                color = QubeePalette.Text,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = QubeeMono,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    IconButton(onClick = onCopyAddresses, modifier = Modifier.size(44.dp)) {
+                        Icon(
+                            Icons.Filled.ContentCopy,
+                            contentDescription = stringResource(R.string.settings_copy_address),
+                            tint = QubeePalette.Cyan,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Text(
+            stringResource(R.string.settings_peer_address_label),
+            color = QubeePalette.MutedText,
+            style = MaterialTheme.typography.labelMedium,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.Top) {
+            QubeeTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                placeholder = stringResource(R.string.settings_peer_address_placeholder),
+                singleLine = false,
+                monospace = true,
+                modifier = Modifier.weight(1f),
             )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = { onSaveBootstrapPeers(draft) },
+                enabled = draft.trim() != bootstrapPeers.trim(),
+                modifier = Modifier.height(56.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = QubeePalette.PanelAlt,
+                    contentColor = QubeePalette.Text,
+                    disabledContainerColor = QubeePalette.Panel,
+                    disabledContentColor = QubeePalette.MutedText,
+                ),
+            ) { Text(stringResource(R.string.settings_connect), style = MaterialTheme.typography.labelLarge) }
+        }
+        Spacer(Modifier.height(8.dp))
+        QubeeMutedText(stringResource(R.string.settings_retry_note), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun StartOverPanel(state: SettingsResetState, onReset: () -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = QubeePalette.Panel,
+        border = BorderStroke(1.dp, QubeePalette.Danger.copy(alpha = 0.4f)),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                stringResource(R.string.settings_start_over_title),
+                color = QubeePalette.Danger,
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(Modifier.height(6.dp))
+            QubeeMutedText(stringResource(R.string.settings_start_over_body), style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(14.dp))
+            when (state) {
+                SettingsResetState.Working -> CircularProgressIndicator(color = QubeePalette.Cyan)
+                is SettingsResetState.Error -> {
+                    Text(
+                        state.message,
+                        color = QubeePalette.Danger,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    ResetButton(enabled = true, onClick = onReset)
+                }
+                else -> ResetButton(enabled = state !is SettingsResetState.Done, onClick = onReset)
+            }
         }
     }
 }
@@ -366,152 +495,9 @@ internal fun NetworkPanelBody(
 @Composable
 @androidx.annotation.VisibleForTesting
 internal fun ResetButton(enabled: Boolean, onClick: () -> Unit) {
-    Button(
+    QubeeDangerButton(
+        text = stringResource(R.string.settings_reset_button),
         onClick = onClick,
         enabled = enabled,
-        modifier = Modifier.fillMaxWidth(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = QubeePalette.Danger,
-            contentColor = QubeePalette.Void,
-            disabledContainerColor = QubeePalette.PanelAlt,
-            disabledContentColor = QubeePalette.MutedText,
-        ),
-    ) { Text("Destroy local identity", fontWeight = FontWeight.Bold) }
-}
-
-/**
- * Identity-display panel: shows the local user's display name,
- * canonical fingerprint, and `qubee://identity/<token>` invite
- * link as both text and QR. Lets the user share their identity
- * with new contacts after onboarding without retracing through
- * the OnboardingScreen.
- *
- * `viewModel.identity` is loaded once at VM init via
- * `qubeeManager.loadOnboardingBundle()` + `IdentityBundle.fromJson`.
- * A null bundle (pre-onboarding state, JSON parse failure)
- * collapses the panel to a muted "Identity not yet generated"
- * placeholder so the rest of Settings still renders.
- */
-@Composable
-private fun MyIdentityPanel(viewModel: SettingsViewModel) {
-    val identity by viewModel.identity.collectAsStateWithLifecycle()
-    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
-    val context = androidx.compose.ui.platform.LocalContext.current
-
-    QubeePanel {
-        QubeeStatusPill("YOUR IDENTITY")
-        Spacer(Modifier.height(14.dp))
-        val bundle = identity
-        if (bundle == null) {
-            Text(
-                "Identity not yet generated",
-                color = QubeePalette.Text,
-                style = MaterialTheme.typography.titleLarge,
-            )
-            Spacer(Modifier.height(6.dp))
-            QubeeMutedText(
-                "Onboarding hasn't completed on this device yet. Once it has, your share link and fingerprint show up here.",
-            )
-        } else {
-            Text(
-                bundle.displayName.ifBlank { "Anonymous" },
-                color = QubeePalette.Text,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(Modifier.height(4.dp))
-            QubeeMutedText("Fingerprint")
-            Text(
-                bundle.fingerprint.ifBlank { "Not available" },
-                color = QubeePalette.Text,
-                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                style = MaterialTheme.typography.bodyLarge,
-            )
-
-            val shareLink = bundle.shareLink
-            if (!shareLink.isNullOrBlank()) {
-                Spacer(Modifier.height(16.dp))
-                QubeeMutedText("Share link")
-                ShareLinkQr(shareLink)
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    shareLink,
-                    color = QubeePalette.Text,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                )
-                Spacer(Modifier.height(10.dp))
-                androidx.compose.foundation.layout.Row(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    QubeeSecondaryButton(
-                        text = "Copy link",
-                        onClick = {
-                            clipboard.setText(
-                                androidx.compose.ui.text.AnnotatedString(shareLink),
-                            )
-                        },
-                        modifier = Modifier.weight(1f),
-                    )
-                    QubeeSecondaryButton(
-                        text = "Share…",
-                        onClick = { startShareIntent(context, shareLink) },
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * Open the system share sheet with the share link as plain text.
- * Used by the "Share…" button on the My identity panel — saves
- * the user a copy-paste round-trip when they want to send the
- * invite via another messaging app.
- *
- * `Intent.ACTION_SEND` with `text/plain` MIME is the standard
- * Android pattern; the system chooser presents every app that
- * registered for plain-text share intents (Messages, Email,
- * Slack, etc.). The chooser title is fixed to "Share Qubee
- * identity" so users see what they're sharing in the chooser
- * header.
- */
-private fun startShareIntent(context: android.content.Context, link: String) {
-    val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-        type = "text/plain"
-        putExtra(android.content.Intent.EXTRA_TEXT, link)
-    }
-    val chooser = android.content.Intent.createChooser(sendIntent, "Share Qubee identity")
-    chooser.flags = chooser.flags or android.content.Intent.FLAG_ACTIVITY_NEW_TASK
-    runCatching { context.startActivity(chooser) }
-}
-
-@Composable
-private fun ShareLinkQr(link: String) {
-    val bitmap = remember(link) {
-        com.qubee.messenger.util.QrUtils.encodeAsBitmap(link, sizePx = 540)
-    }
-    if (bitmap != null) {
-        androidx.compose.material3.Surface(
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
-            color = androidx.compose.ui.graphics.Color.White,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            androidx.compose.foundation.layout.Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(12.dp),
-                contentAlignment = androidx.compose.ui.Alignment.Center,
-            ) {
-                androidx.compose.foundation.Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "Your identity share link as a QR code",
-                    modifier = Modifier.size(220.dp),
-                )
-            }
-        }
-    }
+    )
 }

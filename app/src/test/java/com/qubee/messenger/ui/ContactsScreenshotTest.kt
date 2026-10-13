@@ -1,18 +1,16 @@
 package com.qubee.messenger.ui
 
-import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import com.qubee.messenger.ui.contacts.ContactSummaryUi
 import com.qubee.messenger.ui.contacts.ContactsBody
 import com.qubee.messenger.ui.contacts.EmptyContacts
 import com.qubee.messenger.ui.theme.QubeeScreen
+import com.qubee.messenger.ui.theme.QubeeTrust
 import org.junit.Rule
 import org.junit.Test
 
-/** Baselines for the contacts list: populated (verified/online mix + a
- * blocked entry) and the empty first-run state. */
+/** Baselines for the contacts list grouped by trust state, with a
+ * blocked entry, and the empty first-run state. */
 class ContactsScreenshotTest {
 
     @get:Rule
@@ -27,7 +25,7 @@ class ContactsScreenshotTest {
     private fun contact(
         id: String,
         name: String,
-        verified: Boolean,
+        trust: QubeeTrust,
         online: Boolean,
         initials: String,
         lastSeen: Long? = null,
@@ -35,7 +33,8 @@ class ContactsScreenshotTest {
         contactId = id,
         displayName = name,
         identityIdHex = "aa".repeat(32),
-        isVerified = verified,
+        trust = trust,
+        isVerified = trust == QubeeTrust.Verified,
         isOnline = online,
         initials = initials,
         lastSeenEpochMillis = lastSeen,
@@ -44,23 +43,22 @@ class ContactsScreenshotTest {
     @Test
     fun contacts_populated() {
         host {
-            androidx.compose.foundation.layout.Box(Modifier.padding(16.dp)) {
-                ContactsBody(
-                    active = listOf(
-                        contact("1", "Ada Lovelace", verified = true, online = true, initials = "AL"),
-                        contact("2", "Alan Turing", verified = false, online = false, initials = "AT", lastSeen = 1_700_000_000_000L),
-                        contact("3", "Grace Hopper", verified = true, online = false, initials = "GH", lastSeen = 1_700_000_000_000L),
-                    ),
-                    blocked = listOf(
-                        contact("9", "Spam Sender", verified = false, online = false, initials = "SS"),
-                    ),
-                    onContactClick = {},
-                    onDeleteContact = {},
-                    onBlockContact = {},
-                    onUnblockContact = {},
-                    onVerifyContact = {},
-                )
-            }
+            ContactsBody(
+                active = listOf(
+                    contact("1", "Sara Nyberg", QubeeTrust.KeyChanged, online = false, initials = "SN"),
+                    contact("2", "Jonas Pettersson", QubeeTrust.Unverified, online = false, initials = "JP", lastSeen = 1_700_000_000_000L),
+                    contact("3", "Anna Lindqvist", QubeeTrust.Verified, online = true, initials = "AL"),
+                    contact("4", "Mira Ekholm", QubeeTrust.Verified, online = false, initials = "ME", lastSeen = 1_700_000_000_000L),
+                ),
+                blocked = listOf(
+                    contact("9", "Spam Sender", QubeeTrust.Unverified, online = false, initials = "SS"),
+                ),
+                onContactClick = {},
+                onDeleteContact = {},
+                onBlockContact = {},
+                onUnblockContact = {},
+                onVerifyContact = {},
+            )
         }
     }
 

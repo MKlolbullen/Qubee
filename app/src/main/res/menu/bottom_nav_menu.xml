@@ -2,17 +2,16 @@
 <menu xmlns:android="http://schemas.android.com/apk/res/android">
     <item
         android:id="@+id/navigation_conversations"
-        android:icon="@android:drawable/ic_menu_edit" 
-        android:title="Chattar" />
-        
+        android:icon="@drawable/ic_nav_chats"
+        android:title="@string/title_conversations" />
+
     <item
         android:id="@+id/navigation_contacts"
-        android:icon="@drawable/ic_contacts"
-        android:title="Kontakter" />
+        android:icon="@drawable/ic_nav_contacts"
+        android:title="@string/title_contacts" />
 
     <item
         android:id="@+id/navigation_settings"
-        android:icon="@android:drawable/ic_menu_preferences"
-        android:title="Inställningar" />
+        android:icon="@drawable/ic_nav_settings"
+        android:title="@string/title_settings" />
 </menu>
-

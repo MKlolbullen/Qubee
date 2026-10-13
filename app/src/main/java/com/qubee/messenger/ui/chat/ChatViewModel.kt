@@ -346,47 +346,11 @@ class ChatViewModel @Inject constructor(
      * [MessageType.IMAGE] with empty content. Camera integration +
      * encryption land later.
      */
-    fun onTakePhoto() {
-        if (conversationId.isEmpty()) return
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val msg = Message(
-                id = UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
-                content = "",
-                contentType = MessageType.IMAGE,
-                timestamp = now,
-                status = MessageStatus.SENDING,
-                isFromMe = true,
-            )
-            messageRepository.saveMessage(msg)
-            _events.emit(ChatUiEvent.Notice("Photo queued (camera integration not yet implemented)"))
-        }
-    }
 
     /**
      * Queue an audio note. Placeholder — recording / encryption /
      * playback land later.
      */
-    fun onRecordAudio() {
-        if (conversationId.isEmpty()) return
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val msg = Message(
-                id = UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = selfSenderId ?: SELF_SENDER_ID_FALLBACK,
-                content = "",
-                contentType = MessageType.AUDIO,
-                timestamp = now,
-                status = MessageStatus.SENDING,
-                isFromMe = true,
-            )
-            messageRepository.saveMessage(msg)
-            _events.emit(ChatUiEvent.Notice("Voice note queued (recording not yet implemented)"))
-        }
-    }
 
     /**
      * Secure calling — gated on the Rust `calling` feature flag and

@@ -4,64 +4,78 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.fragment.findNavController
 import com.qubee.messenger.R
-import com.qubee.messenger.ui.theme.QubeeHeroMark
+import com.qubee.messenger.ui.theme.QubeeAvatar
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
-import com.qubee.messenger.ui.theme.QubeePanelBorder
 import com.qubee.messenger.ui.theme.QubeePrimaryButton
 import com.qubee.messenger.ui.theme.QubeeScreen
-import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.QubeeSectionLabel
+import com.qubee.messenger.ui.theme.QubeeTextField
 import com.qubee.messenger.ui.theme.QubeeTheme
+import com.qubee.messenger.ui.theme.QubeeTrust
+import com.qubee.messenger.ui.theme.QubeeTrustShield
+import com.qubee.messenger.ui.theme.label
 import dagger.hilt.android.AndroidEntryPoint
 
 /**
- * Address-book tab. Renders [ContactsViewModel.uiState] as a
- * vertical list of contacts; tapping a row navigates to the chat
- * with that contact. The "Add contact" button at the top routes
- * to [com.qubee.messenger.ui.contacts.AddContactFragment] for the
- * `qubee://identity/<token>` invite flow.
+ * Address-book tab, grouped by what the user has to do about each
+ * contact: confirm a changed key, confirm a new one, or nothing.
+ * Tapping a row opens the chat; the trailing action on an unconfirmed
+ * row opens the verification screen. Long-press keeps the rarer
+ * actions (block, delete).
  *
  * The data class [ContactVerificationResult] kept at the bottom
  * stays in this file to preserve the existing
@@ -88,7 +102,7 @@ class ContactsFragment : Fragment() {
                     findNavController().navigate(R.id.action_contact_to_chat, args)
                 },
                 onAddContactClick = {
-                    findNavController().navigate(R.id.action_contact_to_add_contact)
+                    findNavController().navigate(R.id.action_contact_to_connect)
                 },
                 onDeleteContact = viewModel::deleteContact,
                 onBlockContact = viewModel::blockContact,
@@ -112,31 +126,70 @@ private fun ContactsScreen(
     onUnblockContact: (String) -> Unit,
     onVerifyContact: (ContactSummaryUi) -> Unit,
 ) {
+    var query by remember { mutableStateOf("") }
     QubeeTheme {
         QubeeScreen {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 22.dp, vertical = 26.dp),
-            ) {
+            Column(modifier = Modifier.fillMaxSize()) {
                 ContactsHeader(onAddContactClick = onAddContactClick)
-                Spacer(Modifier.height(22.dp))
-
+                val hasContacts = state.contacts.isNotEmpty() || state.blocked.isNotEmpty()
+                if (hasContacts) {
+                    QubeeTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        placeholder = stringResource(R.string.contacts_search),
+                        modifier = Modifier.padding(horizontal = 20.dp),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                }
                 when {
                     state.isLoading -> LoadingContacts()
-                    state.contacts.isEmpty() && state.blocked.isEmpty() ->
-                        EmptyContacts(onAddContactClick = onAddContactClick)
-                    else -> ContactsBody(
-                        active = state.contacts,
-                        blocked = state.blocked,
-                        onContactClick = onContactClick,
-                        onDeleteContact = onDeleteContact,
-                        onBlockContact = onBlockContact,
-                        onUnblockContact = onUnblockContact,
-                        onVerifyContact = onVerifyContact,
-                    )
+                    !hasContacts -> EmptyContacts(onAddContactClick = onAddContactClick)
+                    else -> {
+                        val needle = query.trim()
+                        val matches: (ContactSummaryUi) -> Boolean = { needle.isEmpty() || it.displayName.contains(needle, ignoreCase = true) }
+                        ContactsBody(
+                            active = state.contacts.filter(matches),
+                            blocked = state.blocked.filter(matches),
+                            onContactClick = onContactClick,
+                            onDeleteContact = onDeleteContact,
+                            onBlockContact = onBlockContact,
+                            onUnblockContact = onUnblockContact,
+                            onVerifyContact = onVerifyContact,
+                        )
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ContactsHeader(onAddContactClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 20.dp, end = 16.dp, top = 20.dp, bottom = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            stringResource(R.string.title_contacts),
+            color = QubeePalette.Text,
+            style = MaterialTheme.typography.headlineMedium,
+        )
+        Button(
+            onClick = onAddContactClick,
+            modifier = Modifier.height(44.dp),
+            shape = RoundedCornerShape(22.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = QubeePalette.Cyan,
+                contentColor = QubeePalette.Void,
+            ),
+            contentPadding = PaddingValues(start = 12.dp, end = 16.dp),
+        ) {
+            Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(stringResource(R.string.contacts_add), style = MaterialTheme.typography.labelLarge)
         }
     }
 }
@@ -153,26 +206,54 @@ internal fun ContactsBody(
     onVerifyContact: (ContactSummaryUi) -> Unit,
 ) {
     var pendingDelete by remember { mutableStateOf<ContactSummaryUi?>(null) }
-    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (active.isNotEmpty()) {
-            items(active, key = { "active-${it.contactId}" }) { contact ->
-                ContactRow(
-                    contact = contact,
-                    onClick = { onContactClick(contact) },
-                    onRequestDelete = { pendingDelete = contact },
-                    onBlock = { onBlockContact(contact.contactId) },
-                    onVerify = { onVerifyContact(contact) },
-                )
-            }
+    val needsCheck = active.filter { it.trust == QubeeTrust.KeyChanged || it.trust == QubeeTrust.Compromised }
+    val unconfirmed = active.filter { it.trust == QubeeTrust.Unverified }
+    val confirmed = active.filter { it.trust == QubeeTrust.Verified }
+
+    if (active.isEmpty() && blocked.isEmpty()) {
+        Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+            QubeeMutedText(stringResource(R.string.contacts_no_results))
         }
+        return
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+    ) {
+        section(
+            label = R.string.contacts_section_check,
+            color = QubeePalette.Warning,
+            contacts = needsCheck,
+            onContactClick = onContactClick,
+            onRequestDelete = { pendingDelete = it },
+            onBlock = { onBlockContact(it.contactId) },
+            onVerify = onVerifyContact,
+        )
+        section(
+            label = R.string.contacts_section_unconfirmed,
+            color = QubeePalette.MutedText,
+            contacts = unconfirmed,
+            onContactClick = onContactClick,
+            onRequestDelete = { pendingDelete = it },
+            onBlock = { onBlockContact(it.contactId) },
+            onVerify = onVerifyContact,
+        )
+        section(
+            label = R.string.contacts_section_confirmed,
+            color = QubeePalette.Green,
+            contacts = confirmed,
+            onContactClick = onContactClick,
+            onRequestDelete = { pendingDelete = it },
+            onBlock = { onBlockContact(it.contactId) },
+            onVerify = onVerifyContact,
+        )
         if (blocked.isNotEmpty()) {
             item(key = "blocked-header") {
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text = "Blocked",
-                    color = QubeePalette.Text,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
+                QubeeSectionLabel(
+                    stringResource(R.string.contacts_section_blocked),
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 4.dp),
+                    color = QubeePalette.Danger,
                 )
             }
             items(blocked, key = { "blocked-${it.contactId}" }) { contact ->
@@ -196,6 +277,169 @@ internal fun ContactsBody(
     }
 }
 
+private fun LazyListScope.section(
+    label: Int,
+    color: Color,
+    contacts: List<ContactSummaryUi>,
+    onContactClick: (ContactSummaryUi) -> Unit,
+    onRequestDelete: (ContactSummaryUi) -> Unit,
+    onBlock: (ContactSummaryUi) -> Unit,
+    onVerify: (ContactSummaryUi) -> Unit,
+) {
+    if (contacts.isEmpty()) return
+    item(key = "section-$label") {
+        QubeeSectionLabel(
+            stringResource(label),
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 4.dp),
+            color = color,
+        )
+    }
+    items(contacts, key = { "contact-${it.contactId}" }) { contact ->
+        ContactRow(
+            contact = contact,
+            onClick = { onContactClick(contact) },
+            onRequestDelete = { onRequestDelete(contact) },
+            onBlock = { onBlock(contact) },
+            onVerify = { onVerify(contact) },
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ContactRow(
+    contact: ContactSummaryUi,
+    onClick: () -> Unit,
+    onRequestDelete: () -> Unit,
+    onBlock: () -> Unit,
+    onVerify: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val avatarColor = when (contact.trust) {
+        QubeeTrust.Verified -> QubeePalette.Cyan
+        QubeeTrust.Unverified -> QubeePalette.Blue
+        QubeeTrust.KeyChanged -> QubeePalette.Warning
+        QubeeTrust.Compromised -> QubeePalette.Danger
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { menuOpen = true },
+            )
+            .padding(horizontal = 20.dp, vertical = 10.dp)
+            .heightIn(min = 48.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box {
+            QubeeAvatar(initials = contact.initials, size = 44.dp, color = avatarColor)
+            if (contact.isOnline) {
+                Box(
+                    modifier = Modifier
+                        .size(12.dp)
+                        .align(Alignment.BottomEnd)
+                        .background(QubeePalette.Green, CircleShape),
+                )
+            }
+        }
+        Spacer(Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = contact.displayName,
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(3.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (contact.trust == QubeeTrust.Verified) {
+                    QubeeTrustShield(contact.trust, size = 14.dp)
+                    Spacer(Modifier.width(5.dp))
+                }
+                Text(
+                    text = subtitleFor(contact),
+                    color = when (contact.trust) {
+                        QubeeTrust.KeyChanged -> QubeePalette.Warning
+                        QubeeTrust.Compromised -> QubeePalette.Danger
+                        else -> QubeePalette.MutedText
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        if (contact.trust == QubeeTrust.Verified) {
+            Icon(
+                imageVector = Icons.Filled.ChevronRight,
+                contentDescription = null,
+                tint = QubeePalette.MutedText,
+                modifier = Modifier.size(22.dp),
+            )
+        } else {
+            TextButton(onClick = onVerify) {
+                Text(
+                    stringResource(R.string.contacts_confirm_action),
+                    color = QubeePalette.Cyan,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+        }
+        Box {
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false },
+            ) {
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            stringResource(
+                                if (contact.isVerified) R.string.contacts_menu_reverify else R.string.contacts_menu_verify,
+                            ),
+                        )
+                    },
+                    onClick = {
+                        menuOpen = false
+                        onVerify()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.contacts_menu_block)) },
+                    onClick = {
+                        menuOpen = false
+                        onBlock()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.contacts_menu_delete)) },
+                    onClick = {
+                        menuOpen = false
+                        onRequestDelete()
+                    },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The trust state is the subtitle for anything that needs doing; a
+ * confirmed contact gets presence instead.
+ */
+@Composable
+private fun subtitleFor(contact: ContactSummaryUi): String = when (contact.trust) {
+    QubeeTrust.KeyChanged -> stringResource(R.string.trust_hint_key_changed, contact.displayName)
+    QubeeTrust.Compromised -> stringResource(R.string.trust_hint_compromised)
+    QubeeTrust.Unverified -> stringResource(R.string.trust_hint_unverified)
+    QubeeTrust.Verified -> when {
+        contact.isOnline -> stringResource(R.string.contacts_online)
+        else -> contact.trust.label()
+    }
+}
+
 @Composable
 private fun BlockedContactRow(
     contact: ContactSummaryUi,
@@ -204,56 +448,25 @@ private fun BlockedContactRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(QubeePalette.Panel.copy(alpha = 0.55f))
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 20.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Avatar(initials = contact.initials, isOnline = false)
+        QubeeAvatar(initials = contact.initials, size = 44.dp, color = QubeePalette.MutedText)
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = contact.displayName,
                 color = QubeePalette.Text,
                 style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            QubeeMutedText("Blocked — inbound is suppressed")
+            QubeeMutedText(stringResource(R.string.contacts_blocked_hint), style = MaterialTheme.typography.bodySmall)
         }
-        androidx.compose.material3.TextButton(onClick = onUnblock) {
-            Text("Unblock", color = QubeePalette.Cyan)
+        TextButton(onClick = onUnblock) {
+            Text(stringResource(R.string.contacts_unblock), color = QubeePalette.Cyan, style = MaterialTheme.typography.labelLarge)
         }
     }
-}
-
-@Composable
-private fun ContactsHeader(onAddContactClick: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            QubeeStatusPill("ADDRESS BOOK")
-            Spacer(Modifier.height(12.dp))
-            Text(
-                "Contacts",
-                color = QubeePalette.Text,
-                style = MaterialTheme.typography.headlineLarge,
-                fontWeight = FontWeight.Black,
-            )
-            QubeeMutedText("Identities you've paired with via invite link.")
-        }
-        QubeeHeroMark(modifier = Modifier.size(72.dp))
-    }
-    Spacer(Modifier.height(18.dp))
-    QubeePrimaryButton(
-        text = "Add contact",
-        onClick = onAddContactClick,
-        modifier = Modifier.fillMaxWidth(),
-    )
 }
 
 @Composable
@@ -270,22 +483,30 @@ private fun LoadingContacts() {
 @androidx.annotation.VisibleForTesting
 internal fun EmptyContacts(onAddContactClick: () -> Unit) {
     Column(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 28.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            "No contacts yet",
+            stringResource(R.string.contacts_empty_title),
             color = QubeePalette.Text,
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.headlineSmall,
+            textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(8.dp))
-        QubeeMutedText("Tap “Add contact” above and scan or paste an identity link.")
-        Spacer(Modifier.height(20.dp))
+        Text(
+            stringResource(R.string.contacts_empty_body),
+            color = QubeePalette.MutedText,
+            style = MaterialTheme.typography.bodyLarge,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(24.dp))
         QubeePrimaryButton(
-            text = "Add your first contact",
+            text = stringResource(R.string.chats_add_someone),
             onClick = onAddContactClick,
+            icon = Icons.Filled.Add,
         )
     }
 }
@@ -296,168 +517,22 @@ private fun ConfirmDeleteContactDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    androidx.compose.material3.AlertDialog(
+    AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Delete $contactName?") },
-        text = {
-            Text(
-                "This removes the contact from your address book on this device. " +
-                    "If you've shared a group with them, they remain a group member " +
-                    "until you explicitly remove them from the group.",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        },
+        containerColor = QubeePalette.Panel,
+        titleContentColor = QubeePalette.Text,
+        textContentColor = QubeePalette.MutedText,
+        title = { Text(stringResource(R.string.contacts_delete_title, contactName)) },
+        text = { Text(stringResource(R.string.contacts_delete_body), style = MaterialTheme.typography.bodyMedium) },
         confirmButton = {
-            androidx.compose.material3.TextButton(onClick = onConfirm) {
-                Text("Delete", color = QubeePalette.Cyan)
+            TextButton(onClick = onConfirm) {
+                Text(stringResource(R.string.contacts_delete_ok), color = QubeePalette.Danger)
             }
         },
         dismissButton = {
-            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel), color = QubeePalette.MutedText) }
         },
     )
-}
-
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
-@Composable
-private fun ContactRow(
-    contact: ContactSummaryUi,
-    onClick: () -> Unit,
-    onRequestDelete: () -> Unit,
-    onBlock: () -> Unit,
-    onVerify: () -> Unit,
-) {
-    var menuOpen by remember { mutableStateOf(false) }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(QubeePalette.Panel.copy(alpha = 0.92f))
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = { menuOpen = true },
-            )
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Avatar(initials = contact.initials, isOnline = contact.isOnline)
-        Spacer(Modifier.width(14.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = contact.displayName,
-                    color = QubeePalette.Text,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-                if (contact.isVerified) {
-                    Spacer(Modifier.width(8.dp))
-                    Icon(
-                        imageVector = Icons.Filled.VerifiedUser,
-                        contentDescription = "Verified",
-                        tint = QubeePalette.Cyan,
-                        modifier = Modifier.size(16.dp),
-                    )
-                }
-            }
-            Spacer(Modifier.height(2.dp))
-            QubeeMutedText(text = subtitleFor(contact))
-        }
-        Box {
-            androidx.compose.material3.DropdownMenu(
-                expanded = menuOpen,
-                onDismissRequest = { menuOpen = false },
-            ) {
-                androidx.compose.material3.DropdownMenuItem(
-                    text = { Text(if (contact.isVerified) "Re-verify" else "Verify") },
-                    onClick = {
-                        menuOpen = false
-                        onVerify()
-                    },
-                )
-                androidx.compose.material3.DropdownMenuItem(
-                    text = { Text("Block") },
-                    onClick = {
-                        menuOpen = false
-                        onBlock()
-                    },
-                )
-                androidx.compose.material3.DropdownMenuItem(
-                    text = { Text("Delete contact") },
-                    onClick = {
-                        menuOpen = false
-                        onRequestDelete()
-                    },
-                )
-            }
-        }
-    }
-}
-
-/**
- * Build the row subtitle from online status + relative time on
- * `lastSeenEpochMillis`. Buckets are coarse on purpose — this is
- * an at-a-glance hint, not a clock.
- *
- *  * online → "Online"
- *  * `lastSeen == null` → "Last seen offline" (no timestamp ever
- *    recorded; usually means we've never received a packet from
- *    this peer since pairing).
- *  * within 1 minute → "Last seen just now"
- *  * within 1 hour → "Last seen Xm ago"
- *  * within 1 day → "Last seen Xh ago"
- *  * within 7 days → "Last seen Xd ago"
- *  * older → "Last seen on YYYY-MM-DD"
- */
-private fun subtitleFor(contact: ContactSummaryUi): String {
-    if (contact.isOnline) return "Online"
-    val ts = contact.lastSeenEpochMillis ?: return "Last seen offline"
-    val deltaSeconds = ((System.currentTimeMillis() - ts) / 1000).coerceAtLeast(0)
-    return when {
-        deltaSeconds < 60 -> "Last seen just now"
-        deltaSeconds < 60 * 60 -> "Last seen ${deltaSeconds / 60}m ago"
-        deltaSeconds < 24 * 60 * 60 -> "Last seen ${deltaSeconds / 3600}h ago"
-        deltaSeconds < 7 * 24 * 60 * 60 -> "Last seen ${deltaSeconds / 86_400}d ago"
-        else -> {
-            val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-            "Last seen on ${fmt.format(java.util.Date(ts))}"
-        }
-    }
-}
-
-@Composable
-private fun Avatar(initials: String, isOnline: Boolean) {
-    Box(
-        modifier = Modifier
-            .size(46.dp)
-            .clip(CircleShape)
-            .background(QubeePalette.Cyan.copy(alpha = 0.18f))
-            .border(
-                width = 1.dp,
-                brush = QubeePanelBorder,
-                shape = CircleShape,
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = initials,
-            color = QubeePalette.Text,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-        )
-        if (isOnline) {
-            Box(
-                modifier = Modifier
-                    .size(12.dp)
-                    .align(Alignment.BottomEnd)
-                    .clip(CircleShape)
-                    .background(QubeePalette.Green),
-            )
-        }
-    }
 }
 
 data class ContactVerificationResult(

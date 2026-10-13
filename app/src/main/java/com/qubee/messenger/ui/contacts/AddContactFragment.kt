@@ -70,9 +70,10 @@ class AddContactFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?,
     ): View {
-        // Pull the full `qubee://identity/...` URI off the deep-link
-        // intent that Navigation hands us via KEY_DEEP_LINK_INTENT.
-        val link = deepLinkUri()
+        // The scanner on the Add someone screen passes the link as an
+        // argument; a tapped qubee://identity/... link arrives as the
+        // deep-link intent Navigation stores under KEY_DEEP_LINK_INTENT.
+        val link = arguments?.getString("link") ?: deepLinkUri()
         return ComposeView(requireContext()).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             setContent { AddContactScreen(viewModel, initialLink = link) }

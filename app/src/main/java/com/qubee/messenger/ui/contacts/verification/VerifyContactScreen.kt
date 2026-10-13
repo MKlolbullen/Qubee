@@ -1,6 +1,6 @@
 package com.qubee.messenger.ui.contacts.verification
 
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,61 +16,49 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.GppGood
+import androidx.compose.material.icons.filled.GppMaybe
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Divider
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.qubee.messenger.R
+import com.qubee.messenger.ui.theme.QubeeDangerButton
+import com.qubee.messenger.ui.theme.QubeeMono
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeePrimaryButton
-import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.QubeeQrCard
+import com.qubee.messenger.ui.theme.QubeeSecondaryButton
+import com.qubee.messenger.ui.theme.QubeeSectionLabel
+import com.qubee.messenger.ui.theme.QubeeTextField
+import com.qubee.messenger.ui.theme.QubeeTopBar
 import com.qubee.messenger.util.QrUtils
 
 /**
- * Full-screen identity verification surface hosted by
- * [ContactVerificationActivity]. Same trust ceremony as the
- * in-chat `VerifyContactDialog`, laid out as a Scaffold instead
- * of an `AlertDialog` so it has room for the SAS, the typed
- * fingerprint field, and the local user's QR side-by-side.
- *
- * Two routes lead to `TrustLevel.VERIFIED`:
- *
- *   1. Type or scan the contact's fingerprint → match against
- *      their stored `IdentityKey` via the Rust `verifyIdentityKey`
- *      JNI export. Mismatches keep the screen open.
- *
- *   2. Tap "Codes match" on the SAS pane after both devices
- *      independently confirm the same 8-digit code. The user's
- *      attestation IS the trust ceremony — there's no bridge
- *      round-trip.
+ * Full-screen identity confirmation hosted by [ContactVerificationActivity].
+ * The short code both phones compute is the main path; the typed or
+ * scanned fingerprint and the local QR stay below it for people who
+ * prefer them. Both routes end in `TrustLevel.VERIFIED` through the
+ * same trust policy.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VerifyContactScreen(
     viewModel: ContactVerificationViewModel,
@@ -86,7 +74,7 @@ fun VerifyContactScreen(
                 is ContactVerificationEvent.Notice ->
                     snackbarHostState.showSnackbar(event.message)
                 ContactVerificationEvent.Verified ->
-                    snackbarHostState.showSnackbar("Verified — trust level is now VERIFIED.")
+                    snackbarHostState.showSnackbar("Confirmed. This contact is now marked as checked in person.")
             }
         }
     }
@@ -94,25 +82,12 @@ fun VerifyContactScreen(
     Scaffold(
         containerColor = QubeePalette.Void,
         snackbarHost = { SnackbarHost(snackbarHostState) },
-        topBar = {
-            TopAppBar(
-                title = { Text("Verify contact", color = QubeePalette.Text) },
-                navigationIcon = {
-                    IconButton(onClick = onClose) {
-                        Icon(
-                            imageVector = Icons.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = QubeePalette.Text,
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = QubeePalette.Void,
-                ),
-            )
-        },
     ) { padding ->
-        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            QubeeTopBar(
+                title = stringResource(R.string.verify_title, state.contactName.ifBlank { "…" }),
+                onBack = onClose,
+            )
             when {
                 state.isLoading -> LoadingContent()
                 state.loadError != null -> LoadErrorContent(state.loadError!!, onClose)
@@ -143,15 +118,14 @@ private fun LoadErrorContent(message: String, onClose: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = "Couldn't load contact",
+            text = stringResource(R.string.verify_load_error),
             color = QubeePalette.Text,
             style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold,
         )
         Spacer(Modifier.height(8.dp))
         QubeeMutedText(text = message)
         Spacer(Modifier.height(24.dp))
-        QubeePrimaryButton(text = "Close", onClick = onClose)
+        QubeePrimaryButton(text = stringResource(R.string.verify_close), onClick = onClose)
     }
 }
 
@@ -164,205 +138,188 @@ internal fun VerifyContent(
     onConfirmSas: () -> Unit,
     onScanQr: () -> Unit,
 ) {
-    val scroll = rememberScrollState()
+    var mismatch by remember { mutableStateOf(false) }
+    val name = state.contactName.ifBlank { "this contact" }
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(scroll)
-            .padding(horizontal = 22.dp, vertical = 18.dp),
+            .verticalScroll(rememberScrollState())
+            .padding(start = 24.dp, end = 24.dp, top = 4.dp, bottom = 28.dp),
     ) {
-        QubeeStatusPill(
-            text = if (state.alreadyVerified) "ALREADY VERIFIED" else "OOB COMPARE",
-        )
-        Spacer(Modifier.height(10.dp))
-        Text(
-            text = state.contactName,
-            color = QubeePalette.Text,
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Black,
-        )
-        Spacer(Modifier.height(4.dp))
         QubeeMutedText(
-            text = "Compare codes over a separate channel — voice call, in person, " +
-                "or another already-trusted app. The two devices compute the same " +
-                "value if no one's tampering with the link.",
+            text = stringResource(R.string.verify_body),
+            style = MaterialTheme.typography.bodyLarge,
         )
 
         Spacer(Modifier.height(20.dp))
-        FingerprintBlock(
-            fingerprint = state.contactFingerprint,
-            typed = state.typedFingerprint,
-            onTypedChange = onTypedFingerprintChange,
-            onScanQr = onScanQr,
-            onConfirm = onConfirmFingerprint,
-        )
-
-        if (state.myFingerprint != null) {
-            Spacer(Modifier.height(20.dp))
-            Divider(color = QubeePalette.PanelAlt)
-            Spacer(Modifier.height(20.dp))
-            MyFingerprintBlock(myFingerprint = state.myFingerprint)
+        val sas = state.sasCode
+        if (sas != null) {
+            SasGrid(sas)
+        } else {
+            QubeeMutedText(stringResource(R.string.verify_no_code))
         }
 
-        if (state.sasCode != null) {
-            Spacer(Modifier.height(20.dp))
-            Divider(color = QubeePalette.PanelAlt)
-            Spacer(Modifier.height(20.dp))
-            SasBlock(sas = state.sasCode, onConfirm = onConfirmSas)
+        if (state.alreadyVerified) {
+            Spacer(Modifier.height(16.dp))
+            NoteCard(
+                text = stringResource(R.string.verify_already, name),
+                color = QubeePalette.Green,
+                icon = Icons.Filled.GppGood,
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        QubeePrimaryButton(
+            text = stringResource(R.string.verify_match),
+            onClick = {
+                mismatch = false
+                onConfirmSas()
+            },
+            enabled = sas != null,
+        )
+        Spacer(Modifier.height(10.dp))
+        QubeeDangerButton(
+            text = stringResource(R.string.verify_mismatch),
+            onClick = { mismatch = true },
+            enabled = sas != null,
+        )
+        if (mismatch) {
+            Spacer(Modifier.height(12.dp))
+            NoteCard(
+                text = stringResource(R.string.verify_mismatch_warning),
+                color = QubeePalette.Warning,
+                icon = Icons.Filled.GppMaybe,
+            )
         }
 
         Spacer(Modifier.height(28.dp))
-    }
-}
-
-@Composable
-private fun FingerprintBlock(
-    fingerprint: String,
-    typed: String,
-    onTypedChange: (String) -> Unit,
-    onScanQr: () -> Unit,
-    onConfirm: () -> Unit,
-) {
-    Text(
-        text = "Their fingerprint as we see it",
-        color = QubeePalette.Text,
-        style = MaterialTheme.typography.titleSmall,
-        fontWeight = FontWeight.SemiBold,
-    )
-    Spacer(Modifier.height(8.dp))
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = QubeePalette.PanelAlt,
-        modifier = Modifier.fillMaxWidth(),
-    ) {
+        QubeeSectionLabel(stringResource(R.string.verify_other_ways))
+        Spacer(Modifier.height(12.dp))
+        QubeeMutedText(
+            stringResource(R.string.verify_their_fingerprint),
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(6.dp))
         Text(
-            text = fingerprint.ifBlank { "Not available" },
-            modifier = Modifier.fillMaxWidth().padding(14.dp),
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold,
+            text = state.contactFingerprint.ifBlank { "Not available" },
             color = QubeePalette.Text,
-            style = MaterialTheme.typography.titleMedium,
+            style = MaterialTheme.typography.bodyMedium,
+            fontFamily = QubeeMono,
         )
-    }
-    Spacer(Modifier.height(14.dp))
-    OutlinedTextField(
-        value = typed,
-        onValueChange = onTypedChange,
-        label = { Text("Fingerprint from contact") },
-        placeholder = { Text("AABB CCDD EEFF GGHH") },
-        singleLine = false,
-        modifier = Modifier.fillMaxWidth(),
-    )
-    Spacer(Modifier.height(8.dp))
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        OutlinedButton(
-            onClick = onScanQr,
-            modifier = Modifier.weight(1f),
-        ) {
-            Icon(
-                imageVector = Icons.Filled.QrCodeScanner,
-                contentDescription = null,
-                tint = QubeePalette.Cyan,
+
+        Spacer(Modifier.height(16.dp))
+        QubeeTextField(
+            value = state.typedFingerprint,
+            onValueChange = onTypedFingerprintChange,
+            label = stringResource(R.string.verify_typed_label, name),
+            singleLine = false,
+            monospace = true,
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            QubeeSecondaryButton(
+                text = stringResource(R.string.verify_scan),
+                onClick = onScanQr,
+                icon = Icons.Filled.QrCodeScanner,
+                modifier = Modifier.weight(1f),
             )
-            Spacer(Modifier.width(8.dp))
-            Text("Scan QR", color = QubeePalette.Cyan)
+            QubeeSecondaryButton(
+                text = stringResource(R.string.verify_typed_button),
+                onClick = onConfirmFingerprint,
+                enabled = state.typedFingerprint.isNotBlank(),
+                modifier = Modifier.weight(1f),
+            )
         }
-        QubeePrimaryButton(
-            text = "Verify",
-            onClick = onConfirm,
-            enabled = typed.isNotBlank(),
-            modifier = Modifier.weight(1f),
-        )
+
+        if (state.myFingerprint != null) {
+            Spacer(Modifier.height(24.dp))
+            Text(
+                stringResource(R.string.verify_let_them_scan),
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(Modifier.height(4.dp))
+            QubeeMutedText(
+                stringResource(R.string.verify_let_them_scan_body),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(12.dp))
+            val bitmap = remember(state.myFingerprint) {
+                QrUtils.encodeAsBitmap(state.myFingerprint, sizePx = 540)
+            }
+            QubeeQrCard(bitmap = bitmap, contentDescription = "Your verification code")
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = state.myFingerprint,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+                fontFamily = QubeeMono,
+                color = QubeePalette.MutedText,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
     }
 }
 
+/** The short code as large cards, two per row, in whatever groups Rust formatted it. */
 @Composable
-private fun MyFingerprintBlock(myFingerprint: String) {
-    Text(
-        text = "Let them scan you",
-        color = QubeePalette.Text,
-        style = MaterialTheme.typography.titleSmall,
-        fontWeight = FontWeight.SemiBold,
-    )
-    Spacer(Modifier.height(6.dp))
-    QubeeMutedText(
-        text = "Show this QR to their device. Their verify screen scans it to " +
-            "confirm your identity at the same time you're confirming theirs.",
-    )
-    Spacer(Modifier.height(12.dp))
-    val bitmap = remember(myFingerprint) {
-        QrUtils.encodeAsBitmap(myFingerprint, sizePx = 540)
-    }
-    if (bitmap != null) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = Color.White,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Box(
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "Your verification QR code",
-                    modifier = Modifier.size(220.dp),
-                )
+private fun SasGrid(sas: String) {
+    val chunks = sas.split(Regex("[\\s-]+")).filter { it.isNotBlank() }
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        chunks.chunked(2).forEachIndexed { rowIndex, pair ->
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                pair.forEachIndexed { column, chunk ->
+                    SasCard(
+                        index = rowIndex * 2 + column + 1,
+                        text = chunk,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (pair.size == 1) Spacer(Modifier.weight(1f))
             }
         }
-        Spacer(Modifier.height(8.dp))
     }
-    Text(
-        text = myFingerprint,
-        modifier = Modifier.fillMaxWidth(),
-        textAlign = TextAlign.Center,
-        fontFamily = FontFamily.Monospace,
-        fontWeight = FontWeight.SemiBold,
-        color = QubeePalette.Text,
-        style = MaterialTheme.typography.bodyMedium,
-    )
 }
 
 @Composable
-private fun SasBlock(sas: String, onConfirm: () -> Unit) {
-    Text(
-        text = "Or compare a SAS code",
-        color = QubeePalette.Text,
-        style = MaterialTheme.typography.titleSmall,
-        fontWeight = FontWeight.SemiBold,
-    )
-    Spacer(Modifier.height(8.dp))
+private fun SasCard(index: Int, text: String, modifier: Modifier = Modifier) {
     Surface(
-        shape = RoundedCornerShape(14.dp),
-        color = QubeePalette.Cyan.copy(alpha = 0.18f),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier,
+        shape = RoundedCornerShape(16.dp),
+        color = QubeePalette.Panel,
+        border = BorderStroke(1.dp, QubeePalette.PanelAlt),
     ) {
-        Box(
-            modifier = Modifier.fillMaxWidth().padding(20.dp),
-            contentAlignment = Alignment.Center,
-        ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
             Text(
-                text = sas,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                color = QubeePalette.Cyan,
-                style = MaterialTheme.typography.headlineMedium,
-                textAlign = TextAlign.Center,
+                text = index.toString(),
+                color = QubeePalette.MutedText,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = text,
+                color = QubeePalette.Text,
+                style = MaterialTheme.typography.headlineSmall,
+                fontFamily = QubeeMono,
             )
         }
     }
-    Spacer(Modifier.height(8.dp))
-    QubeeMutedText(
-        text = "Both devices show the same digits when nothing's intercepting. " +
-            "If they match, tap below.",
-    )
-    Spacer(Modifier.height(12.dp))
-    QubeePrimaryButton(
-        text = "Codes match",
-        onClick = onConfirm,
+}
+
+@Composable
+private fun NoteCard(text: String, color: androidx.compose.ui.graphics.Color, icon: androidx.compose.ui.graphics.vector.ImageVector) {
+    Surface(
         modifier = Modifier.fillMaxWidth(),
-    )
+        shape = RoundedCornerShape(14.dp),
+        color = QubeePalette.Panel,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            QubeeMutedText(text, style = MaterialTheme.typography.bodySmall)
+        }
+    }
 }

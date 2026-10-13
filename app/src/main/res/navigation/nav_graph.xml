@@ -29,6 +29,9 @@
         <action
             android:id="@+id/action_to_group_invite"
             app:destination="@id/groupInviteFragment" />
+        <action
+            android:id="@+id/action_to_connect"
+            app:destination="@id/connectFragment" />
     </fragment>
 
     <fragment
@@ -42,12 +45,33 @@
         <action
             android:id="@+id/action_contact_to_add_contact"
             app:destination="@id/addContactFragment" />
+        <action
+            android:id="@+id/action_contact_to_connect"
+            app:destination="@id/connectFragment" />
     </fragment>
 
     <fragment
         android:id="@+id/navigation_settings"
         android:name="com.qubee.messenger.ui.settings.SettingsFragment"
-        android:label="Settings" />
+        android:label="Settings">
+        <action
+            android:id="@+id/action_settings_to_connect"
+            app:destination="@id/connectFragment" />
+    </fragment>
+
+    <!-- "Add someone": the user's own code to be scanned, the scanner
+         for the other phone's code, and the two discovery routes. -->
+    <fragment
+        android:id="@+id/connectFragment"
+        android:name="com.qubee.messenger.ui.connect.ConnectFragment"
+        android:label="Add someone">
+        <action
+            android:id="@+id/action_connect_to_add_contact"
+            app:destination="@id/addContactFragment" />
+        <action
+            android:id="@+id/action_connect_to_settings"
+            app:destination="@id/navigation_settings" />
+    </fragment>
 
     <fragment
         android:id="@+id/chatFragment"
@@ -84,11 +108,18 @@
         <deepLink app:uri="qubee://invite/{token}" />
     </fragment>
 
-    <!-- Adding a contact from a scanned/pasted qubee://identity/... link. -->
+    <!-- Adding a contact from a scanned/pasted qubee://identity/... link.
+         Reached by deep link, or with a "link" argument from the scanner
+         on the Add someone screen. -->
     <fragment
         android:id="@+id/addContactFragment"
         android:name="com.qubee.messenger.ui.contacts.AddContactFragment"
         android:label="Add contact">
+        <argument
+            android:name="link"
+            app:argType="string"
+            app:nullable="true"
+            android:defaultValue="@null" />
         <deepLink app:uri="qubee://identity/{token}" />
     </fragment>
 

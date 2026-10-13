@@ -5,6 +5,9 @@
         <item name="colorPrimaryVariant">@color/qubee_primary_variant</item>
         <item name="colorOnPrimary">@color/qubee_on_primary</item>
         <item name="colorSecondary">@color/qubee_secondary</item>
-        <item name="android:statusBarColor" tools:targetApi="l">@color/qubee_primary_variant</item>
+        <item name="android:windowBackground">@color/qubee_background</item>
+        <item name="android:statusBarColor" tools:targetApi="l">@color/qubee_background</item>
+        <item name="android:navigationBarColor" tools:targetApi="l">@color/qubee_void2</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
     </style>
 </resources>

@@ -95,7 +95,11 @@ class AddContactFragment : Fragment() {
                 }
                 LaunchedEffect(state.savedContactId) {
                     val contactId = state.savedContactId ?: return@LaunchedEffect
-                    findNavController().navigate(
+                    // The id outlives this view in the view model, so a
+                    // recomposition after the pop must not navigate twice.
+                    val nav = findNavController()
+                    if (nav.currentDestination?.id != R.id.addContactFragment) return@LaunchedEffect
+                    nav.navigate(
                         R.id.action_add_contact_to_chat,
                         Bundle().apply { putString("contactId", contactId) },
                     )

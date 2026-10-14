@@ -71,11 +71,13 @@ fun GroupDetailsSheet(
     onLeaveGroup: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val myRole = members.orEmpty()
+    // A removed member keeps its old role in the roster; only an active
+    // entry grants anything.
+    val me = members.orEmpty()
         .firstOrNull { myIdentityIdHex != null && it.identityIdHex == myIdentityIdHex }
-        ?.role
-    val canManage = myRole == "Owner" || myRole == "Admin"
-    val isOwner = myRole == "Owner"
+        ?.takeIf { it.isActive }
+    val canManage = me?.role == "Owner" || me?.role == "Admin"
+    val isOwner = me?.role == "Owner"
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var confirmLeave by remember { mutableStateOf(false) }
     val name = groupName.ifBlank { "Group" }

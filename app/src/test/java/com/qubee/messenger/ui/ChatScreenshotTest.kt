@@ -8,6 +8,7 @@ import com.qubee.messenger.ui.chat.MessageDeliveryState
 import com.qubee.messenger.ui.chat.UiMessage
 import com.qubee.messenger.ui.chat.UiMessageType
 import java.util.TimeZone
+import org.junit.After
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -22,9 +23,17 @@ class ChatScreenshotTest {
 
     // Message times render through the default zone; pin it so the
     // baselines do not depend on the recording machine.
+    private lateinit var originalTimeZone: TimeZone
+
     @Before
     fun pinTimeZone() {
+        originalTimeZone = TimeZone.getDefault()
         TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+    }
+
+    @After
+    fun restoreTimeZone() {
+        TimeZone.setDefault(originalTimeZone)
     }
 
     private val evening = 1_699_987_320_000L

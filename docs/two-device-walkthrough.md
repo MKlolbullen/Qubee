@@ -235,11 +235,11 @@ useful when running the walkthrough against an older build.)
   Remove / Role picker (owner-only), Leave group, cold-start
   hydration so groups survive an app restart.
 * **OOB SAS gesture** — the symmetric SAS code shows on both
-  ends of the verify screen; tapping "Codes match" persists
+  ends of the confirm screen; tapping "They match" persists
   `TrustLevel.VERIFIED` without a bridge round-trip.
 * **Ownership transfer** — owners can hand the role to an
   existing active member via the Group Details role picker's
-  "Transfer ownership →" entry; the swap is atomic (donor →
+  "Make them the owner" entry; the swap is atomic (donor →
   Admin, target → Owner) via a signed
   `qubee_handshake_ownership_transfer_v1` wire frame, no group
   key rotation needed.

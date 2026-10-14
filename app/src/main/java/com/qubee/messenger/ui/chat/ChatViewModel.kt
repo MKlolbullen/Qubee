@@ -400,8 +400,9 @@ class ChatViewModel @Inject constructor(
 
     /**
      * Reset the local identity via [QubeeManager.resetIdentity] and
-     * re-initialise the core. On success, the conversation drops
-     * back to [ConversationSecurityState.Unverified].
+     * re-initialise the core. The peer's trust state is theirs, not
+     * ours: the contact row still says whether their key was
+     * confirmed, so the header keeps following it.
      */
     fun resetSecureSession() {
         viewModelScope.launch {
@@ -421,14 +422,6 @@ class ChatViewModel @Inject constructor(
                 _events.emit(ChatUiEvent.Notice("Session reset but reinitialisation failed"))
                 return@launch
             }
-            val current = _uiState.value
-            _uiState.value = current.copy(
-                details = current.details.copy(
-                    isVerified = false,
-                    verificationLabel = "Not confirmed yet",
-                ),
-                securityState = ConversationSecurityState.Unverified,
-            )
             _events.emit(ChatUiEvent.Notice("Secure session reset and reinitialised"))
         }
     }

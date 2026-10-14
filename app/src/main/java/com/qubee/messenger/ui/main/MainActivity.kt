@@ -4,8 +4,6 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.view.Menu
-import android.view.MenuItem
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -28,9 +26,6 @@ import com.qubee.messenger.security.SqlCipherKeyProvider
 import com.qubee.messenger.ui.lock.UnlockScreen
 import androidx.navigation.NavController
 import androidx.navigation.fragment.NavHostFragment
-import androidx.navigation.ui.AppBarConfiguration
-import androidx.navigation.ui.navigateUp
-import androidx.navigation.ui.setupActionBarWithNavController
 import androidx.navigation.ui.setupWithNavController
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.qubee.messenger.R
@@ -53,7 +48,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var navController: NavController
-    private lateinit var appBarConfiguration: AppBarConfiguration
     
     private val viewModel: MainViewModel by viewModels()
     private val callViewModel: CallViewModel by viewModels()
@@ -105,7 +99,6 @@ class MainActivity : AppCompatActivity() {
         setupLockOverlay()
         setupCallOverlay()
 
-        setupToolbar()
         setupNavigation(isFreshLaunch = savedInstanceState == null)
 
         // When the DB key is bound to unlock (Screen Lock on), the
@@ -152,11 +145,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupToolbar() {
-        setSupportActionBar(binding.toolbar)
-        supportActionBar?.setDisplayShowTitleEnabled(true)
-    }
-
     private fun setupNavigation(isFreshLaunch: Boolean) {
         val navHostFragment = supportFragmentManager
             .findFragmentById(R.id.nav_host_fragment) as NavHostFragment
@@ -176,35 +164,15 @@ class MainActivity : AppCompatActivity() {
         }
         navController.graph = graph
 
-        // Setup bottom navigation
         binding.bottomNavigation.setupWithNavController(navController)
 
-        // Setup app bar configuration
-        appBarConfiguration = AppBarConfiguration(
-            setOf(
-                R.id.navigation_conversations,
-                R.id.navigation_contacts,
-                R.id.navigation_settings
-            )
-        )
-        setupActionBarWithNavController(navController, appBarConfiguration)
-
-        // Handle navigation changes
+        // Every screen draws its own header; the tab bar belongs to the tabs alone.
         navController.addOnDestinationChangedListener { _, destination, _ ->
-            // The tabs, the chat and the add-someone screen draw their
-            // own headers, so the toolbar only serves the nested screens
-            // that do not. The tab bar belongs to the tabs alone.
             val topLevel = destination.id in setOf(
                 R.id.navigation_conversations,
                 R.id.navigation_contacts,
                 R.id.navigation_settings,
             )
-            val composeHeaded = topLevel || destination.id in setOf(
-                R.id.onboardingFragment,
-                R.id.chatFragment,
-                R.id.connectFragment,
-            )
-            binding.appBarLayout.visibility = if (composeHeaded) View.GONE else View.VISIBLE
             binding.bottomNavigation.visibility = if (topLevel) View.VISIBLE else View.GONE
         }
     }
@@ -534,41 +502,6 @@ class MainActivity : AppCompatActivity() {
             .setMessage(error)
             .setPositiveButton(R.string.ok, null)
             .show()
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menuInflater.inflate(R.menu.main_menu, menu)
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        return when (item.itemId) {
-            R.id.action_search -> {
-                // Handle search
-                true
-            }
-            R.id.action_new_chat -> {
-                // Navigate to contact selection
-                navController.navigate(R.id.contactSelectionFragment)
-                true
-            }
-            R.id.action_new_group -> {
-                // Top-level entry to the create-or-scan group flow.
-                // groupInviteFragment hosts both halves: minting a new
-                // group (with a fresh invite QR) and accepting one.
-                navController.navigate(R.id.groupInviteFragment)
-                true
-            }
-            R.id.action_settings -> {
-                navController.navigate(R.id.navigation_settings)
-                true
-            }
-            else -> super.onOptionsItemSelected(item)
-        }
-    }
-
-    override fun onSupportNavigateUp(): Boolean {
-        return navController.navigateUp(appBarConfiguration) || super.onSupportNavigateUp()
     }
 
     override fun onDestroy() {

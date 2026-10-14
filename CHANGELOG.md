@@ -130,6 +130,16 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
   only screens without a header of their own. The composer's camera
   and microphone buttons, which only queued placeholder rows, are
   gone.
+- The remaining screens follow the same language: the chat (now with
+  Paparazzi baselines of its own), the New chat picker, New group, Add
+  contact, the group details sheet, the call overlay and the camera
+  screen. Add contact's Save button stores the contact through
+  `addContactFromInviteLink` and opens the chat; before, it did
+  nothing. The chat header and details sheet open the one confirm
+  screen instead of a second, differently styled dialog, and the
+  header follows the contact row live, so a confirmation or a changed
+  safety key shows without reopening the chat. The toolbar and its
+  overflow menu are gone: every screen draws its own header.
 - CI: CodeQL analyses Kotlin from source instead of autobuilding the
   app, which the runner cannot do. MobSF findings are published to code
   scanning again rather than only to a 30-day artifact. The clippy

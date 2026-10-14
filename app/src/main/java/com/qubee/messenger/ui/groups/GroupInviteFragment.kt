@@ -10,6 +10,7 @@ import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
 import androidx.navigation.NavController
+import androidx.navigation.fragment.findNavController
 import com.qubee.messenger.util.QrUtils
 import dagger.hilt.android.AndroidEntryPoint
 
@@ -39,7 +40,7 @@ class GroupInviteFragment : Fragment() {
             setContent {
                 GroupInviteScreen(
                     viewModel = viewModel,
-                    onAcceptInvite = { /* hooked up once GroupManager is JNI-exposed */ },
+                    onBack = { findNavController().navigateUp() },
                 )
             }
         }

@@ -6,7 +6,6 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
@@ -25,7 +25,9 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -33,22 +35,27 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.core.content.ContextCompat
 import com.qubee.messenger.BuildConfig
+import com.qubee.messenger.R
 import com.qubee.messenger.calling.VideoSurfaces
 import com.qubee.messenger.data.repository.CallRepository.CallUiState
+import com.qubee.messenger.ui.theme.QubeeAvatar
+import com.qubee.messenger.ui.theme.QubeeMono
+import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
+import com.qubee.messenger.ui.theme.QubeeStatusPill
 import com.qubee.messenger.ui.theme.QubeeTheme
 
 /**
@@ -104,23 +111,25 @@ internal fun IncomingCallBody(
     CallSurface(modifier) {
         CallHeader(
             title = callerLabel,
-            subtitle = if (isVideo) "Incoming video call…" else "Incoming call…",
+            subtitle = stringResource(if (isVideo) R.string.call_incoming_video else R.string.call_incoming),
         )
-        Spacer(Modifier.size(48.dp))
+        Spacer(Modifier.height(56.dp))
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             RoundCallButton(
                 icon = Icons.Filled.CallEnd,
-                tint = QubeePalette.Danger,
-                contentDescription = "Reject call",
+                label = stringResource(R.string.call_decline),
+                tint = QubeePalette.Text,
+                background = QubeePalette.Danger,
                 onClick = onReject,
             )
             RoundCallButton(
                 icon = Icons.Filled.Call,
-                tint = QubeePalette.Green,
-                contentDescription = "Accept call",
+                label = stringResource(R.string.call_answer),
+                tint = QubeePalette.Void,
+                background = QubeePalette.Green,
                 onClick = onAccept,
             )
         }
@@ -143,34 +152,42 @@ internal fun ActiveCallBody(
     CallSurface(modifier) {
         CallHeader(
             title = peerLabel,
-            subtitle = if (isVideo) "Video call" else "Voice call",
+            subtitle = stringResource(if (isVideo) R.string.call_video else R.string.call_voice),
         )
         if (showVideoControls && (isVideo || videoOn)) {
-            RemoteVideoSurface(Modifier.fillMaxWidth().height(260.dp))
-            Spacer(Modifier.size(20.dp))
+            Spacer(Modifier.height(24.dp))
+            RemoteVideoSurface(
+                Modifier
+                    .fillMaxWidth()
+                    .height(260.dp)
+                    .clip(RoundedCornerShape(20.dp)),
+            )
         }
-        Spacer(Modifier.size(48.dp))
+        Spacer(Modifier.height(48.dp))
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
             RoundCallButton(
                 icon = if (muted) Icons.Filled.MicOff else Icons.Filled.Mic,
+                label = stringResource(if (muted) R.string.call_unmute else R.string.call_mute),
                 tint = if (muted) QubeePalette.Warning else QubeePalette.Text,
-                contentDescription = if (muted) "Unmute" else "Mute",
+                background = QubeePalette.PanelAlt,
                 onClick = onToggleMute,
             )
             RoundCallButton(
                 icon = Icons.Filled.CallEnd,
-                tint = QubeePalette.Danger,
-                contentDescription = "Hang up",
+                label = stringResource(R.string.call_hang_up),
+                tint = QubeePalette.Text,
+                background = QubeePalette.Danger,
                 onClick = onHangUp,
             )
             if (showVideoControls) {
                 RoundCallButton(
                     icon = if (videoOn) Icons.Filled.Videocam else Icons.Filled.VideocamOff,
+                    label = stringResource(if (videoOn) R.string.call_video_on else R.string.call_video_off),
                     tint = if (videoOn) QubeePalette.Cyan else QubeePalette.MutedText,
-                    contentDescription = if (videoOn) "Turn video off" else "Turn video on",
+                    background = QubeePalette.PanelAlt,
                     onClick = onToggleVideo,
                 )
             }
@@ -221,43 +238,51 @@ private fun CallSurface(modifier: Modifier = Modifier, content: @Composable () -
 
 @Composable
 private fun CallHeader(title: String, subtitle: String) {
+    QubeeAvatar(initials = "", size = 96.dp, icon = Icons.Outlined.Lock)
+    Spacer(Modifier.height(22.dp))
     Text(
         text = title,
         color = QubeePalette.Text,
-        fontSize = 26.sp,
-        fontWeight = FontWeight.SemiBold,
+        style = MaterialTheme.typography.headlineMedium,
+        fontFamily = QubeeMono,
         textAlign = TextAlign.Center,
     )
-    Spacer(Modifier.size(8.dp))
-    Text(
-        text = subtitle,
-        color = QubeePalette.MutedText,
-        fontSize = 15.sp,
-        textAlign = TextAlign.Center,
-    )
+    Spacer(Modifier.height(8.dp))
+    QubeeMutedText(subtitle, style = MaterialTheme.typography.bodyLarge)
+    Spacer(Modifier.height(14.dp))
+    QubeeStatusPill(text = stringResource(R.string.call_private), color = QubeePalette.Green, dot = true)
 }
 
 @Composable
 private fun RoundCallButton(
     icon: ImageVector,
+    label: String,
     tint: Color,
-    contentDescription: String,
+    background: Color,
     onClick: () -> Unit,
 ) {
-    Surface(
-        color = QubeePalette.PanelAlt,
-        shape = CircleShape,
-        onClick = onClick,
-        modifier = Modifier.size(68.dp),
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Icon(
-                imageVector = icon,
-                contentDescription = contentDescription,
-                tint = tint,
-                modifier = Modifier.size(30.dp),
-            )
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Surface(
+            color = background,
+            shape = CircleShape,
+            onClick = onClick,
+            modifier = Modifier.size(68.dp),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = label,
+                    tint = tint,
+                    modifier = Modifier.size(30.dp),
+                )
+            }
         }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            text = label,
+            color = QubeePalette.MutedText,
+            style = MaterialTheme.typography.labelMedium,
+        )
     }
 }
 

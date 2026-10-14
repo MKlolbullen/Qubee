@@ -1,26 +1,27 @@
 package com.qubee.messenger.ui.chat
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -33,38 +34,28 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.qubee.messenger.R
 import com.qubee.messenger.groups.GroupMemberInfo
+import com.qubee.messenger.ui.theme.QubeeAvatar
+import com.qubee.messenger.ui.theme.QubeeDangerButton
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
+import com.qubee.messenger.ui.theme.QubeeSecondaryButton
 import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.qubeeInitials
 
 /**
- * Bottom sheet variant of `ConversationDetailsSheet` for groups.
- * Shows the group's name + status pill at the top, then the
- * member roster fetched from the Rust core via
- * `ChatViewModel.loadGroupMembers()`.
+ * Bottom sheet for a group chat: the roster from the Rust core, with
+ * add, remove, role and ownership actions gated by the viewer's own
+ * role (`Owner` / `Admin` may remove; only `Owner` may change roles or
+ * hand over ownership, mirroring `GroupManager`'s checks).
  *
- * The roster loads lazily on sheet open: a `LaunchedEffect`
- * triggers `onLoadMembers` once per appearance. While the load
- * is in flight `members == null` and a spinner renders; an empty
- * list (group not yet known Rust-side, or roster genuinely
- * empty) gets the explicit "no members yet" copy instead.
- *
- * Not yet wired:
- *   * "Add member" — needs a `nativeCreateGroupInvite` call
- *     producing a fresh share link.
- *   * "Remove member" / "Promote" — need owner-role gates and
- *     existing JNI exports (`nativeRemoveMember`) /
- *     a missing one (`nativePromoteMember`).
- *   * "Leave group" — needs `nativeRemoveMember(self_id)` plus a
- *     confirm dialog.
- *
- * For now this sheet is read-only; actions land in the next
- * batch.
+ * The roster loads lazily on sheet open. While the load is in flight
+ * `members == null` and a spinner renders; an empty list (group not
+ * yet known Rust-side) gets the explicit empty copy instead.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -83,13 +74,11 @@ fun GroupDetailsSheet(
     val myRole = members.orEmpty()
         .firstOrNull { myIdentityIdHex != null && it.identityIdHex == myIdentityIdHex }
         ?.role
-    val canManage = myRole?.let { it == "Owner" || it == "Admin" } == true
-    // Promote / demote is strictly owner-only Rust-side
-    // (`GroupManager::promote_member` checks `promoter.role == Owner`),
-    // so the UI gate is stricter than `canManage`.
+    val canManage = myRole == "Owner" || myRole == "Admin"
     val isOwner = myRole == "Owner"
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var confirmLeave by remember { mutableStateOf(false) }
+    val name = groupName.ifBlank { "Group" }
 
     LaunchedEffect(Unit) { onLoadMembers() }
 
@@ -97,35 +86,54 @@ fun GroupDetailsSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
         containerColor = QubeePalette.Panel,
+        tonalElevation = 0.dp,
+        dragHandle = null,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 22.dp, vertical = 18.dp),
+                .navigationBarsPadding()
+                .padding(horizontal = 18.dp, vertical = 14.dp),
         ) {
-            QubeeStatusPill("GROUP DETAILS")
-            Spacer(Modifier.height(10.dp))
-            Text(
-                groupName.ifBlank { "Group" },
-                color = QubeePalette.Text,
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Black,
-            )
-            Spacer(Modifier.height(4.dp))
-            QubeeMutedText("Member roster, fetched live from the Rust core.")
-
-            if (canManage) {
-                Spacer(Modifier.height(14.dp))
-                OutlinedButton(
-                    onClick = onAddMember,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Add member", color = QubeePalette.Cyan)
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .width(46.dp)
+                    .height(4.dp),
+                shape = RoundedCornerShape(999.dp),
+                color = QubeePalette.PanelAlt,
+            ) {}
+            Spacer(Modifier.height(16.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                QubeeAvatar(initials = "", icon = Icons.Outlined.Group, color = QubeePalette.MutedText)
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = name,
+                        color = QubeePalette.Text,
+                        style = MaterialTheme.typography.headlineSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (members != null) {
+                        QubeeMutedText(
+                            text = stringResource(R.string.group_sheet_members, members.count { it.isActive }),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
             }
 
-            Spacer(Modifier.height(16.dp))
+            if (canManage) {
+                Spacer(Modifier.height(16.dp))
+                QubeeSecondaryButton(
+                    text = stringResource(R.string.group_sheet_add),
+                    onClick = onAddMember,
+                    icon = Icons.Filled.PersonAdd,
+                )
+            }
 
+            Spacer(Modifier.height(16.dp))
             when {
                 members == null -> LoadingMembers()
                 members.isEmpty() -> EmptyMembers()
@@ -141,34 +149,28 @@ fun GroupDetailsSheet(
             }
 
             Spacer(Modifier.height(20.dp))
-            OutlinedButton(
+            QubeeDangerButton(
+                text = stringResource(R.string.group_sheet_leave),
                 onClick = { confirmLeave = true },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Leave group", color = QubeePalette.Cyan)
-            }
+            )
+            Spacer(Modifier.height(12.dp))
         }
     }
 
     if (confirmLeave) {
         AlertDialog(
             onDismissRequest = { confirmLeave = false },
-            title = { Text("Leave $groupName?") },
-            text = {
-                Text(
-                    "You'll stop receiving messages and the remaining members will rotate the group key. The conversation stays in your inbox so you can scroll back through history, but you can't post or decrypt new messages.",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
+            title = { Text(stringResource(R.string.group_sheet_leave_title, name)) },
+            text = { Text(stringResource(R.string.group_sheet_leave_body), style = MaterialTheme.typography.bodyMedium) },
             confirmButton = {
                 TextButton(onClick = {
                     confirmLeave = false
                     onLeaveGroup()
                     onDismiss()
-                }) { Text("Leave", color = QubeePalette.Cyan) }
+                }) { Text(stringResource(R.string.group_sheet_leave_ok), color = QubeePalette.Danger) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmLeave = false }) { Text("Cancel") }
+                TextButton(onClick = { confirmLeave = false }) { Text(stringResource(R.string.cancel), color = QubeePalette.MutedText) }
             },
         )
     }
@@ -176,13 +178,15 @@ fun GroupDetailsSheet(
 
 @Composable
 private fun LoadingMembers() {
-    Box(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(24.dp),
-        contentAlignment = Alignment.Center,
+            .padding(vertical = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        CircularProgressIndicator(color = QubeePalette.Cyan)
+        CircularProgressIndicator(color = QubeePalette.Cyan, modifier = Modifier.size(22.dp))
+        Spacer(Modifier.width(12.dp))
+        QubeeMutedText(stringResource(R.string.group_sheet_loading))
     }
 }
 
@@ -191,19 +195,15 @@ private fun EmptyMembers() {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
+            .padding(vertical = 12.dp),
     ) {
         Text(
-            "No members yet",
+            text = stringResource(R.string.group_sheet_empty_title),
             color = QubeePalette.Text,
             style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
         )
-        Spacer(Modifier.height(6.dp))
-        QubeeMutedText(
-            text = "The Rust core doesn't have a roster for this group yet — your invite acceptance may still be in flight.",
-        )
+        Spacer(Modifier.height(4.dp))
+        QubeeMutedText(stringResource(R.string.group_sheet_empty_body), style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -221,7 +221,7 @@ internal fun MemberList(
     var pendingRemove by remember { mutableStateOf<GroupMemberInfo?>(null) }
     var pendingPromote by remember { mutableStateOf<GroupMemberInfo?>(null) }
     var pendingTransfer by remember { mutableStateOf<GroupMemberInfo?>(null) }
-    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         items(members, key = { it.identityIdHex }) { member ->
             val isSelf = myIdentityIdHex != null && member.identityIdHex == myIdentityIdHex
             val isMemberOwner = member.role == "Owner"
@@ -239,21 +239,16 @@ internal fun MemberList(
     if (removeTarget != null) {
         AlertDialog(
             onDismissRequest = { pendingRemove = null },
-            title = { Text("Remove ${removeTarget.displayName.ifBlank { "this member" }}?") },
-            text = {
-                Text(
-                    "The Rust core will rotate the group key and the removed member loses access to new messages. They keep their copy of past traffic up to the rotation point.",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
+            title = { Text(stringResource(R.string.group_sheet_remove_title, removeTarget.label())) },
+            text = { Text(stringResource(R.string.group_sheet_remove_body), style = MaterialTheme.typography.bodyMedium) },
             confirmButton = {
                 TextButton(onClick = {
                     onRemoveMember(removeTarget.identityIdHex)
                     pendingRemove = null
-                }) { Text("Remove", color = QubeePalette.Cyan) }
+                }) { Text(stringResource(R.string.group_sheet_remove), color = QubeePalette.Danger) }
             },
             dismissButton = {
-                TextButton(onClick = { pendingRemove = null }) { Text("Cancel") }
+                TextButton(onClick = { pendingRemove = null }) { Text(stringResource(R.string.cancel), color = QubeePalette.MutedText) }
             },
         )
     }
@@ -267,11 +262,8 @@ internal fun MemberList(
                 pendingPromote = null
             },
             onRequestTransferOwnership = {
-                // Hand off from role picker to the transfer
-                // confirmation. The transfer is asymmetric (the
-                // donor *also* changes role, irreversibly) so it
-                // gets its own confirm sheet rather than living
-                // in the role picker proper.
+                // Ownership transfer also changes the donor's role, so it
+                // gets its own confirmation rather than a row in the picker.
                 pendingPromote = null
                 pendingTransfer = promoteTarget
             },
@@ -281,44 +273,25 @@ internal fun MemberList(
     if (transferTarget != null) {
         AlertDialog(
             onDismissRequest = { pendingTransfer = null },
-            title = {
-                Text(
-                    text = "Transfer ownership to ${transferTarget.displayName.ifBlank { "this member" }}?",
-                )
-            },
-            text = {
-                Text(
-                    "You'll lose Owner privileges and become Admin. " +
-                        "${transferTarget.displayName.ifBlank { "They" }} will become Owner. " +
-                        "The Rust core broadcasts a signed atomic role swap; remaining members " +
-                        "converge on the new view. The group key is not rotated, so you keep " +
-                        "full read access as Admin.",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
+            title = { Text(stringResource(R.string.group_sheet_transfer_title, transferTarget.label())) },
+            text = { Text(stringResource(R.string.group_sheet_transfer_body), style = MaterialTheme.typography.bodyMedium) },
             confirmButton = {
                 TextButton(onClick = {
                     onTransferOwnership(transferTarget.identityIdHex)
                     pendingTransfer = null
-                }) { Text("Transfer", color = QubeePalette.Cyan) }
+                }) { Text(stringResource(R.string.group_sheet_transfer_ok), color = QubeePalette.Cyan) }
             },
             dismissButton = {
-                TextButton(onClick = { pendingTransfer = null }) { Text("Cancel") }
+                TextButton(onClick = { pendingTransfer = null }) { Text(stringResource(R.string.cancel), color = QubeePalette.MutedText) }
             },
         )
     }
 }
 
 /**
- * Owner-only role picker. Lists the four assignable roles (`Owner`
- * is excluded — transferring ownership has its own flow that this
- * batch doesn't ship). Greys out the row matching the member's
- * current role.
- *
- * Strings here must match the small fixed vocabulary the JNI
- * accepts (`Admin` / `Moderator` / `Member` / `Observer`); see
- * `Java_com_qubee_messenger_crypto_QubeeManager_nativePromoteMember`
- * in `src/jni_api.rs` for the canonical list.
+ * Owner-only role picker. The four assignable roles are the fixed
+ * vocabulary `nativePromoteMember` accepts (`Admin` / `Moderator` /
+ * `Member` / `Observer`); ownership moves through its own confirmation.
  */
 @Composable
 private fun RolePickerDialog(
@@ -330,13 +303,11 @@ private fun RolePickerDialog(
     val roles = listOf("Admin", "Moderator", "Member", "Observer")
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Change role for ${member.displayName.ifBlank { "this member" }}") },
+        title = { Text(stringResource(R.string.group_sheet_role_title, member.label())) },
         text = {
             Column {
-                QubeeMutedText(
-                    text = "Currently: ${member.role}. The Rust core broadcasts a signed RoleChange so other members converge on the new view.",
-                )
-                Spacer(Modifier.height(12.dp))
+                QubeeMutedText(stringResource(R.string.group_sheet_role_now, member.role))
+                Spacer(Modifier.height(8.dp))
                 roles.forEach { role ->
                     val isCurrent = role == member.role
                     TextButton(
@@ -345,32 +316,26 @@ private fun RolePickerDialog(
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text(
-                            text = if (isCurrent) "$role (current)" else role,
-                            color = if (isCurrent) QubeeMutedColor else QubeePalette.Cyan,
+                            text = if (isCurrent) stringResource(R.string.group_sheet_role_current, role) else role,
+                            color = if (isCurrent) QubeePalette.MutedText else QubeePalette.Cyan,
                         )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-                TextButton(
-                    onClick = onRequestTransferOwnership,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        text = "Transfer ownership →",
-                        color = QubeePalette.Cyan,
-                    )
+                Spacer(Modifier.height(4.dp))
+                TextButton(onClick = onRequestTransferOwnership, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.group_sheet_transfer), color = QubeePalette.Warning)
                 }
             }
         },
         confirmButton = {},
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel), color = QubeePalette.MutedText) }
         },
     )
 }
 
-private val QubeeMutedColor: androidx.compose.ui.graphics.Color
-    get() = QubeePalette.Text.copy(alpha = 0.45f)
+@Composable
+private fun GroupMemberInfo.label(): String = displayName.ifBlank { stringResource(R.string.group_sheet_unnamed) }
 
 @Composable
 private fun MemberRow(
@@ -381,78 +346,43 @@ private fun MemberRow(
     onRequestRemove: () -> Unit,
     onRequestPromote: () -> Unit,
 ) {
-    val initials = member.displayName
-        .split(' ', '\t', '\n')
-        .mapNotNull { it.firstOrNull()?.toString()?.uppercase() }
-        .take(2)
-        .joinToString(separator = "")
-        .ifBlank { member.displayName.take(2).uppercase() }
-        .ifBlank { member.identityIdHex.take(2).uppercase() }
-
+    val name = member.label()
+    val initials = member.displayName.ifBlank { member.identityIdHex.take(2) }.qubeeInitials()
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(QubeePalette.PanelAlt)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            modifier = Modifier
-                .size(38.dp)
-                .clip(CircleShape)
-                .background(QubeePalette.Cyan.copy(alpha = 0.2f)),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                initials,
-                color = QubeePalette.Text,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-            )
-        }
+        QubeeAvatar(initials = initials, size = 40.dp)
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = member.displayName.ifBlank { "Unnamed member" },
+                text = name,
                 color = QubeePalette.Text,
                 style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             QubeeMutedText(
-                text = if (member.isActive) member.role else "${member.role} · removed",
+                text = if (member.isActive) member.role else stringResource(R.string.group_sheet_removed, member.role),
+                style = MaterialTheme.typography.bodySmall,
             )
         }
         if (isSelf) {
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = QubeePalette.Cyan.copy(alpha = 0.18f),
-                modifier = Modifier.padding(start = 8.dp),
-            ) {
-                Text(
-                    "You",
-                    color = QubeePalette.Cyan,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                )
-            }
+            QubeeStatusPill(stringResource(R.string.group_sheet_you))
         } else {
-            // Right-edge actions for non-self rows. Owner / admin
-            // can remove; owner alone can change role. Both can be
-            // visible on the same row when the viewer is the owner.
             if (canPromote) {
                 TextButton(onClick = onRequestPromote) {
-                    Text("Role", color = QubeePalette.Cyan)
+                    Text(stringResource(R.string.group_sheet_role), color = QubeePalette.Cyan)
                 }
             }
             if (canRemove) {
                 TextButton(onClick = onRequestRemove) {
-                    Text("Remove", color = QubeePalette.Cyan)
+                    Text(stringResource(R.string.group_sheet_remove), color = QubeePalette.Cyan)
                 }
             }
         }
     }
+    Divider(modifier = Modifier.padding(start = 52.dp), color = QubeePalette.PanelAlt)
 }

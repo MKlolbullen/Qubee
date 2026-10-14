@@ -7,8 +7,8 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
+import com.qubee.messenger.R
+import com.qubee.messenger.ui.invite.QrScannerActivity
 import com.qubee.messenger.ui.theme.QubeeTheme
 import dagger.hilt.android.AndroidEntryPoint
 
@@ -32,7 +32,7 @@ class ContactVerificationActivity : ComponentActivity() {
 
     private val viewModel: ContactVerificationViewModel by viewModels()
 
-    private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
+    private val scanLauncher = registerForActivityResult(QrScannerActivity.contract()) { result ->
         val payload = result?.contents ?: return@registerForActivityResult
         // The scanned text is whatever the QR encodes — for a Qubee
         // identity QR that's the textual fingerprint. The ViewModel
@@ -51,11 +51,7 @@ class ContactVerificationActivity : ComponentActivity() {
                     onClose = { finish() },
                     onScanQr = {
                         scanLauncher.launch(
-                            ScanOptions().apply {
-                                setPrompt("Scan the contact's verification QR")
-                                setBeepEnabled(false)
-                                setOrientationLocked(false)
-                            },
+                            QrScannerActivity.options(this, getString(R.string.verify_scan_prompt)),
                         )
                     },
                 )

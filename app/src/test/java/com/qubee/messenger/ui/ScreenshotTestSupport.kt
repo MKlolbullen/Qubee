@@ -3,16 +3,18 @@ package com.qubee.messenger.ui
 import androidx.compose.runtime.Composable
 import app.cash.paparazzi.DeviceConfig
 import app.cash.paparazzi.Paparazzi
+import com.android.resources.Density
+import com.android.resources.ScreenRatio
+import com.android.resources.ScreenSize
 import com.qubee.messenger.ui.theme.QubeeTheme
 
 /**
- * Shared Paparazzi rule factory for the screen-level baseline tests.
- *
- * PIXEL_5 is the closest built-in [DeviceConfig] to the reference
- * Galaxy S25 form factor these screens were laid out against
- * (~360x780 dp, 3x density). Keeping every screen on one device
- * config means a global theme/typography change shows up as one
- * consistent diff across all baselines rather than per-device noise.
+ * The reference phone: a Galaxy S25 Ultra, 6.9" 3120x1440 at 498 ppi.
+ * Android runs it at 560 dpi (3.5x), so the screens lay out at
+ * 411x891 dp, which is what these baselines render. Keeping every
+ * screen on one device config means a global theme/typography change
+ * shows up as one consistent diff across all baselines rather than
+ * per-device noise.
  *
  * Record baselines:  ./gradlew :app:recordPaparazziDebug
  * Verify against:    ./gradlew :app:verifyPaparazziDebug
@@ -23,7 +25,18 @@ import com.qubee.messenger.ui.theme.QubeeTheme
  * That keeps them deterministic and makes a snapshot diff mean "the
  * pixels changed", never "the backend behaved differently".
  */
-internal fun paparazziRule(): Paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)
+internal val GALAXY_S25_ULTRA: DeviceConfig = DeviceConfig.PIXEL_5.copy(
+    screenHeight = 3120,
+    screenWidth = 1440,
+    xdpi = 498,
+    ydpi = 498,
+    density = Density.DPI_560,
+    ratio = ScreenRatio.LONG,
+    size = ScreenSize.NORMAL,
+    released = "February 7, 2025",
+)
+
+internal fun paparazziRule(): Paparazzi = Paparazzi(deviceConfig = GALAXY_S25_ULTRA)
 
 /**
  * Snapshot [content] wrapped in [QubeeTheme] — the one piece of the

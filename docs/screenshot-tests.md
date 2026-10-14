@@ -37,7 +37,7 @@ JVM-only). Pattern:
 ```kotlin
 class FooScreenshotTest {
     @get:Rule
-    val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)
+    val paparazzi = paparazziRule() // the Galaxy S25 Ultra profile, see ScreenshotTestSupport.kt
 
     @Test fun foo_default_state() = paparazzi.snapshot {
         QubeeTheme { FooScreenContent(state = FooState()) }
@@ -65,18 +65,15 @@ function. The pattern:
 
 ## Device config
 
-`DeviceConfig.PIXEL_5` is the default in this repo because it matches
-the Galaxy S25 form factor closely enough (~360x780 dp at default
-font scale). For other devices Paparazzi ships:
-
-* `DeviceConfig.NEXUS_5` — small phone
-* `DeviceConfig.PIXEL_5` — default
-* `DeviceConfig.PIXEL_6_PRO` — large phone
-* `DeviceConfig.NEXUS_7_2012` — tablet
-
-…or you can construct a custom `DeviceConfig` with explicit
-`screenWidth`, `screenHeight`, `density` if you need to test a
-specific form factor.
+The reference phone is a Galaxy S25 Ultra. `GALAXY_S25_ULTRA` in
+`ScreenshotTestSupport.kt` is a custom `DeviceConfig` for it:
+3120x1440 at 498 ppi, rendered at 560 dpi (3.5x), so every screen
+lays out at 411x891 dp, the same as on the phone. `paparazziRule()`
+uses it; every baseline is recorded on it so a theme change shows up
+as one consistent diff. For other form factors Paparazzi ships
+`DeviceConfig.NEXUS_5` (small phone), `PIXEL_5`, `PIXEL_6_PRO` (large
+phone) and `NEXUS_7_2012` (tablet), or construct a `DeviceConfig`
+with explicit `screenWidth`, `screenHeight` and `density`.
 
 ## CI integration
 

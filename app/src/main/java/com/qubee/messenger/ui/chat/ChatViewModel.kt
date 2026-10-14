@@ -125,7 +125,7 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    private fun applyContact(contact: Contact?) {
+    private suspend fun applyContact(contact: Contact?) {
         val trust = contact?.let { QubeeTrust.of(it.trustLevel) } ?: QubeeTrust.Unverified
         // The Kotlin-side 8-byte fingerprint never matched what the other
         // phone shows; only the Rust canonical one is worth displaying.

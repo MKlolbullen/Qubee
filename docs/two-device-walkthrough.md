@@ -55,7 +55,7 @@ On first launch, each device runs through `OnboardingScreen`:
      bundle, persists the keypair, and returns the JSON bundle plus
      the `qubee://identity/<token>` deep link.
 3. The screen displays your 8-byte BLAKE3 fingerprint:
-   `"AABB CCDD EEFF GGHH"`. This is what the verification dialog
+   `"AABB CCDD EEFF GGHH"`. This is what the confirm screen
    displays later — the format is canonical, both devices see the
    same string for the same identity bytes.
 
@@ -150,86 +150,70 @@ different identity in the QR scan; the handshake would succeed
 because the MITM signs everything correctly with their own key.
 The OOB ceremony is what closes that gap.
 
-There are two entry-points to the same ceremony:
+There is one confirm screen (`VerifyContactScreen`, hosted by
+`ContactVerificationActivity`) and two ways into it:
 
-* **In-chat:** open the chat with the contact, tap the details
-  arrow, then `Verify`. Renders the same widget as an
-  `AlertDialog` over the chat.
-* **Standalone:** from the Contacts tab, long-press the contact
-  and tap `Verify` (or `Re-verify` if the row already shows the
-  cyan check). Launches `ContactVerificationActivity`, which
-  hosts the same widget as a full-screen Scaffold — preferred
-  when both devices are co-located and you want a larger QR for
-  scanning.
+* **In-chat:** tap the trust line under the contact's name in the
+  chat header, or open the details sheet and tap "Confirm it is
+  really …". The chat hands the contact's identity id to the
+  screen and follows the contact row live, so the header reads
+  "Private · Confirmed in person" the moment the ceremony lands.
+* **Standalone:** from the Contacts tab, tap "Confirm" on the row
+  (or long-press → "Confirm identity").
 
-Both surfaces accept **two** routes that arrive at the same
-end-state:
+The screen offers two routes that arrive at the same end-state:
 
-### 4a. Fingerprint compare
+### 4a. Short code (SAS)
 
-On device A:
+The screen leads with an 8-digit "NNNN NNNN" code as two cards.
+Both devices independently compute the same code (Rust orders the
+byte buffers lexicographically before BLAKE3-hashing them).
 
-1. Tap the contact's name in the chat top bar → details sheet
-   appears.
-2. Tap "Verify". The sheet closes; the verification dialog opens.
-3. The dialog shows a `"AABB CCDD EEFF GGHH"` string —
-   **device A's local view of B's fingerprint**, computed via
-   `qubeeManager.computeFingerprint(B's identityKey)`.
-4. Read this string out loud to device B's user.
+1. On device A, open the confirm screen for B.
+2. On device B, open the confirm screen for A.
+3. Read the code to each other.
+4. If it matches, tap "They match" on both devices. The `Contact`
+   row updates: `trustLevel = VERIFIED`,
+   `verificationStatus = VERIFIED_ONCE`. "They do not match" leaves
+   the contact unconfirmed and shows a warning.
 
-On device B:
+### 4b. Fingerprint compare (alternative)
 
-1. Open the chat with A; tap details → "Verify".
-2. Type (or paste) the string A read out into the "Fingerprint
-   from contact" field.
-3. Tap "Verify".
+Under "Other ways to check" the screen shows **device A's local
+view of B's fingerprint**, computed via
+`qubeeManager.computeFingerprint(B's identityKey)`.
+
+1. On device A, read the fingerprint out loud to device B's user.
+2. On device B, type it into "Fingerprint read out by A" and tap
+   "Check fingerprint", or tap "Scan their code" and point the
+   camera at the QR under "Let them scan you" on A's screen.
 
 Behind the scenes on B:
 `qubeeManager.verifyIdentityKey(A's contactId, A's identityKey,
 typed_bytes)` — the Rust side computes B's local view of A's
 fingerprint, normalises spaces and case, compares against the
-typed bytes. On match, B's `Contact` row updates:
-`trustLevel = VERIFIED`, `verificationStatus = VERIFIED_ONCE`.
-The security badge flips to "Verified" — cyan, with the
-`VerifiedUser` icon. The dialog dismisses.
+typed bytes. On match the same row update as 4a lands.
 
-A repeats the same on their side (typing the fingerprint B
-dictates). Now both sides see "Verified" persistently.
-
-### 4b. SAS compare (alternative)
-
-Same dialog. Below the fingerprint section, an 8-digit
-"NNNN NNNN" code is displayed prominently. Both devices
-independently compute the same code (Rust orders the byte
-buffers lexicographically before BLAKE3-hashing them).
-
-1. On device A, open the verify dialog.
-2. On device B, open the verify dialog.
-3. Both users look at the SAS code on their respective screens.
-4. If the codes match, tap "Codes match" on both devices. The
-   trust ceremony is complete; persistence + UI flip identical to
-   4a.
-
-SAS is faster than fingerprint compare — 8 digits versus 16 hex
-characters with separators — and works well over voice. Either
-ceremony writes the same `Contact` row state.
+A repeats the same on their side. Now both sides see "Confirmed in
+person" persistently. The short code is faster than the
+fingerprint and works well over voice; either route writes the
+same `Contact` row state.
 
 ## 5. Restart & verify persistence
 
 Force-stop both apps; relaunch.
 
 * The chats list shows the previous conversations.
-* Opening a verified chat should show "Verified" in the top bar
-  (the badge respects `Contact.trustLevel`).
+* Opening a confirmed chat should show "Private · Confirmed in
+  person" in the top bar (the header follows `Contact.trustLevel`).
 * Sending another message round-trips as before — the libp2p
   identity is stable across launches (Ed25519 keypair persists),
   so the contact's `peerId` stays valid.
 
-If "Verified" reverts to "Unverified" after restart, the
-persistence path is broken — file an issue with the contact id
-and the timestamp; the
-`ChatViewModel.init`-reads-`contact.trustLevel` path is the
-likely culprit.
+If "Confirmed in person" reverts to "Not confirmed yet" after
+restart, the persistence path is broken — file an issue with the
+contact id and the timestamp; `ChatViewModel.applyContact`, which
+maps `Contact.trustLevel` to the header, is the likely culprit.
 
 ## What's deferred
 
@@ -241,22 +225,21 @@ likely culprit.
 (Items previously listed as deferred that have since landed —
 useful when running the walkthrough against an older build.)
 
-* **QR-scan flavor of the verify dialog** — landed in the in-chat
-  `VerifyContactDialog` and in the new `VerifyContactScreen` that
-  `ContactVerificationActivity` hosts (long-press a contact →
-  Verify). Both routes feed the scanned text into the same
-  `verifyIdentityKey` JNI path as a typed value.
+* **QR-scan flavor of the confirm screen** — "Scan their code" on
+  `VerifyContactScreen` feeds the scanned text into the same
+  `verifyIdentityKey` JNI path as a typed value. The chat opens
+  that same screen; the earlier in-chat dialog is gone.
 * **Group chat (>2 members)** — full UX shipped: create a group
   from contact selection, mint invites, accept invites via QR /
   paste, member roster in `GroupDetailsSheet`, Add member /
   Remove / Role picker (owner-only), Leave group, cold-start
   hydration so groups survive an app restart.
 * **OOB SAS gesture** — the symmetric SAS code shows on both
-  ends of the verify screen; tapping "Codes match" persists
+  ends of the confirm screen; tapping "They match" persists
   `TrustLevel.VERIFIED` without a bridge round-trip.
 * **Ownership transfer** — owners can hand the role to an
   existing active member via the Group Details role picker's
-  "Transfer ownership →" entry; the swap is atomic (donor →
+  "Make them the owner" entry; the swap is atomic (donor →
   Admin, target → Owner) via a signed
   `qubee_handshake_ownership_transfer_v1` wire frame, no group
   key rotation needed.

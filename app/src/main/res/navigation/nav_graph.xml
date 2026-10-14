@@ -92,8 +92,8 @@
             app:popUpTo="@id/contactSelectionFragment"
             app:popUpToInclusive="true" />
         <action
-            android:id="@+id/action_selection_to_add_contact"
-            app:destination="@id/addContactFragment" />
+            android:id="@+id/action_selection_to_connect"
+            app:destination="@id/connectFragment" />
     </fragment>
 
     <!-- Group invite / scan flow. The {token} placeholder lets Navigation
@@ -121,6 +121,16 @@
             app:nullable="true"
             android:defaultValue="@null" />
         <deepLink app:uri="qubee://identity/{token}" />
+        <!-- Saving opens the new chat; Back from there must not return
+             to a preview that has already been saved. -->
+        <action
+            android:id="@+id/action_add_contact_to_chat"
+            app:destination="@id/chatFragment"
+            app:popUpTo="@id/addContactFragment"
+            app:popUpToInclusive="true" />
+        <action
+            android:id="@+id/action_add_contact_to_connect"
+            app:destination="@id/connectFragment" />
     </fragment>
 
 </navigation>

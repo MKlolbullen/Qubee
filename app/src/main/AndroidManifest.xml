@@ -72,7 +72,7 @@
             android:screenOrientation="fullSensor"
             android:stateNotNeeded="true"
             android:taskAffinity=""
-            android:theme="@style/Theme.AppCompat"
+            android:theme="@style/Theme.Qubee"
             android:windowSoftInputMode="stateAlwaysHidden" />
 
         <!-- OOB identity verification: fingerprint compare, scan-peer-QR,

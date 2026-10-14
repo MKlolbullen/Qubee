@@ -1,78 +1,79 @@
 package com.qubee.messenger.ui.groups
 
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.GppMaybe
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Divider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.qubee.messenger.R
 import com.qubee.messenger.ui.invite.QrScannerActivity
 import com.qubee.messenger.ui.theme.QubeeMutedText
 import com.qubee.messenger.ui.theme.QubeePalette
 import com.qubee.messenger.ui.theme.QubeePanel
 import com.qubee.messenger.ui.theme.QubeePrimaryButton
-import com.qubee.messenger.ui.theme.QubeeScreen
+import com.qubee.messenger.ui.theme.QubeeQrCard
 import com.qubee.messenger.ui.theme.QubeeSecondaryButton
+import com.qubee.messenger.ui.theme.QubeeSectionLabel
 import com.qubee.messenger.ui.theme.QubeeStatusPill
+import com.qubee.messenger.ui.theme.QubeeTextField
 import com.qubee.messenger.ui.theme.QubeeTheme
+import com.qubee.messenger.ui.theme.QubeeTopBar
 import com.qubee.messenger.util.QrUtils
+import com.qubee.messenger.util.shareText
 
 /**
- * Group invite screen.
- *
- * - Create a local group and render a `qubee://invite/...` deep link as QR.
- * - Scan or paste an inbound invite and inspect the signed envelope before join.
- * - Network acceptance is delegated through [onAcceptInvite] to keep UI pure.
+ * New group: create one and show its invite as a code, or join one by
+ * scanning or pasting an invite. Acceptance is the view model's job;
+ * the screen only reports how the signed join request went.
  */
 @Composable
 fun GroupInviteScreen(
     viewModel: GroupInviteViewModel,
-    onAcceptInvite: (link: String) -> Unit,
+    onBack: () -> Unit,
 ) {
     QubeeTheme {
         val state by viewModel.state.collectAsStateWithLifecycle()
         val context = LocalContext.current
         val snackbarHost = remember { SnackbarHostState() }
-        var pastedLink by remember { mutableStateOf("") }
-        var newGroupName by remember { mutableStateOf("") }
+        var pastedLink by rememberSaveable { mutableStateOf("") }
+        var newGroupName by rememberSaveable { mutableStateOf("") }
+        val scanPrompt = stringResource(R.string.group_scan_prompt)
+        val shareTitle = stringResource(R.string.chat_share_invite_title)
 
         val scanLauncher = rememberLauncherForActivityResult(QrScannerActivity.contract()) { result ->
             result.contents?.let { scanned ->
-                if (QrUtils.isInviteLink(scanned)) {
-                    viewModel.decodeScannedLink(scanned)
-                }
+                if (QrUtils.isInviteLink(scanned)) viewModel.decodeScannedLink(scanned)
             }
         }
 
@@ -86,176 +87,188 @@ fun GroupInviteScreen(
             containerColor = QubeePalette.Void,
             snackbarHost = { SnackbarHost(snackbarHost) },
         ) { padding ->
-            QubeeScreen(
+            GroupInviteBody(
+                state = state,
+                maxMembers = viewModel.maxMembers,
+                newGroupName = newGroupName,
+                onNewGroupNameChange = { newGroupName = it },
+                pastedLink = pastedLink,
+                onPastedLinkChange = { pastedLink = it },
+                onBack = onBack,
+                onCreate = { viewModel.createGroupAndInvite(newGroupName.trim()) },
+                onShareInvite = { state.generatedLink?.let { shareText(context, it, shareTitle) } },
+                onScan = { scanLauncher.launch(QrScannerActivity.options(context, scanPrompt)) },
+                onInspect = { viewModel.decodeScannedLink(pastedLink.trim()) },
+                onJoin = viewModel::acceptInvite,
+                onDiscard = viewModel::clearScanned,
                 modifier = Modifier.padding(padding),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(20.dp)
-                        .verticalScroll(rememberScrollState()),
-                    horizontalAlignment = Alignment.CenterHorizontally,
+            )
+        }
+    }
+}
+
+/** Stateless render of the New group screen, exposed for Paparazzi. */
+@Composable
+@androidx.annotation.VisibleForTesting
+internal fun GroupInviteBody(
+    state: InviteUiState,
+    maxMembers: Int,
+    newGroupName: String,
+    onNewGroupNameChange: (String) -> Unit,
+    pastedLink: String,
+    onPastedLinkChange: (String) -> Unit,
+    onBack: () -> Unit,
+    onCreate: () -> Unit,
+    onShareInvite: () -> Unit,
+    onScan: () -> Unit,
+    onInspect: () -> Unit,
+    onJoin: () -> Unit,
+    onDiscard: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxSize()) {
+        QubeeTopBar(title = stringResource(R.string.group_title), onBack = onBack)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 28.dp),
+        ) {
+            if (state.isWorking) {
+                Row(
+                    modifier = Modifier.padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    QubeeStatusPill("GROUP HANDSHAKE")
+                    CircularProgressIndicator(color = QubeePalette.Cyan, modifier = Modifier.size(22.dp))
+                    Spacer(Modifier.width(12.dp))
+                    QubeeMutedText(stringResource(R.string.group_working))
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            val link = state.generatedLink
+            if (link == null && state.scannedInvite == null) {
+                QubeePanel {
+                    Text(
+                        text = stringResource(R.string.group_create_title),
+                        color = QubeePalette.Text,
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    QubeeMutedText(
+                        text = stringResource(R.string.group_create_body, maxMembers),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    QubeeTextField(
+                        value = newGroupName,
+                        onValueChange = onNewGroupNameChange,
+                        label = stringResource(R.string.group_name_label),
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    QubeePrimaryButton(
+                        text = stringResource(R.string.group_create_button),
+                        onClick = onCreate,
+                        enabled = newGroupName.isNotBlank() && !state.isWorking,
+                    )
+                }
+            }
+
+            if (link != null) {
+                val bitmap = remember(link) { QrUtils.encodeAsBitmap(link, sizePx = 540) }
+                QubeeQrCard(
+                    bitmap = bitmap,
+                    contentDescription = stringResource(R.string.group_qr_description),
+                    title = state.groupName ?: stringResource(R.string.group_invite_ready),
+                    body = stringResource(R.string.group_qr_body),
+                )
+                Spacer(Modifier.height(12.dp))
+                QubeeSecondaryButton(
+                    text = stringResource(R.string.group_share_invite),
+                    onClick = onShareInvite,
+                    icon = Icons.Filled.Share,
+                )
+            }
+
+            val invite = state.scannedInvite
+            if (invite != null) {
+                Spacer(Modifier.height(if (link != null) 20.dp else 0.dp))
+                QubeePanel {
+                    QubeeStatusPill(
+                        text = stringResource(if (invite.isExpired) R.string.group_invite_expired else R.string.group_invite_checked),
+                        color = if (invite.isExpired) QubeePalette.Danger else QubeePalette.Green,
+                    )
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "Invite without leaking the hive.",
+                        text = invite.groupName,
                         color = QubeePalette.Text,
-                        style = MaterialTheme.typography.headlineMedium,
-                        fontWeight = FontWeight.Black,
+                        style = MaterialTheme.typography.headlineSmall,
                     )
-                    Spacer(Modifier.height(6.dp))
-                    QubeeMutedText(
-                        "Create a local group invite, scan a peer's code, or paste a signed deep link. Max ${viewModel.maxMembers} members including creator.",
-                        modifier = Modifier.fillMaxWidth(),
+                    Spacer(Modifier.height(4.dp))
+                    QubeeMutedText(stringResource(R.string.group_invite_from, invite.inviterName, invite.maxMembers))
+                    if (invite.isExpired) {
+                        Spacer(Modifier.height(10.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.GppMaybe, contentDescription = null, tint = QubeePalette.Warning, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            QubeeMutedText(stringResource(R.string.group_invite_expired_note), style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    state.acceptanceResult?.let { result ->
+                        Spacer(Modifier.height(10.dp))
+                        QubeeMutedText(
+                            text = stringResource(if (result.networkPublished) R.string.group_accept_sent else R.string.group_accept_offline),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    QubeePrimaryButton(
+                        text = if (state.accepted) stringResource(R.string.group_joined) else stringResource(R.string.group_join_button, invite.groupName),
+                        onClick = onJoin,
+                        enabled = !invite.isExpired && state.scannedLink != null && !state.accepted && !state.isWorking,
                     )
+                    Spacer(Modifier.height(10.dp))
+                    QubeeSecondaryButton(text = stringResource(R.string.group_discard), onClick = onDiscard)
+                }
+            }
 
-                    Spacer(Modifier.height(22.dp))
-
-                    if (state.isWorking) {
-                        QubeePanel {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                CircularProgressIndicator(color = QubeePalette.Cyan, modifier = Modifier.size(28.dp))
-                                Spacer(Modifier.width(12.dp))
-                                QubeeMutedText("Signing invite envelope…")
-                            }
-                        }
-                        Spacer(Modifier.height(16.dp))
-                    }
-
-                    if (state.generatedLink == null && state.scannedInvite == null) {
-                        QubeePanel {
-                            Text("Create new group", style = MaterialTheme.typography.titleLarge)
-                            Spacer(Modifier.height(6.dp))
-                            QubeeMutedText("Mint a fresh invite QR for a peer sitting next to you. Old-school social ritual, post-quantum bones.")
-                            Spacer(Modifier.height(16.dp))
-                            OutlinedTextField(
-                                value = newGroupName,
-                                onValueChange = { newGroupName = it },
-                                label = { Text("Group name") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                            Spacer(Modifier.height(14.dp))
-                            QubeePrimaryButton(
-                                text = "Create group + invite",
-                                onClick = { viewModel.createGroupAndInvite(newGroupName.trim()) },
-                                enabled = newGroupName.isNotBlank() && !state.isWorking,
-                            )
-                        }
-                        Spacer(Modifier.height(16.dp))
-                    }
-
-                    state.generatedLink?.let { link ->
-                        val bitmap = remember(link) { QrUtils.encodeAsBitmap(link) }
-                        QubeePanel {
-                            Text(
-                                state.groupName ?: "Invite ready",
-                                style = MaterialTheme.typography.titleLarge,
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            QubeeMutedText("Show this QR to the peer you want inside the group. Screenshotting invites is convenient. Also cursed. Prefer live exchange.")
-                            Spacer(Modifier.height(16.dp))
-                            bitmap?.let {
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.CenterHorizontally)
-                                        .size(248.dp)
-                                        .clip(RoundedCornerShape(28.dp))
-                                        .background(QubeePalette.Text)
-                                        .padding(12.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Image(
-                                        bitmap = it.asImageBitmap(),
-                                        contentDescription = "Group invite QR code",
-                                        modifier = Modifier.fillMaxSize(),
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                link,
-                                color = QubeePalette.MutedText,
-                                style = MaterialTheme.typography.bodySmall,
-                                maxLines = 3,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        Spacer(Modifier.height(16.dp))
-                    }
-
-                    QubeePanel {
-                        Text("Join existing group", style = MaterialTheme.typography.titleLarge)
-                        Spacer(Modifier.height(6.dp))
-                        QubeeMutedText("Scan a QR or paste a `qubee://invite/...` link. The app inspects the envelope before enabling join.")
-                        Spacer(Modifier.height(16.dp))
-
-                        QubeeSecondaryButton(
-                            text = "Scan invite QR",
-                            onClick = { scanLauncher.launch(QrScannerActivity.options(context)) },
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        OutlinedTextField(
-                            value = pastedLink,
-                            onValueChange = { pastedLink = it },
-                            label = { Text("Paste qubee://invite/...") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        QubeePrimaryButton(
-                            text = "Inspect link",
-                            onClick = { viewModel.decodeScannedLink(pastedLink.trim()) },
-                            enabled = QrUtils.isInviteLink(pastedLink.trim()) && !state.isWorking,
-                        )
-                    }
-
-                    state.scannedInvite?.let { invite ->
-                        Spacer(Modifier.height(16.dp))
-                        QubeePanel {
-                            QubeeStatusPill(if (invite.isExpired) "EXPIRED" else "INVITE VERIFIED")
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                invite.groupName,
-                                style = MaterialTheme.typography.titleLarge,
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            QubeeMutedText("Invitation from ${invite.inviterName}")
-                            QubeeMutedText("Members allowed: ${invite.maxMembers}")
-                            if (invite.isExpired) {
-                                Spacer(Modifier.height(8.dp))
-                                Text(
-                                    "This invite has expired.",
-                                    color = MaterialTheme.colorScheme.error,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            }
-                            state.acceptanceResult?.let { result ->
-                                Spacer(Modifier.height(10.dp))
-                                val msg = if (result.networkPublished) {
-                                    "Saved. A signed handshake was sent; the inviter's device will enrol you when it sees it."
-                                } else {
-                                    "Saved locally. Network publish failed; reopen the chat while connected to retry."
-                                }
-                                QubeeMutedText(msg)
-                            }
-                            Spacer(Modifier.height(14.dp))
-                            QubeePrimaryButton(
-                                text = if (state.accepted) "Saved" else "Join ${invite.groupName}",
-                                onClick = {
-                                    viewModel.acceptInvite()
-                                    state.scannedLink?.let(onAcceptInvite)
-                                },
-                                enabled = !invite.isExpired && state.scannedLink != null && !state.accepted,
-                            )
-                            Spacer(Modifier.height(10.dp))
-                            QubeeSecondaryButton(
-                                text = "Discard",
-                                onClick = { viewModel.clearScanned() },
-                            )
-                        }
-                    }
+            if (invite == null) {
+                Spacer(Modifier.height(24.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Divider(modifier = Modifier.weight(1f), color = QubeePalette.PanelAlt)
+                    Spacer(Modifier.width(12.dp))
+                    QubeeSectionLabel(stringResource(R.string.group_join_divider))
+                    Spacer(Modifier.width(12.dp))
+                    Divider(modifier = Modifier.weight(1f), color = QubeePalette.PanelAlt)
+                }
+                Spacer(Modifier.height(20.dp))
+                QubeePanel {
+                    Text(
+                        text = stringResource(R.string.group_join_title),
+                        color = QubeePalette.Text,
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    QubeeMutedText(stringResource(R.string.group_join_body), style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(14.dp))
+                    QubeeSecondaryButton(
+                        text = stringResource(R.string.group_scan),
+                        onClick = onScan,
+                        icon = Icons.Filled.QrCodeScanner,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    QubeeTextField(
+                        value = pastedLink,
+                        onValueChange = onPastedLinkChange,
+                        placeholder = stringResource(R.string.group_paste_placeholder),
+                        monospace = true,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    QubeePrimaryButton(
+                        text = stringResource(R.string.group_check_link),
+                        onClick = onInspect,
+                        enabled = QrUtils.isInviteLink(pastedLink.trim()) && !state.isWorking,
+                    )
                 }
             }
         }

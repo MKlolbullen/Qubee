@@ -11,6 +11,12 @@
     <color name="qubee_on_background">#EAFBFF</color>
     <color name="qubee_muted_text">#A3BDCA</color>
 
+    <!-- Camera screen: translucent Void over the preview, cyan finder. -->
+    <color name="qubee_scanner_bar">#CC040C16</color>
+    <color name="qubee_scanner_mask">#99040C16</color>
+    <color name="qubee_scanner_result">#9912EAD8</color>
+    <color name="qubee_scanner_points">#C012EAD8</color>
+
     <color name="qubee_quantum_cyan">#12EAD8</color>
     <color name="qubee_quantum_blue">#00A7FF</color>
     <color name="qubee_quantum_green">#8CFF72</color>

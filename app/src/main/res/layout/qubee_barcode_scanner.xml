@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The inner layout DecoratedBarcodeView inflates (zxing_scanner_layout).
+     The three view ids are fixed by the library. -->
+<merge xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <com.journeyapps.barcodescanner.BarcodeView
+        android:id="@+id/zxing_barcode_surface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:zxing_framing_rect_height="260dp"
+        app:zxing_framing_rect_width="260dp" />
+
+    <com.journeyapps.barcodescanner.ViewfinderView
+        android:id="@+id/zxing_viewfinder_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:zxing_possible_result_points="@color/qubee_scanner_points"
+        app:zxing_result_view="@color/qubee_scanner_result"
+        app:zxing_viewfinder_laser="@color/qubee_primary"
+        app:zxing_viewfinder_mask="@color/qubee_scanner_mask" />
+
+    <TextView
+        android:id="@+id/zxing_status_view"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginBottom="48dp"
+        android:background="@drawable/bg_scanner_hint"
+        android:fontFamily="@font/manrope_variable"
+        android:gravity="center"
+        android:paddingStart="18dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="12dp"
+        android:textColor="@color/qubee_on_background"
+        android:textFontWeight="600"
+        android:textSize="15sp" />
+
+</merge>

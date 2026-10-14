@@ -3,6 +3,7 @@ package com.qubee.messenger.ui.chat
 import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -28,9 +29,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GppGood
+import androidx.compose.material.icons.filled.GppMaybe
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Lock
@@ -67,14 +70,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.qubee.messenger.R
 import com.qubee.messenger.transfer.FileTransfer
-import com.qubee.messenger.ui.invite.QrScannerActivity
+import com.qubee.messenger.ui.contacts.verification.ContactVerificationActivity
 import com.qubee.messenger.ui.theme.QubeeAvatar
 import com.qubee.messenger.ui.theme.QubeeDangerButton
 import com.qubee.messenger.ui.theme.QubeeIconButton
@@ -85,11 +90,11 @@ import com.qubee.messenger.ui.theme.QubeePrimaryButton
 import com.qubee.messenger.ui.theme.QubeeSecondaryButton
 import com.qubee.messenger.ui.theme.QubeeTheme
 import com.qubee.messenger.ui.theme.qubeeInitials
+import com.qubee.messenger.util.shareText
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
@@ -101,9 +106,10 @@ fun ChatScreen(
         var inputText by remember { mutableStateOf("") }
         var showDetails by remember { mutableStateOf(false) }
         val context = LocalContext.current
+        val noPeerIdentity = stringResource(R.string.chat_no_peer_identity)
         var pendingVideoSession by remember { mutableStateOf(false) }
         val microphonePermission = rememberLauncherForActivityResult(
-            androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+            ActivityResultContracts.RequestPermission(),
         ) { granted -> if (granted) viewModel.requestSecureCall(pendingVideoSession) }
         val startSession = { video: Boolean ->
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
@@ -113,99 +119,48 @@ fun ChatScreen(
                 microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
             }
         }
+        val filePicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument(),
+        ) { uri -> uri?.let(viewModel::sendSelectedFile) }
 
-        // Embedded ZXing scanner for the verification dialog. The
-        // scanned text is fed straight into the existing
-        // `confirmContactVerification` bridge so QR + typed-input
-        // share the same persistence + UI flip path.
-        val verifyScanLauncher = rememberLauncherForActivityResult(QrScannerActivity.contract()) { result ->
-            result.contents?.let { scanned ->
-                viewModel.confirmContactVerification(scanned)
+        // One confirm screen for the whole app: the chat hands the peer's
+        // identity to it and the contact flow brings the result back.
+        val openConfirm = {
+            val peer = uiState.peerIdentityIdHex
+            if (peer == null) {
+                viewModel.notice(noPeerIdentity)
+            } else {
+                context.startActivity(ContactVerificationActivity.createIntent(context, peer))
             }
         }
-        val filePicker = rememberLauncherForActivityResult(
-            androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
-        ) { uri -> uri?.let(viewModel::sendSelectedFile) }
 
         LaunchedEffect(viewModel) {
             viewModel.events.collect { event ->
                 when (event) {
                     is ChatUiEvent.Notice -> snackbarHostState.showSnackbar(event.message)
-                    is ChatUiEvent.ShareLink -> {
-                        runCatching {
-                            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                                type = "text/plain"
-                                putExtra(android.content.Intent.EXTRA_TEXT, event.link)
-                            }
-                            val chooser = android.content.Intent.createChooser(intent, event.title)
-                            chooser.flags = chooser.flags or android.content.Intent.FLAG_ACTIVITY_NEW_TASK
-                            context.startActivity(chooser)
-                        }
-                    }
+                    is ChatUiEvent.ShareLink -> shareText(context, event.link, event.title)
                 }
             }
         }
 
-        Scaffold(
-            containerColor = QubeePalette.Void,
-            snackbarHost = { SnackbarHost(snackbarHostState) },
-            topBar = {
-                SecureChatTopBar(
-                    contactName = uiState.contactName,
-                    securityState = uiState.securityState,
-                    isGroup = uiState.isGroup,
-                    onBackClick = onBackClick,
-                    onSecurityClick = {
-                        if (uiState.isGroup) showDetails = true else viewModel.requestContactVerification()
-                    },
-                    onSecureCallClick = { startSession(false) },
-                    onSecureVideoClick = { startSession(true) },
-                    callingAvailable = uiState.callingAvailable && !uiState.isGroup,
-                    onDetailsClick = { showDetails = true },
-                )
+        ChatContent(
+            uiState = uiState,
+            inputText = inputText,
+            onTextChanged = { inputText = it },
+            onSend = {
+                viewModel.sendMessage(inputText)
+                inputText = ""
             },
-            bottomBar = {
-                ChatInputBar(
-                    text = inputText,
-                    onTextChanged = { inputText = it },
-                    onSend = {
-                        viewModel.sendMessage(inputText)
-                        inputText = ""
-                    },
-                    onAttach = { filePicker.launch(arrayOf("*/*")) },
-                )
-            },
-        ) { padding ->
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .fillMaxSize()
-                    .background(QubeePalette.Void),
-            ) {
-                SecurityBanner(uiState.securityState)
-                if (uiState.messages.isEmpty()) {
-                    EmptyChatState(contactName = uiState.contactName)
-                } else {
-                    LazyColumn(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(horizontal = 16.dp),
-                        reverseLayout = true,
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        items(uiState.messages.reversed(), key = { it.id }) { msg ->
-                            MessageItem(msg, isGroup = uiState.isGroup)
-                        }
-                    }
-                }
-            }
-        }
+            onAttach = { filePicker.launch(arrayOf("*/*")) },
+            onBackClick = onBackClick,
+            onSecurityClick = { if (uiState.isGroup) showDetails = true else openConfirm() },
+            onSecureCallClick = { startSession(false) },
+            onSecureVideoClick = { startSession(true) },
+            onDetailsClick = { showDetails = true },
+            snackbarHostState = snackbarHostState,
+        )
 
         if (showDetails) {
-            // Branch on conversation type. The 1:1 sheet is built
-            // around fingerprint-verification + disappearing-timer
-            // controls that don't really apply to groups; for
-            // groups we surface the member roster instead.
             if (uiState.isGroup) {
                 GroupDetailsSheet(
                     groupName = uiState.contactName,
@@ -226,10 +181,8 @@ fun ChatScreen(
                     details = uiState.details,
                     onDismiss = { showDetails = false },
                     onVerifyClick = {
-                        // Close the details sheet first so the dialog
-                        // doesn't stack on top of it.
                         showDetails = false
-                        viewModel.requestContactVerification()
+                        openConfirm()
                     },
                     onTimerClick = viewModel::changeDisappearingTimer,
                     onClearChatClick = {
@@ -240,25 +193,72 @@ fun ChatScreen(
                 )
             }
         }
+    }
+}
 
-        if (uiState.pendingVerification) {
-            VerifyContactDialog(
+/** The chat itself, stateless so Paparazzi can render it from a fabricated [ChatUiState]. */
+@Composable
+@androidx.annotation.VisibleForTesting
+internal fun ChatContent(
+    uiState: ChatUiState,
+    inputText: String,
+    onTextChanged: (String) -> Unit,
+    onSend: () -> Unit,
+    onAttach: () -> Unit,
+    onBackClick: () -> Unit,
+    onSecurityClick: () -> Unit,
+    onSecureCallClick: () -> Unit,
+    onSecureVideoClick: () -> Unit,
+    onDetailsClick: () -> Unit,
+    snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
+) {
+    Scaffold(
+        containerColor = QubeePalette.Void,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        topBar = {
+            SecureChatTopBar(
                 contactName = uiState.contactName,
-                localFingerprint = uiState.details.fingerprint,
-                myFingerprint = uiState.myFingerprint,
-                sasCode = uiState.pendingSas,
-                onConfirmFingerprint = viewModel::confirmContactVerification,
-                onConfirmSasMatch = viewModel::confirmSasMatch,
-                onScanQr = {
-                    verifyScanLauncher.launch(
-                        QrScannerActivity.options(
-                            context,
-                            prompt = "Scan the contact's verification QR",
-                        ),
-                    )
-                },
-                onDismiss = viewModel::dismissContactVerification,
+                securityState = uiState.securityState,
+                isGroup = uiState.isGroup,
+                onBackClick = onBackClick,
+                onSecurityClick = onSecurityClick,
+                onSecureCallClick = onSecureCallClick,
+                onSecureVideoClick = onSecureVideoClick,
+                callingAvailable = uiState.callingAvailable && !uiState.isGroup,
+                onDetailsClick = onDetailsClick,
             )
+        },
+        bottomBar = {
+            ChatInputBar(
+                text = inputText,
+                onTextChanged = onTextChanged,
+                onSend = onSend,
+                onAttach = onAttach,
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .background(QubeePalette.Void),
+        ) {
+            SecurityBanner(uiState.securityState)
+            if (uiState.messages.isEmpty()) {
+                EmptyChatState(contactName = uiState.contactName)
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 16.dp),
+                    reverseLayout = true,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(uiState.messages.reversed(), key = { it.id }) { msg ->
+                        MessageItem(msg, isGroup = uiState.isGroup)
+                    }
+                }
+            }
         }
     }
 }
@@ -284,7 +284,7 @@ private fun SecureChatTopBar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = onBackClick, modifier = Modifier.size(44.dp)) {
-                    Icon(Icons.Filled.ArrowBack, contentDescription = "Back", tint = QubeePalette.Text)
+                    Icon(Icons.Filled.ArrowBack, contentDescription = stringResource(R.string.chat_back), tint = QubeePalette.Text)
                 }
                 if (isGroup) {
                     QubeeAvatar(initials = "", size = 40.dp, icon = Icons.Outlined.Group, color = QubeePalette.MutedText)
@@ -328,14 +328,14 @@ private fun SecureChatTopBar(
                 // fails closed.
                 if (callingAvailable) {
                     IconButton(onClick = onSecureCallClick) {
-                        Icon(Icons.Filled.Lock, contentDescription = "Encrypted voice session", tint = QubeePalette.Cyan)
+                        Icon(Icons.Filled.Call, contentDescription = stringResource(R.string.chat_voice_call), tint = QubeePalette.Cyan)
                     }
                     IconButton(onClick = onSecureVideoClick) {
-                        Icon(Icons.Filled.Videocam, contentDescription = "Encrypted video session", tint = QubeePalette.Cyan)
+                        Icon(Icons.Filled.Videocam, contentDescription = stringResource(R.string.chat_video_call), tint = QubeePalette.Cyan)
                     }
                 }
                 IconButton(onClick = onDetailsClick) {
-                    Icon(Icons.Filled.MoreVert, contentDescription = "Conversation details", tint = QubeePalette.MutedText)
+                    Icon(Icons.Filled.MoreVert, contentDescription = stringResource(R.string.chat_details), tint = QubeePalette.MutedText)
                 }
             }
             Divider(color = QubeePalette.PanelAlt)
@@ -390,10 +390,10 @@ private fun EmptyChatState(contactName: String) {
         ) {
             QubeeAvatar(initials = "", size = 72.dp, icon = Icons.Outlined.Lock)
             Spacer(Modifier.height(18.dp))
-            Text("Say hello", color = QubeePalette.Text, style = MaterialTheme.typography.headlineSmall)
+            Text(stringResource(R.string.chat_empty_title), color = QubeePalette.Text, style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "Messages to $contactName are locked before they leave your phone.",
+                text = stringResource(R.string.chat_empty_body, contactName),
                 color = QubeePalette.MutedText,
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = TextAlign.Center,
@@ -646,7 +646,7 @@ fun ChatInputBar(
             ) {
                 QubeeIconButton(
                     icon = Icons.Filled.Add,
-                    contentDescription = "Attach a file",
+                    contentDescription = stringResource(R.string.chat_attach),
                     onClick = onAttach,
                 )
                 Spacer(Modifier.width(10.dp))
@@ -665,7 +665,7 @@ fun ChatInputBar(
                         unfocusedIndicatorColor = Color.Transparent,
                         disabledIndicatorColor = Color.Transparent,
                     ),
-                    placeholder = { Text("Message", color = QubeePalette.MutedText) },
+                    placeholder = { Text(stringResource(R.string.chat_message_placeholder), color = QubeePalette.MutedText) },
                     maxLines = 5,
                 )
                 Spacer(Modifier.width(10.dp))
@@ -678,7 +678,7 @@ fun ChatInputBar(
                 ) {
                     Icon(
                         imageVector = Icons.Filled.Send,
-                        contentDescription = "Send",
+                        contentDescription = stringResource(R.string.chat_send),
                         tint = if (canSend) QubeePalette.Void else QubeePalette.MutedText,
                         modifier = Modifier.size(22.dp),
                     )
@@ -747,38 +747,38 @@ private fun ConversationDetailsSheet(
 
             Spacer(Modifier.height(18.dp))
 
-            DetailsSection(title = "Identity") {
-                DetailsRow("Fingerprint", details.fingerprint)
-                DetailsRow("Checked", details.verificationLabel)
+            DetailsSection(title = stringResource(R.string.chat_details_identity)) {
+                DetailsRow(stringResource(R.string.chat_details_fingerprint), details.fingerprint)
+                DetailsRow(stringResource(R.string.chat_details_checked), details.verificationLabel)
                 Spacer(Modifier.height(12.dp))
-                QubeePrimaryButton(text = "Confirm it is really $contactName", onClick = onVerifyClick)
+                QubeePrimaryButton(text = stringResource(R.string.chat_details_confirm, contactName), onClick = onVerifyClick)
             }
 
             Spacer(Modifier.height(12.dp))
 
-            DetailsSection(title = "Session") {
-                DetailsRow("Session", details.sessionLabel)
-                DetailsRow("Disappearing messages", details.disappearingTimerLabel)
+            DetailsSection(title = stringResource(R.string.chat_details_session)) {
+                DetailsRow(stringResource(R.string.chat_details_session), details.sessionLabel)
+                DetailsRow(stringResource(R.string.chat_details_disappearing), details.disappearingTimerLabel)
                 Spacer(Modifier.height(8.dp))
                 QubeeMutedText(details.sessionNote, style = MaterialTheme.typography.bodySmall)
                 Spacer(Modifier.height(12.dp))
-                QubeeSecondaryButton(text = "Change disappearing timer", onClick = onTimerClick)
+                QubeeSecondaryButton(text = stringResource(R.string.chat_details_change_timer), onClick = onTimerClick)
             }
 
             Spacer(Modifier.height(12.dp))
 
-            DetailsSection(title = "Media and files") {
-                DetailsRow("Media", details.mediaCount.toString())
-                DetailsRow("Files", details.fileCount.toString())
-                DetailsRow("Voice notes", details.audioCount.toString())
+            DetailsSection(title = stringResource(R.string.chat_details_media)) {
+                DetailsRow(stringResource(R.string.chat_details_media_count), details.mediaCount.toString())
+                DetailsRow(stringResource(R.string.chat_details_file_count), details.fileCount.toString())
+                DetailsRow(stringResource(R.string.chat_details_audio_count), details.audioCount.toString())
             }
 
             Spacer(Modifier.height(12.dp))
 
-            DetailsSection(title = "Careful") {
-                QubeeSecondaryButton(text = "Clear chat on this phone", onClick = onClearChatClick)
+            DetailsSection(title = stringResource(R.string.chat_details_careful)) {
+                QubeeSecondaryButton(text = stringResource(R.string.chat_details_clear), onClick = onClearChatClick)
                 Spacer(Modifier.height(10.dp))
-                QubeeDangerButton(text = "Reset secure session", onClick = onResetSessionClick)
+                QubeeDangerButton(text = stringResource(R.string.chat_details_reset), onClick = onResetSessionClick)
             }
 
             Spacer(Modifier.height(18.dp))
@@ -829,7 +829,8 @@ private fun formatMessageTime(timestamp: Long): String {
 /**
  * What the header and the strip above the thread say about a chat.
  * Plain words only: the user needs to know whether it is private and
- * whether they have checked who is on the other end.
+ * whether they have checked who is on the other end. A changed key is
+ * its own state, never a flavour of "confirmed", per TrustStatePolicy.
  */
 enum class ConversationSecurityState(
     val label: String,
@@ -858,6 +859,13 @@ enum class ConversationSecurityState(
         description = "Messages here are locked end to end. A post-quantum session starts once both phones have exchanged keys.",
         color = QubeePalette.MutedText,
         icon = Icons.Outlined.Shield,
+    ),
+    KeyChanged(
+        label = "Safety key changed · Tap to check",
+        compactLabel = "CHECK",
+        description = "This contact's safety key changed. That happens when they reset Qubee, but also if someone is in between. Confirm the short code together before trusting new messages.",
+        color = QubeePalette.Warning,
+        icon = Icons.Filled.GppMaybe,
     ),
     OfflineQueued(
         label = "Offline · sends when back in reach",

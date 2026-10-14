@@ -1,7 +1,6 @@
 package com.qubee.messenger.ui.connect
 
 import android.content.Context
-import android.content.Intent
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -59,6 +58,7 @@ import com.qubee.messenger.ui.theme.QubeeTheme
 import com.qubee.messenger.ui.theme.QubeeToggleRow
 import com.qubee.messenger.ui.theme.QubeeTopBar
 import com.qubee.messenger.util.QrUtils
+import com.qubee.messenger.util.shareText
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 
@@ -220,11 +220,5 @@ internal fun ConnectBody(
 
 /** Open the system share sheet with the identity link as plain text. */
 internal fun shareIdentityLink(context: Context, link: String) {
-    val sendIntent = Intent(Intent.ACTION_SEND).apply {
-        type = "text/plain"
-        putExtra(Intent.EXTRA_TEXT, link)
-    }
-    val chooser = Intent.createChooser(sendIntent, "Share Qubee identity")
-    chooser.flags = chooser.flags or Intent.FLAG_ACTIVITY_NEW_TASK
-    runCatching { context.startActivity(chooser) }
+    shareText(context, link, context.getString(R.string.share_identity_title))
 }

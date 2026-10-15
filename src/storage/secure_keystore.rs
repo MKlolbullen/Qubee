@@ -280,6 +280,15 @@ const MAX_SNAPSHOT_LEN: u64 = 256 * 1024 * 1024;
 /// other permission bits are cleared on the way in rather than refused,
 /// so a file an older build left looser still opens, as private.
 fn read_private_file(path: &Path, max_len: u64) -> Result<Vec<u8>> {
+    // Refused on every platform; on unix, O_NOFOLLOW below also closes
+    // the gap between this check and the open.
+    anyhow::ensure!(
+        !fs::symlink_metadata(path)
+            .context("stat keystore path")?
+            .file_type()
+            .is_symlink(),
+        "keystore path is a symlink"
+    );
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

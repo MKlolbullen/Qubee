@@ -88,6 +88,29 @@ impl Clock for FixedClock {
     }
 }
 
+/// Advances one second on every read, so a test can place the reads of
+/// one operation on either side of a boundary.
+#[cfg(test)]
+pub(crate) struct SteppingClock(std::sync::atomic::AtomicU64);
+
+#[cfg(test)]
+impl SteppingClock {
+    pub(crate) fn new(now: u64) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(now))
+    }
+
+    pub(crate) fn set(&self, now: u64) {
+        self.0.store(now, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Clock for SteppingClock {
+    fn now_unix_seconds(&self) -> Result<u64> {
+        Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
 /// `expiry` is an exclusive upper bound: at exactly that second the key
 /// is already unusable, so there is no ambiguous instant.
 fn is_expired(entry: &EncryptedKeyEntry, now: u64) -> bool {
@@ -443,33 +466,31 @@ impl SecureKeyStore {
         purpose: KeyUsage,
     ) -> Result<Option<SecretBox<Vec<u8>>>> {
         self.ensure_healthy()?;
+        let Some(entry) = self.keys.get(key_id) else {
+            return Ok(None);
+        };
         let now = self.clock.now_unix_seconds()?;
+        if let Some(expiry) = entry.metadata.expiry.filter(|&expiry| now >= expiry) {
+            return Err(KeystoreError::Expired {
+                key_id: key_id.to_string(),
+                expiry,
+            }
+            .into());
+        }
+        if !entry.metadata.usage.contains(&purpose) {
+            return Err(KeystoreError::UsageDenied {
+                key_id: key_id.to_string(),
+                purpose,
+            }
+            .into());
+        }
         // Snapshot the fields we need without holding a borrow across
         // the possible re-seal + save below.
-        let (nonce_bytes, ciphertext, key_type) = match self.keys.get(key_id) {
-            Some(entry) => {
-                if let Some(expiry) = entry.metadata.expiry.filter(|&expiry| now >= expiry) {
-                    return Err(KeystoreError::Expired {
-                        key_id: key_id.to_string(),
-                        expiry,
-                    }
-                    .into());
-                }
-                if !entry.metadata.usage.contains(&purpose) {
-                    return Err(KeystoreError::UsageDenied {
-                        key_id: key_id.to_string(),
-                        purpose,
-                    }
-                    .into());
-                }
-                (
-                    entry.nonce,
-                    entry.encrypted_data.clone(),
-                    entry.key_type.clone(),
-                )
-            }
-            None => return Ok(None),
-        };
+        let (nonce_bytes, ciphertext, key_type) = (
+            entry.nonce,
+            entry.encrypted_data.clone(),
+            entry.key_type.clone(),
+        );
 
         let cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -2135,6 +2156,10 @@ mod tests {
         assert!(!ks.has_active_key("soon"));
         assert!(ks.retrieve_key("live", KeyUsage::Encryption).is_err());
         assert!(ks.retrieve_key("soon", KeyUsage::Encryption).is_err());
+        assert!(ks
+            .retrieve_key("absent", KeyUsage::Encryption)
+            .unwrap()
+            .is_none());
         assert!(ks
             .store_key("new", b"secret", KeyType::PreKey, plain_metadata(6))
             .is_err());

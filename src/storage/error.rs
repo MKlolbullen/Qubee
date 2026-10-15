@@ -12,3 +12,14 @@ pub enum KeystoreError {
     #[error("key '{key_id}' was not stored for {purpose:?}")]
     UsageDenied { key_id: String, purpose: KeyUsage },
 }
+
+impl KeystoreError {
+    /// Whether `error` is the expiry refusal, for callers that treat an
+    /// expired record like an absent one.
+    pub fn is_expiry(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref::<KeystoreError>(),
+            Some(KeystoreError::Expired { .. })
+        )
+    }
+}

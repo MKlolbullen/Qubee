@@ -1152,14 +1152,7 @@ impl GroupManager {
             Ok(None) => return Ok(None),
             // An invitation past its expiry gets the same answer as one
             // we never minted.
-            Err(e)
-                if matches!(
-                    e.downcast_ref::<KeystoreError>(),
-                    Some(KeystoreError::Expired { .. })
-                ) =>
-            {
-                return Ok(None)
-            }
+            Err(e) if KeystoreError::is_expiry(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
@@ -1228,7 +1221,12 @@ impl GroupManager {
             None => return Ok(()),
         };
         invitation.current_uses = invitation.current_uses.saturating_sub(1);
-        self.store_invitation(&invitation)
+        match self.store_invitation(&invitation) {
+            // Expired between the read and the write: nothing is left to
+            // hand the use back to.
+            Err(e) if KeystoreError::is_expiry(&e) => Ok(()),
+            result => result,
+        }
     }
 
     /// Promote an outstanding `accepted_invite_*` receipt into a real
@@ -1762,7 +1760,7 @@ impl Default for GroupSettings {
 mod tests {
     use super::*;
     use crate::identity::identity_key::IdentityKeyPair;
-    use crate::storage::secure_keystore::FixedClock;
+    use crate::storage::secure_keystore::{FixedClock, SteppingClock};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -2111,6 +2109,45 @@ mod tests {
         assert!(gm
             .create_invitation(group_id, owner_id, Some(2_000), None)
             .is_err());
+    }
+
+    #[test]
+    fn a_release_that_crosses_the_expiry_is_a_no_op() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let clock = Arc::new(SteppingClock::new(1_000));
+        let keystore = SecureKeystore::new_with_clock(
+            &temp_dir.path().join("k.db"),
+            b"test-keystore-passphrase",
+            clock.clone(),
+        )
+        .expect("keystore");
+        let mut gm = GroupManager::new(keystore).expect("gm");
+
+        let owner = IdentityKeyPair::generate().expect("kp");
+        let owner_id = owner.public_key().identity_id;
+        let group_id = gm
+            .create_group(
+                owner_id,
+                owner.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("group");
+        let code = gm
+            .create_invitation(group_id, owner_id, Some(5_000), Some(5))
+            .expect("invite")
+            .invitation_code;
+        clock.set(4_998);
+        assert!(gm.consume_invitation_use(&code, 4_998).is_ok());
+
+        // The release reads the record one second before it expires and
+        // writes it back one second after.
+        clock.set(4_999);
+        gm.release_invitation_use(&code)
+            .expect("a release across the boundary is a no-op");
+        assert!(gm.get_invitation(&code).expect("get").is_none());
     }
 
     #[test]

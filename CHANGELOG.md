@@ -143,6 +143,9 @@ SHA-256 is listed in the release notes and in `SECURITY.md`.
   header follows the contact row live, so a confirmation or a changed
   safety key shows without reopening the chat. The toolbar and its
   overflow menu are gone: every screen draws its own header.
+- Screenshot baselines render on a Galaxy S25 Ultra profile
+  (3120x1440 at 560 dpi, 411x891 dp) instead of a Pixel 5, so they
+  show what the reference phone shows.
 - CI: CodeQL analyses Kotlin from source instead of autobuilding the
   app, which the runner cannot do. MobSF findings are published to code
   scanning again rather than only to a 30-day artifact. The clippy

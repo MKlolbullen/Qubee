@@ -27,7 +27,6 @@ import com.qubee.messenger.ui.theme.QubeeTheme
 internal val GALAXY_S25_ULTRA: DeviceConfig = DeviceConfig.PIXEL_6_PRO.copy(
     xdpi = 498,
     ydpi = 498,
-    released = "February 7, 2025",
 )
 
 internal fun paparazziRule(): Paparazzi = Paparazzi(deviceConfig = GALAXY_S25_ULTRA)

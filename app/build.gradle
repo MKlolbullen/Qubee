@@ -40,14 +40,6 @@ if (nativeAbis.isEmpty() || nativeAbis.any { !['arm64-v8a', 'armeabi-v7a', 'x86'
 }
 
 android {
-    testOptions {
-        unitTests.all {
-            // Paparazzi renders every screen at the S25 Ultra's 1440x3120.
-            // Gradle's default 512 MB test worker runs out of heap on it.
-            maxHeapSize = "2g"
-        }
-    }
-
     namespace 'com.qubee.messenger'
     compileSdk 34
     // NDK version is pinned in two places (here + the release/

@@ -965,6 +965,35 @@ impl GroupManager {
         Ok(())
     }
 
+    /// Re-stamp an enrolled member's Kyber-768 public key without
+    /// advancing `group.version`. A re-issued acceptance is private to
+    /// that one member, so nothing announces a new generation to the
+    /// others; a bump here would trip the strict generation gate in
+    /// `decrypt_group_message` for every message that followed. A no-op
+    /// when the key is unchanged.
+    pub fn refresh_member_kyber_pub(
+        &mut self,
+        group_id: GroupId,
+        member_id: IdentityId,
+        kyber_pub: Vec<u8>,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("Group not found"))?;
+        let member = group
+            .members
+            .get_mut(&member_id)
+            .ok_or_else(|| anyhow::anyhow!("Member not in group"))?;
+        if member.kyber_pub == kyber_pub {
+            return Ok(());
+        }
+        member.kyber_pub = kyber_pub;
+        group.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.store_group_securely(&group_id)?;
+        Ok(())
+    }
+
     /// Record a member's libp2p PeerId for gossip-independent direct
     /// routing. Unlike [`set_member_kyber_pub`], this deliberately does
     /// **not** bump `group.version`: `peer_id` is transport-routing

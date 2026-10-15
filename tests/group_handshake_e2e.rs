@@ -677,9 +677,15 @@ fn reissued_request_join_is_idempotent() {
 
     // Second request (a lost JoinAccepted, retried) with a *new*
     // ephemeral Kyber key. Must be a no-consume re-issue, not a reject.
+    let version_before = alice_gm.get_group(&group_id).unwrap().version;
     let (kyber_pub2, kyber_sec2) = generate_ephemeral_kyber();
     let (rb2, rs2) = sign_req(kyber_pub2);
     let out2 = process_request_join(&mut alice_gm, &alice_kp, &rb2, &rs2).expect("reissue");
+    assert_eq!(
+        alice_gm.get_group(&group_id).unwrap().version,
+        version_before,
+        "a re-issue is private to one member; the generation the rest of the group is on must not move",
+    );
     let accepted = match out2 {
         HandshakeOutcome::ReIssueAccept { body, .. } => body,
         other => panic!("expected ReIssueAccept, got {other:?}"),

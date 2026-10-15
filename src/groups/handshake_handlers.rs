@@ -108,7 +108,10 @@ pub fn process_request_join(
         .map(|m| m.member_status == MemberStatus::Active)
         .unwrap_or(false);
     if already_member {
-        let _ = gm.set_member_kyber_pub(
+        // Not `set_member_kyber_pub`: that advances the generation, and
+        // with no MemberAdded to carry it the rest of the group would be
+        // left one behind.
+        let _ = gm.refresh_member_kyber_pub(
             body.group_id,
             body.joiner_public_key.identity_id,
             body.joiner_kyber_pub.clone(),
@@ -1008,10 +1011,19 @@ mod tests {
         // invitation has expired.
         clock.set(expires_at);
         assert!(alice_gm.get_invitation(&code).unwrap().is_none());
+        let version_before = alice_gm.get_group(&group_id).unwrap().version;
         let (body, signature) = signed_request(&bob_kp, group_id, &code);
         let retry = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
         assert_eq!(kind(&retry), "ReIssueAccept");
-        assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
+        let group = alice_gm.get_group(&group_id).unwrap();
+        assert_eq!(group.members.len(), 2);
+        // The re-issue is private to Bob: the generation the rest of the
+        // group is on must not move, while Bob's fresh Kyber key is kept.
+        assert_eq!(group.version, version_before);
+        assert_eq!(
+            group.members[&bob_kp.identity_id()].kyber_pub,
+            body.joiner_kyber_pub
+        );
 
         // A newcomer on the same expired code is told so; one on a code
         // this device never minted gets silence.

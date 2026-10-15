@@ -337,7 +337,7 @@ fn load_identity_from_keystore() -> anyhow::Result<Option<(String, String)>> {
         Some(k) => k,
         None => return Ok(None),
     };
-    let secret = match ks.retrieve_key(ACTIVE_IDENTITY_KEY)? {
+    let secret = match ks.retrieve_key(ACTIVE_IDENTITY_KEY, KeyUsage::Authentication)? {
         Some(s) => s,
         None => return Ok(None),
     };
@@ -402,7 +402,7 @@ fn load_or_create_libp2p_keypair() -> anyhow::Result<libp2p::identity::Keypair> 
     let ks = ks_guard
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
-    if let Some(secret) = ks.retrieve_key(LIBP2P_NODE_KEY)? {
+    if let Some(secret) = ks.retrieve_key(LIBP2P_NODE_KEY, KeyUsage::Authentication)? {
         return Ok(libp2p::identity::Keypair::from_protobuf_encoding(
             secret.expose_secret(),
         )?);
@@ -1843,7 +1843,7 @@ fn active_display_name() -> anyhow::Result<String> {
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
     let secret = ks
-        .retrieve_key(ACTIVE_IDENTITY_KEY)?
+        .retrieve_key(ACTIVE_IDENTITY_KEY, KeyUsage::Authentication)?
         .ok_or_else(|| anyhow::anyhow!("no persisted identity"))?;
     let blob: PersistedActiveIdentity = bincode::deserialize(secret.expose_secret())?;
     Ok(blob.display_name)
@@ -2644,7 +2644,7 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeLoadOn
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let secret = ks
-                .retrieve_key(ACTIVE_IDENTITY_KEY)?
+                .retrieve_key(ACTIVE_IDENTITY_KEY, KeyUsage::Authentication)?
                 .ok_or_else(|| anyhow::anyhow!("active identity record missing"))?;
             let blob: PersistedActiveIdentity = bincode::deserialize(secret.expose_secret())?;
 

@@ -1,4 +1,5 @@
 use crate::security::secure_rng;
+use crate::storage::error::KeystoreError;
 use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake3::Hasher;
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Magic prefix of the v2 `.master` file layout:
@@ -49,6 +51,72 @@ const ARGON2_M_COST_KIB: u32 = 19_456;
 const ARGON2_T_COST: u32 = 2;
 const ARGON2_P_COST: u32 = 1;
 
+/// Where the store reads "now" from. Production uses the system clock;
+/// tests pin it so expiry boundaries are exact rather than racy.
+pub(crate) trait Clock: Send + Sync {
+    fn now_unix_seconds(&self) -> Result<u64>;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix_seconds(&self) -> Result<u64> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs())
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FixedClock(std::sync::atomic::AtomicU64);
+
+#[cfg(test)]
+impl FixedClock {
+    pub(crate) fn new(now: u64) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(now))
+    }
+
+    pub(crate) fn set(&self, now: u64) {
+        self.0.store(now, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Clock for FixedClock {
+    fn now_unix_seconds(&self) -> Result<u64> {
+        Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Advances one second on every read, so a test can place the reads of
+/// one operation on either side of a boundary.
+#[cfg(test)]
+pub(crate) struct SteppingClock(std::sync::atomic::AtomicU64);
+
+#[cfg(test)]
+impl SteppingClock {
+    pub(crate) fn new(now: u64) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(now))
+    }
+
+    pub(crate) fn set(&self, now: u64) {
+        self.0.store(now, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Clock for SteppingClock {
+    fn now_unix_seconds(&self) -> Result<u64> {
+        Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// `expiry` is an exclusive upper bound: at exactly that second the key
+/// is already unusable, so there is no ambiguous instant.
+fn is_expired(entry: &EncryptedKeyEntry, now: u64) -> bool {
+    entry.metadata.expiry.is_some_and(|expiry| now >= expiry)
+}
+
 /// Secure key storage with encryption and integrity protection.
 ///
 /// Mutations are persisted explicitly; dropping a store never writes. After an
@@ -70,6 +138,7 @@ pub struct SecureKeyStore {
     keys: HashMap<String, EncryptedKeyEntry>,
     write_failed: bool,
     transaction_active: bool,
+    clock: Arc<dyn Clock>,
 }
 
 /// Everything `load_master_key` recovers in one pass, so `new()` never
@@ -122,7 +191,7 @@ pub struct KeyMetadata {
     pub tags: HashMap<String, String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyUsage {
     Signing,
     Encryption,
@@ -238,7 +307,24 @@ impl SecureKeyStore {
     /// (unsalted BLAKE3) and pre-v1 (hardcoded passphrase) files are
     /// transparently migrated to the v2 layout on first open.
     pub fn new<P: AsRef<Path>>(storage_path: P, passphrase: &[u8]) -> Result<Self> {
-        let storage_path = storage_path.as_ref().to_path_buf();
+        Self::open_with_clock(storage_path.as_ref(), passphrase, Arc::new(SystemClock))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_clock(
+        storage_path: &Path,
+        passphrase: &[u8],
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        Self::open_with_clock(storage_path, passphrase, clock)
+    }
+
+    fn open_with_clock(
+        storage_path: &Path,
+        passphrase: &[u8],
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        let storage_path = storage_path.to_path_buf();
 
         // Create storage directory if it doesn't exist
         if let Some(parent) = storage_path.parent() {
@@ -256,6 +342,7 @@ impl SecureKeyStore {
             keys: HashMap::new(),
             write_failed: false,
             transaction_active: false,
+            clock,
         };
 
         let (used_alt, migrate) = keystore.load_keys(unwrapped.alt_master_key.as_ref())?;
@@ -327,6 +414,14 @@ impl SecureKeyStore {
         if key_id.is_empty() || key_id.len() > 256 {
             return Err(anyhow::anyhow!("Invalid key ID"));
         }
+        let current_time = self.clock.now_unix_seconds()?;
+        if let Some(expiry) = metadata.expiry.filter(|&expiry| current_time >= expiry) {
+            return Err(KeystoreError::Expired {
+                key_id: key_id.to_string(),
+                expiry,
+            }
+            .into());
+        }
 
         // Generate random nonce
         let nonce_bytes = secure_rng::random::array::<12>()?;
@@ -346,10 +441,6 @@ impl SecureKeyStore {
             )
             .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
 
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-
         let entry = EncryptedKeyEntry {
             encrypted_data,
             nonce: nonce_bytes,
@@ -365,24 +456,41 @@ impl SecureKeyStore {
         Ok(())
     }
 
-    /// Retrieve a key from the secure keystore
-    pub fn retrieve_key(&mut self, key_id: &str) -> Result<Option<SecretBox<Vec<u8>>>> {
+    /// Retrieve a key for `purpose`. An expired record, or one that was
+    /// not stored for `purpose`, is refused before anything is decrypted
+    /// and without touching its access time (see [`KeystoreError`]).
+    /// `Ok(None)` means no record exists under `key_id`.
+    pub fn retrieve_key(
+        &mut self,
+        key_id: &str,
+        purpose: KeyUsage,
+    ) -> Result<Option<SecretBox<Vec<u8>>>> {
         self.ensure_healthy()?;
-        // Snapshot the fields we need without holding a mutable borrow
-        // across the possible re-seal + save below.
-        let (nonce_bytes, ciphertext, key_type) = match self.keys.get_mut(key_id) {
-            Some(entry) => {
-                entry.last_accessed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs();
-                (
-                    entry.nonce,
-                    entry.encrypted_data.clone(),
-                    entry.key_type.clone(),
-                )
-            }
-            None => return Ok(None),
+        let Some(entry) = self.keys.get(key_id) else {
+            return Ok(None);
         };
+        let now = self.clock.now_unix_seconds()?;
+        if let Some(expiry) = entry.metadata.expiry.filter(|&expiry| now >= expiry) {
+            return Err(KeystoreError::Expired {
+                key_id: key_id.to_string(),
+                expiry,
+            }
+            .into());
+        }
+        if !entry.metadata.usage.contains(&purpose) {
+            return Err(KeystoreError::UsageDenied {
+                key_id: key_id.to_string(),
+                purpose,
+            }
+            .into());
+        }
+        // Snapshot the fields we need without holding a borrow across
+        // the possible re-seal + save below.
+        let (nonce_bytes, ciphertext, key_type) = (
+            entry.nonce,
+            entry.encrypted_data.clone(),
+            entry.key_type.clone(),
+        );
 
         let cipher = ChaCha20Poly1305::new(self.master_key.expose_secret().into());
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -396,6 +504,7 @@ impl SecureKeyStore {
                 aad: &aad,
             },
         ) {
+            self.touch(key_id, now);
             return Ok(Some(SecretBox::new(Box::new(pt))));
         }
 
@@ -423,12 +532,25 @@ impl SecureKeyStore {
         if let Some(entry) = self.keys.get_mut(key_id) {
             entry.encrypted_data = new_ciphertext;
             entry.nonce = new_nonce_bytes;
+            entry.last_accessed = now;
         }
         self.save_keys()?;
 
         Ok(Some(SecretBox::new(Box::new(std::mem::take(
             &mut *legacy_pt,
         )))))
+    }
+
+    fn touch(&mut self, key_id: &str, now: u64) {
+        if let Some(entry) = self.keys.get_mut(key_id) {
+            entry.last_accessed = now;
+        }
+    }
+
+    /// A clock that cannot be read makes every expiring key count as
+    /// expired, so a listing never advertises a key a read would refuse.
+    fn now_or_fail_closed(&self) -> u64 {
+        self.clock.now_unix_seconds().unwrap_or(u64::MAX)
     }
 
     /// Delete a key from the keystore
@@ -441,8 +563,19 @@ impl SecureKeyStore {
         Ok(removed)
     }
 
-    /// List all key IDs in the keystore
+    /// IDs of the keys that are usable now. Expired records are left out
+    /// so a caller iterating the list never hits an [`KeystoreError::Expired`].
     pub fn list_keys(&self) -> Vec<String> {
+        let now = self.now_or_fail_closed();
+        self.keys
+            .iter()
+            .filter(|(_, entry)| !is_expired(entry, now))
+            .map(|(key_id, _)| key_id.clone())
+            .collect()
+    }
+
+    /// Every stored record, usable or expired, for inspection and purging.
+    pub fn list_key_records(&self) -> Vec<String> {
         self.keys.keys().cloned().collect()
     }
 
@@ -451,8 +584,16 @@ impl SecureKeyStore {
         self.keys.get(key_id).map(|entry| &entry.metadata)
     }
 
-    /// Check if a key exists
-    pub fn has_key(&self, key_id: &str) -> bool {
+    /// Whether a usable (unexpired) key is stored under `key_id`.
+    pub fn has_active_key(&self, key_id: &str) -> bool {
+        let now = self.now_or_fail_closed();
+        self.keys
+            .get(key_id)
+            .is_some_and(|entry| !is_expired(entry, now))
+    }
+
+    /// Whether any record, usable or expired, is stored under `key_id`.
+    pub fn contains_key_record(&self, key_id: &str) -> bool {
         self.keys.contains_key(key_id)
     }
 
@@ -547,30 +688,35 @@ impl SecureKeyStore {
         commit
     }
 
-    /// Clean up expired keys
+    /// Drop expired records to reclaim space. Not a security check: an
+    /// expired key is refused at read time whether or not this has run.
+    /// If the removal cannot be persisted the records stay in memory, so
+    /// the handle still describes what is on disk.
     pub fn cleanup_expired_keys(&mut self) -> Result<usize> {
         self.ensure_healthy()?;
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-
-        let initial_count = self.keys.len();
-
-        self.keys.retain(|_, entry| {
-            if let Some(expiry) = entry.metadata.expiry {
-                current_time < expiry
-            } else {
-                true
-            }
-        });
-
-        let removed_count = initial_count - self.keys.len();
-
-        if removed_count > 0 {
-            self.save_keys()?;
+        let now = self.clock.now_unix_seconds()?;
+        let expired: Vec<String> = self
+            .keys
+            .iter()
+            .filter(|(_, entry)| is_expired(entry, now))
+            .map(|(key_id, _)| key_id.clone())
+            .collect();
+        if expired.is_empty() {
+            return Ok(0);
         }
-
-        Ok(removed_count)
+        let removed: Vec<(String, EncryptedKeyEntry)> = expired
+            .iter()
+            .filter_map(|key_id| {
+                self.keys
+                    .remove(key_id)
+                    .map(|entry| (key_id.clone(), entry))
+            })
+            .collect();
+        if let Err(error) = self.save_keys() {
+            self.keys.extend(removed);
+            return Err(error);
+        }
+        Ok(expired.len())
     }
 
     fn load_or_generate_master_key(
@@ -1065,7 +1211,7 @@ mod tests {
                     metadata: KeyMetadata {
                         algorithm: "x".into(),
                         key_size: 19,
-                        usage: vec![],
+                        usage: vec![KeyUsage::Encryption],
                         expiry: None,
                         tags: HashMap::new(),
                     },
@@ -1079,7 +1225,7 @@ mod tests {
         // stored key is still retrievable.
         let mut ks = SecureKeyStore::new(&path, b"real-keystore-passphrase").unwrap();
         let got = ks
-            .retrieve_key("id")
+            .retrieve_key("id", KeyUsage::Encryption)
             .unwrap()
             .expect("legacy key survived migration");
         assert_eq!(got.expose_secret().as_slice(), b"legacy identity key");
@@ -1119,7 +1265,7 @@ mod tests {
 
         // Retrieve key
         let retrieved = keystore
-            .retrieve_key("test_key")
+            .retrieve_key("test_key", KeyUsage::Encryption)
             .expect("Failed to retrieve key")
             .expect("Key not found");
 
@@ -1131,7 +1277,7 @@ mod tests {
         let (mut keystore, _temp_dir) = create_test_keystore();
 
         let result = keystore
-            .retrieve_key("nonexistent_key")
+            .retrieve_key("nonexistent_key", KeyUsage::Encryption)
             .expect("Should not error");
         assert!(result.is_none());
     }
@@ -1153,13 +1299,14 @@ mod tests {
             .store_key("test_key", key_data, KeyType::SigningKey, metadata)
             .expect("Failed to store key");
 
-        assert!(keystore.has_key("test_key"));
+        assert!(keystore.has_active_key("test_key"));
 
         let deleted = keystore
             .delete_key("test_key")
             .expect("Failed to delete key");
         assert!(deleted);
-        assert!(!keystore.has_key("test_key"));
+        assert!(!keystore.has_active_key("test_key"));
+        assert!(!keystore.contains_key_record("test_key"));
     }
 
     #[test]
@@ -1213,7 +1360,7 @@ mod tests {
 
         // Verify key can still be retrieved
         let retrieved = keystore
-            .retrieve_key("test_key")
+            .retrieve_key("test_key", KeyUsage::Encryption)
             .expect("Failed to retrieve key after rotation")
             .expect("Key not found after rotation");
 
@@ -1256,7 +1403,7 @@ mod tests {
         let mut ks = SecureKeyStore::new(&path, b"atomic-pass").unwrap();
         for i in 0..8 {
             assert_eq!(
-                ks.retrieve_key(&format!("k{i}"))
+                ks.retrieve_key(&format!("k{i}"), KeyUsage::Encryption)
                     .unwrap()
                     .unwrap()
                     .expose_secret(),
@@ -1299,12 +1446,15 @@ mod tests {
         // under "slot_a", so the swapped entry must fail to open.
         let mut ks = SecureKeyStore::new(&path, b"aad-swap-pass").unwrap();
         assert!(
-            ks.retrieve_key("slot_b").is_err(),
+            ks.retrieve_key("slot_b", KeyUsage::Encryption).is_err(),
             "AAD must reject a ciphertext moved from a different slot",
         );
         // The untouched slot still opens.
         assert_eq!(
-            ks.retrieve_key("slot_a").unwrap().unwrap().expose_secret(),
+            ks.retrieve_key("slot_a", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"alice secret",
         );
     }
@@ -1330,7 +1480,7 @@ mod tests {
 
         let mut ks = SecureKeyStore::new(&path, b"aad-type-pass").unwrap();
         assert!(
-            ks.retrieve_key("k").is_err(),
+            ks.retrieve_key("k", KeyUsage::Encryption).is_err(),
             "relabelling the key type must invalidate the AEAD tag",
         );
     }
@@ -1363,7 +1513,10 @@ mod tests {
 
         // First read opens it (empty-AAD fallback) and re-seals with AAD.
         assert_eq!(
-            ks.retrieve_key("legacy").unwrap().unwrap().expose_secret(),
+            ks.retrieve_key("legacy", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"legacy value",
         );
         drop(ks);
@@ -1373,7 +1526,10 @@ mod tests {
         // empty-AAD decrypt of the stored ciphertext now fails).
         let mut ks = SecureKeyStore::new(&path, b"legacy-aad-pass").unwrap();
         assert_eq!(
-            ks.retrieve_key("legacy").unwrap().unwrap().expose_secret(),
+            ks.retrieve_key("legacy", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"legacy value",
         );
         let migrated = ks.keys.get("legacy").unwrap();
@@ -1447,7 +1603,10 @@ mod tests {
         // Opening under the same passphrase migrates the wrap to v2 and
         // keeps the data readable.
         let mut ks = SecureKeyStore::new(&path, passphrase).unwrap();
-        let got = ks.retrieve_key("id").unwrap().expect("v1 key survived");
+        let got = ks
+            .retrieve_key("id", KeyUsage::Encryption)
+            .unwrap()
+            .expect("v1 key survived");
         assert_eq!(got.expose_secret().as_slice(), b"v1 identity key");
         drop(ks);
 
@@ -1489,7 +1648,10 @@ mod tests {
 
         let mut ks = SecureKeyStore::new(&path, b"rot-crash-1").unwrap();
         assert_eq!(
-            ks.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            ks.retrieve_key("k", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"secret value",
         );
         drop(ks);
@@ -1560,7 +1722,10 @@ mod tests {
 
         let mut ks = SecureKeyStore::new(&path, b"rot-crash-2").unwrap();
         assert_eq!(
-            ks.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            ks.retrieve_key("k", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"secret value",
         );
         drop(ks);
@@ -1594,7 +1759,7 @@ mod tests {
         let mut reopened = SecureKeyStore::new(&path, passphrase).unwrap();
         assert_eq!(
             reopened
-                .retrieve_key("k")
+                .retrieve_key("k", KeyUsage::Encryption)
                 .unwrap()
                 .unwrap()
                 .expose_secret()
@@ -1673,9 +1838,12 @@ mod tests {
         });
         assert!(failed.is_err());
         assert_eq!(fs::read(&ks.storage_path).unwrap(), before);
-        assert!(!ks.has_key("prekey-consumed"));
+        assert!(!ks.contains_key_record("prekey-consumed"));
         assert_eq!(
-            ks.retrieve_key("session").unwrap().unwrap().expose_secret(),
+            ks.retrieve_key("session", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"old"
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1686,7 +1854,7 @@ mod tests {
         }));
         assert!(panic.is_err());
         assert!(!ks.transaction_active);
-        assert!(ks.has_key("session"));
+        assert!(ks.has_active_key("session"));
         ks.transaction(|ks| {
             ks.store_key("session", b"new", KeyType::RootKey, plain_metadata(3))?;
             ks.store_key(
@@ -1702,13 +1870,13 @@ mod tests {
         let mut reopened = SecureKeyStore::new(path, b"test-keystore-passphrase").unwrap();
         assert_eq!(
             reopened
-                .retrieve_key("session")
+                .retrieve_key("session", KeyUsage::Encryption)
                 .unwrap()
                 .unwrap()
                 .expose_secret(),
             b"new"
         );
-        assert!(reopened.has_key("prekey-consumed"));
+        assert!(reopened.has_active_key("prekey-consumed"));
     }
 
     #[test]
@@ -1724,14 +1892,18 @@ mod tests {
             .store_key("k", b"new", KeyType::RootKey, plain_metadata(3))
             .is_err());
         ks.storage_path = path.clone();
-        assert!(ks.retrieve_key("k").is_err());
+        assert!(ks.retrieve_key("k", KeyUsage::Encryption).is_err());
         assert!(ks.delete_key("k").is_err());
         assert!(ks.rotate_master_key().is_err());
         drop(ks);
         assert_eq!(fs::read(&path).unwrap(), before);
         let mut reopened = SecureKeyStore::new(path, b"test-keystore-passphrase").unwrap();
         assert_eq!(
-            reopened.retrieve_key("k").unwrap().unwrap().expose_secret(),
+            reopened
+                .retrieve_key("k", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
             b"old"
         );
     }
@@ -1779,6 +1951,254 @@ mod tests {
         drop(reopened);
         assert!(SecureKeyStore::new(path, b"test-keystore-passphrase")
             .unwrap()
-            .has_key("after-recovery"));
+            .has_active_key("after-recovery"));
+    }
+
+    struct BrokenClock;
+
+    impl Clock for BrokenClock {
+        fn now_unix_seconds(&self) -> Result<u64> {
+            anyhow::bail!("clock unavailable")
+        }
+    }
+
+    fn expiring_metadata(expiry: u64) -> KeyMetadata {
+        KeyMetadata {
+            expiry: Some(expiry),
+            ..plain_metadata(6)
+        }
+    }
+
+    fn keystore_at(now: u64) -> (SecureKeyStore, Arc<FixedClock>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let clock = Arc::new(FixedClock::new(now));
+        let ks = SecureKeyStore::new_with_clock(
+            &dir.path().join("ks.db"),
+            b"test-keystore-passphrase",
+            clock.clone(),
+        )
+        .unwrap();
+        (ks, clock, dir)
+    }
+
+    fn reopen_at(dir: &TempDir, now: u64) -> SecureKeyStore {
+        SecureKeyStore::new_with_clock(
+            &dir.path().join("ks.db"),
+            b"test-keystore-passphrase",
+            Arc::new(FixedClock::new(now)),
+        )
+        .unwrap()
+    }
+
+    fn refusal<T>(result: Result<T>) -> KeystoreError {
+        match result {
+            Ok(_) => panic!("the keystore should have refused"),
+            Err(error) => error
+                .downcast::<KeystoreError>()
+                .expect("a typed keystore refusal"),
+        }
+    }
+
+    fn expired(key_id: &str, expiry: u64) -> KeystoreError {
+        KeystoreError::Expired {
+            key_id: key_id.into(),
+            expiry,
+        }
+    }
+
+    fn sorted(mut ids: Vec<String>) -> Vec<String> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn expiry_is_an_exclusive_upper_bound() {
+        let (mut ks, clock, _dir) = keystore_at(1_000);
+        ks.store_key("k", b"secret", KeyType::PreKey, expiring_metadata(2_000))
+            .unwrap();
+
+        clock.set(1_999);
+        assert!(ks
+            .retrieve_key("k", KeyUsage::Encryption)
+            .unwrap()
+            .is_some());
+        assert!(ks.has_active_key("k"));
+        assert_eq!(ks.list_keys(), ["k"]);
+
+        for now in [2_000, 2_001, u64::MAX] {
+            clock.set(now);
+            assert_eq!(
+                refusal(ks.retrieve_key("k", KeyUsage::Encryption)),
+                expired("k", 2_000)
+            );
+            assert!(!ks.has_active_key("k"));
+            assert!(ks.list_keys().is_empty());
+            assert!(ks.contains_key_record("k"));
+            assert_eq!(ks.list_key_records(), ["k"]);
+        }
+    }
+
+    #[test]
+    fn refusals_come_before_decryption_and_leave_the_record_untouched() {
+        let (mut ks, clock, _dir) = keystore_at(1_000);
+        ks.store_key("k", b"secret", KeyType::PreKey, expiring_metadata(2_000))
+            .unwrap();
+        clock.set(1_500);
+        ks.retrieve_key("k", KeyUsage::Encryption).unwrap().unwrap();
+        assert_eq!(ks.keys["k"].last_accessed, 1_500);
+        // With the ciphertext destroyed, a read that reaches the cipher
+        // reports a decryption failure instead of a typed refusal.
+        ks.keys.get_mut("k").unwrap().encrypted_data.fill(0);
+
+        clock.set(1_600);
+        assert_eq!(
+            refusal(ks.retrieve_key("k", KeyUsage::Signing)),
+            KeystoreError::UsageDenied {
+                key_id: "k".into(),
+                purpose: KeyUsage::Signing,
+            }
+        );
+        clock.set(2_000);
+        assert_eq!(
+            refusal(ks.retrieve_key("k", KeyUsage::Encryption)),
+            expired("k", 2_000)
+        );
+        assert_eq!(
+            refusal(ks.retrieve_key("k", KeyUsage::Signing)),
+            expired("k", 2_000)
+        );
+        assert_eq!(ks.keys["k"].last_accessed, 1_500);
+        assert!(!ks.write_failed);
+    }
+
+    #[test]
+    fn store_key_refuses_a_key_that_is_already_expired() {
+        let (mut ks, _clock, dir) = keystore_at(2_000);
+        for expiry in [0, 1_999, 2_000] {
+            assert_eq!(
+                refusal(ks.store_key("k", b"secret", KeyType::PreKey, expiring_metadata(expiry),)),
+                expired("k", expiry)
+            );
+        }
+        assert!(!ks.contains_key_record("k"));
+        assert!(!ks.storage_path.exists());
+
+        ks.store_key("k", b"secret", KeyType::PreKey, expiring_metadata(2_001))
+            .unwrap();
+        assert!(ks.has_active_key("k"));
+        drop(ks);
+        assert_eq!(reopen_at(&dir, 2_000).list_keys(), ["k"]);
+    }
+
+    #[test]
+    fn listings_and_purge_only_differ_on_expired_records() {
+        let (mut ks, clock, dir) = keystore_at(1_000);
+        ks.store_key("live", b"secret", KeyType::PreKey, plain_metadata(6))
+            .unwrap();
+        ks.store_key("soon", b"secret", KeyType::PreKey, expiring_metadata(2_000))
+            .unwrap();
+        assert_eq!(ks.cleanup_expired_keys().unwrap(), 0);
+        assert_eq!(sorted(ks.list_keys()), ["live", "soon"]);
+
+        clock.set(2_000);
+        assert_eq!(ks.list_keys(), ["live"]);
+        assert_eq!(sorted(ks.list_key_records()), ["live", "soon"]);
+        assert_eq!(ks.cleanup_expired_keys().unwrap(), 1);
+        assert_eq!(ks.list_key_records(), ["live"]);
+        drop(ks);
+
+        let reopened = reopen_at(&dir, 2_000);
+        assert!(reopened.has_active_key("live"));
+        assert!(!reopened.contains_key_record("soon"));
+    }
+
+    #[test]
+    fn a_purge_that_cannot_be_persisted_keeps_the_records() {
+        let (mut ks, clock, dir) = keystore_at(1_000);
+        ks.store_key("live", b"secret", KeyType::PreKey, plain_metadata(6))
+            .unwrap();
+        ks.store_key("soon", b"secret", KeyType::PreKey, expiring_metadata(2_000))
+            .unwrap();
+        let path = ks.storage_path.clone();
+        let on_disk = fs::read(&path).unwrap();
+
+        clock.set(2_000);
+        // Renaming the staged snapshot over a directory must fail.
+        ks.storage_path = dir.path().to_path_buf();
+        assert!(ks.cleanup_expired_keys().is_err());
+        assert!(ks.write_failed);
+        assert_eq!(sorted(ks.list_key_records()), ["live", "soon"]);
+        assert_eq!(fs::read(&path).unwrap(), on_disk);
+        drop(ks);
+        assert_eq!(
+            sorted(reopen_at(&dir, 2_000).list_key_records()),
+            ["live", "soon"]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_clock_fails_closed() {
+        let (mut ks, _clock, dir) = keystore_at(1_000);
+        ks.store_key("live", b"secret", KeyType::PreKey, plain_metadata(6))
+            .unwrap();
+        ks.store_key("soon", b"secret", KeyType::PreKey, expiring_metadata(2_000))
+            .unwrap();
+        drop(ks);
+
+        let mut ks = SecureKeyStore::new_with_clock(
+            &dir.path().join("ks.db"),
+            b"test-keystore-passphrase",
+            Arc::new(BrokenClock),
+        )
+        .unwrap();
+        assert_eq!(ks.list_keys(), ["live"]);
+        assert!(ks.has_active_key("live"));
+        assert!(!ks.has_active_key("soon"));
+        assert!(ks.retrieve_key("live", KeyUsage::Encryption).is_err());
+        assert!(ks.retrieve_key("soon", KeyUsage::Encryption).is_err());
+        assert!(ks
+            .retrieve_key("absent", KeyUsage::Encryption)
+            .unwrap()
+            .is_none());
+        assert!(ks
+            .store_key("new", b"secret", KeyType::PreKey, plain_metadata(6))
+            .is_err());
+        assert!(!ks.contains_key_record("new"));
+        assert!(ks.cleanup_expired_keys().is_err());
+        assert_eq!(sorted(ks.list_key_records()), ["live", "soon"]);
+    }
+
+    #[test]
+    fn every_observer_agrees_on_whether_a_key_is_usable() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let (ks, clock, _dir) = keystore_at(0);
+        let ks = std::cell::RefCell::new(ks);
+        let cases = (2u64..u64::MAX - 2, any::<u64>(), -2i64..=3);
+        TestRunner::new(Config::with_cases(64))
+            .run(&cases, |(expiry, anywhere, nudge)| {
+                // Five cases in six sit on the boundary, where the bugs are.
+                let now = if nudge == 3 {
+                    anywhere
+                } else {
+                    expiry.wrapping_add_signed(nudge)
+                };
+                let mut ks = ks.borrow_mut();
+                clock.set(expiry - 1);
+                ks.store_key("k", b"secret", KeyType::PreKey, expiring_metadata(expiry))
+                    .unwrap();
+                clock.set(now);
+                let usable = now < expiry;
+                prop_assert_eq!(ks.retrieve_key("k", KeyUsage::Encryption).is_ok(), usable);
+                prop_assert_eq!(ks.has_active_key("k"), usable);
+                prop_assert_eq!(ks.list_keys().contains(&"k".to_string()), usable);
+                prop_assert!(ks.contains_key_record("k"));
+                prop_assert_eq!(ks.cleanup_expired_keys().unwrap(), usize::from(!usable));
+                prop_assert_eq!(ks.contains_key_record("k"), usable);
+                ks.delete_key("k").unwrap();
+                Ok(())
+            })
+            .unwrap();
     }
 }

@@ -207,7 +207,7 @@ fn signature_digest(
 }
 
 fn load_own_state(ks: &mut SecureKeyStore, group: &GroupId) -> Result<Option<StoredOwnState>> {
-    match ks.retrieve_key(&own_key_id(group))? {
+    match ks.retrieve_key(&own_key_id(group), KeyUsage::Encryption)? {
         Some(secret) => Ok(Some(
             bincode::deserialize(secret.expose_secret())
                 .map_err(|e| anyhow!("decode own sender state: {e}"))?,
@@ -233,7 +233,7 @@ fn load_recv_state(
     group: &GroupId,
     sender: &IdentityId,
 ) -> Result<Option<StoredRecvState>> {
-    match ks.retrieve_key(&recv_key_id(group, sender))? {
+    match ks.retrieve_key(&recv_key_id(group, sender), KeyUsage::Encryption)? {
         Some(secret) => Ok(Some(
             bincode::deserialize(secret.expose_secret())
                 .map_err(|e| anyhow!("decode recv sender state: {e}"))?,

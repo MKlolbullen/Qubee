@@ -9,7 +9,20 @@ between minor versions.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- The keystore enforces its own metadata. `retrieve_key` takes the
+  `KeyUsage` the caller needs and refuses, before anything is
+  decrypted, a record stored for another purpose or one whose `expiry`
+  has passed; the expiry is exclusive, so a key is unusable from that
+  second on. `store_key` rejects a key that has already expired.
+  `list_keys` and the new `has_active_key` report only usable keys,
+  while `list_key_records` and `contains_key_record` see every record;
+  a purge whose write fails keeps the records in memory so the handle
+  still describes the disk. Refusals are typed (`storage::KeystoreError`).
+  An expired group invitation reads as absent to the group manager; a
+  joiner whose enrolment was committed but whose acceptance was lost
+  still has it re-sent after the invitation expires.
 
 ## [0.2.0-beta.1] — 2026-10-11
 

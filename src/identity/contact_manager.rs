@@ -144,7 +144,7 @@ impl ContactManager {
                 // Acquire lock each time we need to retrieve a key
                 if let Some(secret_data) = {
                     let mut ks = ks_arc.lock().await;
-                    ks.retrieve_key(&key_name)?
+                    ks.retrieve_key(&key_name, KeyUsage::Encryption)?
                 } {
                     let data = secret_data.expose_secret();
                     if let Ok(contact) = bincode::deserialize::<Contact>(data) {

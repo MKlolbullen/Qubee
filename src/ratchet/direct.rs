@@ -198,7 +198,7 @@ fn encrypt_direct_inner(
         }
     };
 
-    let initial = match ks.retrieve_key(&pending_initial_key(&peer_id))? {
+    let initial = match ks.retrieve_key(&pending_initial_key(&peer_id), KeyUsage::KeyAgreement)? {
         Some(secret) => Some(
             bincode::deserialize::<WireInitialMessage>(secrecy::ExposeSecret::expose_secret(
                 &secret,
@@ -207,10 +207,11 @@ fn encrypt_direct_inner(
         ),
         None => None,
     };
-    let prekey_selection = match ks.retrieve_key(&pending_selection_key(&peer_id))? {
-        Some(secret) => Some(bincode::deserialize(secret.expose_secret())?),
-        None => None,
-    };
+    let prekey_selection =
+        match ks.retrieve_key(&pending_selection_key(&peer_id), KeyUsage::KeyAgreement)? {
+            Some(secret) => Some(bincode::deserialize(secret.expose_secret())?),
+            None => None,
+        };
 
     // Length-hiding: pad before the ratchet AEAD so distinct 1:1
     // messages (and the sender-key distributions that ride these
@@ -293,7 +294,7 @@ fn decrypt_direct_inner(
         .ok_or_else(|| anyhow!("no session with sender and frame carries no initial"))?;
 
     let hash = initial_hash(initial)?;
-    if let Some(prev) = ks.retrieve_key(&accepted_initial_key(&peer_id))? {
+    if let Some(prev) = ks.retrieve_key(&accepted_initial_key(&peer_id), KeyUsage::KeyAgreement)? {
         if secrecy::ExposeSecret::expose_secret(&prev).as_slice() == hash.as_slice() {
             bail!("initial message already consumed (replay)");
         }
@@ -959,7 +960,7 @@ mod tests {
         assert!(load_session(&mut a.ks, &bid).unwrap().is_none());
         assert!(a
             .ks
-            .retrieve_key(&pending_initial_key(&bid))
+            .retrieve_key(&pending_initial_key(&bid), KeyUsage::KeyAgreement)
             .unwrap()
             .is_none());
 
@@ -993,7 +994,7 @@ mod tests {
         assert!(load_session(&mut b.ks, &aid).unwrap().is_none());
         assert!(b
             .ks
-            .retrieve_key(&accepted_initial_key(&aid))
+            .retrieve_key(&accepted_initial_key(&aid), KeyUsage::KeyAgreement)
             .unwrap()
             .is_none());
 

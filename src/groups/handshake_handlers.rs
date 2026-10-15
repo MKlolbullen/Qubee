@@ -956,6 +956,18 @@ mod tests {
         }
     }
 
+    // Assertions compare on this rather than on `{:?}`: an accepted
+    // outcome carries the wrapped group key, which has no place in a
+    // panic message.
+    fn kind(outcome: &HandshakeOutcome) -> &'static str {
+        match outcome {
+            HandshakeOutcome::Accept { .. } => "Accept",
+            HandshakeOutcome::ReIssueAccept { .. } => "ReIssueAccept",
+            HandshakeOutcome::Reject { .. } => "Reject",
+            HandshakeOutcome::UnknownInvitation => "UnknownInvitation",
+        }
+    }
+
     #[test]
     fn a_committed_member_is_reissued_its_acceptance_after_the_invitation_expires() {
         let dir = TempDir::new().unwrap();
@@ -990,10 +1002,7 @@ mod tests {
         let bob_kp = IdentityKeyPair::generate().unwrap();
         let (body, signature) = signed_request(&bob_kp, group_id, &code);
         let first = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
-        assert!(
-            matches!(first, HandshakeOutcome::Accept { .. }),
-            "{first:?}"
-        );
+        assert_eq!(kind(&first), "Accept");
 
         // Bob never received the acceptance; by the time he retries, the
         // invitation has expired.
@@ -1001,10 +1010,7 @@ mod tests {
         assert!(alice_gm.get_invitation(&code).unwrap().is_none());
         let (body, signature) = signed_request(&bob_kp, group_id, &code);
         let retry = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
-        assert!(
-            matches!(retry, HandshakeOutcome::ReIssueAccept { .. }),
-            "{retry:?}"
-        );
+        assert_eq!(kind(&retry), "ReIssueAccept");
         assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
 
         // A newcomer on the same expired code is told so; one on a code
@@ -1012,16 +1018,13 @@ mod tests {
         let carol_kp = IdentityKeyPair::generate().unwrap();
         let (body, signature) = signed_request(&carol_kp, group_id, &code);
         let late = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
-        match late {
-            HandshakeOutcome::Reject { body, .. } => assert!(body.reason.contains("expired")),
-            other => panic!("{other:?}"),
+        assert_eq!(kind(&late), "Reject");
+        if let HandshakeOutcome::Reject { body, .. } = late {
+            assert!(body.reason.contains("expired"));
         }
         let (body, signature) = signed_request(&carol_kp, group_id, "not-ours");
         let unknown = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
-        assert!(
-            matches!(unknown, HandshakeOutcome::UnknownInvitation),
-            "{unknown:?}"
-        );
+        assert_eq!(kind(&unknown), "UnknownInvitation");
         assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
     }
 }

@@ -11,7 +11,7 @@ use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
@@ -218,7 +218,9 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let mut file = options
             .open(&tmp)
@@ -233,10 +235,13 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
             } else {
                 parent
             };
+            // Past the rename the new file is in place but not yet known
+            // to be durable, so this failure leaves the on-disk state
+            // uncertain; callers poison the handle on it.
             fs::File::open(parent)
                 .context("open parent directory")?
                 .sync_all()
-                .context("fsync parent directory")?;
+                .context("fsync parent directory after rename")?;
         }
         Ok(())
     })();
@@ -244,6 +249,72 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// The storage directory is created for the owner alone. An existing
+/// directory is left as the platform made it: Android app data lives in
+/// a sandbox whose modes are not ours to police.
+fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .context("Failed to create storage directory")
+}
+
+/// Bound on a `.master` file: the dual-key layout is 141 bytes.
+const MAX_MASTER_FILE_LEN: u64 = 4096;
+/// Bound on a `.db` snapshot. Far above anything the store holds today;
+/// it exists so a replaced file cannot make the open allocate without
+/// limit.
+const MAX_SNAPSHOT_LEN: u64 = 256 * 1024 * 1024;
+
+/// Read a store file through a handle that is checked after opening,
+/// so what was validated is what gets read: no symlink is followed, the
+/// target must be a regular file, and it must fit `max_len`. Group and
+/// other permission bits are cleared on the way in rather than refused,
+/// so a file an older build left looser still opens, as private.
+fn read_private_file(path: &Path, max_len: u64) -> Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: opening a FIFO left in place of the file must fail
+        // the checks below, not wait for a writer.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).context("open keystore file")?;
+    let metadata = file.metadata().context("stat keystore file")?;
+    anyhow::ensure!(metadata.is_file(), "keystore path is not a regular file");
+    anyhow::ensure!(
+        metadata.len() <= max_len,
+        "keystore file exceeds {max_len} bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(mode & !0o077))
+                .context("make keystore file private")?;
+        }
+    }
+    let mut data = Vec::with_capacity(usize::try_from(metadata.len())?);
+    (&mut file)
+        .take(max_len + 1)
+        .read_to_end(&mut data)
+        .context("read keystore file")?;
+    anyhow::ensure!(
+        u64::try_from(data.len())? <= max_len,
+        "keystore file exceeds {max_len} bytes"
+    );
+    Ok(data)
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"QKS1";
@@ -328,7 +399,7 @@ impl SecureKeyStore {
 
         // Create storage directory if it doesn't exist
         if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent).context("Failed to create storage directory")?;
+            create_private_dir(parent)?;
         }
 
         // Generate or load master key, wrapped under `passphrase`.
@@ -738,7 +809,8 @@ impl SecureKeyStore {
     }
 
     fn load_master_key(path: &Path, passphrase: &[u8]) -> Result<UnwrappedMaster> {
-        let encrypted_data = fs::read(path).context("Failed to read master key file")?;
+        let encrypted_data = read_private_file(path, MAX_MASTER_FILE_LEN)
+            .context("Failed to read master key file")?;
 
         // v3 (transient dual-key) layout, written only mid-rotation:
         // "QKM3" || salt(16) || count(1) || [nonce(12) || ct]×count.
@@ -1055,7 +1127,8 @@ impl SecureKeyStore {
         if !self.storage_path.exists() {
             return Ok((false, false));
         }
-        let data = fs::read(&self.storage_path).context("read keystore")?;
+        let data =
+            read_private_file(&self.storage_path, MAX_SNAPSHOT_LEN).context("read keystore")?;
         anyhow::ensure!(!data.is_empty(), "empty keystore file");
         if data.starts_with(SNAPSHOT_MAGIC) {
             anyhow::ensure!(data.len() >= 4 + 12 + 16, "truncated keystore snapshot");
@@ -2200,5 +2273,93 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_directory_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a").join("b");
+        SecureKeyStore::new(nested.join("ks.db"), b"test-keystore-passphrase").unwrap();
+        for created in [nested.parent().unwrap(), nested.as_path()] {
+            assert_eq!(
+                fs::metadata(created).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_store_files_are_refused() {
+        let (mut ks, _dir) = create_test_keystore();
+        ks.store_key("k", b"secret", KeyType::RootKey, plain_metadata(6))
+            .unwrap();
+        let path = ks.storage_path.clone();
+        drop(ks);
+        for file in [path.clone(), path.with_extension("master")] {
+            let aside = file.with_extension("aside");
+            fs::rename(&file, &aside).unwrap();
+            std::os::unix::fs::symlink(&aside, &file).unwrap();
+            assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+            fs::remove_file(&file).unwrap();
+            fs::rename(&aside, &file).unwrap();
+        }
+        assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_place_of_a_store_file_is_refused_without_blocking() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ks.db");
+        let master =
+            std::ffi::CString::new(path.with_extension("master").as_os_str().as_encoded_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(master.as_ptr(), 0o600) }, 0);
+        assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+    }
+
+    #[test]
+    fn an_oversized_master_file_is_refused() {
+        let (ks, _dir) = create_test_keystore();
+        let path = ks.storage_path.clone();
+        drop(ks);
+        let master = path.with_extension("master");
+        let mut data = fs::read(&master).unwrap();
+        data.resize(MAX_MASTER_FILE_LEN as usize + 1, 0);
+        fs::write(&master, &data).unwrap();
+        assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_permissions_are_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut ks, _dir) = create_test_keystore();
+        ks.store_key("k", b"secret", KeyType::RootKey, plain_metadata(6))
+            .unwrap();
+        let path = ks.storage_path.clone();
+        drop(ks);
+        let files = [path.clone(), path.with_extension("master")];
+        for file in &files {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let mut reopened = SecureKeyStore::new(&path, b"test-keystore-passphrase").unwrap();
+        for file in &files {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            reopened
+                .retrieve_key("k", KeyUsage::Encryption)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            b"secret"
+        );
     }
 }

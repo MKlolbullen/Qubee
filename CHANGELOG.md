@@ -33,6 +33,11 @@ between minor versions.
   zeroised them, is gone, as are the Windows branches that referenced
   a crate the project never depended on; `SecureString::from_str`
   became `From<&str>`.
+- Keystore files are opened without following symlinks and checked
+  through the open handle: a path that is not a regular file, or a
+  `.master` or `.db` beyond its size bound, is refused, and group and
+  other permission bits are cleared on the way in. The storage
+  directory is created mode 0700. File names and layout are unchanged.
 
 ## [0.2.0-beta.1] — 2026-10-11
 

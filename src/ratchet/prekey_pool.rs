@@ -121,7 +121,7 @@ fn replenish(epoch: &mut StoredEpoch) -> Result<()> {
     Ok(())
 }
 fn load(ks: &mut SecureKeyStore, now: u64) -> Result<StoredPool> {
-    if let Some(secret) = ks.retrieve_key(LOCAL)? {
+    if let Some(secret) = ks.retrieve_key(LOCAL, KeyUsage::KeyAgreement)? {
         let pool: StoredPool = bincode::deserialize(secret.expose_secret())?;
         ensure!(
             !pool.epochs.is_empty() && pool.epochs.len() <= MAX_EPOCHS,
@@ -267,7 +267,7 @@ pub fn verify(body: &PoolBody, signature: &HybridSignature) -> Result<bool> {
         .verify_with_max_age(&canonical(body)?, signature, PREKEY_BUNDLE_MAX_AGE_SECS)
 }
 pub fn peer(ks: &mut SecureKeyStore, id: &IdentityId) -> Result<Option<PoolBody>> {
-    let Some(secret) = ks.retrieve_key(&key(PEER, id))? else {
+    let Some(secret) = ks.retrieve_key(&key(PEER, id), KeyUsage::KeyAgreement)? else {
         return Ok(None);
     };
     let body: PoolBody = bincode::deserialize(secret.expose_secret())?;
@@ -350,7 +350,7 @@ pub fn reserve(
     body: &PoolBody,
 ) -> Result<(PrekeySelection, PrekeyBundlePublic)> {
     let name = key(USED, &body.publisher.identity_id);
-    let mut used = match ks.retrieve_key(&name)? {
+    let mut used = match ks.retrieve_key(&name, KeyUsage::KeyAgreement)? {
         Some(s) => bincode::deserialize::<Reservations>(s.expose_secret())?,
         None => Reservations {
             epoch: body.epoch,

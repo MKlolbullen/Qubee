@@ -247,7 +247,7 @@ pub fn store_session(ks: &mut SecureKeyStore, session: &Session) -> Result<()> {
 
 /// Load a peer's session from the keystore, if one exists.
 pub fn load_session(ks: &mut SecureKeyStore, peer: &IdentityId) -> Result<Option<Session>> {
-    match ks.retrieve_key(&session_key_id(peer))? {
+    match ks.retrieve_key(&session_key_id(peer), KeyUsage::Encryption)? {
         Some(secret) => {
             let session = Session::deserialize(secret.expose_secret())?;
             if session.peer_id != *peer {

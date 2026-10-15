@@ -89,7 +89,7 @@ pub fn get_or_create_local_bundle(
     ks: &mut SecureKeyStore,
     now: u64,
 ) -> Result<(PrekeyBundleSecret, KemPublicKey)> {
-    if let Some(secret) = ks.retrieve_key(LOCAL_BUNDLE_KEY_ID)? {
+    if let Some(secret) = ks.retrieve_key(LOCAL_BUNDLE_KEY_ID, KeyUsage::KeyAgreement)? {
         let stored: StoredLocalBundle = bincode::deserialize(secret.expose_secret())
             .map_err(|e| anyhow!("decode stored prekey bundle: {e}"))?;
         return stored_to_secret(stored);
@@ -155,7 +155,7 @@ pub(crate) fn retire_legacy_bundle(ks: &mut SecureKeyStore) -> Result<()> {
 /// Returns `Ok(true)` if an OTP was present and rotated, `Ok(false)` if
 /// the local bundle had none.
 pub fn consume_one_time_prekey(ks: &mut SecureKeyStore) -> Result<bool> {
-    let stored_secret = match ks.retrieve_key(LOCAL_BUNDLE_KEY_ID)? {
+    let stored_secret = match ks.retrieve_key(LOCAL_BUNDLE_KEY_ID, KeyUsage::KeyAgreement)? {
         Some(s) => s,
         None => return Ok(false),
     };
@@ -255,7 +255,7 @@ pub fn get_peer_bundle(
     ks: &mut SecureKeyStore,
     id: &IdentityId,
 ) -> Result<Option<PrekeyBundleBody>> {
-    match ks.retrieve_key(&peer_key_id(id))? {
+    match ks.retrieve_key(&peer_key_id(id), KeyUsage::KeyAgreement)? {
         Some(secret) => {
             let body: PrekeyBundleBody = bincode::deserialize(secret.expose_secret())
                 .map_err(|e| anyhow!("decode peer bundle: {e}"))?;

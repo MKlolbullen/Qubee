@@ -10,6 +10,7 @@ use crate::groups::group_events::{GroupEvent, GroupEventType};
 use crate::groups::group_permissions::{GroupPermissions, Permission, Role};
 use crate::identity::identity_key::{IdentityId, IdentityKey};
 use crate::storage::secure_keystore::{KeyMetadata, KeyType, KeyUsage, SecureKeystore};
+use crate::storage::KeystoreError;
 use std::collections::HashMap as StdHashMap;
 
 /// Hard cap on the number of members in a single Qubee group, including
@@ -1020,7 +1021,7 @@ impl GroupManager {
     /// local user never joined the group (or already left it).
     pub fn load_my_kyber_secret(&mut self, group_id: GroupId) -> Result<Option<Vec<u8>>> {
         let key = format!("my_kyber_{}", hex::encode(group_id.as_ref()));
-        let secret = match self.keystore.retrieve_key(&key)? {
+        let secret = match self.keystore.retrieve_key(&key, KeyUsage::KeyAgreement)? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -1146,9 +1147,20 @@ impl GroupManager {
     /// matches a real, unexpired invitation we know about.
     pub fn get_invitation(&mut self, invitation_code: &str) -> Result<Option<GroupInvitation>> {
         let key = format!("invitation_{invitation_code}");
-        let secret = match self.keystore.retrieve_key(&key)? {
-            Some(s) => s,
-            None => return Ok(None),
+        let secret = match self.keystore.retrieve_key(&key, KeyUsage::Authentication) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(None),
+            // An invitation past its expiry gets the same answer as one
+            // we never minted.
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<KeystoreError>(),
+                    Some(KeystoreError::Expired { .. })
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
         };
         let invitation: GroupInvitation = bincode::deserialize(secret.expose_secret())?;
         Ok(Some(invitation))
@@ -1193,7 +1205,7 @@ impl GroupManager {
             .get_invitation(invitation_code)?
             .ok_or_else(|| anyhow::anyhow!("invitation not found"))?;
         if let Some(expires_at) = invitation.expires_at {
-            if now > expires_at {
+            if now >= expires_at {
                 return Err(anyhow::anyhow!("invitation expired"));
             }
         }
@@ -1364,7 +1376,10 @@ impl GroupManager {
             if !key_id.starts_with("accepted_invite_") {
                 continue;
             }
-            if let Some(secret) = self.keystore.retrieve_key(&key_id)? {
+            if let Some(secret) = self
+                .keystore
+                .retrieve_key(&key_id, KeyUsage::Authentication)?
+            {
                 if let Ok(entry) =
                     bincode::deserialize::<AcceptedExternalInvite>(secret.expose_secret())
                 {
@@ -1626,7 +1641,9 @@ impl GroupManager {
         let mut events = Vec::new();
         for key_id in key_ids {
             if key_id.starts_with(&prefix) {
-                if let Some(secret_data) = self.keystore.retrieve_key(&key_id)? {
+                if let Some(secret_data) =
+                    self.keystore.retrieve_key(&key_id, KeyUsage::Encryption)?
+                {
                     let data = secret_data.expose_secret();
                     if let Ok(event) = bincode::deserialize::<GroupEvent>(data) {
                         events.push(event);
@@ -1666,7 +1683,10 @@ impl GroupManager {
             .collect::<Vec<_>>();
 
         for key_name in group_keys {
-            if let Some(secret_data) = self.keystore.retrieve_key(&key_name)? {
+            if let Some(secret_data) = self
+                .keystore
+                .retrieve_key(&key_name, KeyUsage::Encryption)?
+            {
                 let data = secret_data.expose_secret();
                 if let Ok(group) = bincode::deserialize::<Group>(data) {
                     let group_id = group.id;
@@ -1742,6 +1762,8 @@ impl Default for GroupSettings {
 mod tests {
     use super::*;
     use crate::identity::identity_key::IdentityKeyPair;
+    use crate::storage::secure_keystore::FixedClock;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -2032,11 +2054,62 @@ mod tests {
         assert!(gm.consume_invitation_use(&code, now).is_ok());
 
         // Expired invitations are refused regardless of remaining uses.
+        // The keystore refuses to mint one that is already expired by
+        // its own clock, so the expiry sits in the future and the
+        // caller's `now` is what moves past it.
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            + 3_600;
         let expiring = gm
-            .create_invitation(group_id, owner_id, Some(500), Some(5))
+            .create_invitation(group_id, owner_id, Some(expires_at), Some(5))
             .expect("expiring invite");
         assert!(gm
-            .consume_invitation_use(&expiring.invitation_code, 1_000)
+            .consume_invitation_use(&expiring.invitation_code, expires_at - 1)
+            .is_ok());
+        assert!(gm
+            .consume_invitation_use(&expiring.invitation_code, expires_at)
+            .is_err());
+    }
+
+    #[test]
+    fn an_invitation_past_its_expiry_reads_as_absent() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let clock = Arc::new(FixedClock::new(1_000));
+        let keystore = SecureKeystore::new_with_clock(
+            &temp_dir.path().join("k.db"),
+            b"test-keystore-passphrase",
+            clock.clone(),
+        )
+        .expect("keystore");
+        let mut gm = GroupManager::new(keystore).expect("gm");
+
+        let owner = IdentityKeyPair::generate().expect("kp");
+        let owner_id = owner.public_key().identity_id;
+        let group_id = gm
+            .create_group(
+                owner_id,
+                owner.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .expect("group");
+        let code = gm
+            .create_invitation(group_id, owner_id, Some(2_000), Some(5))
+            .expect("invite")
+            .invitation_code;
+        assert!(gm.get_invitation(&code).expect("get").is_some());
+
+        clock.set(2_000);
+        assert!(gm.get_invitation(&code).expect("get").is_none());
+        assert!(gm.consume_invitation_use(&code, 2_000).is_err());
+        gm.release_invitation_use(&code)
+            .expect("releasing a vanished invitation is a no-op");
+        assert!(gm
+            .create_invitation(group_id, owner_id, Some(2_000), None)
             .is_err());
     }
 

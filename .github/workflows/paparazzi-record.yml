@@ -77,7 +77,7 @@ jobs:
               | grep -vE '^\s+at ' | head -n 60
             echo '--- last lines ---'
             tail -n 30 record.log
-          } | cut -c1-400 | sed 's/%/%25/g' > failure.txt
+          } | cut -c1-400 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' > failure.txt
           split -l 9 -d failure.txt chunk_
           for f in chunk_*; do
             echo "::error::$(sed ':a;N;$!ba;s/\n/%0A/g' "$f")"

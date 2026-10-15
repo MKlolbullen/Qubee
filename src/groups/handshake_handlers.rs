@@ -88,15 +88,11 @@ pub fn process_request_join(
         return Err(anyhow!("RequestJoin signature failed"));
     }
 
-    let invitation = match gm.get_invitation(&body.invitation_code)? {
-        Some(i) => i,
-        None => return Ok(HandshakeOutcome::UnknownInvitation),
-    };
-    if invitation.group_id != body.group_id {
-        return Err(anyhow!("invitation/group mismatch"));
+    // Only the device that minted the code answers. An expired record
+    // still names its minter, so the recovery below survives expiry.
+    if !gm.has_invitation_record(&body.invitation_code) {
+        return Ok(HandshakeOutcome::UnknownInvitation);
     }
-
-    let now = now_secs();
 
     // Idempotent re-issue: if this signed requester is already an active
     // member, a prior Accept enrolled them but its JoinAccepted may not
@@ -104,6 +100,8 @@ pub fn process_request_join(
     // reply without consuming another invitation use or re-adding, and
     // do not re-broadcast MemberAdded — the group already knows. Re-stamp
     // their Kyber pubkey so future rotations target the key they hold now.
+    // Nothing here needs the invitation itself, so it runs before the
+    // lookup and keeps working once the invitation has expired.
     let already_member = gm
         .get_group(&body.group_id)
         .and_then(|g| g.members.get(&body.joiner_public_key.identity_id))
@@ -126,6 +124,18 @@ pub fn process_request_join(
             signature: accepted_signature,
         });
     }
+
+    let invitation = match gm.get_invitation(&body.invitation_code)? {
+        Some(i) => i,
+        // Minted here but past its expiry: the joiner gets a reason, not
+        // silence.
+        None => return reject(inviter_identity, body, "invitation expired"),
+    };
+    if invitation.group_id != body.group_id {
+        return Err(anyhow!("invitation/group mismatch"));
+    }
+
+    let now = now_secs();
 
     // Atomically reserve one use of the invitation, re-validating expiry
     // and max_uses and bumping the counter in a single step. Doing this
@@ -915,4 +925,103 @@ pub fn process_key_delivery(
 
     gm.adopt_group_version(body.group_id, body.generation)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::groups::group_handshake::{generate_ephemeral_kyber, sign_request_join};
+    use crate::groups::group_manager::{GroupSettings, GroupType};
+    use crate::storage::secure_keystore::{FixedClock, SecureKeyStore};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn signed_request(
+        joiner: &IdentityKeyPair,
+        group_id: GroupId,
+        code: &str,
+    ) -> (RequestJoinBody, HybridSignature) {
+        let (kyber_pub, _secret) = generate_ephemeral_kyber();
+        let body = RequestJoinBody {
+            group_id,
+            invitation_code: code.to_string(),
+            joiner_public_key: joiner.public_key(),
+            joiner_display_name: "joiner".to_string(),
+            joiner_kyber_pub: kyber_pub,
+            joiner_peer_id: String::new(),
+        };
+        match sign_request_join(joiner, body).unwrap() {
+            GroupHandshake::RequestJoin { body, signature } => (body, signature),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_committed_member_is_reissued_its_acceptance_after_the_invitation_expires() {
+        let dir = TempDir::new().unwrap();
+        let now = now_secs();
+        let clock = Arc::new(FixedClock::new(now));
+        let keystore = SecureKeyStore::new_with_clock(
+            &dir.path().join("alice.db"),
+            b"test-keystore-passphrase",
+            clock.clone(),
+        )
+        .unwrap();
+        let mut alice_gm = GroupManager::new(keystore).unwrap();
+        let alice_kp = IdentityKeyPair::generate().unwrap();
+        let alice_id = alice_kp.identity_id();
+        let group_id = alice_gm
+            .create_group(
+                alice_id,
+                alice_kp.public_key(),
+                "G".to_string(),
+                String::new(),
+                GroupType::Private,
+                GroupSettings::default(),
+            )
+            .unwrap();
+        alice_gm.ensure_group_key(group_id).unwrap();
+        let expires_at = now + 3_600;
+        let code = alice_gm
+            .create_invitation(group_id, alice_id, Some(expires_at), Some(1))
+            .unwrap()
+            .invitation_code;
+
+        let bob_kp = IdentityKeyPair::generate().unwrap();
+        let (body, signature) = signed_request(&bob_kp, group_id, &code);
+        let first = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
+        assert!(
+            matches!(first, HandshakeOutcome::Accept { .. }),
+            "{first:?}"
+        );
+
+        // Bob never received the acceptance; by the time he retries, the
+        // invitation has expired.
+        clock.set(expires_at);
+        assert!(alice_gm.get_invitation(&code).unwrap().is_none());
+        let (body, signature) = signed_request(&bob_kp, group_id, &code);
+        let retry = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
+        assert!(
+            matches!(retry, HandshakeOutcome::ReIssueAccept { .. }),
+            "{retry:?}"
+        );
+        assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
+
+        // A newcomer on the same expired code is told so; one on a code
+        // this device never minted gets silence.
+        let carol_kp = IdentityKeyPair::generate().unwrap();
+        let (body, signature) = signed_request(&carol_kp, group_id, &code);
+        let late = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
+        match late {
+            HandshakeOutcome::Reject { body, .. } => assert!(body.reason.contains("expired")),
+            other => panic!("{other:?}"),
+        }
+        let (body, signature) = signed_request(&carol_kp, group_id, "not-ours");
+        let unknown = process_request_join(&mut alice_gm, &alice_kp, &body, &signature).unwrap();
+        assert!(
+            matches!(unknown, HandshakeOutcome::UnknownInvitation),
+            "{unknown:?}"
+        );
+        assert_eq!(alice_gm.get_group(&group_id).unwrap().members.len(), 2);
+    }
 }

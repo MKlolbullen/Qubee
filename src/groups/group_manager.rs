@@ -1142,6 +1142,14 @@ impl GroupManager {
         Ok(invitation.group_id)
     }
 
+    /// Whether this device minted an invitation under `invitation_code`,
+    /// expired or not. Answers "is this request for me" without opening
+    /// the record.
+    pub fn has_invitation_record(&self, invitation_code: &str) -> bool {
+        self.keystore
+            .contains_key_record(&format!("invitation_{invitation_code}"))
+    }
+
     /// Look up an invitation we previously minted by its code. Used by
     /// the network handshake handler to verify that a `RequestJoin`
     /// matches a real, unexpired invitation we know about.

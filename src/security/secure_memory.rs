@@ -1,3 +1,9 @@
+//! Page-locked scratch memory for secrets that must not be swapped out.
+//!
+//! `mlock` keeps the pages resident. It does not keep them out of core
+//! dumps, and the kernel may refuse it (`RLIMIT_MEMLOCK`); then the
+//! allocation fails instead of quietly handing out ordinary heap.
+
 use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretBox};
 use std::alloc::{self, Layout};
@@ -5,21 +11,18 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zeroize::Zeroize;
 
-/// Secure memory allocator that provides protected memory regions
-/// for storing sensitive cryptographic material
+/// Hands out page-locked regions and caps how much locked memory they
+/// hold together.
 pub struct SecureAllocator {
     allocated_bytes: AtomicUsize,
     max_allocation: usize,
 }
 
 impl SecureAllocator {
-    const DEFAULT_MAX_ALLOCATION: usize = 64 * 1024 * 1024; // 64MB
+    const DEFAULT_MAX_ALLOCATION: usize = 64 * 1024 * 1024;
 
     pub fn new() -> Self {
-        Self {
-            allocated_bytes: AtomicUsize::new(0),
-            max_allocation: Self::DEFAULT_MAX_ALLOCATION,
-        }
+        Self::with_max_allocation(Self::DEFAULT_MAX_ALLOCATION)
     }
 
     pub fn with_max_allocation(max_allocation: usize) -> Self {
@@ -29,122 +32,66 @@ impl SecureAllocator {
         }
     }
 
-    /// Allocate secure memory with protection against swapping and core dumps
-    pub fn allocate_secure(&self, size: usize) -> Result<SecureMemoryRegion> {
-        if size == 0 {
-            return Err(anyhow::anyhow!("Cannot allocate zero bytes"));
-        }
-
-        // Check allocation limits
-        let current = self.allocated_bytes.load(Ordering::Acquire);
-        if current + size > self.max_allocation {
-            return Err(anyhow::anyhow!("Allocation would exceed maximum limit"));
-        }
-
-        // Align size to page boundary for mlock
-        let page_size = Self::get_page_size();
-        let aligned_size = (size + page_size - 1) & !(page_size - 1);
-
-        // Allocate memory
+    /// `size` zeroed bytes in freshly locked pages. The region is zeroed
+    /// again, unlocked and freed on drop. A refused request, including
+    /// one the kernel will not lock, charges nothing to the budget.
+    pub fn allocate_secure(&self, size: usize) -> Result<SecureMemoryRegion<'_>> {
+        anyhow::ensure!(size > 0, "Cannot allocate zero bytes");
+        let page_size = page_size()?;
+        let locked_size = size
+            .checked_add(page_size - 1)
+            .map(|rounded| rounded & !(page_size - 1))
+            .context("allocation size overflows")?;
         let layout =
-            Layout::from_size_align(aligned_size, page_size).context("Invalid memory layout")?;
+            Layout::from_size_align(locked_size, page_size).context("Invalid memory layout")?;
 
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return Err(anyhow::anyhow!("Memory allocation failed"));
-        }
-
-        let non_null_ptr =
-            NonNull::new(ptr).ok_or_else(|| anyhow::anyhow!("Allocated null pointer"))?;
-
-        // Lock memory to prevent swapping
-        #[cfg(unix)]
-        {
-            let result = unsafe { libc::mlock(ptr as *const libc::c_void, aligned_size) };
-            if result != 0 {
-                unsafe { alloc::dealloc(ptr, layout) };
-                return Err(anyhow::anyhow!(
-                    "Failed to lock memory: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use winapi::um::memoryapi::VirtualLock;
-            let result = unsafe { VirtualLock(ptr as *mut winapi::ctypes::c_void, aligned_size) };
-            if result == 0 {
-                unsafe { alloc::dealloc(ptr, layout) };
-                return Err(anyhow::anyhow!(
-                    "Failed to lock memory: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-
-        // Update allocation counter
+        // The whole locked span is reserved in one atomic step before
+        // anything is allocated, so racing requests cannot both pass the
+        // check and the budget is never exceeded.
         self.allocated_bytes
-            .fetch_add(aligned_size, Ordering::AcqRel);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(locked_size)
+                    .filter(|&next| next <= self.max_allocation)
+            })
+            .map_err(|_| anyhow::anyhow!("Allocation would exceed maximum limit"))?;
+
+        let Some(ptr) = NonNull::new(unsafe { alloc::alloc_zeroed(layout) }) else {
+            self.release(locked_size);
+            return Err(anyhow::anyhow!("Memory allocation failed"));
+        };
+        if let Err(error) = lock_pages(ptr, locked_size) {
+            unsafe { alloc::dealloc(ptr.as_ptr(), layout) };
+            self.release(locked_size);
+            return Err(error);
+        }
 
         Ok(SecureMemoryRegion {
-            ptr: non_null_ptr,
-            size: aligned_size,
-            actual_size: size,
+            ptr,
+            locked_size,
+            len: size,
             layout,
             allocator: self,
         })
     }
 
-    fn get_page_size() -> usize {
-        #[cfg(unix)]
-        {
-            unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-        }
-
-        #[cfg(windows)]
-        {
-            use winapi::um::sysinfoapi::{GetSystemInfo, SYSTEM_INFO};
-            let mut sys_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
-            unsafe { GetSystemInfo(&mut sys_info) };
-            sys_info.dwPageSize as usize
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            4096 // Default page size
-        }
+    /// Bytes currently held in locked pages, counted in whole pages.
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes.load(Ordering::Acquire)
     }
 
-    fn deallocate(&self, region: &SecureMemoryRegion) {
-        // Unlock memory
-        #[cfg(unix)]
-        {
-            unsafe { libc::munlock(region.ptr.as_ptr() as *const libc::c_void, region.size) };
-        }
+    fn release(&self, bytes: usize) {
+        self.allocated_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
 
-        #[cfg(windows)]
-        {
-            use winapi::um::memoryapi::VirtualUnlock;
-            unsafe {
-                VirtualUnlock(
-                    region.ptr.as_ptr() as *mut winapi::ctypes::c_void,
-                    region.size,
-                )
-            };
-        }
-
-        // Securely zero memory before deallocation
-        unsafe {
-            std::ptr::write_bytes(region.ptr.as_ptr(), 0, region.size);
-        }
-
-        // Deallocate memory
+    fn deallocate(&self, region: &mut SecureMemoryRegion<'_>) {
+        // Volatile writes: a plain memset right before the free is a dead
+        // store the optimiser may drop.
+        unsafe { std::slice::from_raw_parts_mut(region.ptr.as_ptr(), region.locked_size) }
+            .zeroize();
+        unlock_pages(region.ptr, region.locked_size);
         unsafe { alloc::dealloc(region.ptr.as_ptr(), region.layout) };
-
-        // Update allocation counter
-        self.allocated_bytes
-            .fetch_sub(region.size, Ordering::AcqRel);
+        self.release(region.locked_size);
     }
 }
 
@@ -154,211 +101,120 @@ impl Default for SecureAllocator {
     }
 }
 
-/// A secure memory region that automatically zeros its contents on drop
+/// Bytes in locked pages; zeroed, unlocked and freed on drop.
 pub struct SecureMemoryRegion<'a> {
     ptr: NonNull<u8>,
-    size: usize,
-    actual_size: usize,
+    locked_size: usize,
+    len: usize,
     layout: Layout,
     allocator: &'a SecureAllocator,
 }
 
-impl<'a> SecureMemoryRegion<'a> {
-    /// Get a mutable slice to the secure memory
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.actual_size) }
-    }
-
-    /// Get an immutable slice to the secure memory
+impl SecureMemoryRegion<'_> {
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.actual_size) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
-    /// Get the size of the usable memory
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
     pub fn len(&self) -> usize {
-        self.actual_size
+        self.len
     }
 
-    /// Check if the memory region is empty
     pub fn is_empty(&self) -> bool {
-        self.actual_size == 0
+        self.len == 0
     }
 
-    /// Securely zero the memory contents
     pub fn zeroize(&mut self) {
-        unsafe {
-            std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.actual_size);
-        }
+        self.as_mut_slice().zeroize();
     }
 }
 
-impl<'a> Drop for SecureMemoryRegion<'a> {
+impl Drop for SecureMemoryRegion<'_> {
     fn drop(&mut self) {
-        self.allocator.deallocate(self);
+        let allocator = self.allocator;
+        allocator.deallocate(self);
     }
 }
 
-/// A secure buffer that automatically manages its memory.
-/// Manual `Drop` (further down) zeroises `data`; we don't combine
-/// with `#[derive(ZeroizeOnDrop)]` because that would synthesise a
-/// second `Drop` impl and trigger E0119.
-pub struct SecureBuffer {
-    data: Vec<u8>,
-    is_locked: bool,
+#[cfg(unix)]
+fn page_size() -> Result<usize> {
+    let size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .context("sysconf(_SC_PAGESIZE) failed")?;
+    anyhow::ensure!(size.is_power_of_two(), "unusable page size {size}");
+    Ok(size)
 }
 
-impl SecureBuffer {
-    /// Create a new secure buffer with the specified capacity
-    pub fn new(capacity: usize) -> Result<Self> {
-        let mut data = Vec::with_capacity(capacity);
-
-        // Try to lock the memory
-        let is_locked = Self::lock_memory(&data);
-
-        Ok(SecureBuffer { data, is_locked })
-    }
-
-    /// Create a secure buffer from existing data
-    pub fn from_vec(mut data: Vec<u8>) -> Self {
-        let is_locked = Self::lock_memory(&data);
-        SecureBuffer { data, is_locked }
-    }
-
-    /// Get the data as a slice
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Get the data as a mutable slice
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
-    /// Extend the buffer with additional data
-    pub fn extend_from_slice(&mut self, other: &[u8]) {
-        self.data.extend_from_slice(other);
-    }
-
-    /// Clear the buffer and zeroize its contents
-    pub fn clear(&mut self) {
-        self.data.zeroize();
-        self.data.clear();
-    }
-
-    /// Get the length of the buffer
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if the buffer is empty
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    fn lock_memory(data: &Vec<u8>) -> bool {
-        if data.capacity() == 0 {
-            return false;
-        }
-
-        #[cfg(unix)]
-        {
-            let result =
-                unsafe { libc::mlock(data.as_ptr() as *const libc::c_void, data.capacity()) };
-            result == 0
-        }
-
-        #[cfg(windows)]
-        {
-            use winapi::um::memoryapi::VirtualLock;
-            let result = unsafe {
-                VirtualLock(
-                    data.as_ptr() as *mut winapi::ctypes::c_void,
-                    data.capacity(),
-                )
-            };
-            result != 0
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            false
-        }
-    }
+#[cfg(unix)]
+fn lock_pages(ptr: NonNull<u8>, len: usize) -> Result<()> {
+    let rc = unsafe { libc::mlock(ptr.as_ptr().cast::<libc::c_void>(), len) };
+    anyhow::ensure!(
+        rc == 0,
+        "Failed to lock memory: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
 }
 
-impl Drop for SecureBuffer {
-    fn drop(&mut self) {
-        if self.is_locked && !self.data.is_empty() {
-            #[cfg(unix)]
-            {
-                unsafe {
-                    libc::munlock(
-                        self.data.as_ptr() as *const libc::c_void,
-                        self.data.capacity(),
-                    );
-                }
-            }
-
-            #[cfg(windows)]
-            {
-                use winapi::um::memoryapi::VirtualUnlock;
-                unsafe {
-                    VirtualUnlock(
-                        self.data.as_ptr() as *mut winapi::ctypes::c_void,
-                        self.data.capacity(),
-                    );
-                }
-            }
-        }
-    }
+#[cfg(unix)]
+fn unlock_pages(ptr: NonNull<u8>, len: usize) {
+    // The pages are freed right after this; a failure leaves nothing to
+    // act on.
+    let _ = unsafe { libc::munlock(ptr.as_ptr().cast::<libc::c_void>(), len) };
 }
 
-/// A secure string. The underlying [`SecretBox`] zeroises on drop so
-/// no extra `ZeroizeOnDrop` derive is needed (and would conflict).
+#[cfg(not(unix))]
+fn page_size() -> Result<usize> {
+    anyhow::bail!("page locking is only implemented for unix targets")
+}
+
+#[cfg(not(unix))]
+fn lock_pages(_ptr: NonNull<u8>, _len: usize) -> Result<()> {
+    anyhow::bail!("page locking is only implemented for unix targets")
+}
+
+#[cfg(not(unix))]
+fn unlock_pages(_ptr: NonNull<u8>, _len: usize) {}
+
+/// A string whose bytes are zeroised when it is dropped.
 pub struct SecureString {
     inner: SecretBox<String>,
 }
 
 impl SecureString {
-    /// Create a new secure string
     pub fn new(s: String) -> Self {
         SecureString {
             inner: SecretBox::new(Box::new(s)),
         }
     }
 
-    /// Create a secure string from a str
-    pub fn from_str(s: &str) -> Self {
-        SecureString {
-            inner: SecretBox::new(Box::new(s.to_string())),
-        }
-    }
-
-    /// Expose the string contents (use carefully)
     pub fn expose_secret(&self) -> &str {
         self.inner.expose_secret()
     }
 
-    /// Get the length of the string
     pub fn len(&self) -> usize {
         self.inner.expose_secret().len()
     }
 
-    /// Check if the string is empty
     pub fn is_empty(&self) -> bool {
         self.inner.expose_secret().is_empty()
     }
 }
 
-/// Global secure allocator instance
+impl From<&str> for SecureString {
+    fn from(s: &str) -> Self {
+        Self::new(s.to_owned())
+    }
+}
+
 static GLOBAL_ALLOCATOR: std::sync::OnceLock<SecureAllocator> = std::sync::OnceLock::new();
 
-/// Get the global secure allocator
 pub fn global_allocator() -> &'static SecureAllocator {
     GLOBAL_ALLOCATOR.get_or_init(SecureAllocator::default)
 }
 
-/// Allocate secure memory using the global allocator
 pub fn allocate_secure(size: usize) -> Result<SecureMemoryRegion<'static>> {
     global_allocator().allocate_secure(size)
 }
@@ -367,59 +223,89 @@ pub fn allocate_secure(size: usize) -> Result<SecureMemoryRegion<'static>> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn test_secure_allocator() {
+    fn a_region_is_zeroed_and_exactly_as_long_as_requested() {
         let allocator = SecureAllocator::new();
-        let region = allocator.allocate_secure(1024).expect("Should allocate");
+        let region = allocator.allocate_secure(1024).expect("allocate");
         assert_eq!(region.len(), 1024);
-    }
-
-    #[test]
-    fn test_secure_buffer() {
-        let mut buffer = SecureBuffer::new(1024).expect("Should create buffer");
-        buffer.extend_from_slice(b"test data");
-        assert_eq!(buffer.as_slice(), b"test data");
-
-        buffer.clear();
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn test_secure_string() {
-        let secure_str = SecureString::from_str("secret password");
-        assert_eq!(secure_str.expose_secret(), "secret password");
-        assert_eq!(secure_str.len(), 15);
-    }
-
-    #[test]
-    fn test_memory_region_zeroization() {
-        let allocator = SecureAllocator::new();
-        let mut region = allocator.allocate_secure(32).expect("Should allocate");
-
-        // Write some data
-        region
-            .as_mut_slice()
-            .copy_from_slice(b"sensitive data that should be zero");
-
-        // Manually zeroize
-        region.zeroize();
-
-        // Check that data is zeroed
+        assert!(!region.is_empty());
         assert!(region.as_slice().iter().all(|&b| b == 0));
     }
 
     #[test]
-    fn test_allocation_limits() {
-        let allocator = SecureAllocator::with_max_allocation(1024);
+    fn a_zero_byte_request_is_refused() {
+        assert!(SecureAllocator::new().allocate_secure(0).is_err());
+    }
 
-        // Should succeed
-        let _region1 = allocator.allocate_secure(512).expect("Should allocate");
+    #[cfg(unix)]
+    #[test]
+    fn zeroize_clears_the_region() {
+        let allocator = SecureAllocator::new();
+        let mut region = allocator.allocate_secure(32).expect("allocate");
+        region.as_mut_slice().fill(0xA5);
+        region.zeroize();
+        assert!(region.as_slice().iter().all(|&b| b == 0));
+    }
 
-        // Should succeed
-        let _region2 = allocator.allocate_secure(512).expect("Should allocate");
+    #[cfg(unix)]
+    #[test]
+    fn the_budget_counts_whole_locked_pages() {
+        let page = page_size().expect("page size");
+        let allocator = SecureAllocator::with_max_allocation(page);
+        let one_byte = allocator.allocate_secure(1).expect("fits in one page");
+        assert_eq!(allocator.allocated_bytes(), page);
+        assert!(allocator.allocate_secure(1).is_err());
+        drop(one_byte);
+        assert_eq!(allocator.allocated_bytes(), 0);
+        assert!(allocator.allocate_secure(page).is_ok());
+    }
 
-        // Should fail due to limit
-        let result = allocator.allocate_secure(1);
-        assert!(result.is_err());
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_request_charges_nothing() {
+        let page = page_size().expect("page size");
+        let allocator = SecureAllocator::with_max_allocation(page);
+        for size in [page + 1, usize::MAX - page, usize::MAX] {
+            assert!(allocator.allocate_secure(size).is_err());
+            assert_eq!(allocator.allocated_bytes(), 0);
+        }
+        assert!(allocator.allocate_secure(page).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn racing_requests_never_exceed_the_budget() {
+        let page = page_size().expect("page size");
+        let allocator = SecureAllocator::with_max_allocation(4 * page);
+        let barrier = std::sync::Barrier::new(16);
+        let granted = std::thread::scope(|scope| {
+            let attempts: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let region = allocator.allocate_secure(1);
+                        // Hold the page until every thread has tried.
+                        barrier.wait();
+                        region.is_ok()
+                    })
+                })
+                .collect();
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().expect("thread"))
+                .filter(|&granted| granted)
+                .count()
+        });
+        assert_eq!(granted, 4);
+        assert_eq!(allocator.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn secure_string_exposes_its_contents() {
+        let secure = SecureString::from("secret password");
+        assert_eq!(secure.expose_secret(), "secret password");
+        assert_eq!(secure.len(), 15);
+        assert!(!secure.is_empty());
     }
 }

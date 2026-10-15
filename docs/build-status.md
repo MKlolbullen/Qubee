@@ -36,12 +36,13 @@ The verification pass started at 162 errors. Steps:
 
 1. **Feature-gated the legacy modules** behind `#[cfg(feature =
    "legacy")]`: `audio`, `hybrid_ratchet`, `secure_message`,
-   `file_transfer`, `signal_protocol`, `sas`, `oob_secrets`,
-   `secure_memory`. They reference dependency APIs that have since
-   drifted; nothing on the JNI surface uses them. Compile them when
-   you're ready to port: `cargo check --features legacy`. (Today
-   that's still a 100+ error fix-up project — the gating is
-   protective, not a green light.)
+   `file_transfer`, `signal_protocol`, `sas`, `oob_secrets`. They
+   reference dependency APIs that have since drifted; nothing on the
+   JNI surface uses them. Compile them when you're ready to port:
+   `cargo check --features legacy`. (Today that's still a 100+ error
+   fix-up project — the gating is protective, not a green light.)
+   `secure_memory` sat behind the same gate until its allocator was
+   rewritten; it is back in the default build with its tests.
 2. **Upgraded `secrecy 0.8` → `0.10`** and switched
    `Secret<NonCopyType>` to `SecretBox<NonCopyType>` everywhere it
    appeared: `identity/identity_key.rs`, `groups/group_crypto.rs`,

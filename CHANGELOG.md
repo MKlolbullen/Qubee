@@ -23,6 +23,16 @@ between minor versions.
   An expired group invitation reads as absent to the group manager; a
   joiner whose enrolment was committed but whose acceptance was lost
   still has it re-sent after the invitation expires.
+- `security::secure_memory` is back in the default build, with its
+  tests, after sitting behind the broken `legacy` feature. The
+  allocator reserves its budget in one atomic step before allocating,
+  counts whole locked pages, refuses a size that would overflow,
+  charges nothing for a request the kernel will not lock, rejects an
+  unusable page size, and zeroises with volatile writes. `SecureBuffer`,
+  which locked whatever pages a `Vec` happened to occupy and never
+  zeroised them, is gone, as are the Windows branches that referenced
+  a crate the project never depended on; `SecureString::from_str`
+  became `From<&str>`.
 
 ## [0.2.0-beta.1] — 2026-10-11
 

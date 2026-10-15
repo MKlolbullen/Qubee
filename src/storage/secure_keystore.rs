@@ -274,6 +274,18 @@ const MAX_MASTER_FILE_LEN: u64 = 4096;
 /// limit.
 const MAX_SNAPSHOT_LEN: u64 = 256 * 1024 * 1024;
 
+/// Whether anything at all, a symlink included, sits at `path`.
+/// `Path::exists` follows links, so a dangling symlink would read as
+/// absent, the store would open empty, and the next save would rename
+/// over the link.
+fn entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("stat keystore path"),
+    }
+}
+
 /// Read a store file through a handle that is checked after opening,
 /// so what was validated is what gets read: no symlink is followed, the
 /// target must be a regular file, and it must fit `max_len`. Group and
@@ -805,11 +817,11 @@ impl SecureKeyStore {
     ) -> Result<UnwrappedMaster> {
         let master_key_path = storage_path.with_extension("master");
 
-        if master_key_path.exists() {
+        if entry_exists(&master_key_path)? {
             Self::load_master_key(&master_key_path, passphrase)
         } else {
             anyhow::ensure!(
-                !storage_path.exists(),
+                !entry_exists(storage_path)?,
                 "keystore exists but master key is missing"
             );
             let master_key = SecretBox::new(Box::new(secure_rng::random::array::<32>()?));
@@ -1133,7 +1145,7 @@ impl SecureKeyStore {
     }
 
     fn load_keys(&mut self, alt: Option<&SecretBox<[u8; 32]>>) -> Result<(bool, bool)> {
-        if !self.storage_path.exists() {
+        if !entry_exists(&self.storage_path)? {
             return Ok((false, false));
         }
         let data =
@@ -2316,6 +2328,24 @@ mod tests {
             fs::rename(&aside, &file).unwrap();
         }
         assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_refused_rather_than_read_as_absent() {
+        let (mut ks, dir) = create_test_keystore();
+        ks.store_key("k", b"secret", KeyType::RootKey, plain_metadata(6))
+            .unwrap();
+        let path = ks.storage_path.clone();
+        drop(ks);
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), &path).unwrap();
+        assert!(SecureKeyStore::new(&path, b"test-keystore-passphrase").is_err());
+        // Nothing was written over the link.
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]

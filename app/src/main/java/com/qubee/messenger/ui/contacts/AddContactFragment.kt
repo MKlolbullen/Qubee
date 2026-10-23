@@ -157,12 +157,34 @@ class AddContactViewModel @Inject constructor(
                     .onFailure { Timber.w(it, "initiateDmHandshake failed") }
                     .getOrNull()
             }
+            val handshakeQueued = handshakeBytes?.let { bytes ->
+                runCatching {
+                    qubeeManager.sendP2PMessage(current.identityIdHex, bytes)
+                }.getOrDefault(false)
+            } ?: false
 
             _state.value = _state.value.copy(
                 isWorking = false,
                 saved = true,
                 handshakeInitBytes = handshakeBytes,
+                handshakeQueued = handshakeQueued,
             )
+        }
+    }
+
+    fun retryHandshakeDelivery() {
+        val current = _state.value
+        val bytes = current.handshakeInitBytes ?: return
+        val peerId = current.bundle?.identityIdHex ?: return
+        viewModelScope.launch {
+            val queued = runCatching {
+                qubeeManager.sendP2PMessage(peerId, bytes)
+            }.getOrDefault(false)
+            if (queued) {
+                _state.value = _state.value.copy(
+                    handshakeQueued = true,
+                )
+            }
         }
     }
 }
@@ -172,11 +194,9 @@ data class AddContactState(
     val bundle: IdentityBundle? = null,
     val error: String? = null,
     val saved: Boolean = false,
-    /// Wire bytes of a `DmHandshakeInit` for the peer to consume
-    /// via `nativeRespondToDmHandshake`. Null when the peer's
-    /// bundle didn't carry a DM prekey or when the handshake
-    /// failed; in that case the UI falls back to "contact saved
-    /// without secure DM" messaging.
+    val handshakeQueued: Boolean = false,
+    /// Durable `DmHandshakeInit` bytes retained until a response from
+    /// the peer confirms the session is usable.
     val handshakeInitBytes: ByteArray? = null,
 ) {
     override fun equals(other: Any?): Boolean {
@@ -186,6 +206,7 @@ data class AddContactState(
             bundle == other.bundle &&
             error == other.error &&
             saved == other.saved &&
+            handshakeQueued == other.handshakeQueued &&
             handshakeInitBytes.contentEqualsNullable(other.handshakeInitBytes)
     }
 
@@ -194,6 +215,7 @@ data class AddContactState(
         result = 31 * result + (bundle?.hashCode() ?: 0)
         result = 31 * result + (error?.hashCode() ?: 0)
         result = 31 * result + saved.hashCode()
+        result = 31 * result + handshakeQueued.hashCode()
         result = 31 * result + (handshakeInitBytes?.contentHashCode() ?: 0)
         return result
     }
@@ -247,13 +269,11 @@ private fun AddContactScreen(
 
                 if (state.saved) {
                     val msg = if (state.handshakeInitBytes != null) {
-                        // Forward-secret + post-quantum-secure
-                        // session is now half-established locally.
-                        // Receiver-side delivery of these bytes is
-                        // a separate piece of plumbing; for now we
-                        // surface a status line.
-                        "Contact saved. Secure DM session opened (handshake init " +
-                            "${state.handshakeInitBytes!!.size} bytes pending peer delivery)."
+                        if (state.handshakeQueued) {
+                            "Contact saved. Handshake init queued; waiting for the peer's first secure message."
+                        } else {
+                            "Contact saved. Secure DM setup is waiting for delivery."
+                        }
                     } else if (bundle.dmPrekeyBundleB64 == null) {
                         "Contact saved. Older identity bundle — secure DM not " +
                             "available until the peer publishes a v3 QR."
@@ -262,6 +282,13 @@ private fun AddContactScreen(
                             "(see logs); messages will use the group-fallback path."
                     }
                     Text(msg, style = MaterialTheme.typography.bodyMedium)
+                    if (state.handshakeInitBytes != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = viewModel::retryHandshakeDelivery,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Retry secure DM delivery") }
+                    }
                 } else {
                     Button(
                         onClick = { viewModel.acceptContact() },

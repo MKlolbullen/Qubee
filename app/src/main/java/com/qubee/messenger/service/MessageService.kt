@@ -110,6 +110,12 @@ class MessageService : Service(), NetworkCallback {
         Timber.d("Encrypted message received from %s (%d bytes)", senderId, data.size)
         serviceScope.launch {
             try {
+                val dmPeerId = qubeeManager.respondToDmHandshake(data)
+                if (dmPeerId != null) {
+                    Timber.i("Established secure DM session with %s", dmPeerId)
+                    return@launch
+                }
+
                 // Resolve the application-level contact id, if any,
                 // by libp2p PeerId. If the lookup misses,
                 // `populateContactPeerId` below tries to link the

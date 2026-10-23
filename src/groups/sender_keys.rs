@@ -111,9 +111,33 @@ pub struct SenderChain {
 }
 
 impl SenderChain {
-    /// Derive a chain from a group key + sender id + generation.
-    /// Both peers (sender and receivers) call this with identical
-    /// arguments to land on identical starting state.
+    /// Derive a sender chain from an independently generated secret.
+    /// The secret is distributed to authorized group members and is
+    /// deliberately unrelated to the retained group key.
+    pub fn from_sender_seed(
+        sender_seed: &[u8; 32],
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+    ) -> Result<Self> {
+        let mut salt = Vec::with_capacity(group_id.as_ref().len() + sender_id.as_ref().len() + 8);
+        salt.extend_from_slice(group_id.as_ref());
+        salt.extend_from_slice(sender_id.as_ref());
+        salt.extend_from_slice(&generation.to_le_bytes());
+
+        let mut seed = [0u8; KEY_LEN];
+        Hkdf::<Sha256>::new(Some(&salt), sender_seed)
+            .expand(INFO_SEED, &mut seed)
+            .map_err(|e| anyhow::anyhow!("hkdf expand (sender seed): {e}"))?;
+
+        Ok(Self {
+            chain_key: SecretBox::new(Box::new(seed)),
+            next_counter: 0,
+            skipped: HashMap::new(),
+        })
+    }
+
+    /// Legacy v1 derivation retained only to decrypt older messages.
     pub fn from_group_seed(
         group_key: &[u8; 32],
         group_id: &GroupId,

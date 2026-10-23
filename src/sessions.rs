@@ -43,6 +43,7 @@
 //!   surface yet. `crate::jni_api` doesn't see this module.
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use x25519_dalek::{PublicKey as DhPublicKey, StaticSecret as DhStaticSecret};
 
@@ -138,6 +139,7 @@ impl DmSession {
 /// but for pairwise traffic.
 pub struct SessionManager {
     sessions: HashMap<IdentityId, DmSession>,
+    pending_handshake_inits: HashMap<IdentityId, Vec<u8>>,
 }
 
 impl SessionManager {
@@ -146,6 +148,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            pending_handshake_inits: HashMap::new(),
         }
     }
 
@@ -273,6 +276,7 @@ impl SessionManager {
     /// or after the peer revokes their identity). Returns `true`
     /// if a session existed.
     pub fn drop_session(&mut self, peer_id: &IdentityId) -> bool {
+        self.pending_handshake_inits.remove(peer_id);
         self.sessions.remove(peer_id).is_some()
     }
 
@@ -312,13 +316,19 @@ impl SessionManager {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>> {
+        let pending_init = self.pending_handshake_inits.get(peer_id).cloned();
         let session = self
             .sessions
             .get_mut(peer_id)
             .ok_or_else(|| anyhow!("no DM session for peer"))?;
         let snapshot = session.ratchet.persist()?;
         let wire = session.encrypt(plaintext, aad)?;
-        if let Err(err) = Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet) {
+        if let Err(err) = Self::persist_session_to_keystore(
+            keystore,
+            peer_id,
+            &session.ratchet,
+            pending_init.as_deref(),
+        ) {
             // RAM has advanced past disk; roll back so the next
             // retry doesn't emit a frame the peer cannot match
             // against their (still pre-advance) snapshot.
@@ -339,13 +349,19 @@ impl SessionManager {
         wire: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>> {
+        let pending_init = self.pending_handshake_inits.get(peer_id).cloned();
         let session = self
             .sessions
             .get_mut(peer_id)
             .ok_or_else(|| anyhow!("no DM session for peer"))?;
         let snapshot = session.ratchet.persist()?;
         let pt = session.decrypt(wire, aad)?;
-        if let Err(err) = Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet) {
+        if let Err(err) = Self::persist_session_to_keystore(
+            keystore,
+            peer_id,
+            &session.ratchet,
+            pending_init.as_deref(),
+        ) {
             session.ratchet = DoubleRatchet::restore(&snapshot)?;
             return Err(err);
         }
@@ -372,9 +388,75 @@ impl SessionManager {
             ));
         }
         let session = DmSession::establish_initiator(peer_id, root_key, peer_initial_dh_pub)?;
-        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet)?;
+        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet, None)?;
         self.sessions.insert(peer_id, session);
         Ok(())
+    }
+
+    /// Persist the initiator session and its initial message as one
+    /// keystore record, so neither can survive a crash without the other.
+    pub fn establish_initiator_with_pending_init_persistent(
+        &mut self,
+        keystore: &mut SecureKeyStore,
+        peer_id: IdentityId,
+        root_key: &[u8; 32],
+        peer_initial_dh_pub: DhPublicKey,
+        handshake_init: &[u8],
+    ) -> Result<()> {
+        if handshake_init.is_empty() {
+            return Err(anyhow!("handshake init must not be empty"));
+        }
+        if self.sessions.contains_key(&peer_id)
+            || keystore.list_keys().iter().any(|k| k == &session_key_id(&peer_id))
+        {
+            return Err(anyhow!(
+                "session for peer already exists (memory or keystore); drop it first"
+            ));
+        }
+        let session = DmSession::establish_initiator(peer_id, root_key, peer_initial_dh_pub)?;
+        Self::persist_session_to_keystore(
+            keystore,
+            &peer_id,
+            &session.ratchet,
+            Some(handshake_init),
+        )?;
+        self.pending_handshake_inits
+            .insert(peer_id, handshake_init.to_vec());
+        self.sessions.insert(peer_id, session);
+        Ok(())
+    }
+
+    pub fn pending_handshake_init(&self, peer_id: &IdentityId) -> Option<&[u8]> {
+        self.pending_handshake_inits
+            .get(peer_id)
+            .map(Vec::as_slice)
+    }
+
+    /// Clear the queued init after a reply has been authenticated and
+    /// decrypted with this session.
+    pub fn acknowledge_pending_handshake_init(
+        &mut self,
+        keystore: &mut SecureKeyStore,
+        peer_id: &IdentityId,
+    ) -> Result<bool> {
+        let pending = match self.pending_handshake_inits.remove(peer_id) {
+            Some(bytes) => bytes,
+            None => return Ok(false),
+        };
+        let session = match self.sessions.get(peer_id) {
+            Some(session) => session,
+            None => {
+                self.pending_handshake_inits.insert(*peer_id, pending);
+                return Err(anyhow!("no DM session for pending handshake init"));
+            }
+        };
+        if let Err(err) =
+            Self::persist_session_to_keystore(keystore, peer_id, &session.ratchet, None)
+        {
+            self.pending_handshake_inits.insert(*peer_id, pending);
+            return Err(err);
+        }
+        Ok(true)
     }
 
     /// Initiator-side, hybrid mode, persistent.
@@ -395,7 +477,7 @@ impl SessionManager {
         }
         let session =
             DmSession::establish_initiator_hybrid(peer_id, root_key, peer_initial_dh_pub, kyber)?;
-        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet)?;
+        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet, None)?;
         self.sessions.insert(peer_id, session);
         Ok(())
     }
@@ -416,7 +498,7 @@ impl SessionManager {
             ));
         }
         let session = DmSession::establish_responder(peer_id, root_key, own_initial_keypair)?;
-        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet)?;
+        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet, None)?;
         self.sessions.insert(peer_id, session);
         Ok(())
     }
@@ -439,7 +521,7 @@ impl SessionManager {
         }
         let session =
             DmSession::establish_responder_hybrid(peer_id, root_key, own_initial_keypair, kyber)?;
-        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet)?;
+        Self::persist_session_to_keystore(keystore, &peer_id, &session.ratchet, None)?;
         self.sessions.insert(peer_id, session);
         Ok(())
     }
@@ -452,6 +534,7 @@ impl SessionManager {
         peer_id: &IdentityId,
     ) -> Result<bool> {
         let in_memory = self.sessions.remove(peer_id).is_some();
+        self.pending_handshake_inits.remove(peer_id);
         let on_disk = keystore.delete_key(&session_key_id(peer_id))?;
         Ok(in_memory || on_disk)
     }
@@ -490,7 +573,15 @@ impl SessionManager {
                 Some(b) => b,
                 None => continue,
             };
-            let ratchet = match DoubleRatchet::restore(bytes.expose_secret()) {
+            let (ratchet_bytes, pending_init) =
+                match decode_persisted_session(bytes.expose_secret()) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        tracing::warn!("skipping unrestorable DM session {peer_id:?}: {e}");
+                        continue;
+                    }
+                };
+            let ratchet = match DoubleRatchet::restore(&ratchet_bytes) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
@@ -501,6 +592,9 @@ impl SessionManager {
             };
             self.sessions
                 .insert(peer_id, DmSession { peer_id, ratchet });
+            if let Some(pending) = pending_init {
+                self.pending_handshake_inits.insert(peer_id, pending);
+            }
             loaded += 1;
         }
         Ok(loaded)
@@ -510,10 +604,12 @@ impl SessionManager {
         keystore: &mut SecureKeyStore,
         peer_id: &IdentityId,
         ratchet: &DoubleRatchet,
+        pending_init: Option<&[u8]>,
     ) -> Result<()> {
-        let bytes = ratchet.persist()?;
+        let ratchet_bytes = ratchet.persist()?;
+        let bytes = encode_persisted_session(&ratchet_bytes, pending_init)?;
         let metadata = KeyMetadata {
-            algorithm: "qubee_dm_session_v1".to_string(),
+            algorithm: "qubee_dm_session_v2".to_string(),
             key_size: bytes.len(),
             usage: vec![KeyUsage::Encryption],
             expiry: None,
@@ -521,6 +617,33 @@ impl SessionManager {
         };
         keystore.store_key(&session_key_id(peer_id), &bytes, KeyType::ChainKey, metadata)
     }
+}
+
+const PERSISTED_SESSION_MAGIC: &[u8] = b"QUBEE_DM_SESSION\x01";
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    ratchet: Vec<u8>,
+    pending_handshake_init: Option<Vec<u8>>,
+}
+
+fn encode_persisted_session(ratchet: &[u8], pending_init: Option<&[u8]>) -> Result<Vec<u8>> {
+    let record = PersistedSession {
+        ratchet: ratchet.to_vec(),
+        pending_handshake_init: pending_init.map(|bytes| bytes.to_vec()),
+    };
+    let mut bytes = PERSISTED_SESSION_MAGIC.to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&record)?);
+    Ok(bytes)
+}
+
+fn decode_persisted_session(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    if let Some(record_bytes) = bytes.strip_prefix(PERSISTED_SESSION_MAGIC) {
+        let record: PersistedSession = bincode::deserialize(record_bytes)?;
+        return Ok((record.ratchet, record.pending_handshake_init));
+    }
+    // v1 persisted the serialized ratchet directly.
+    Ok((bytes.to_vec(), None))
 }
 
 /// Keystore key prefix for persisted DM sessions.
@@ -808,6 +931,43 @@ mod tests {
         // on-disk collision).
         mgr.establish_initiator_persistent(&mut ks, bob_id, &root, bob_pub)
             .unwrap();
+    }
+
+    #[test]
+    fn pending_handshake_init_survives_restart_until_acknowledged() {
+        use crate::storage::secure_keystore::{install_test_password, SecureKeyStore};
+        install_test_password();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ks_path = tmp.path().join("ks.db");
+        let bob_id = IdentityId::from([2u8; 32]);
+        let bob_priv = DhStaticSecret::random_from_rng(rand::thread_rng());
+        let bob_pub = DhPublicKey::from(&bob_priv);
+        let init = b"durable handshake init";
+
+        {
+            let mut ks = SecureKeyStore::new(&ks_path).unwrap();
+            let mut mgr = SessionManager::new();
+            mgr.establish_initiator_with_pending_init_persistent(
+                &mut ks,
+                bob_id,
+                &shared_root_key(),
+                bob_pub,
+                init,
+            )
+            .unwrap();
+        }
+
+        let mut ks = SecureKeyStore::new(&ks_path).unwrap();
+        let mut restored = SessionManager::new();
+        assert_eq!(restored.load_from_keystore(&mut ks).unwrap(), 1);
+        assert_eq!(restored.pending_handshake_init(&bob_id), Some(init.as_slice()));
+        assert!(restored
+            .acknowledge_pending_handshake_init(&mut ks, &bob_id)
+            .unwrap());
+
+        let mut restored_after_ack = SessionManager::new();
+        assert_eq!(restored_after_ack.load_from_keystore(&mut ks).unwrap(), 1);
+        assert_eq!(restored_after_ack.pending_handshake_init(&bob_id), None);
     }
 
     #[test]

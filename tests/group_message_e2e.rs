@@ -138,6 +138,67 @@ fn round_trip_encrypted_group_message() {
 }
 
 #[test]
+fn retained_group_key_cannot_bootstrap_a_sender_chain() {
+    let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
+    let alice_id = alice_kp.identity_id();
+    let group_id = alice_gm
+        .create_group(
+            alice_id,
+            alice_kp.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    alice_gm.ensure_group_key(group_id).unwrap();
+    let invitation = alice_gm
+        .create_invitation(group_id, alice_id, None, None)
+        .unwrap();
+    let (_bob_dir, _bob_kp, mut bob_gm, _ma_body, _ma_sig) = join_bob_to_alice(
+        &alice_kp,
+        &mut alice_gm,
+        group_id,
+        invitation.invitation_code,
+        invitation.inviter_name,
+    );
+    let wire = encrypt_group_message(&mut alice_gm, &alice_kp, group_id, b"seeded").unwrap();
+
+    bob_gm.wipe_my_kyber_secret(group_id).unwrap();
+    assert!(decrypt_group_message(&mut bob_gm, &wire).is_err());
+}
+
+#[test]
+fn failed_envelope_build_rolls_back_sender_chain() {
+    let (_dir, sender, mut gm) = fresh_device("sender");
+    let sender_id = sender.identity_id();
+    let group_id = gm
+        .create_group(
+            sender_id,
+            sender.public_key(),
+            "Test Group".to_string(),
+            String::new(),
+            GroupType::Private,
+            GroupSettings::default(),
+        )
+        .unwrap();
+    gm.ensure_group_key(group_id).unwrap();
+
+    let result = gm.encrypt_group_message_with_sender_seed(
+        &group_id,
+        &sender_id,
+        0,
+        Some(&[7u8; 32]),
+        b"message",
+        b"aad",
+        |_| Err(anyhow::anyhow!("envelope creation failed")),
+    );
+
+    assert!(result.is_err());
+    assert!(!gm.has_sender_chain(&group_id, &sender_id, 0));
+}
+
+#[test]
 fn rejects_message_from_non_member() {
     let (_alice_dir, alice_kp, mut alice_gm) = fresh_device("alice");
     let alice_id = alice_kp.identity_id();

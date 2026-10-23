@@ -21,10 +21,27 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::groups::group_handshake::WrappedGroupKey;
 use crate::groups::group_manager::{GroupId, GroupManager};
 use crate::identity::identity_key::{
     HybridSignature, IdentityId, IdentityKey, IdentityKeyPair,
 };
+use crate::security::secure_rng;
+use zeroize::Zeroizing;
+
+const SENDER_KEY_FRAME_MAGIC: &[u8] = b"QSK\x01";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SenderKeyDistribution {
+    recipient_id: IdentityId,
+    wrapped_seed: WrappedGroupKey,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SenderKeyFrame {
+    distributions: Vec<SenderKeyDistribution>,
+    chain_payload: Vec<u8>,
+}
 
 /// Magic prefix for a group-message frame. Distinct from the
 /// handshake magic so the dispatch loop can tell the two apart
@@ -132,19 +149,64 @@ pub fn encrypt_group_message(
         .version;
     let timestamp = now_secs();
     let aad = sender_chain_aad(&group_id, &sender_id, generation, timestamp);
-    let aead_payload =
-        gm.encrypt_group_message(&group_id, &sender_id, generation, plaintext, &aad)?;
-    let body = GroupMessageBody {
-        group_id,
-        sender_id,
+    let (sender_seed, distributions) =
+        if gm.has_sender_chain(&group_id, &sender_id, generation) {
+            (None, Vec::new())
+        } else {
+            let seed = Zeroizing::new(secure_rng::random::array::<32>()?);
+            let group = gm
+                .get_group(&group_id)
+                .ok_or_else(|| anyhow!("encrypt: unknown group"))?;
+            let mut deliveries = Vec::new();
+            for (recipient_id, member) in &group.members {
+                if *recipient_id == sender_id
+                    || !matches!(
+                        member.member_status,
+                        crate::groups::group_manager::MemberStatus::Active
+                    )
+                {
+                    continue;
+                }
+                if member.kyber_pub.is_empty() {
+                    return Err(anyhow!(
+                        "encrypt: active member has no sender-key transport key"
+                    ));
+                }
+                deliveries.push(SenderKeyDistribution {
+                    recipient_id: *recipient_id,
+                    wrapped_seed: WrappedGroupKey::wrap(&seed, &member.kyber_pub)?,
+                });
+            }
+            (Some(seed), deliveries)
+        };
+    gm.encrypt_group_message_with_sender_seed(
+        &group_id,
+        &sender_id,
         generation,
-        aead_payload,
-        timestamp,
-    };
-    let payload = canonical_group_message(&body);
-    let signature = sender_identity.sign(&payload).context("sign group message")?;
-    let envelope = GroupMessageEnvelope { body, signature };
-    envelope.to_wire()
+        sender_seed.as_deref(),
+        plaintext,
+        &aad,
+        |chain_payload| {
+            let mut aead_payload = SENDER_KEY_FRAME_MAGIC.to_vec();
+            aead_payload.extend_from_slice(&bincode::serialize(&SenderKeyFrame {
+                distributions,
+                chain_payload,
+            })?);
+            let body = GroupMessageBody {
+                group_id,
+                sender_id,
+                generation,
+                aead_payload,
+                timestamp,
+            };
+            let payload = canonical_group_message(&body);
+            let signature = sender_identity
+                .sign(&payload)
+                .context("sign group message")?;
+            let envelope = GroupMessageEnvelope { body, signature };
+            envelope.to_wire()
+        },
+    )
 }
 
 /// AEAD AAD for the sender-chain layer. Binds the AEAD ciphertext
@@ -179,7 +241,8 @@ fn sender_chain_aad(
 ///      (so a former member's captured key can't be replayed once
 ///      they're rotated out).
 ///   3. Verify the sender's signature against the canonical payload.
-///   4. Decrypt the AEAD payload with the current group key.
+///   4. Decrypt the sender-chain payload (or a legacy group-key-derived
+///      chain for v1 frames).
 ///   5. Return the plaintext + sender id + timestamp.
 ///
 /// Step 2 is the linchpin of "removed members can't keep talking" —
@@ -236,15 +299,63 @@ pub fn decrypt_group_message(
     }
 
     let aad = sender_chain_aad(&body.group_id, &body.sender_id, body.generation, body.timestamp);
-    let plaintext = gm
-        .decrypt_group_message(
+    let plaintext = if body.aead_payload.starts_with(SENDER_KEY_FRAME_MAGIC) {
+        let frame: SenderKeyFrame =
+            bincode::deserialize(&body.aead_payload[SENDER_KEY_FRAME_MAGIC.len()..])
+                .context("sender-key frame deserialize")?;
+        let sender_seed = if gm.has_sender_chain(&body.group_id, &body.sender_id, body.generation) {
+            None
+        } else {
+            let secret = gm
+                .load_my_kyber_secret(body.group_id)?
+                .ok_or_else(|| anyhow!("decrypt: recipient sender-key secret unavailable"))?;
+            let group = gm
+                .get_group(&body.group_id)
+                .ok_or_else(|| anyhow!("decrypt: unknown group"))?;
+            let mut unwrapped = None;
+            for delivery in &frame.distributions {
+                if !group
+                    .members
+                    .get(&delivery.recipient_id)
+                    .map(|member| {
+                        matches!(
+                            member.member_status,
+                            crate::groups::group_manager::MemberStatus::Active
+                        )
+                    })
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Ok(seed) = delivery.wrapped_seed.unwrap(&secret) {
+                    unwrapped = Some(Zeroizing::new(seed));
+                    break;
+                }
+            }
+            Some(unwrapped.ok_or_else(|| {
+                anyhow!("decrypt: sender-key seed not distributed to an active member")
+            })?)
+        };
+        gm.decrypt_group_message_with_sender_seed(
+            &body.group_id,
+            &body.sender_id,
+            body.generation,
+            sender_seed.as_deref(),
+            &frame.chain_payload,
+            &aad,
+        )
+        .context("sender-chain AEAD decrypt")?
+    } else {
+        // v1 frames predate independent sender-key distribution.
+        gm.decrypt_group_message(
             &body.group_id,
             &body.sender_id,
             body.generation,
             &body.aead_payload,
             &aad,
         )
-        .context("AEAD decrypt")?;
+        .context("legacy AEAD decrypt")?
+    };
 
     Ok(DecryptedGroupMessage {
         group_id: body.group_id,

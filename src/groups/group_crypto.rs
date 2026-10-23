@@ -38,8 +38,8 @@ pub struct GroupKeyRotation {
 ///
 /// * **Group key** — shared 256-bit secret negotiated during the
 ///   join handshake (KEM-wrapped) and rotated on member-add/remove.
-///   Seeds the per-sender chains; never used directly to encrypt
-///   group messages anymore.
+///   New sender chains use independent random seeds and never derive
+///   their state from this retained key.
 /// * **Sender chains** — one [`SenderChain`] per `(group, sender,
 ///   generation)` triple. Each member maintains their own send
 ///   chain plus a tracked recv chain for every other active sender
@@ -143,12 +143,8 @@ impl GroupCrypto {
         self.keys.get(group_id)
     }
 
-    /// Encrypt a plaintext message under the local member's
-    /// per-`(group, sender, generation)` send chain. Lazy-initialises
-    /// the chain on first use from the group key + sender id +
-    /// generation via [`SenderChain::from_group_seed`]; subsequent
-    /// calls advance the chain. Returns the wire format
-    /// `[counter: u32 BE][nonce: 12B][AEAD ct + tag]`.
+    /// Legacy v1 encryption path. New messages use
+    /// `encrypt_with_sender_seed`.
     pub fn encrypt_with_sender_chain(
         &mut self,
         group_id: &GroupId,
@@ -161,11 +157,33 @@ impl GroupCrypto {
         chain.encrypt(plaintext, aad)
     }
 
-    /// Decrypt a frame produced by `encrypt_with_sender_chain`,
-    /// against the recv side of the same `(group, sender,
-    /// generation)` chain. Lazy-initialises the chain on first use
-    /// (deterministic from the same inputs as the sender), then
-    /// advances it.
+    /// Encrypt using a sender-chain secret distributed independently
+    /// from the group's shared key.
+    pub fn encrypt_with_sender_seed(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        sender_seed: Option<&[u8; 32]>,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let chain = if self.has_sender_chain(group_id, sender_id, generation) {
+            self.sender_chains
+                .get_mut(&(*group_id, *sender_id, generation))
+                .expect("chain exists")
+        } else {
+            self.ensure_sender_chain_from_seed(
+                group_id,
+                sender_id,
+                generation,
+                sender_seed.ok_or_else(|| anyhow::anyhow!("sender-chain seed is required"))?,
+            )?
+        };
+        chain.encrypt(plaintext, aad)
+    }
+
+    /// Legacy v1 decryption path for group-key-derived chains.
     pub fn decrypt_with_sender_chain(
         &mut self,
         group_id: &GroupId,
@@ -178,11 +196,66 @@ impl GroupCrypto {
         chain.decrypt(wire, aad)
     }
 
-    /// Get-or-init a sender chain. The chain is derived
-    /// deterministically from `(group_key, group_id, sender_id,
-    /// generation)`, so both peers (the sender and any tracking
-    /// receiver) land on identical state when they first touch a
-    /// `(group, sender, generation)` triple they haven't seen yet.
+    /// Decrypt using a sender-chain secret supplied by an authenticated
+    /// sender-key distribution.
+    pub fn decrypt_with_sender_seed(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        sender_seed: Option<&[u8; 32]>,
+        wire: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let chain = if self.has_sender_chain(group_id, sender_id, generation) {
+            self.sender_chains
+                .get_mut(&(*group_id, *sender_id, generation))
+                .expect("chain exists")
+        } else {
+            self.ensure_sender_chain_from_seed(
+                group_id,
+                sender_id,
+                generation,
+                sender_seed.ok_or_else(|| anyhow::anyhow!("sender-chain seed is required"))?,
+            )?
+        };
+        chain.decrypt(wire, aad)
+    }
+
+    pub fn has_sender_chain(
+        &self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+    ) -> bool {
+        self.sender_chains
+            .contains_key(&(*group_id, *sender_id, generation))
+    }
+
+    fn ensure_sender_chain_from_seed(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        sender_seed: &[u8; 32],
+    ) -> Result<&mut SenderChain> {
+        let key_triple = (*group_id, *sender_id, generation);
+        if !self.sender_chains.contains_key(&key_triple) {
+            let chain = SenderChain::from_sender_seed(
+                sender_seed,
+                group_id,
+                sender_id,
+                generation,
+            )?;
+            self.sender_chains.insert(key_triple, chain);
+        }
+        Ok(self
+            .sender_chains
+            .get_mut(&key_triple)
+            .expect("just inserted"))
+    }
+
+    /// Restore the legacy v1 chain derivation for old group messages.
     fn ensure_sender_chain(
         &mut self,
         group_id: &GroupId,

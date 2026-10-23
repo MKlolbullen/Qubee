@@ -1597,9 +1597,8 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeGenera
 /// return the wire bytes of the handshake init for the
 /// embedder to deliver to the responder.
 ///
-/// Caller is responsible for actually transmitting the returned
-/// bytes (e.g. over P2P / push). This function is purely the
-/// "produce the bytes" side; delivery is out of scope.
+/// The session and init bytes are persisted together. Repeating this
+/// call for a peer with an unacknowledged init returns the same bytes.
 #[no_mangle]
 pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitiateDmHandshake(
     env: JNIEnv,
@@ -1612,26 +1611,39 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeInitia
                 .convert_byte_array(&peer_bundle)
                 .map_err(|e| anyhow::anyhow!("invalid peer_bundle: {e}"))?;
             let bundle = DmPreKeyBundle::from_wire(&bundle_bytes)?;
+            let peer_id = bundle.identity.identity_id;
+            if let Some(pending) = SESSION_MANAGER
+                .lock()
+                .unwrap()
+                .pending_handshake_init(&peer_id)
+                .map(ToOwned::to_owned)
+            {
+                let arr = env
+                    .byte_array_from_slice(&pending)
+                    .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
+                return Ok(arr.into_raw());
+            }
 
             let identity = active_identity()?
                 .ok_or_else(|| anyhow::anyhow!("no active identity"))?;
             let outcome = dm_handshake::initiate(identity.as_ref(), &bundle)?;
 
-            let peer_id = bundle.identity.identity_id;
+            let init_bytes = outcome.message.to_wire()?;
             let mut ks_guard = KEYSTORE.lock().unwrap();
             let ks = ks_guard
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let mut sm = SESSION_MANAGER.lock().unwrap();
-            sm.establish_initiator_persistent(
+            sm.establish_initiator_with_pending_init_persistent(
                 ks,
                 peer_id,
                 &outcome.root_key,
                 outcome.peer_initial_dh_pub,
+                &init_bytes,
             )?;
 
             let arr = env
-                .byte_array_from_slice(&outcome.message.to_wire()?)
+                .byte_array_from_slice(&init_bytes)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;
             Ok(arr.into_raw())
         })();
@@ -1671,12 +1683,14 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeRespon
             let outcome = dm_handshake::respond(&secrets, &msg)?;
 
             let mut sm = SESSION_MANAGER.lock().unwrap();
-            sm.establish_responder_persistent(
-                ks,
-                outcome.peer_id,
-                &outcome.root_key,
-                outcome.own_initial_keypair,
-            )?;
+            if !sm.has_session(&outcome.peer_id) {
+                sm.establish_responder_persistent(
+                    ks,
+                    outcome.peer_id,
+                    &outcome.root_key,
+                    outcome.own_initial_keypair,
+                )?;
+            }
 
             let peer_id_hex = hex::encode(outcome.peer_id.as_ref());
             let java_str = env
@@ -1921,6 +1935,9 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeDecryp
                 .ok_or_else(|| anyhow::anyhow!("keystore not initialised"))?;
             let mut sm = SESSION_MANAGER.lock().unwrap();
             let pt = sm.decrypt_persistent(ks, &peer_id, &wire_bytes, &aad)?;
+            if let Err(e) = sm.acknowledge_pending_handshake_init(ks, &peer_id) {
+                eprintln!("Rust: failed to clear delivered DM handshake init: {e:#}");
+            }
             let arr = env
                 .byte_array_from_slice(&pt)
                 .map_err(|e| anyhow::anyhow!("byte_array_from_slice: {e}"))?;

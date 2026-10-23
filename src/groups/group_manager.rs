@@ -1428,6 +1428,63 @@ impl GroupManager {
         Ok(wire)
     }
 
+    /// Encrypt with a sender-chain secret distributed independently
+    /// from the retained group key. A seed is needed only on first use.
+    pub fn encrypt_group_message_with_sender_seed(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        sender_seed: Option<&[u8; 32]>,
+        plaintext: &[u8],
+        aad: &[u8],
+        build_envelope: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let snapshot = self
+            .group_crypto
+            .serialize_sender_chain(group_id, sender_id, generation)?;
+        let chain_payload = self.group_crypto.encrypt_with_sender_seed(
+            group_id,
+            sender_id,
+            generation,
+            sender_seed,
+            plaintext,
+            aad,
+        )?;
+        let wire = match build_envelope(chain_payload) {
+            Ok(wire) => wire,
+            Err(envelope_err) => {
+                match snapshot {
+                    Some(bytes) => self.group_crypto.install_sender_chain(
+                        group_id,
+                        sender_id,
+                        generation,
+                        &bytes,
+                    )?,
+                    None => self
+                        .group_crypto
+                        .drop_sender_chain(group_id, sender_id, generation),
+                }
+                return Err(envelope_err);
+            }
+        };
+        if let Err(persist_err) = self.persist_sender_chain(group_id, sender_id, generation) {
+            match snapshot {
+                Some(bytes) => self.group_crypto.install_sender_chain(
+                    group_id,
+                    sender_id,
+                    generation,
+                    &bytes,
+                )?,
+                None => self
+                    .group_crypto
+                    .drop_sender_chain(group_id, sender_id, generation),
+            }
+            return Err(persist_err);
+        }
+        Ok(wire)
+    }
+
     /// Decrypt an incoming group message. Advances the tracked
     /// sender chain for `(group_id, sender_id, generation)`,
     /// stashing any out-of-order keys; persists the new chain
@@ -1479,6 +1536,55 @@ impl GroupManager {
             return Err(persist_err);
         }
         Ok(pt)
+    }
+
+    /// Decrypt with the sender-chain secret supplied by an authenticated
+    /// sender-key distribution.
+    pub fn decrypt_group_message_with_sender_seed(
+        &mut self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+        sender_seed: Option<&[u8; 32]>,
+        wire: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let snapshot = self
+            .group_crypto
+            .serialize_sender_chain(group_id, sender_id, generation)?;
+        let plaintext = self.group_crypto.decrypt_with_sender_seed(
+            group_id,
+            sender_id,
+            generation,
+            sender_seed,
+            wire,
+            aad,
+        )?;
+        if let Err(persist_err) = self.persist_sender_chain(group_id, sender_id, generation) {
+            match snapshot {
+                Some(bytes) => self.group_crypto.install_sender_chain(
+                    group_id,
+                    sender_id,
+                    generation,
+                    &bytes,
+                )?,
+                None => self
+                    .group_crypto
+                    .drop_sender_chain(group_id, sender_id, generation),
+            }
+            return Err(persist_err);
+        }
+        Ok(plaintext)
+    }
+
+    pub fn has_sender_chain(
+        &self,
+        group_id: &GroupId,
+        sender_id: &IdentityId,
+        generation: u64,
+    ) -> bool {
+        self.group_crypto
+            .has_sender_chain(group_id, sender_id, generation)
     }
 
     /// Keystore key under which this `(group, sender, generation)`

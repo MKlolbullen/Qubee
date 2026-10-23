@@ -7,8 +7,9 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::fs;
 use std::sync::{OnceLock, RwLock};
 use zeroize::Zeroize;
 use crate::security::secure_rng;
@@ -18,6 +19,7 @@ use crate::security::secure_rng;
 /// key with a hard-coded global salt) to "v1" (versioned header,
 /// per-instance Argon2id salt). Old "v0" files no longer load.
 const MASTER_KEY_FORMAT_V1: u8 = 1;
+const LEGACY_MASTER_KEY_LEN: usize = 12 + 32 + 16;
 /// Length of the per-instance salt persisted alongside each master-key
 /// file. 16 bytes is the OWASP-recommended minimum for password hashes.
 const MASTER_KEY_SALT_LEN: usize = 16;
@@ -330,6 +332,35 @@ impl SecureKeyStore {
             return Err(anyhow::anyhow!("master key file is empty"));
         }
 
+        if raw.len() == LEGACY_MASTER_KEY_LEN {
+            let mut password = Self::get_user_password()?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(password.as_bytes());
+            hasher.update(b"qubee_keystore_salt");
+            password.zeroize();
+            let mut derived_key = *hasher.finalize().as_bytes();
+
+            let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).expect("32-byte key");
+            let nonce = Nonce::from_slice(&raw[..12]);
+            let decrypted = cipher
+                .decrypt(nonce, &raw[12..])
+                .map_err(|e| anyhow::anyhow!("legacy master key decrypt failed (wrong password?): {e}"));
+            derived_key.zeroize();
+            let mut decrypted = decrypted?;
+            if decrypted.len() != 32 {
+                decrypted.zeroize();
+                return Err(anyhow::anyhow!("invalid legacy master key size"));
+            }
+
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&decrypted);
+            decrypted.zeroize();
+            let master_key = SecretBox::new(Box::new(key_array));
+            Self::save_master_key_to_path(&master_key, path)
+                .context("failed to atomically migrate legacy master key")?;
+            return Ok(master_key);
+        }
+
         let header_len = 1 + MASTER_KEY_SALT_LEN + MASTER_KEY_NONCE_LEN;
         // ChaCha20-Poly1305 ciphertext is plaintext (32 bytes) + 16-byte
         // tag, so a well-formed file is exactly header + 48 bytes.
@@ -403,9 +434,7 @@ impl SecureKeyStore {
         file_data.extend_from_slice(&nonce_bytes);
         file_data.extend_from_slice(&encrypted);
 
-        fs::write(path, file_data)
-            .context("Failed to write master key file")?;
-        Ok(())
+        write_file_atomically(path, &file_data)
     }
     
     /// Resolve the password used to derive the master-key file encryption
@@ -505,6 +534,37 @@ impl SecureKeyStore {
     }
 }
 
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let suffix = hex::encode(secure_rng::random::array::<8>()?);
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp_path = path.with_file_name(format!(".{file_name}.{suffix}.tmp"));
+
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .context("failed to create temporary master-key file")?;
+        file.write_all(bytes)
+            .context("failed to write temporary master-key file")?;
+        file.sync_all()
+            .context("failed to sync temporary master-key file")?;
+        fs::rename(&temp_path, path)
+            .context("failed to atomically replace master-key file")?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
 impl Drop for SecureKeyStore {
     fn drop(&mut self) {
         // Attempt to save keys on drop
@@ -549,6 +609,77 @@ mod tests {
             .expect("Key not found");
         
         assert_eq!(retrieved.expose_secret(), key_data);
+    }
+
+    #[test]
+    fn migrates_v0_master_key_and_preserves_keystore_entries() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let storage_path = temp_dir.path().join("legacy_keystore.db");
+        let master_path = storage_path.with_extension("master");
+        let password = "qubee-keystore-test-password";
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(password.as_bytes());
+        hasher.update(b"qubee_keystore_salt");
+        let legacy_key = *hasher.finalize().as_bytes();
+        let master_key_bytes = [0x5Au8; 32];
+        let nonce_bytes = secure_rng::random::array::<12>().unwrap();
+        let cipher = ChaCha20Poly1305::new_from_slice(&legacy_key).unwrap();
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), master_key_bytes.as_ref())
+            .unwrap();
+        let mut legacy_file = Vec::with_capacity(LEGACY_MASTER_KEY_LEN);
+        legacy_file.extend_from_slice(&nonce_bytes);
+        legacy_file.extend_from_slice(&ciphertext);
+        fs::write(&master_path, legacy_file).unwrap();
+
+        let key_data = b"preserved legacy entry";
+        let entry_nonce = secure_rng::random::array::<12>().unwrap();
+        let entry_cipher = ChaCha20Poly1305::new_from_slice(&master_key_bytes).unwrap();
+        let entry = EncryptedKeyEntry {
+            encrypted_data: entry_cipher
+                .encrypt(Nonce::from_slice(&entry_nonce), key_data.as_ref())
+                .unwrap(),
+            nonce: entry_nonce,
+            key_type: KeyType::EncryptionKey,
+            created_at: 1,
+            last_accessed: 1,
+            metadata: KeyMetadata {
+                algorithm: "test".to_string(),
+                key_size: key_data.len(),
+                usage: vec![KeyUsage::Encryption],
+                expiry: None,
+                tags: HashMap::new(),
+            },
+        };
+        fs::write(
+            &storage_path,
+            bincode::serialize(&HashMap::from([("legacy_entry".to_string(), entry)])).unwrap(),
+        )
+        .unwrap();
+
+        let mut keystore = SecureKeyStore::new(&storage_path).expect("migrated keystore");
+        assert_eq!(
+            keystore
+                .retrieve_key("legacy_entry")
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            key_data,
+        );
+        let migrated = fs::read(&master_path).unwrap();
+        assert_eq!(migrated[0], MASTER_KEY_FORMAT_V1);
+        assert_eq!(migrated.len(), 1 + MASTER_KEY_SALT_LEN + MASTER_KEY_NONCE_LEN + 48);
+        drop(keystore);
+
+        let mut reopened = SecureKeyStore::new(&storage_path).expect("reopen migrated store");
+        assert_eq!(
+            reopened
+                .retrieve_key("legacy_entry")
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            key_data,
+        );
     }
     
     #[test]

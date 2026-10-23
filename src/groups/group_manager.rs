@@ -832,7 +832,16 @@ impl GroupManager {
         // `set_group_key` so the rotator's own GroupCrypto picks it
         // up immediately.
         let new_key = crate::security::secure_rng::random::array::<32>()?;
+        let previous_key = self.group_crypto.export_group_key(&group_id);
         self.group_crypto.set_group_key(group_id, new_key);
+        if let Err(err) = self.persist_group_key(&group_id) {
+            if let Some(previous_key) = previous_key {
+                self.group_crypto.set_group_key(group_id, previous_key);
+            } else {
+                self.group_crypto.remove_group_key(&group_id);
+            }
+            return Err(err);
+        }
 
         let group = self
             .groups
@@ -2001,5 +2010,42 @@ mod tests {
         // recv-side `gm` and verify.
         let _ = wire_pre_restart;
     }
-}
 
+    #[test]
+    fn rotated_group_key_survives_process_restart() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let keystore_path = temp_dir.path().join("rotated_group_key.db");
+        let creator = IdentityKeyPair::generate().expect("creator keypair");
+        let creator_id = creator.identity_id();
+        let (group_id, rotated_key) = {
+            let keystore = SecureKeystore::new(&keystore_path).expect("keystore");
+            let mut gm = GroupManager::new(keystore).expect("group manager");
+            let group_id = gm
+                .create_group(
+                    creator_id,
+                    creator.public_key(),
+                    "Rotation persistence".to_string(),
+                    String::new(),
+                    GroupType::Private,
+                    GroupSettings::default(),
+                )
+                .expect("create group");
+            gm.ensure_group_key(group_id).expect("initial group key");
+            let original_key = gm.export_group_key(&group_id).expect("original key");
+
+            gm.rotate_group_key_after_removal(group_id, creator_id)
+                .expect("rotate key");
+            let rotated_key = gm.export_group_key(&group_id).expect("rotated key");
+            assert_ne!(rotated_key, original_key);
+            (group_id, rotated_key)
+        };
+
+        let keystore = SecureKeystore::new(&keystore_path).expect("reopen keystore");
+        let mut gm = GroupManager::new(keystore).expect("reopen group manager");
+        gm.load_groups_from_storage().expect("load groups");
+        assert_eq!(
+            gm.export_group_key(&group_id),
+            Some(rotated_key),
+        );
+    }
+}

@@ -134,6 +134,10 @@ impl GroupCrypto {
             .map(|k| *k.key.expose_secret())
     }
 
+    pub fn remove_group_key(&mut self, group_id: &GroupId) {
+        self.keys.remove(group_id);
+    }
+
     /// Retrieve the current key for a group, if any.
     pub fn get_group_key(&self, group_id: &GroupId) -> Option<&GroupKey> {
         self.keys.get(group_id)

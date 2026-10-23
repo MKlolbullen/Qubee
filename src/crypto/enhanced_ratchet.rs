@@ -225,7 +225,8 @@ impl EnhancedHybridRatchet {
     /// the peer can identify which chain step to advance to.
     pub fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let counter = self.send_counter;
-        let msg_key = self.send_chain.step()?;
+        let mut next_send_chain = self.send_chain.duplicate();
+        let msg_key = next_send_chain.step()?;
         let nonce_bytes = secure_rng::random::array::<NONCE_LEN>()?;
 
         let cipher = ChaCha20Poly1305::new_from_slice(msg_key.as_ref()).expect("32-byte key");
@@ -235,10 +236,13 @@ impl EnhancedHybridRatchet {
             .map_err(|e| anyhow::anyhow!("aead encrypt: {e}"))?;
         // msg_key zeroises on drop here.
 
-        self.send_counter = self
+        let next_counter = self
             .send_counter
             .checked_add(1)
             .context("send counter overflow — re-handshake required")?;
+
+        self.send_chain = next_send_chain;
+        self.send_counter = next_counter;
 
         let mut wire = Vec::with_capacity(4 + NONCE_LEN + ct.len());
         wire.extend_from_slice(&counter.to_be_bytes());
@@ -419,6 +423,21 @@ mod tests {
         // Re-delivering the same wire bytes is rejected: the recv
         // chain has already advanced past that counter.
         assert!(b.decrypt(&wire, b"").is_err());
+    }
+
+    #[test]
+    fn send_chain_is_unchanged_when_counter_increment_fails() {
+        let (mut sender, mut receiver) = pair();
+        sender.send_counter = u32::MAX;
+        let chain_before = *sender.send_chain.0.expose_secret();
+
+        assert!(sender.encrypt(b"retry", b"").is_err());
+        assert_eq!(sender.send_counter, u32::MAX);
+        assert_eq!(*sender.send_chain.0.expose_secret(), chain_before);
+
+        sender.send_counter = 0;
+        let wire = sender.encrypt(b"retry", b"").expect("retry succeeds");
+        assert_eq!(receiver.decrypt(&wire, b"").unwrap(), b"retry");
     }
 
     #[test]

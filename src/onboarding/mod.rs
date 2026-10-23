@@ -23,10 +23,9 @@ use crate::sessions::handshake::DmPreKeyBundle;
 
 pub const QUBEE_IDENTITY_HOST: &str = "identity";
 /// Domain separator for the bytes the bundle's signature covers.
-/// Bumped to `v3` when the optional `dm_prekey_bundle` field was
-/// added; `v2` bundles still verify against the v2 tag (different
-/// canonical bytes) so older clients fail gracefully on encounter.
+/// Bumped to `v3` when the optional `dm_prekey_bundle` field was added.
 pub const ONBOARDING_DOMAIN_TAG: &[u8] = b"qubee_onboarding_v3";
+const ONBOARDING_V2_DOMAIN_TAG: &[u8] = b"qubee_onboarding_v2";
 /// Maximum age of an onboarding bundle, in seconds. Older bundles are
 /// rejected at decode time so a leaked QR can't follow you forever.
 pub const ONBOARDING_BUNDLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -49,6 +48,14 @@ pub struct OnboardingBundle {
     /// user_id, public_key, dm_prekey_bundle)` plus a
     /// domain-separation tag.
     pub signature: HybridSignature,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OnboardingBundleV2 {
+    display_name: String,
+    user_id: String,
+    public_key: IdentityKey,
+    signature: HybridSignature,
 }
 
 impl OnboardingBundle {
@@ -104,8 +111,21 @@ impl OnboardingBundle {
         let bytes = URL_SAFE_NO_PAD
             .decode(token.as_bytes())
             .context("identity token is not valid base64url")?;
-        let bundle: OnboardingBundle =
+        if let Ok(bundle) = bincode::deserialize::<OnboardingBundle>(&bytes) {
+            if bundle.verify().is_ok() {
+                return Ok(bundle);
+            }
+        }
+
+        let legacy: OnboardingBundleV2 =
             bincode::deserialize(&bytes).context("identity payload could not be decoded")?;
+        let bundle = OnboardingBundle {
+            display_name: legacy.display_name,
+            user_id: legacy.user_id,
+            public_key: legacy.public_key,
+            dm_prekey_bundle: None,
+            signature: legacy.signature,
+        };
         bundle.verify()?;
         Ok(bundle)
     }
@@ -122,17 +142,29 @@ impl OnboardingBundle {
             &self.public_key,
             self.dm_prekey_bundle.as_deref(),
         )?;
-        match self
-            .public_key
-            .verify_with_max_age(&payload, &self.signature, ONBOARDING_BUNDLE_TTL_SECS)
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(anyhow!(
-                    "onboarding bundle is invalid (bad signature, wrong signer, or expired)"
-                ))
-            }
-            Err(e) => return Err(anyhow!("onboarding signature could not be verified: {e}")),
+        let valid = self.public_key.verify_with_max_age(
+            &payload,
+            &self.signature,
+            ONBOARDING_BUNDLE_TTL_SECS,
+        )?;
+        let valid = if !valid && self.dm_prekey_bundle.is_none() {
+            let legacy_payload = canonical_payload_v2(
+                &self.display_name,
+                &self.user_id,
+                &self.public_key,
+            )?;
+            self.public_key.verify_with_max_age(
+                &legacy_payload,
+                &self.signature,
+                ONBOARDING_BUNDLE_TTL_SECS,
+            )?
+        } else {
+            valid
+        };
+        if !valid {
+            return Err(anyhow!(
+                "onboarding bundle is invalid (bad signature, wrong signer, or expired)"
+            ));
         }
 
         if let Some(bytes) = &self.dm_prekey_bundle {
@@ -185,6 +217,22 @@ fn canonical_payload(
     Ok(out)
 }
 
+fn canonical_payload_v2(
+    display_name: &str,
+    user_id: &str,
+    public_key: &IdentityKey,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(64 + display_name.len() + user_id.len());
+    out.extend_from_slice(ONBOARDING_V2_DOMAIN_TAG);
+    out.push(0u8);
+    out.extend_from_slice(display_name.as_bytes());
+    out.push(0u8);
+    out.extend_from_slice(user_id.as_bytes());
+    out.push(0u8);
+    out.extend_from_slice(&bincode::serialize(public_key).context("pubkey serialize")?);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +261,29 @@ mod tests {
         let link = bundle.to_share_link().unwrap();
         let back = OnboardingBundle::from_share_link(&link).unwrap();
         assert_eq!(back.dm_prekey_bundle.as_ref().unwrap(), &dm_bytes);
+    }
+
+    #[test]
+    fn verifies_legacy_v2_share_link() {
+        let keypair = IdentityKeyPair::generate().unwrap();
+        let display_name = "Alice".to_string();
+        let user_id = "uid-1".to_string();
+        let public_key = keypair.public_key();
+        let payload = canonical_payload_v2(&display_name, &user_id, &public_key).unwrap();
+        let legacy = OnboardingBundleV2 {
+            display_name,
+            user_id,
+            public_key,
+            signature: keypair.sign(&payload).unwrap(),
+        };
+        let token = URL_SAFE_NO_PAD.encode(bincode::serialize(&legacy).unwrap());
+        let link = format!("qubee://{QUBEE_IDENTITY_HOST}/{token}");
+
+        let decoded = OnboardingBundle::from_share_link(&link).unwrap();
+        assert_eq!(decoded.display_name, "Alice");
+        assert_eq!(decoded.user_id, "uid-1");
+        assert!(decoded.dm_prekey_bundle.is_none());
+        decoded.verify().unwrap();
     }
 
     #[test]

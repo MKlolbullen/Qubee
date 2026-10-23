@@ -2247,12 +2247,17 @@ pub extern "system" fn Java_com_qubee_messenger_crypto_QubeeManager_nativeVerify
 
         let result: anyhow::Result<serde_json::Value> = (|| {
             let bundle = OnboardingBundle::from_share_link(&link)?;
+            let dm_prekey_bundle_b64 = bundle.dm_prekey_bundle.as_ref().map(|bytes| {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                STANDARD.encode(bytes)
+            });
             Ok(json!({
                 "user_id": bundle.user_id,
                 "display_name": bundle.display_name,
                 "identity_id_hex": hex::encode(bundle.identity_id().as_ref()),
                 "identity_key_hex": hex::encode(bundle.public_key.to_bytes()),
                 "fingerprint": bundle.public_key.fingerprint(),
+                "dm_prekey_bundle_b64": dm_prekey_bundle_b64,
             }))
         })();
 

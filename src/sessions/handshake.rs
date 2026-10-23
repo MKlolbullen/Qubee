@@ -95,6 +95,10 @@ use crate::identity::identity_key::{
 /// Reject handshake init messages older than this. 5 minutes
 /// matches the rest of the protocol's freshness window.
 pub const HANDSHAKE_MAX_AGE_SECS: u64 = 5 * 60;
+/// Published prekeys remain valid for the same maximum window as the
+/// onboarding link that carries them.
+pub const DM_PREKEY_BUNDLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const PREKEY_FUTURE_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
 /// Domain-separated context for the canonical-bytes serialisers.
 const PREKEY_BUNDLE_TAG: &[u8] = b"qubee/dm-handshake/v1/prekey-bundle";
@@ -377,6 +381,12 @@ pub fn initiate(
     own_identity_kp: &IdentityKeyPair,
     peer_bundle: &DmPreKeyBundle,
 ) -> Result<InitiateOutcome> {
+    let now = now_secs()?;
+    if peer_bundle.timestamp > now.saturating_add(PREKEY_FUTURE_CLOCK_SKEW_SECS)
+        || now.saturating_sub(peer_bundle.timestamp) > DM_PREKEY_BUNDLE_TTL_SECS
+    {
+        return Err(anyhow!("peer prekey bundle is outside its validity window"));
+    }
     let canonical = canonical_prekey_bundle_bytes(
         &peer_bundle.identity,
         &peer_bundle.spk_pub,
@@ -386,7 +396,11 @@ pub fn initiate(
     );
     let valid = peer_bundle
         .identity
-        .verify(&canonical, &peer_bundle.signature)
+        .verify_with_max_age(
+            &canonical,
+            &peer_bundle.signature,
+            DM_PREKEY_BUNDLE_TTL_SECS,
+        )
         .context("verify peer bundle signature")?;
     if !valid {
         return Err(anyhow!("peer prekey bundle signature failed verification"));
@@ -735,6 +749,16 @@ mod tests {
             .timestamp
             .saturating_sub(HANDSHAKE_MAX_AGE_SECS + 60);
         assert!(respond(&secrets, &init_out.message).is_err());
+    }
+
+    #[test]
+    fn rejects_expired_prekey_bundle() {
+        let alice = fresh_identity();
+        let bob = fresh_identity();
+        let (mut bundle, _) = generate_prekey_bundle(&bob, 1).unwrap();
+        bundle.timestamp = now_secs().unwrap() - DM_PREKEY_BUNDLE_TTL_SECS - 1;
+
+        assert!(initiate(&alice, &bundle).is_err());
     }
 
     #[test]
